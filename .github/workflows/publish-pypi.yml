@@ -1,0 +1,23 @@
+name: Publish PyPI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Set up Python
+        run: uv python install 3.13
+      - name: Build
+        run: uv build --sdist --wheel
+      - name: Publish
+        run: uv publish --trusted-publishing always --check-url https://pypi.org/simple/ dist/*
