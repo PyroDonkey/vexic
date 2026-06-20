@@ -296,6 +296,17 @@ class SourceTranscriptIngestResult:
     warning: str | None = None
 
 
+def _source_duplicate_warning(existing_message_json: object, msg_json: str) -> str | None:
+    try:
+        existing = json.loads(str(existing_message_json))
+        incoming = json.loads(msg_json)
+    except (json.JSONDecodeError, TypeError):
+        return "source key already ingested; existing content unreadable"
+    if existing != incoming:
+        return "source key already ingested with different content"
+    return None
+
+
 def _normalize_source_host(value: str) -> str:
     return unicodedata.normalize("NFC", value.strip()).casefold()
 
@@ -409,9 +420,7 @@ def ingest_source_messages(
                     (source_host, source_session_id, source_message_id),
                 ).fetchone()
                 if existing is not None:
-                    warning = None
-                    if json.loads(str(existing[1])) != json.loads(msg_json):
-                        warning = "source key already ingested with different content"
+                    warning = _source_duplicate_warning(existing[1], msg_json)
                     results.append(
                         SourceTranscriptIngestResult(
                             source_host=source_host,
@@ -459,9 +468,7 @@ def ingest_source_messages(
                     ).fetchone()
                     if existing is None:
                         raise
-                    warning = None
-                    if json.loads(str(existing[1])) != json.loads(msg_json):
-                        warning = "source key already ingested with different content"
+                    warning = _source_duplicate_warning(existing[1], msg_json)
                     results.append(
                         SourceTranscriptIngestResult(
                             source_host=source_host,

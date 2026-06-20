@@ -476,6 +476,57 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(hits), 1)
         self.assertIn("original cedar", hits[0].body)
 
+    async def test_ingest_source_transcript_skips_unreadable_existing_duplicate(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+
+        def source_message(source_message_id: str, content: str) -> SourceTranscriptMessage:
+            return SourceTranscriptMessage(
+                source_host="claude-code",
+                source_session_id="session-1",
+                source_message_id=source_message_id,
+                message_json=single_message_adapter.dump_json(
+                    ModelRequest(parts=[UserPromptPart(content=content)])
+                ).decode(),
+            )
+
+        await service.ingest_source_transcript(
+            IngestSourceTranscriptRequest(
+                scope=_scope().model_copy(
+                    update={"capabilities": {MemoryCapability.WRITE}}
+                ),
+                messages=[source_message("uuid-1", "original cedar")],
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("UPDATE messages SET message_json = '{' WHERE id = 1")
+            conn.commit()
+
+        retry = await service.ingest_source_transcript(
+            IngestSourceTranscriptRequest(
+                scope=_scope().model_copy(
+                    update={"capabilities": {MemoryCapability.WRITE}}
+                ),
+                messages=[
+                    source_message("uuid-1", "original cedar"),
+                    source_message("uuid-2", "fresh cedar"),
+                ],
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+
+        self.assertEqual([row.status for row in retry.items], ["skipped", "inserted"])
+        self.assertEqual(retry.items[0].message_id, 1)
+        self.assertEqual(
+            retry.items[0].warning,
+            "source key already ingested; existing content unreadable",
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 2)
+
     async def test_ingest_source_transcript_rejects_polluted_rows_per_row(self) -> None:
         from vexic.service import LocalMemoryService
 
