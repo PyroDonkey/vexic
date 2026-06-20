@@ -511,6 +511,22 @@ def _ensure_vector_memory_schema(conn: sqlite3.Connection) -> None:
     _ensure_long_term_memory_embeddings(conn)
 
 
+def _ensure_source_transcript_ledger(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS source_transcript_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_host TEXT NOT NULL,
+            source_session_id TEXT NOT NULL,
+            source_message_id TEXT NOT NULL,
+            message_id INTEGER NOT NULL REFERENCES messages(id),
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (source_host, source_session_id, source_message_id)
+        )
+        """
+    )
+
+
 def init_db(db_path: str) -> None:
     # Lazy import breaks the schema<->transcript cycle: transcript imports the
     # secret guard from this module at load time, so the Tier-1 FTS builder is
@@ -543,6 +559,7 @@ def init_db(db_path: str) -> None:
             )
 
             _ensure_messages_fts(conn)
+            _ensure_source_transcript_ledger(conn)
 
             conn.execute(
                 """

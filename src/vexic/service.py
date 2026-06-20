@@ -10,6 +10,8 @@ from vexic.contract import (
     ExpandHistoryResult,
     ExportScopeRequest,
     ExportScopeResult,
+    IngestSourceTranscriptRequest,
+    IngestSourceTranscriptResult,
     MemoryCapability,
     MemoryCategory,
     MemoryScope,
@@ -29,6 +31,7 @@ from vexic.contract import (
     SearchLongTermResult,
     SearchTranscriptRequest,
     SearchTranscriptResult,
+    SourceTranscriptIngestItemResult,
     TranscriptHit,
     LongTermFact as ContractLongTermFact,
     require_capability,
@@ -37,6 +40,8 @@ from vexic.ports import EmbedTexts
 from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage import (
     TranscriptRangeTooLarge,
+    SourceTranscriptInput,
+    ingest_source_messages,
     init_db,
     load_messages_in_id_range,
     save_messages,
@@ -86,6 +91,40 @@ class LocalMemoryService(MemoryService):
             forbidden_secret_values=self._redaction_values(request.redaction),
         )
         return AppendTranscriptResult(message_ids=message_ids)
+
+    async def ingest_source_transcript(
+        self,
+        request: IngestSourceTranscriptRequest,
+    ) -> IngestSourceTranscriptResult:
+        self._authorize(request.scope, request.required_capability)
+        results = ingest_source_messages(
+            self.db_path,
+            [
+                SourceTranscriptInput(
+                    source_host=item.source_host,
+                    source_session_id=item.source_session_id,
+                    source_message_id=item.source_message_id,
+                    message_json=item.message_json,
+                )
+                for item in request.messages
+            ],
+            session_id=request.scope.session_id or "default",
+            forbidden_secret_values=self._redaction_values(request.redaction),
+        )
+        return IngestSourceTranscriptResult(
+            items=[
+                SourceTranscriptIngestItemResult(
+                    source_host=item.source_host,
+                    source_session_id=item.source_session_id,
+                    source_message_id=item.source_message_id,
+                    status=item.status,
+                    message_id=item.message_id,
+                    reason=item.reason,
+                    warning=item.warning,
+                )
+                for item in results
+            ]
+        )
 
     async def search_transcript(
         self,

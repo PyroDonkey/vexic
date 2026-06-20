@@ -1,8 +1,10 @@
 import json
 import sqlite3
+import unicodedata
 from collections.abc import Iterable
 from contextlib import closing
 from dataclasses import dataclass, replace
+from typing import Literal
 
 from pydantic import TypeAdapter
 from pydantic_ai.messages import (
@@ -273,6 +275,215 @@ def save_messages(
                 if cursor.lastrowid is not None:
                     message_ids.append(int(cursor.lastrowid))
     return message_ids
+
+
+@dataclass(frozen=True)
+class SourceTranscriptInput:
+    source_host: str
+    source_session_id: str
+    source_message_id: str
+    message_json: str
+
+
+@dataclass(frozen=True)
+class SourceTranscriptIngestResult:
+    source_host: str
+    source_session_id: str
+    source_message_id: str
+    status: Literal["inserted", "skipped", "rejected"]
+    message_id: int | None = None
+    reason: str | None = None
+    warning: str | None = None
+
+
+def _normalize_source_host(value: str) -> str:
+    return unicodedata.normalize("NFC", value.strip()).casefold()
+
+
+def _normalize_source_id(value: str) -> str:
+    # Source host names are case-insensitive; host-owned session/message IDs are not.
+    return unicodedata.normalize("NFC", value.strip())
+
+
+def _part_kind(part: object) -> str:
+    return str(getattr(part, "part_kind", type(part).__name__))
+
+
+def _polluted_transcript_reason(msg: ModelMessage) -> str | None:
+    if isinstance(msg, ModelRequest):
+        if msg.instructions is not None:
+            return "dynamic instructions are not transcript text"
+        if msg.run_id is not None or msg.metadata:
+            return "request metadata is not transcript text"
+        for part in msg.parts:
+            if isinstance(part, UserPromptPart):
+                if not isinstance(part.content, str):
+                    return "non-text user content is not transcript text"
+                continue
+            return f"{_part_kind(part)} is not transcript text"
+    elif isinstance(msg, ModelResponse):
+        if (
+            msg.model_name is not None
+            or msg.provider_name is not None
+            or msg.provider_url is not None
+            or msg.provider_details is not None
+            or msg.provider_response_id is not None
+            or msg.finish_reason is not None
+            or msg.run_id is not None
+            or msg.metadata
+            or msg.usage != type(msg.usage)()
+        ):
+            return "response metadata is not transcript text"
+        for part in msg.parts:
+            if isinstance(part, TextPart):
+                if part.id is not None or part.provider_name is not None or part.provider_details:
+                    return "text metadata is not transcript text"
+                continue
+            return f"{_part_kind(part)} is not transcript text"
+    else:
+        return "only user and assistant transcript messages can be ingested"
+
+    if not message_search_text(msg):
+        return "message has no transcript text"
+    return None
+
+
+def ingest_source_messages(
+    db_path: str,
+    inputs: list[SourceTranscriptInput],
+    *,
+    session_id: str = "default",
+    forbidden_secret_values: Iterable[str] = (),
+) -> list[SourceTranscriptIngestResult]:
+    results: list[SourceTranscriptIngestResult] = []
+    forbidden_values = tuple(forbidden_secret_values)
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute("PRAGMA foreign_keys=ON")
+        with conn:
+            for item in inputs:
+                source_host = _normalize_source_host(item.source_host)
+                source_session_id = _normalize_source_id(item.source_session_id)
+                source_message_id = _normalize_source_id(item.source_message_id)
+                try:
+                    message = single_message_adapter.validate_json(item.message_json)
+                except ValueError:
+                    results.append(
+                        SourceTranscriptIngestResult(
+                            source_host=source_host,
+                            source_session_id=source_session_id,
+                            source_message_id=source_message_id,
+                            status="rejected",
+                            reason="invalid message_json",
+                        )
+                    )
+                    continue
+                msg_json = single_message_adapter.dump_json(message).decode()
+                body = message_search_text(message)
+                reason = _polluted_transcript_reason(message)
+                if reason is None:
+                    try:
+                        _assert_no_forbidden_secret_values(forbidden_values, msg_json, body)
+                    except ValueError as exc:
+                        reason = str(exc)
+                if reason is not None:
+                    results.append(
+                        SourceTranscriptIngestResult(
+                            source_host=source_host,
+                            source_session_id=source_session_id,
+                            source_message_id=source_message_id,
+                            status="rejected",
+                            reason=reason,
+                        )
+                    )
+                    continue
+
+                existing = conn.execute(
+                    """
+                    SELECT l.message_id, m.message_json
+                    FROM source_transcript_ledger AS l
+                    JOIN messages AS m ON m.id = l.message_id
+                    WHERE l.source_host = ?
+                        AND l.source_session_id = ?
+                        AND l.source_message_id = ?
+                    """,
+                    (source_host, source_session_id, source_message_id),
+                ).fetchone()
+                if existing is not None:
+                    warning = None
+                    if json.loads(str(existing[1])) != json.loads(msg_json):
+                        warning = "source key already ingested with different content"
+                    results.append(
+                        SourceTranscriptIngestResult(
+                            source_host=source_host,
+                            source_session_id=source_session_id,
+                            source_message_id=source_message_id,
+                            status="skipped",
+                            message_id=int(existing[0]),
+                            warning=warning,
+                        )
+                    )
+                    continue
+
+                conn.execute("SAVEPOINT source_ingest_row")
+                try:
+                    cursor = conn.execute(
+                        "INSERT INTO messages (session_id, message_json) VALUES (?, ?)",
+                        (session_id, msg_json),
+                    )
+                    message_id = int(cursor.lastrowid)
+                    conn.execute(
+                        "INSERT INTO messages_fts (message_id, session_id, body) VALUES (?, ?, ?)",
+                        (message_id, session_id, body),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO source_transcript_ledger
+                            (source_host, source_session_id, source_message_id, message_id)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (source_host, source_session_id, source_message_id, message_id),
+                    )
+                except sqlite3.IntegrityError:
+                    conn.execute("ROLLBACK TO SAVEPOINT source_ingest_row")
+                    conn.execute("RELEASE SAVEPOINT source_ingest_row")
+                    existing = conn.execute(
+                        """
+                        SELECT l.message_id, m.message_json
+                        FROM source_transcript_ledger AS l
+                        JOIN messages AS m ON m.id = l.message_id
+                        WHERE l.source_host = ?
+                            AND l.source_session_id = ?
+                            AND l.source_message_id = ?
+                        """,
+                        (source_host, source_session_id, source_message_id),
+                    ).fetchone()
+                    if existing is None:
+                        raise
+                    warning = None
+                    if json.loads(str(existing[1])) != json.loads(msg_json):
+                        warning = "source key already ingested with different content"
+                    results.append(
+                        SourceTranscriptIngestResult(
+                            source_host=source_host,
+                            source_session_id=source_session_id,
+                            source_message_id=source_message_id,
+                            status="skipped",
+                            message_id=int(existing[0]),
+                            warning=warning,
+                        )
+                    )
+                    continue
+                conn.execute("RELEASE SAVEPOINT source_ingest_row")
+                results.append(
+                    SourceTranscriptIngestResult(
+                        source_host=source_host,
+                        source_session_id=source_session_id,
+                        source_message_id=source_message_id,
+                        status="inserted",
+                        message_id=message_id,
+                    )
+                )
+    return results
 
 
 # Provenance-rich Tier 1 search hit, mirroring LongTermFact's glass-box shape:

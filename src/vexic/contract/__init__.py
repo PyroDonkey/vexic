@@ -223,6 +223,39 @@ class AppendTranscriptResult(MemoryResult):
     message_ids: list[int]
 
 
+class SourceTranscriptMessage(MemoryContractModel):
+    source_host: str = Field(min_length=1)
+    source_session_id: str = Field(min_length=1)
+    source_message_id: str = Field(min_length=1)
+    message_json: str
+
+    @field_validator("source_host", "source_session_id", "source_message_id")
+    @classmethod
+    def _source_ids_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("source identifiers must not be blank.")
+        return value
+
+
+class SourceTranscriptIngestItemResult(MemoryContractModel):
+    source_host: str
+    source_session_id: str
+    source_message_id: str
+    status: Literal["inserted", "skipped", "rejected"]
+    message_id: int | None = None
+    reason: str | None = None
+    warning: str | None = None
+
+
+class IngestSourceTranscriptRequest(SessionScopedRedactionRequiredRequest):
+    required_capability: ClassVar[MemoryCapability] = MemoryCapability.WRITE
+    messages: list[SourceTranscriptMessage]
+
+
+class IngestSourceTranscriptResult(MemoryResult):
+    items: list[SourceTranscriptIngestItemResult]
+
+
 class SearchTranscriptRequest(SessionScopedRequest):
     required_capability: ClassVar[MemoryCapability] = MemoryCapability.SEARCH
     query: str
@@ -347,6 +380,11 @@ class MemoryService(Protocol):
         self,
         request: AppendTranscriptRequest,
     ) -> AppendTranscriptResult: ...
+
+    async def ingest_source_transcript(
+        self,
+        request: IngestSourceTranscriptRequest,
+    ) -> IngestSourceTranscriptResult: ...
 
     async def search_transcript(
         self,

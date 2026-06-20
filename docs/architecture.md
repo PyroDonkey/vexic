@@ -60,6 +60,8 @@ consumer, not a dependency.
 - Writers append serialized Pydantic AI messages.
 - Existing rows are never updated or deleted.
 - Stored text is cleaned replay material, not raw provider payload.
+- `source_transcript_ledger` records idempotent host-recorder source keys and
+  points to `messages`; source columns do not live on `messages`.
 - `messages_fts` is a rebuildable FTS5 projection over clean user/assistant
   text.
 - Session-scoped transcript search maps to `SearchTranscriptRequest`.
@@ -172,9 +174,9 @@ scope contract, but does not need to match the physical SQLite schema.
 
 ## v0.1 Service Surface
 
-`LocalMemoryService` implements the local read/write core for transcript and
-long-term search. It intentionally leaves several `MemoryService` protocol
-operations deferred:
+`LocalMemoryService` implements the local read/write core for transcript ingest,
+source-ledger transcript ingest, and long-term search. It intentionally leaves
+several `MemoryService` protocol operations deferred:
 
 - retrieval-event direct recording
 - fact retirement

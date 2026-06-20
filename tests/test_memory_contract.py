@@ -13,6 +13,7 @@ from vexic.contract import (
     DreamPhase,
     EgressKind,
     ExpandHistoryRequest,
+    IngestSourceTranscriptRequest,
     LongTermFact,
     MemoryCapability,
     MemoryCategory,
@@ -26,6 +27,7 @@ from vexic.contract import (
     RetireFactRequest,
     SearchTranscriptRequest,
     SearchLongTermRequest,
+    SourceTranscriptMessage,
     TombstoneRecord,
     TrustBoundary,
     require_capability,
@@ -253,6 +255,19 @@ class MemoryContractCapabilityTests(unittest.TestCase):
                 messages_json=["{}"],
             )
 
+        with self.assertRaises(ValidationError):
+            IngestSourceTranscriptRequest(
+                scope=scope,
+                messages=[
+                    SourceTranscriptMessage(
+                        source_host="claude-code",
+                        source_session_id="session-a",
+                        source_message_id="uuid-1",
+                        message_json="{}",
+                    )
+                ],
+            )
+
         request = AppendTranscriptRequest(
             scope=scope,
             messages_json=["{}"],
@@ -260,6 +275,21 @@ class MemoryContractCapabilityTests(unittest.TestCase):
         )
 
         self.assertIsInstance(request, RedactionRequiredRequest)
+        self.assertIsInstance(
+            IngestSourceTranscriptRequest(
+                scope=scope,
+                messages=[
+                    SourceTranscriptMessage(
+                        source_host="claude-code",
+                        source_session_id="session-a",
+                        source_message_id="uuid-1",
+                        message_json="{}",
+                    )
+                ],
+                redaction=RedactionContext(forbidden_values=()),
+            ),
+            RedactionRequiredRequest,
+        )
 
     def test_transcript_and_expand_operations_require_session_scope(self) -> None:
         scope = self._scope({MemoryCapability.WRITE})
@@ -268,6 +298,20 @@ class MemoryContractCapabilityTests(unittest.TestCase):
             AppendTranscriptRequest(
                 scope=scope,
                 messages_json=["{}"],
+                redaction=RedactionContext(forbidden_values=()),
+            )
+
+        with self.assertRaises(ValidationError):
+            IngestSourceTranscriptRequest(
+                scope=scope,
+                messages=[
+                    SourceTranscriptMessage(
+                        source_host="claude-code",
+                        source_session_id="session-a",
+                        source_message_id="uuid-1",
+                        message_json="{}",
+                    )
+                ],
                 redaction=RedactionContext(forbidden_values=()),
             )
 
@@ -365,6 +409,7 @@ class MemoryContractProtocolTests(unittest.TestCase):
     def test_protocol_methods_accept_scope_and_return_typed_results(self) -> None:
         for method_name in (
             "append_transcript",
+            "ingest_source_transcript",
             "search_transcript",
             "expand_history",
             "search_long_term",
