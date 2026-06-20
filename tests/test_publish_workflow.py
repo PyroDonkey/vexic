@@ -79,10 +79,10 @@ def test_publish_workflow_requires_matching_version_tag() -> None:
         "release_tag:",
         "required: true",
         "if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v') && github.ref_name == inputs.release_tag",
-        "PROJECT_DIR: pypi",
+        "working-directory: pypi",
         "RELEASE_TAG: ${{ inputs.release_tag }}",
         "GITHUB_REF_NAME: ${{ github.ref_name }}",
-        "uv run python scripts/check_release_tag.py",
+        "uv run python ../scripts/check_release_tag.py",
         "uv build --sdist --wheel --out-dir dist --clear pypi",
     ]
 
