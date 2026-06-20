@@ -299,7 +299,11 @@ def search_messages(
     query: str,
     *,
     session_id: str = "default",
+    limit: int = 5,
 ) -> list[TranscriptHit]:
+    if limit < 1:
+        raise ValueError("limit must be at least 1.")
+
     safe_query = _fts_query(query)
     if safe_query is None:
         return []
@@ -314,9 +318,9 @@ def search_messages(
                 WHERE messages_fts MATCH ?
                     AND messages_fts.session_id = ?
                 ORDER BY rank
-                LIMIT 5
+                LIMIT ?
                 """,
-                (safe_query, session_id),
+                (safe_query, session_id, limit),
             ).fetchall()
         except sqlite3.OperationalError:
             return []

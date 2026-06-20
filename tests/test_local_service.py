@@ -25,6 +25,7 @@ from vexic.storage import (
     commit_deep_cycle,
     commit_dream_cycle,
     save_messages,
+    search_messages,
     single_message_adapter,
 )
 from vexic.storage.promotion import PromotionDecision
@@ -79,6 +80,35 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(result.hits), 1)
         self.assertIn("telegram cedar detail", result.hits[0].body)
+
+    async def test_search_transcript_honors_limit_above_storage_default(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        save_messages(
+            self.db_path,
+            [
+                ModelRequest(parts=[UserPromptPart(content=f"cedar detail {index}")])
+                for index in range(7)
+            ],
+            session_id="default",
+        )
+
+        result = await service.search_transcript(
+            SearchTranscriptRequest(scope=_scope(), query="cedar", limit=7)
+        )
+
+        self.assertEqual(len(result.hits), 7)
+
+    async def test_search_messages_rejects_non_positive_limit(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+
+        with self.assertRaisesRegex(ValueError, "limit must be at least 1"):
+            search_messages(self.db_path, "cedar", limit=0)
 
     async def test_search_long_term_returns_contract_facts(self) -> None:
         from vexic.service import LocalMemoryService

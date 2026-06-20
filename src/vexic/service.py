@@ -93,7 +93,8 @@ class LocalMemoryService(MemoryService):
             self.db_path,
             request.query,
             session_id=request.scope.session_id or "default",
-        )[: request.limit]
+            limit=request.limit,
+        )
         return SearchTranscriptResult(
             hits=[
                 TranscriptHit(
