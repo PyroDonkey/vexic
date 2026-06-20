@@ -9,10 +9,12 @@ from typing import Any, TextIO
 
 from vexic import CONTRACT_VERSION
 from vexic.contract import (
+    ExpandHistoryRequest,
     MemoryCapability,
     MemoryScope,
     Principal,
     PrincipalType,
+    RedactionContext,
     SearchLongTermRequest,
     SearchTranscriptRequest,
     TrustBoundary,
@@ -23,6 +25,8 @@ from vexic.service import LocalMemoryService
 MCP_PROTOCOL_VERSION = "2025-11-25"
 MAX_QUERY_CHARS = 1_000
 MAX_LIMIT = 20
+MAX_EXPAND_HISTORY_MESSAGES = 100
+MAX_EXPAND_HISTORY_CHARS = 20_000
 
 
 @dataclass(frozen=True)
@@ -34,6 +38,7 @@ class McpServerConfig:
     user_id: str | None = None
     principal_id: str = "vexic-local-mcp"
     forbidden_secret_values: tuple[str, ...] = ()
+    enable_expand_history: bool = False
 
     def service(self) -> LocalMemoryService:
         return LocalMemoryService(
@@ -43,6 +48,9 @@ class McpServerConfig:
         )
 
     def scope(self) -> MemoryScope:
+        capabilities = {MemoryCapability.SEARCH}
+        if self.enable_expand_history:
+            capabilities.add(MemoryCapability.EXPAND_HISTORY)
         return MemoryScope(
             tenant_id=self.tenant_id,
             project_id=self.project_id,
@@ -53,11 +61,11 @@ class McpServerConfig:
                 principal_type=PrincipalType.AGENT,
             ),
             trust_boundary=TrustBoundary.LOCAL_TRUSTED,
-            capabilities={MemoryCapability.SEARCH},
+            capabilities=capabilities,
         )
 
 
-TOOLS: tuple[dict[str, Any], ...] = (
+BASE_TOOLS: tuple[dict[str, Any], ...] = (
     {
         "name": "search_transcript",
         "title": "Search Transcript",
@@ -94,6 +102,30 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
 )
 
+EXPAND_HISTORY_TOOL: dict[str, Any] = {
+    "name": "expand_history",
+    "title": "Expand History",
+    "description": (
+        "Privileged verbatim expansion of a bounded range in the configured "
+        "session transcript. Requires explicit local server opt-in."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "first_message_id": {"type": "integer", "minimum": 1},
+            "last_message_id": {"type": "integer", "minimum": 1},
+        },
+        "required": ["first_message_id", "last_message_id"],
+        "additionalProperties": False,
+    },
+}
+
+
+def _tools(config: McpServerConfig) -> tuple[dict[str, Any], ...]:
+    if config.enable_expand_history:
+        return (*BASE_TOOLS, EXPAND_HISTORY_TOOL)
+    return BASE_TOOLS
+
 
 def _response(message_id: Any, result: dict[str, Any]) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": message_id, "result": result}
@@ -119,6 +151,25 @@ def _tool_error(message: str) -> dict[str, Any]:
     return _tool_text({"error": message}, is_error=True)
 
 
+def _instructions(config: McpServerConfig) -> str:
+    unavailable = (
+        "No transcript append, export, delete, rebuild, or admin tools are available."
+    )
+    if config.enable_expand_history:
+        return (
+            "Read-only Vexic memory. Use search_transcript for the configured "
+            "session, search_long_term for durable facts, and expand_history "
+            "only for bounded privileged verbatim history egress. "
+            f"{unavailable}"
+        )
+    return (
+        "Read-only Vexic memory. Use search_transcript for the "
+        "configured session and search_long_term for durable facts. "
+        "No transcript append, verbatim history expansion, export, "
+        "delete, rebuild, or admin tools are available."
+    )
+
+
 def _query(arguments: dict[str, Any]) -> str:
     query = arguments.get("query")
     if not isinstance(query, str) or not query.strip():
@@ -135,6 +186,32 @@ def _limit(arguments: dict[str, Any]) -> int:
     if limit < 1 or limit > MAX_LIMIT:
         raise ValueError(f"limit must be between 1 and {MAX_LIMIT}.")
     return limit
+
+
+def _message_id(arguments: dict[str, Any], name: str) -> int:
+    value = arguments.get(name)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer.")
+    if value < 1:
+        raise ValueError(f"{name} must be positive.")
+    return value
+
+
+def _expand_range(arguments: dict[str, Any]) -> tuple[int, int]:
+    extra_args = set(arguments) - {"first_message_id", "last_message_id"}
+    if extra_args:
+        raise ValueError(f"unexpected argument: {sorted(extra_args)[0]}")
+    first_message_id = _message_id(arguments, "first_message_id")
+    last_message_id = _message_id(arguments, "last_message_id")
+    if first_message_id > last_message_id:
+        raise ValueError(
+            "first_message_id must be less than or equal to last_message_id."
+        )
+    if last_message_id - first_message_id + 1 > MAX_EXPAND_HISTORY_MESSAGES:
+        raise ValueError(
+            f"expand_history ranges are capped at {MAX_EXPAND_HISTORY_MESSAGES} messages."
+        )
+    return first_message_id, last_message_id
 
 
 def _check_egress(config: McpServerConfig, values: list[str]) -> None:
@@ -154,6 +231,34 @@ async def _search_transcript(
     )
     _check_egress(config, [hit.body for hit in result.hits])
     return _tool_text({"hits": [hit.model_dump(mode="json") for hit in result.hits]})
+
+
+async def _expand_history(
+    arguments: dict[str, Any],
+    config: McpServerConfig,
+) -> dict[str, Any]:
+    first_message_id, last_message_id = _expand_range(arguments)
+    result = await config.service().expand_history(
+        ExpandHistoryRequest(
+            scope=config.scope(),
+            first_message_id=first_message_id,
+            last_message_id=last_message_id,
+            redaction=RedactionContext(forbidden_values=config.forbidden_secret_values),
+        )
+    )
+    text = result.text
+    truncated = result.truncated
+    if len(text) > MAX_EXPAND_HISTORY_CHARS:
+        text = text[:MAX_EXPAND_HISTORY_CHARS]
+        truncated = True
+    _check_egress(config, [text])
+    return _tool_text(
+        {
+            "egress_kind": result.egress_kind.value,
+            "text": text,
+            "truncated": truncated,
+        }
+    )
 
 
 async def _search_long_term(
@@ -196,6 +301,8 @@ async def _call_tool(
             return await _search_transcript(arguments, config)
         if name == "search_long_term":
             return await _search_long_term(arguments, config)
+        if name == "expand_history" and config.enable_expand_history:
+            return await _expand_history(arguments, config)
         return _tool_error(f"unknown tool: {name}")
     except Exception as exc:
         return _tool_error(str(exc))
@@ -226,12 +333,7 @@ async def handle_jsonrpc_message(
                     "title": "Vexic Local Memory",
                     "version": CONTRACT_VERSION,
                 },
-                "instructions": (
-                    "Read-only Vexic memory. Use search_transcript for the "
-                    "configured session and search_long_term for durable facts. "
-                    "No transcript append, verbatim history expansion, export, "
-                    "delete, rebuild, or admin tools are available."
-                ),
+                "instructions": _instructions(config),
             },
         )
     if method == "ping":
@@ -239,7 +341,7 @@ async def handle_jsonrpc_message(
     if method == "shutdown":
         return _response(message_id, {})
     if method == "tools/list":
-        return _response(message_id, {"tools": list(TOOLS)})
+        return _response(message_id, {"tools": list(_tools(config))})
     if method == "tools/call":
         params = message.get("params") or {}
         if not isinstance(params, dict):
@@ -286,6 +388,7 @@ def _parse_args(argv: list[str] | None) -> McpServerConfig:
     parser.add_argument("--user-id")
     parser.add_argument("--principal-id", default="vexic-local-mcp")
     parser.add_argument("--forbidden-value", action="append", default=[])
+    parser.add_argument("--enable-expand-history", action="store_true")
     args = parser.parse_args(argv)
     return McpServerConfig(
         db_path=args.db_path,
@@ -295,6 +398,7 @@ def _parse_args(argv: list[str] | None) -> McpServerConfig:
         user_id=args.user_id,
         principal_id=args.principal_id,
         forbidden_secret_values=tuple(args.forbidden_value),
+        enable_expand_history=args.enable_expand_history,
     )
 
 
