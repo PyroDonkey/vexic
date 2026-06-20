@@ -8,6 +8,7 @@ from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 from vexic.mcp_stdio import (
     MAX_EXPAND_HISTORY_CHARS,
+    MAX_EXPAND_HISTORY_MESSAGES,
     McpServerConfig,
     _parse_args,
     handle_jsonrpc_message,
@@ -180,6 +181,53 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("session alpha two", payload["text"])
         self.assertNotIn("session beta", payload["text"])
 
+    async def test_expand_history_caps_configured_session_rows_not_id_span(self) -> None:
+        first_id = save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="session alpha first")])],
+            session_id="session-a",
+        )[0]
+        save_messages(
+            self.db_path,
+            [
+                ModelRequest(parts=[UserPromptPart(content=f"session beta {index}")])
+                for index in range(MAX_EXPAND_HISTORY_MESSAGES)
+            ],
+            session_id="session-b",
+        )
+        last_id = save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="session alpha last")])],
+            session_id="session-a",
+        )[0]
+
+        response = await handle_jsonrpc_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": {
+                    "name": "expand_history",
+                    "arguments": {
+                        "first_message_id": first_id,
+                        "last_message_id": last_id,
+                    },
+                },
+            },
+            McpServerConfig(
+                db_path=self.db_path,
+                tenant_id="tenant-a",
+                session_id="session-a",
+                enable_expand_history=True,
+            ),
+        )
+
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertFalse(response["result"]["isError"])
+        self.assertIn("session alpha first", payload["text"])
+        self.assertIn("session alpha last", payload["text"])
+        self.assertNotIn("session beta", payload["text"])
+
     async def test_expand_history_rejects_caller_supplied_session(self) -> None:
         beta_ids = save_messages(
             self.db_path,
@@ -278,6 +326,15 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("cedar-secret", text)
 
     async def test_expand_history_rejects_broad_ranges(self) -> None:
+        message_ids = save_messages(
+            self.db_path,
+            [
+                ModelRequest(parts=[UserPromptPart(content=f"session alpha {index}")])
+                for index in range(MAX_EXPAND_HISTORY_MESSAGES + 1)
+            ],
+            session_id="session-a",
+        )
+
         response = await handle_jsonrpc_message(
             {
                 "jsonrpc": "2.0",
@@ -285,7 +342,10 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
                 "method": "tools/call",
                 "params": {
                     "name": "expand_history",
-                    "arguments": {"first_message_id": 1, "last_message_id": 101},
+                    "arguments": {
+                        "first_message_id": message_ids[0],
+                        "last_message_id": message_ids[-1],
+                    },
                 },
             },
             McpServerConfig(

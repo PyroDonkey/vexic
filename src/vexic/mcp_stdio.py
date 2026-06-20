@@ -207,10 +207,6 @@ def _expand_range(arguments: dict[str, Any]) -> tuple[int, int]:
         raise ValueError(
             "first_message_id must be less than or equal to last_message_id."
         )
-    if last_message_id - first_message_id + 1 > MAX_EXPAND_HISTORY_MESSAGES:
-        raise ValueError(
-            f"expand_history ranges are capped at {MAX_EXPAND_HISTORY_MESSAGES} messages."
-        )
     return first_message_id, last_message_id
 
 
@@ -244,8 +240,13 @@ async def _expand_history(
             first_message_id=first_message_id,
             last_message_id=last_message_id,
             redaction=RedactionContext(forbidden_values=config.forbidden_secret_values),
-        )
+        ),
+        max_rows=MAX_EXPAND_HISTORY_MESSAGES,
     )
+    if result.truncated and not result.text:
+        raise ValueError(
+            f"expand_history ranges are capped at {MAX_EXPAND_HISTORY_MESSAGES} messages."
+        )
     text = result.text
     truncated = result.truncated
     if len(text) > MAX_EXPAND_HISTORY_CHARS:

@@ -43,8 +43,8 @@ Privileged verbatim history egress is disabled by default. For a local,
 session-bound agent that explicitly needs it, pass `--enable-expand-history` to
 register `expand_history`. That tool requires `MemoryCapability.EXPAND_HISTORY`,
 uses the configured scope only, applies forbidden-value redaction before
-egress, and caps both range and returned text. The local stdio MVP does not yet
-have a dedicated audit hook for this privileged egress path.
+egress, and caps both returned messages and returned text. The local stdio MVP
+does not yet have a dedicated audit hook for this privileged egress path.
 
 Codex-style MCP config:
 
@@ -74,7 +74,7 @@ claude mcp add --scope local vexic -- uv run python scripts\vexic-mcp-stdio.py -
 ```
 
 The stdio tool schemas cap `query` at 1000 characters, `limit` at 1-20 results,
-and privileged `expand_history` responses at 100 message ids and 20000
+and privileged `expand_history` responses at 100 returned messages and 20000
 characters.
 
 <!-- memory-reliability-gate -->
