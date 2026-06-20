@@ -33,6 +33,7 @@ from vexic.contract import (
     LongTermFact as ContractLongTermFact,
     require_capability,
 )
+from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage import (
     TranscriptRangeTooLarge,
     init_db,
@@ -42,6 +43,8 @@ from vexic.storage import (
     single_message_adapter,
 )
 from vexic.subagents.retrieval import retrieve_candidate_fallback, retrieve_long_term_facts
+
+EXPAND_HISTORY_MAX_ROWS = 2_000
 
 
 class LocalMemoryService(MemoryService):
@@ -114,6 +117,7 @@ class LocalMemoryService(MemoryService):
                 request.first_message_id,
                 request.last_message_id,
                 session_id=request.scope.session_id or "default",
+                max_rows=EXPAND_HISTORY_MAX_ROWS,
             )
         except TranscriptRangeTooLarge:
             return ExpandHistoryResult(text="", truncated=True)
@@ -122,6 +126,9 @@ class LocalMemoryService(MemoryService):
             if hit.timestamp
             else f"[message {hit.message_id}]\n{hit.body}"
             for hit in rows
+        )
+        assert_no_forbidden_secret_values(
+            self._redaction_values(request.redaction), text
         )
         return ExpandHistoryResult(text=text)
 

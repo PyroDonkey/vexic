@@ -8,6 +8,7 @@ from unittest.mock import patch
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 from vexic.contract import (
+    ExpandHistoryRequest,
     MemoryCapability,
     MemoryCategory,
     MemoryScope,
@@ -170,6 +171,58 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         result = await service.append_transcript(request)
 
         self.assertEqual(result.message_ids, [1])
+
+    async def test_expand_history_truncates_oversized_ranges(self) -> None:
+        from vexic.service import EXPAND_HISTORY_MAX_ROWS, LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        last_message_id = EXPAND_HISTORY_MAX_ROWS + 1
+        save_messages(
+            self.db_path,
+            [
+                ModelRequest(parts=[UserPromptPart(content=f"history row {index}")])
+                for index in range(last_message_id)
+            ],
+            session_id="default",
+        )
+
+        result = await service.expand_history(
+            ExpandHistoryRequest(
+                scope=_scope().model_copy(
+                    update={"capabilities": {MemoryCapability.EXPAND_HISTORY}}
+                ),
+                first_message_id=1,
+                last_message_id=last_message_id,
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+
+        self.assertEqual(result.text, "")
+        self.assertTrue(result.truncated)
+
+    async def test_expand_history_uses_request_redaction_before_egress(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="cedar-secret detail")])],
+            session_id="default",
+        )
+
+        with self.assertRaisesRegex(ValueError, "forbidden secret"):
+            await service.expand_history(
+                ExpandHistoryRequest(
+                    scope=_scope().model_copy(
+                        update={"capabilities": {MemoryCapability.EXPAND_HISTORY}}
+                    ),
+                    first_message_id=1,
+                    last_message_id=1,
+                    redaction=RedactionContext(forbidden_values=("cedar-secret",)),
+                )
+            )
 
 
 if __name__ == "__main__":
