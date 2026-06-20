@@ -545,6 +545,72 @@ class MemoryIsolationAndRedactionReliabilityTests(unittest.IsolatedAsyncioTestCa
         self.assertIn("telegram session cedar detail", telegram_expand)
         self.assertNotIn("default session cedar detail", telegram_expand)
 
+    async def test_source_transcript_ledger_failure_rolls_back_message_and_fts(self) -> None:
+        from vexic.contract import (
+            IngestSourceTranscriptRequest,
+            MemoryCapability,
+            MemoryScope,
+            Principal,
+            PrincipalType,
+            RedactionContext,
+            SourceTranscriptMessage,
+            TrustBoundary,
+        )
+        from vexic.service import LocalMemoryService
+        from vexic.storage import single_message_adapter
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                """
+                CREATE TRIGGER fail_source_ledger_insert
+                BEFORE INSERT ON source_transcript_ledger
+                BEGIN
+                    SELECT RAISE(ABORT, 'ledger insert failed');
+                END
+                """
+            )
+            conn.commit()
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        scope = MemoryScope(
+            tenant_id="tenant-a",
+            session_id="default",
+            principal=Principal(
+                principal_id="test-operator",
+                principal_type=PrincipalType.OPERATOR,
+            ),
+            trust_boundary=TrustBoundary.LOCAL_TRUSTED,
+            capabilities={MemoryCapability.WRITE},
+        )
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            await service.ingest_source_transcript(
+                IngestSourceTranscriptRequest(
+                    scope=scope,
+                    messages=[
+                        SourceTranscriptMessage(
+                            source_host="claude-code",
+                            source_session_id="session-1",
+                            source_message_id="uuid-1",
+                            message_json=single_message_adapter.dump_json(
+                                ModelRequest(
+                                    parts=[UserPromptPart(content="atomic cedar")]
+                                )
+                            ).decode(),
+                        )
+                    ],
+                    redaction=RedactionContext(forbidden_values=()),
+                )
+            )
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0], 0)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM source_transcript_ledger").fetchone()[0],
+                0,
+            )
+
     def test_search_memory_fails_closed_on_loaded_secret_egress(self) -> None:
         save_messages(
             self.db_path,

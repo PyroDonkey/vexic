@@ -78,6 +78,7 @@ behavioral contract and the current `LocalMemoryService` v0.1 surface.
 | Operation | Request | Required capability | Current local service |
 | --- | --- | --- | --- |
 | Append transcript | `AppendTranscriptRequest` | `memory:write` | Implemented |
+| Ingest source transcript | `IngestSourceTranscriptRequest` | `memory:write` | Implemented |
 | Search transcript | `SearchTranscriptRequest` | `memory:search` | Implemented |
 | Expand history | `ExpandHistoryRequest` | `memory:expand` | Implemented |
 | Search long-term | `SearchLongTermRequest` | `memory:search` | Implemented |
@@ -103,6 +104,8 @@ The core policy is fail-closed:
 - reject payloads containing configured forbidden values
 - do not sanitize payloads in place
 - do not persist or return forbidden values after a redaction violation
+- source-ledger transcript ingestion rejects polluted rows per row before
+  persistence and creates no ledger entry for rejected rows
 
 Direct or offline database modes that cannot load host secrets must make that
 limitation explicit. Vexic core accepts forbidden values supplied by the host;

@@ -4,10 +4,20 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 
-from pydantic_ai.messages import ModelRequest, UserPromptPart
+from pydantic_ai.messages import (
+    ModelRequest,
+    ModelResponse,
+    SystemPromptPart,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 
 from vexic.contract import (
     ExpandHistoryRequest,
+    IngestSourceTranscriptRequest,
+    SourceTranscriptMessage,
     MemoryCapability,
     MemoryCategory,
     MemoryScope,
@@ -237,6 +247,397 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         result = await service.append_transcript(request)
 
         self.assertEqual(result.message_ids, [1])
+
+    async def test_ingest_source_transcript_records_ledgered_message(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+
+        result = await service.ingest_source_transcript(
+            IngestSourceTranscriptRequest(
+                scope=_scope().model_copy(
+                    update={"capabilities": {MemoryCapability.WRITE}}
+                ),
+                messages=[
+                    SourceTranscriptMessage(
+                        source_host="Claude-Code",
+                        source_session_id="session-1",
+                        source_message_id="uuid-1",
+                        message_json=single_message_adapter.dump_json(
+                            ModelRequest(parts=[UserPromptPart(content="ledger cedar")])
+                        ).decode(),
+                    )
+                ],
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+
+        self.assertEqual(result.items[0].status, "inserted")
+        self.assertEqual(result.items[0].message_id, 1)
+        self.assertEqual(result.items[0].source_host, "claude-code")
+        self.assertEqual(len(search_messages(self.db_path, "cedar")), 1)
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            message_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(messages)")
+            }
+            ledger_row = conn.execute(
+                """
+                SELECT source_host, source_session_id, source_message_id, message_id
+                FROM source_transcript_ledger
+                """
+            ).fetchone()
+
+        self.assertNotIn("source_host", message_columns)
+        self.assertEqual(ledger_row, ("claude-code", "session-1", "uuid-1", 1))
+
+    async def test_ingest_source_transcript_accepts_assistant_text(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+
+        result = await service.ingest_source_transcript(
+            IngestSourceTranscriptRequest(
+                scope=_scope().model_copy(
+                    update={"capabilities": {MemoryCapability.WRITE}}
+                ),
+                messages=[
+                    SourceTranscriptMessage(
+                        source_host="claude-code",
+                        source_session_id="session-1",
+                        source_message_id="uuid-1",
+                        message_json=single_message_adapter.dump_json(
+                            ModelResponse(parts=[TextPart(content="assistant cedar")])
+                        ).decode(),
+                    )
+                ],
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+
+        self.assertEqual(result.items[0].status, "inserted")
+        self.assertIn("assistant cedar", search_messages(self.db_path, "cedar")[0].body)
+
+    async def test_ingest_source_transcript_skips_duplicate_source_key(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        message_json = single_message_adapter.dump_json(
+            ModelRequest(parts=[UserPromptPart(content="duplicate cedar")])
+        ).decode()
+        request = IngestSourceTranscriptRequest(
+            scope=_scope().model_copy(update={"capabilities": {MemoryCapability.WRITE}}),
+            messages=[
+                SourceTranscriptMessage(
+                    source_host="claude-code",
+                    source_session_id="session-1",
+                    source_message_id="uuid-1",
+                    message_json=message_json,
+                )
+            ],
+            redaction=RedactionContext(forbidden_values=()),
+        )
+
+        first = await service.ingest_source_transcript(request)
+        second = await service.ingest_source_transcript(request)
+
+        self.assertEqual(first.items[0].status, "inserted")
+        self.assertEqual(second.items[0].status, "skipped")
+        self.assertEqual(second.items[0].message_id, first.items[0].message_id)
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            message_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+            fts_count = conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0]
+            ledger_count = conn.execute(
+                "SELECT COUNT(*) FROM source_transcript_ledger"
+            ).fetchone()[0]
+
+        self.assertEqual(message_count, 1)
+        self.assertEqual(fts_count, 1)
+        self.assertEqual(ledger_count, 1)
+
+    async def test_ingest_source_transcript_partial_retry_inserts_only_missing_rows(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+
+        def item(source_message_id: str, content: str) -> SourceTranscriptMessage:
+            return SourceTranscriptMessage(
+                source_host="claude-code",
+                source_session_id="session-1",
+                source_message_id=source_message_id,
+                message_json=single_message_adapter.dump_json(
+                    ModelRequest(parts=[UserPromptPart(content=content)])
+                ).decode(),
+            )
+
+        await service.ingest_source_transcript(
+            IngestSourceTranscriptRequest(
+                scope=_scope().model_copy(
+                    update={"capabilities": {MemoryCapability.WRITE}}
+                ),
+                messages=[item("uuid-1", "first cedar")],
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+
+        retry = await service.ingest_source_transcript(
+            IngestSourceTranscriptRequest(
+                scope=_scope().model_copy(
+                    update={"capabilities": {MemoryCapability.WRITE}}
+                ),
+                messages=[
+                    item("uuid-1", "first cedar"),
+                    item("uuid-2", "second cedar"),
+                ],
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+
+        self.assertEqual([row.status for row in retry.items], ["skipped", "inserted"])
+        self.assertEqual(retry.items[1].message_id, 2)
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 2)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM source_transcript_ledger").fetchone()[0],
+                2,
+            )
+
+    async def test_ingest_source_transcript_keeps_identical_text_from_distinct_source_ids(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        message_json = single_message_adapter.dump_json(
+            ModelRequest(parts=[UserPromptPart(content="same cedar")])
+        ).decode()
+
+        result = await service.ingest_source_transcript(
+            IngestSourceTranscriptRequest(
+                scope=_scope().model_copy(
+                    update={"capabilities": {MemoryCapability.WRITE}}
+                ),
+                messages=[
+                    SourceTranscriptMessage(
+                        source_host="claude-code",
+                        source_session_id="session-1",
+                        source_message_id="uuid-1",
+                        message_json=message_json,
+                    ),
+                    SourceTranscriptMessage(
+                        source_host="claude-code",
+                        source_session_id="session-1",
+                        source_message_id="uuid-2",
+                        message_json=message_json,
+                    ),
+                ],
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+
+        self.assertEqual([row.status for row in result.items], ["inserted", "inserted"])
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 2)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0], 2)
+
+    async def test_ingest_source_transcript_warns_changed_content_for_existing_key(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+
+        def request(content: str) -> IngestSourceTranscriptRequest:
+            return IngestSourceTranscriptRequest(
+                scope=_scope().model_copy(
+                    update={"capabilities": {MemoryCapability.WRITE}}
+                ),
+                messages=[
+                    SourceTranscriptMessage(
+                        source_host="claude-code",
+                        source_session_id="session-1",
+                        source_message_id="uuid-1",
+                        message_json=single_message_adapter.dump_json(
+                            ModelRequest(parts=[UserPromptPart(content=content)])
+                        ).decode(),
+                    )
+                ],
+                redaction=RedactionContext(forbidden_values=()),
+            )
+
+        await service.ingest_source_transcript(request("original cedar"))
+        changed = await service.ingest_source_transcript(request("changed cedar"))
+
+        self.assertEqual(changed.items[0].status, "skipped")
+        self.assertEqual(changed.items[0].message_id, 1)
+        self.assertIn("different content", changed.items[0].warning or "")
+        hits = search_messages(self.db_path, "cedar")
+        self.assertEqual(len(hits), 1)
+        self.assertIn("original cedar", hits[0].body)
+
+    async def test_ingest_source_transcript_skips_unreadable_existing_duplicate(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+
+        def source_message(source_message_id: str, content: str) -> SourceTranscriptMessage:
+            return SourceTranscriptMessage(
+                source_host="claude-code",
+                source_session_id="session-1",
+                source_message_id=source_message_id,
+                message_json=single_message_adapter.dump_json(
+                    ModelRequest(parts=[UserPromptPart(content=content)])
+                ).decode(),
+            )
+
+        await service.ingest_source_transcript(
+            IngestSourceTranscriptRequest(
+                scope=_scope().model_copy(
+                    update={"capabilities": {MemoryCapability.WRITE}}
+                ),
+                messages=[source_message("uuid-1", "original cedar")],
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("UPDATE messages SET message_json = '{' WHERE id = 1")
+            conn.commit()
+
+        retry = await service.ingest_source_transcript(
+            IngestSourceTranscriptRequest(
+                scope=_scope().model_copy(
+                    update={"capabilities": {MemoryCapability.WRITE}}
+                ),
+                messages=[
+                    source_message("uuid-1", "original cedar"),
+                    source_message("uuid-2", "fresh cedar"),
+                ],
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+
+        self.assertEqual([row.status for row in retry.items], ["skipped", "inserted"])
+        self.assertEqual(retry.items[0].message_id, 1)
+        self.assertEqual(
+            retry.items[0].warning,
+            "source key already ingested; existing content unreadable",
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 2)
+
+    async def test_ingest_source_transcript_rejects_polluted_rows_per_row(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+
+        def source_message(source_message_id: str, msg: object) -> SourceTranscriptMessage:
+            return SourceTranscriptMessage(
+                source_host="claude-code",
+                source_session_id="session-1",
+                source_message_id=source_message_id,
+                message_json=single_message_adapter.dump_json(msg).decode(),
+            )
+
+        result = await service.ingest_source_transcript(
+            IngestSourceTranscriptRequest(
+                scope=_scope().model_copy(
+                    update={"capabilities": {MemoryCapability.WRITE}}
+                ),
+                messages=[
+                    source_message(
+                        "system",
+                        ModelRequest(parts=[SystemPromptPart(content="hidden")]),
+                    ),
+                    source_message(
+                        "instructions",
+                        ModelRequest(
+                            parts=[UserPromptPart(content="visible")],
+                            instructions="developer hint",
+                        ),
+                    ),
+                    source_message(
+                        "tool-call",
+                        ModelResponse(parts=[ToolCallPart(tool_name="lookup", args={})]),
+                    ),
+                    source_message(
+                        "tool-return",
+                        ModelRequest(
+                            parts=[
+                                ToolReturnPart(
+                                    tool_name="lookup",
+                                    content="result",
+                                    tool_call_id="call-1",
+                                )
+                            ]
+                        ),
+                    ),
+                    source_message(
+                        "secret",
+                        ModelRequest(parts=[UserPromptPart(content="secret-token")]),
+                    ),
+                    source_message(
+                        "clean",
+                        ModelRequest(parts=[UserPromptPart(content="clean cedar")]),
+                    ),
+                ],
+                redaction=RedactionContext(forbidden_values=("secret-token",)),
+            )
+        )
+
+        self.assertEqual(
+            [row.status for row in result.items],
+            ["rejected", "rejected", "rejected", "rejected", "rejected", "inserted"],
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0], 1)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM source_transcript_ledger").fetchone()[0],
+                1,
+            )
+
+    async def test_ingest_source_transcript_rejects_invalid_json_per_row(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+
+        result = await service.ingest_source_transcript(
+            IngestSourceTranscriptRequest(
+                scope=_scope().model_copy(
+                    update={"capabilities": {MemoryCapability.WRITE}}
+                ),
+                messages=[
+                    SourceTranscriptMessage(
+                        source_host="claude-code",
+                        source_session_id="session-1",
+                        source_message_id="bad-json",
+                        message_json="{",
+                    ),
+                    SourceTranscriptMessage(
+                        source_host="claude-code",
+                        source_session_id="session-1",
+                        source_message_id="clean",
+                        message_json=single_message_adapter.dump_json(
+                            ModelRequest(parts=[UserPromptPart(content="clean cedar")])
+                        ).decode(),
+                    ),
+                ],
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+
+        self.assertEqual([row.status for row in result.items], ["rejected", "inserted"])
+        self.assertEqual(result.items[0].reason, "invalid message_json")
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 1)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM source_transcript_ledger").fetchone()[0],
+                1,
+            )
 
     async def test_expand_history_truncates_oversized_ranges(self) -> None:
         from vexic.service import EXPAND_HISTORY_MAX_ROWS, LocalMemoryService

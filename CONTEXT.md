@@ -26,6 +26,11 @@ _Avoid_: Core service, separate memory API
 The supported way external agent runtimes connect to Vexic memory.
 _Avoid_: Control plane, product backend
 
+**Host Transcript Recorder**:
+A host-owned integration that captures completed agent turns, produces cleaned
+replayable transcript material, and submits it to the memory core.
+_Avoid_: Agent memory tool, direct database writer
+
 **Control Plane**:
 Account, billing, admin, auth, metering, and operational management around the
 hosted memory API.
