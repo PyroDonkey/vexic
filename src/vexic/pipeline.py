@@ -11,9 +11,8 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
-from vexic.embeddings import embed_texts
 from vexic.models import FactCandidate
-from vexic.ports import AgentFactory, EmbedTexts, missing_host_port
+from vexic.ports import AgentFactory, EmbedTexts, HostPortNotConfigured, missing_host_port
 from vexic.storage import (
     backfill_missing_candidate_embeddings,
     commit_dream_cycle,
@@ -101,7 +100,9 @@ async def run_light_phase(
     watermark = 0
     forbidden = _forbidden_secret_values(secrets)
     agent_factory = extraction_agent_factory or build_extraction_agent
-    embedder = embed or embed_texts
+    if embed is None:
+        raise missing_host_port("Embeddings")
+    embedder = embed
 
     try:
         init_db(db_path)
@@ -197,7 +198,10 @@ def _main() -> None:
     parser.add_argument("--model-group", required=True, help="Host model group label.")
     args = parser.parse_args()
 
-    asyncio.run(run_light_phase(args.db, args.model_group))
+    try:
+        asyncio.run(run_light_phase(args.db, args.model_group))
+    except HostPortNotConfigured as exc:
+        parser.exit(2, f"{exc}\n")
 
 
 if __name__ == "__main__":
