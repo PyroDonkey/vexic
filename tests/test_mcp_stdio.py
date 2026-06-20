@@ -26,6 +26,24 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
     async def _request(self, message: dict) -> dict | None:
         return await handle_jsonrpc_message(message, self.config)
 
+    async def test_initialize_advertises_read_only_server(self) -> None:
+        response = await self._request(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": "2025-11-25"},
+            }
+        )
+
+        result = response["result"]
+        self.assertEqual(result["protocolVersion"], "2025-11-25")
+        self.assertEqual(result["capabilities"], {"tools": {"listChanged": False}})
+        self.assertEqual(result["serverInfo"]["name"], "vexic-local-memory")
+        self.assertIn("Read-only Vexic memory", result["instructions"])
+        self.assertIn("No transcript append", result["instructions"])
+        self.assertIn("verbatim history expansion", result["instructions"])
+
     async def test_tools_list_is_read_only(self) -> None:
         response = await self._request(
             {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
@@ -107,6 +125,30 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(response["result"]["isError"])
         self.assertIn("Embeddings", response["result"]["content"][0]["text"])
+
+    async def test_invalid_tool_calls_return_tool_errors(self) -> None:
+        cases = [
+            ("search_transcript", {"query": ""}, "query must be a non-empty string"),
+            ("search_transcript", {"query": "x" * 1001}, "1000 characters"),
+            ("search_transcript", {"query": "cedar", "limit": 0}, "between 1 and 20"),
+            ("search_transcript", {"query": "cedar", "limit": 21}, "between 1 and 20"),
+            ("search_transcript", {"query": "cedar", "limit": "5"}, "integer"),
+            ("append_transcript", {"query": "cedar"}, "unknown tool"),
+        ]
+
+        for name, arguments, expected in cases:
+            with self.subTest(name=name, arguments=arguments):
+                response = await self._request(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 5,
+                        "method": "tools/call",
+                        "params": {"name": name, "arguments": arguments},
+                    }
+                )
+
+                self.assertTrue(response["result"]["isError"])
+                self.assertIn(expected, response["result"]["content"][0]["text"])
 
     async def test_notifications_do_not_emit_responses(self) -> None:
         response = await self._request(
