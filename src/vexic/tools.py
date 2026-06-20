@@ -88,7 +88,9 @@ def search_memory(ctx_or_deps: Any, query: str) -> str:
     if not results:
         return "No relevant memories found."
 
-    return "\n---\n".join(_format_hit(hit) for hit in results)
+    rendered = "\n---\n".join(_format_hit(hit) for hit in results)
+    assert_no_forbidden_secret_values(deps.secrets.values(), rendered)
+    return rendered
 
 
 def expand_history(
@@ -166,7 +168,9 @@ async def search_long_term(ctx_or_deps: Any, query: str) -> str:
     )
 
     if facts:
-        return "\n---\n".join(_format_fact(fact) for fact in facts)
+        rendered = "\n---\n".join(_format_fact(fact) for fact in facts)
+        assert_no_forbidden_secret_values(deps.secrets.values(), rendered)
+        return rendered
 
     notes = await retrieve_candidate_fallback(
         deps.db_path,

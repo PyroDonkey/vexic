@@ -541,6 +541,57 @@ class MemoryIsolationAndRedactionReliabilityTests(unittest.IsolatedAsyncioTestCa
         self.assertIn("telegram session cedar detail", telegram_expand)
         self.assertNotIn("default session cedar detail", telegram_expand)
 
+    def test_search_memory_fails_closed_on_loaded_secret_egress(self) -> None:
+        save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="cedar-secret transcript")])],
+            session_id="default",
+        )
+
+        with self.assertRaisesRegex(ValueError, "forbidden secret"):
+            search_memory(
+                self._ctx(
+                    self.db_path,
+                    session_id="default",
+                    secrets={"api_key": "cedar-secret"},
+                ),
+                "cedar",
+            )
+
+    async def test_long_term_fact_search_fails_closed_on_loaded_secret_egress(self) -> None:
+        commit_dream_cycle(
+            self.db_path,
+            [_candidate("Ryan stores cedar-secret in memory.", message_ids=[1])],
+            candidate_embeddings=[_unit_vector(1.0)],
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+        commit_deep_cycle(
+            self.db_path,
+            [PromotionDecision(candidate_id=1, embedding=_unit_vector(1.0))],
+            started_at="2026-06-02T00:00:00+00:00",
+            finished_at="2026-06-02T00:00:01+00:00",
+        )
+
+        with (
+            patch(
+                "vexic.subagents.retrieval.embed_texts",
+                return_value=[_unit_vector(1.0)],
+            ),
+            self.assertRaisesRegex(ValueError, "forbidden secret"),
+        ):
+            await search_long_term(
+                self._ctx(
+                    self.db_path,
+                    session_id="default",
+                    secrets={"api_key": "cedar-secret"},
+                ),
+                "memory storage",
+            )
+
     def test_candidate_retrieval_redaction_fails_closed_before_event_or_counter_write(self) -> None:
         commit_dream_cycle(
             self.db_path,
