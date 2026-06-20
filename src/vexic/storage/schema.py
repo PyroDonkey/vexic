@@ -1,0 +1,620 @@
+import re
+import sqlite3
+import struct
+from contextlib import closing
+from typing import Literal
+
+from vexic.embeddings import EMBEDDING_DIM, EMBEDDING_MODEL_NAME
+
+# Back-compat re-export: storage-internal callers keep importing the persistence
+# secret guard from here under the old private name.
+from vexic.redaction import assert_no_forbidden_secret_values as _assert_no_forbidden_secret_values
+
+# Shared spine for the three memory tiers. Owns the connection seam (WAL,
+# schema creation, vec-extension load), the embedding-blob math reused across
+# tiers, and the persistence secret guard. Tier modules (transcript, candidates,
+# longterm) and the cross-tier promotion module import from here; this module
+# never imports them at module load (init_db reaches transcript lazily to build
+# the Tier-1 FTS shadow without creating an import cycle).
+
+DreamStatus = Literal["ok", "error", "partial"]
+EMBEDDING_DISTANCE_METRIC = "l2"
+
+CATEGORY_CHECK = (
+    "category IN ('preference', 'fact', 'goal', 'event', "
+    "'relationship', 'skill', 'constraint', 'context')"
+)
+
+
+def _fts_match_query(query: str, *, any_token: bool = False) -> str | None:
+    # Shared FTS5 MATCH sanitizer: free-text queries may contain FTS operators
+    # (AND, NEAR, unbalanced quotes), so each token is quoted into a bare-word
+    # phrase. None means "nothing searchable" — callers return no rows.
+    # any_token=True ORs the tokens (recall-oriented retrieval feeding RRF);
+    # the default keeps transcript search's all-tokens-must-match semantics.
+    tokens = re.findall(r"[\w]+", query, flags=re.UNICODE)
+    if not tokens:
+        return None
+    separator = " OR " if any_token else " "
+    return separator.join(f'"{token}"' for token in tokens)
+
+
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> list[str]:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return [row[1] for row in rows]
+
+
+def _ensure_column(
+    conn: sqlite3.Connection,
+    table_name: str,
+    column_name: str,
+    column_definition: str,
+) -> None:
+    if column_name not in _table_columns(conn, table_name):
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_definition}")
+
+
+def _load_vec_extension(conn: sqlite3.Connection) -> None:
+    import sqlite_vec
+
+    conn.enable_load_extension(True)
+    try:
+        sqlite_vec.load(conn)
+    finally:
+        conn.enable_load_extension(False)
+
+
+def _serialize_float32(embedding: list[float]) -> bytes:
+    from sqlite_vec import serialize_float32
+
+    return serialize_float32(embedding)
+
+
+def _normalize_embedding(embedding: list[float]) -> list[float]:
+    magnitude = sum(value * value for value in embedding) ** 0.5
+    if magnitude == 0:
+        raise ValueError("Embedding magnitude must be greater than zero.")
+    return [value / magnitude for value in embedding]
+
+
+def _embedding_blob_to_list(blob: bytes) -> list[float]:
+    return list(struct.unpack(f"{EMBEDDING_DIM}f", blob))
+
+
+def _similarity_from_distance(distance: float) -> float:
+    similarity = 1.0 - ((distance * distance) / 2.0)
+    return max(-1.0, min(1.0, similarity))
+
+
+def _ensure_memory_candidate_columns(conn: sqlite3.Connection) -> None:
+    columns = _table_columns(conn, "memory_candidates")
+    if not columns:
+        return
+
+    _ensure_column(conn, "memory_candidates", "hit_count", "hit_count INTEGER NOT NULL DEFAULT 1")
+    _ensure_column(conn, "memory_candidates", "retrieved_count", "retrieved_count INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "memory_candidates", "used_count", "used_count INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "memory_candidates", "rem_boost", "rem_boost REAL NOT NULL DEFAULT 0.0")
+    _ensure_column(conn, "memory_candidates", "last_seen_at", "last_seen_at DATETIME")
+    _ensure_column(conn, "memory_candidates", "promoted", "promoted BOOLEAN NOT NULL DEFAULT 0")
+    _ensure_column(conn, "memory_candidates", "promoted_fact_id", "promoted_fact_id INTEGER")
+    _ensure_column(conn, "memory_candidates", "retired", "retired BOOLEAN NOT NULL DEFAULT 0")
+    _ensure_column(conn, "memory_candidates", "retired_at", "retired_at DATETIME")
+    _ensure_column(conn, "memory_candidates", "retired_by_fact_id", "retired_by_fact_id INTEGER")
+    _ensure_column(conn, "memory_candidates", "stale", "stale BOOLEAN NOT NULL DEFAULT 0")
+    _ensure_column(conn, "memory_candidates", "needs_review", "needs_review BOOLEAN NOT NULL DEFAULT 0")
+    _ensure_column(conn, "memory_candidates", "review_neighbor_id", "review_neighbor_id INTEGER")
+    _ensure_column(conn, "memory_candidates", "best_similarity", "best_similarity REAL")
+
+    conn.execute(
+        """
+        UPDATE memory_candidates
+        SET last_seen_at = created_at
+        WHERE last_seen_at IS NULL
+        """
+    )
+
+
+def _ensure_candidate_embeddings(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        f"""
+        CREATE VIRTUAL TABLE IF NOT EXISTS memory_candidate_embeddings
+        USING vec0(
+            candidate_id integer primary key,
+            embedding float[{EMBEDDING_DIM}]
+        )
+        """
+    )
+
+
+def _ensure_embedding_metadata(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS embedding_metadata (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            model_name TEXT NOT NULL,
+            dimension INTEGER NOT NULL,
+            distance_metric TEXT NOT NULL
+        )
+        """
+    )
+    row = conn.execute(
+        """
+        SELECT model_name, dimension, distance_metric
+        FROM embedding_metadata
+        WHERE id = 1
+        """
+    ).fetchone()
+
+    expected = (EMBEDDING_MODEL_NAME, EMBEDDING_DIM, EMBEDDING_DISTANCE_METRIC)
+    if row is None:
+        conn.execute(
+            """
+            INSERT INTO embedding_metadata
+                (id, model_name, dimension, distance_metric)
+            VALUES (1, ?, ?, ?)
+            """,
+            expected,
+        )
+    elif tuple(row) != expected:
+        raise ValueError(
+            "Embedding metadata mismatch. Rebuild memory_candidate_embeddings before "
+            f"using vector dedup. Expected {expected}, got {tuple(row)}."
+        )
+
+
+def _ensure_dedup_events(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_dedup_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            candidate_id INTEGER NOT NULL,
+            matched_candidate_id INTEGER,
+            best_similarity REAL,
+            decision TEXT NOT NULL CHECK (decision IN ('insert', 'merge', 'review')),
+            incoming_fact_text TEXT NOT NULL,
+            incoming_source_message_ids TEXT NOT NULL
+        )
+        """
+    )
+    _ensure_column(conn, "memory_dedup_events", "incoming_fact_text", "incoming_fact_text TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "memory_dedup_events", "incoming_source_message_ids", "incoming_source_message_ids TEXT NOT NULL DEFAULT '[]'")
+
+
+def _ensure_long_term_memory(conn: sqlite3.Connection) -> None:
+    # Tier 3 durable fact store. Base table + FTS5 shadow live here (no vec
+    # extension required) so the core transcript path stays usable even when
+    # sqlite-vec is unavailable, mirroring the candidate base table.
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS long_term_memory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fact_text TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            category TEXT NOT NULL CHECK ({CATEGORY_CHECK}),
+            importance INTEGER NOT NULL CHECK (importance BETWEEN 1 AND 10),
+            confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+            source_message_ids TEXT NOT NULL,
+            promoted_from_candidate_id INTEGER NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            retrieved_count INTEGER NOT NULL DEFAULT 0,
+            used_count INTEGER NOT NULL DEFAULT 0,
+            retired BOOLEAN NOT NULL DEFAULT 0,
+            retired_at DATETIME,
+            retired_by_fact_id INTEGER,
+            editable BOOLEAN NOT NULL DEFAULT 1
+        )
+        """
+    )
+    # Idempotency backstop for promotion: at most one Tier 3 fact per source
+    # candidate. The atomic claim in _promote_candidate is the primary guard;
+    # this UNIQUE index is the schema-level safety net so even a racy double
+    # claim cannot land two durable facts for the same candidate.
+    #
+    # The guard is partial over live (non-retired) rows: at most one *active*
+    # Tier 3 fact per candidate. Live promotion only ever writes retired=0 rows
+    # and never re-promotes a candidate, so a racy double-claim is still caught,
+    # while a retired duplicate can legitimately coexist with its live successor.
+    #
+    # Migration preflight: a DB written before this index existed could already
+    # hold duplicate rows from the historical double-promote race. Creating the
+    # UNIQUE index over such data raises a bare IntegrityError mid-init, bricking
+    # startup with no clue. Detect live duplicates first and fail loud with a
+    # recoverable message instead. Because the index is scoped to retired=0,
+    # retiring the redundant duplicate in place (a lossless UPDATE, no DELETE)
+    # actually resolves the conflict before re-running.
+    index_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+        "AND name = 'idx_long_term_memory_promoted_from'"
+    ).fetchone()
+    if index_exists is None:
+        duplicate_ids = conn.execute(
+            """
+            SELECT promoted_from_candidate_id
+            FROM long_term_memory
+            WHERE retired = 0
+            GROUP BY promoted_from_candidate_id
+            HAVING COUNT(*) > 1
+            ORDER BY promoted_from_candidate_id
+            """
+        ).fetchall()
+        if duplicate_ids:
+            ids = ", ".join(str(row[0]) for row in duplicate_ids)
+            raise ValueError(
+                "Cannot enforce one live Tier 3 fact per candidate: long_term_memory still "
+                f"holds duplicate active rows for promoted_from_candidate_id(s): {ids}. This is "
+                "a pre-existing double-promotion from before the promotion race fix. Retire the "
+                "redundant fact rows in place (set retired = 1; keep all rows, the history is "
+                "lossless) so one live row remains per candidate, then re-run."
+            )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX idx_long_term_memory_promoted_from
+            ON long_term_memory(promoted_from_candidate_id)
+            WHERE retired = 0
+            """
+        )
+    # External-content FTS5 shadow over fact_text, kept in sync by triggers.
+    # Retirement is an UPDATE (fact_text unchanged), but the update trigger
+    # keeps the index consistent regardless.
+    conn.execute(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS long_term_memory_fts
+        USING fts5(fact_text, content='long_term_memory', content_rowid='id')
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS long_term_memory_ai
+        AFTER INSERT ON long_term_memory BEGIN
+            INSERT INTO long_term_memory_fts (rowid, fact_text)
+            VALUES (new.id, new.fact_text);
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS long_term_memory_ad
+        AFTER DELETE ON long_term_memory BEGIN
+            INSERT INTO long_term_memory_fts (long_term_memory_fts, rowid, fact_text)
+            VALUES ('delete', old.id, old.fact_text);
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS long_term_memory_au
+        AFTER UPDATE ON long_term_memory BEGIN
+            INSERT INTO long_term_memory_fts (long_term_memory_fts, rowid, fact_text)
+            VALUES ('delete', old.id, old.fact_text);
+            INSERT INTO long_term_memory_fts (rowid, fact_text)
+            VALUES (new.id, new.fact_text);
+        END
+        """
+    )
+
+
+def _ensure_long_term_memory_embeddings(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        f"""
+        CREATE VIRTUAL TABLE IF NOT EXISTS long_term_memory_embeddings
+        USING vec0(
+            fact_id integer primary key,
+            embedding float[{EMBEDDING_DIM}]
+        )
+        """
+    )
+
+
+def _ensure_retrieval_events(conn: sqlite3.Connection) -> None:
+    # One row per fact surfaced by one Tier 3 retrieval (ADR-0008). The durable
+    # source that makes retrieved_count/used_count derivable and rebuild-safe.
+    # `used` is tri-state: NULL = use judge never ran, 0 = judged not used,
+    # 1 = judged used — the only mutation a row ever receives is that judgment.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS retrieval_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fact_id INTEGER NOT NULL,
+            session_id TEXT NOT NULL,
+            query TEXT NOT NULL,
+            rewritten_query TEXT,
+            keyword_fact_ids TEXT NOT NULL DEFAULT '[]',
+            vector_fact_ids TEXT NOT NULL DEFAULT '[]',
+            fused_fact_ids TEXT NOT NULL DEFAULT '[]',
+            retrieved_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            used INTEGER CHECK (used IN (0, 1)),
+            judged_at DATETIME
+        )
+        """
+    )
+    _ensure_column(conn, "retrieval_events", "rewritten_query", "rewritten_query TEXT")
+    _ensure_column(
+        conn,
+        "retrieval_events",
+        "keyword_fact_ids",
+        "keyword_fact_ids TEXT NOT NULL DEFAULT '[]'",
+    )
+    _ensure_column(
+        conn,
+        "retrieval_events",
+        "vector_fact_ids",
+        "vector_fact_ids TEXT NOT NULL DEFAULT '[]'",
+    )
+    _ensure_column(
+        conn,
+        "retrieval_events",
+        "fused_fact_ids",
+        "fused_fact_ids TEXT NOT NULL DEFAULT '[]'",
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_retrieval_events_fact
+        ON retrieval_events(fact_id, retrieved_at)
+        """
+    )
+
+
+def _ensure_memory_candidates_fts(conn: sqlite3.Connection) -> None:
+    # External-content FTS5 shadow over candidate fact_text for the Tier 2
+    # candidate-fallback keyword retriever (ADR-0010), mirroring
+    # long_term_memory_fts. Light-phase merge updates hit_count/source ids/
+    # embedding but not fact_text, so the update trigger rarely fires; it is
+    # kept for correctness regardless.
+    #
+    # Unlike long_term_memory (created together with its shadow), the candidate
+    # base table predates this shadow, so existing rows are not covered by the
+    # insert trigger. Detect first creation and rebuild from memory_candidates
+    # once so pre-existing candidates become searchable.
+    shadow_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'memory_candidates_fts'"
+    ).fetchone()
+    conn.execute(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS memory_candidates_fts
+        USING fts5(fact_text, content='memory_candidates', content_rowid='id')
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS memory_candidates_ai
+        AFTER INSERT ON memory_candidates BEGIN
+            INSERT INTO memory_candidates_fts (rowid, fact_text)
+            VALUES (new.id, new.fact_text);
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS memory_candidates_ad
+        AFTER DELETE ON memory_candidates BEGIN
+            INSERT INTO memory_candidates_fts (memory_candidates_fts, rowid, fact_text)
+            VALUES ('delete', old.id, old.fact_text);
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS memory_candidates_au
+        AFTER UPDATE OF fact_text ON memory_candidates BEGIN
+            INSERT INTO memory_candidates_fts (memory_candidates_fts, rowid, fact_text)
+            VALUES ('delete', old.id, old.fact_text);
+            INSERT INTO memory_candidates_fts (rowid, fact_text)
+            VALUES (new.id, new.fact_text);
+        END
+        """
+    )
+    if shadow_exists is None:
+        conn.execute(
+            "INSERT INTO memory_candidates_fts (memory_candidates_fts) VALUES ('rebuild')"
+        )
+
+
+def _ensure_candidate_retrieval_events(conn: sqlite3.Connection) -> None:
+    # One row per Tier 2 candidate surfaced by one candidate-fallback retrieval
+    # (ADR-0010). Parallel to retrieval_events, never an extension of it: the
+    # referent is a mutable candidate, not a durable fact, so the shipped Tier 3
+    # events path stays untouched. `used` is tri-state like retrieval_events
+    # (NULL = no candidate use judge ran yet — deferred), reserved for a future
+    # candidate use verdict.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS candidate_retrieval_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            candidate_id INTEGER NOT NULL,
+            session_id TEXT NOT NULL,
+            query TEXT NOT NULL,
+            retrieved_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            used INTEGER CHECK (used IN (0, 1)),
+            judged_at DATETIME
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_candidate_retrieval_events_candidate
+        ON candidate_retrieval_events(candidate_id, retrieved_at)
+        """
+    )
+
+
+def _ensure_promotion_labels(conn: sqlite3.Connection) -> None:
+    # Human promote/reject judgments over candidates (COA-93): the eval corpus
+    # that will eventually tune Deep scoring weights. fact_text is snapshotted
+    # at label time so the label survives later candidate edits/retirement.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS promotion_labels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            candidate_id INTEGER NOT NULL UNIQUE,
+            fact_text TEXT NOT NULL,
+            label TEXT NOT NULL CHECK (label IN ('promote', 'reject')),
+            reason TEXT,
+            labeled_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        DELETE FROM promotion_labels
+        WHERE id NOT IN (
+            SELECT MAX(id)
+            FROM promotion_labels
+            GROUP BY candidate_id
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_promotion_labels_candidate_id
+        ON promotion_labels(candidate_id)
+        """
+    )
+
+
+def _ensure_session_summaries(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session_summaries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('leaf', 'condensed')),
+            first_message_id INTEGER NOT NULL CHECK (first_message_id >= 1),
+            last_message_id INTEGER NOT NULL CHECK (last_message_id >= first_message_id),
+            summary_text TEXT NOT NULL,
+            token_estimate INTEGER NOT NULL CHECK (token_estimate >= 0),
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            replaces_summary_ids TEXT NOT NULL DEFAULT '[]',
+            model_requests INTEGER NOT NULL DEFAULT 0,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            estimated_cost_micros INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_session_summaries_session_range
+        ON session_summaries(session_id, first_message_id, last_message_id)
+        """
+    )
+
+
+def _ensure_vector_memory_schema(conn: sqlite3.Connection) -> None:
+    _load_vec_extension(conn)
+    _ensure_candidate_embeddings(conn)
+    _ensure_embedding_metadata(conn)
+    _ensure_dedup_events(conn)
+    _ensure_long_term_memory_embeddings(conn)
+
+
+def init_db(db_path: str) -> None:
+    # Lazy import breaks the schema<->transcript cycle: transcript imports the
+    # secret guard from this module at load time, so the Tier-1 FTS builder is
+    # reached here only at call time, once both modules are fully initialized.
+    from vexic.storage.transcript import _ensure_messages_fts
+
+    with closing(sqlite3.connect(db_path)) as conn:
+        # WAL is a persistent database property: once set it applies to every
+        # later connection. It lets readers run alongside a single writer, so a
+        # scheduled cron brief and a live chat turn don't contend on memory.db.
+        # (Python's sqlite3 already defaults timeout=5.0 for writer waits.)
+        conn.execute("PRAGMA journal_mode=WAL")
+        with conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL DEFAULT 'default',
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    message_json TEXT NOT NULL
+                )
+                """
+            )
+            _ensure_column(conn, "messages", "session_id", "session_id TEXT NOT NULL DEFAULT 'default'")
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_messages_session_id_id
+                ON messages(session_id, id)
+                """
+            )
+
+            _ensure_messages_fts(conn)
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_candidates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    fact_text TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    category TEXT NOT NULL CHECK (category IN (
+                        'preference', 'fact', 'goal', 'event',
+                        'relationship', 'skill', 'constraint', 'context'
+                    )),
+                    importance INTEGER NOT NULL CHECK (importance BETWEEN 1 AND 10),
+                    confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+                    source_message_ids TEXT NOT NULL,
+                    hit_count INTEGER NOT NULL DEFAULT 1,
+                    retrieved_count INTEGER NOT NULL DEFAULT 0,
+                    used_count INTEGER NOT NULL DEFAULT 0,
+                    rem_boost REAL NOT NULL DEFAULT 0.0,
+                    editable BOOLEAN NOT NULL DEFAULT 1,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    last_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    promoted BOOLEAN NOT NULL DEFAULT 0,
+                    promoted_fact_id INTEGER,
+                    retired BOOLEAN NOT NULL DEFAULT 0,
+                    retired_at DATETIME,
+                    retired_by_fact_id INTEGER,
+                    stale BOOLEAN NOT NULL DEFAULT 0,
+                    needs_review BOOLEAN NOT NULL DEFAULT 0,
+                    review_neighbor_id INTEGER,
+                    best_similarity REAL
+                )
+                """
+            )
+            _ensure_memory_candidate_columns(conn)
+            _ensure_memory_candidates_fts(conn)
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dream_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    started_at DATETIME NOT NULL,
+                    finished_at DATETIME,
+                    status TEXT NOT NULL CHECK (status IN ('ok', 'error', 'partial')),
+                    messages_processed INTEGER NOT NULL DEFAULT 0 CHECK (messages_processed >= 0),
+                    candidates_inserted INTEGER NOT NULL DEFAULT 0 CHECK (candidates_inserted >= 0),
+                    candidates_merged INTEGER NOT NULL DEFAULT 0 CHECK (candidates_merged >= 0),
+                    candidates_review INTEGER NOT NULL DEFAULT 0 CHECK (candidates_review >= 0),
+                    last_processed_message_id INTEGER NOT NULL DEFAULT 0 CHECK (last_processed_message_id >= 0),
+                    error_detail TEXT
+                )
+                """
+            )
+            _ensure_column(conn, "dream_runs", "candidates_merged", "candidates_merged INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(conn, "dream_runs", "candidates_review", "candidates_review INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(conn, "dream_runs", "candidates_boosted", "candidates_boosted INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(conn, "dream_runs", "promotions", "promotions INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(conn, "dream_runs", "retirements", "retirements INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(conn, "dream_runs", "model_requests", "model_requests INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(conn, "dream_runs", "input_tokens", "input_tokens INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(conn, "dream_runs", "output_tokens", "output_tokens INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(conn, "dream_runs", "total_tokens", "total_tokens INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(conn, "dream_runs", "estimated_cost_micros", "estimated_cost_micros INTEGER NOT NULL DEFAULT 0")
+
+            _ensure_long_term_memory(conn)
+            _ensure_retrieval_events(conn)
+            _ensure_candidate_retrieval_events(conn)
+            _ensure_promotion_labels(conn)
+            _ensure_session_summaries(conn)
+
+
+def init_vector_memory(db_path: str) -> None:
+    init_db(db_path)
+    with closing(sqlite3.connect(db_path)) as conn:
+        with conn:
+            _ensure_vector_memory_schema(conn)
