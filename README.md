@@ -30,9 +30,14 @@ Run the read-only stdio MCP server against a local Vexic database:
 uv run python scripts\vexic-mcp-stdio.py --db-path .\memory.db --tenant-id local --session-id default
 ```
 
+For v0.1, `scripts\vexic-mcp-stdio.py` is the supported launcher. A package
+entry point can wait for release packaging.
+
 The MVP exposes `search_transcript` and `search_long_term` only. Transcript
 writes, verbatim history expansion, export, delete, rebuild, and admin tools are
-intentionally not registered.
+intentionally not registered. Long-term vector search requires a host-supplied
+embedding adapter; without one, `search_long_term` returns a configuration
+error instead of loading a model from Vexic core.
 
 Codex-style MCP config:
 
@@ -52,6 +57,15 @@ args = [
 ]
 cwd = "C:\\Users\\Ryan\\Documents\\GitHub\\Vexic"
 ```
+
+Claude Code local MCP config:
+
+```powershell
+claude mcp add --scope local vexic -- uv run python scripts\vexic-mcp-stdio.py --db-path .\memory.db --tenant-id local --session-id default
+```
+
+The stdio tool schemas cap `query` at 1000 characters and `limit` at 1-20
+results.
 
 <!-- memory-reliability-gate -->
 

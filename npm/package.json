@@ -1,0 +1,17 @@
+{
+  "name": "vexic",
+  "version": "0.0.0",
+  "description": "npm name reservation for Vexic, a provenance-first Python memory core.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PyroDonkey/vexic.git"
+  },
+  "homepage": "https://github.com/PyroDonkey/vexic#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "README.md"
+  ]
+}

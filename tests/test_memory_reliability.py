@@ -171,15 +171,12 @@ class FreshCandidateFallbackReliabilityTests(unittest.IsolatedAsyncioTestCase):
             candidate_id=1,
             embedding=_unit_vector(1.0),
         )
+        self.ctx.deps.embed = lambda texts: [_unit_vector(1.0) for _ in texts]
 
-        with patch(
-            "vexic.subagents.retrieval.embed_texts",
-            return_value=[_unit_vector(1.0)],
-        ):
-            result = await search_long_term(
-                self.ctx,
-                "what starts Ryan's launch checklist?",
-            )
+        result = await search_long_term(
+            self.ctx,
+            "what starts Ryan's launch checklist?",
+        )
 
         self.assertIn("No durable long-term memories matched", result)
         self.assertIn("[unverified note]", result)
@@ -372,17 +369,24 @@ class DreamCycleReliabilityTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("vexic.pipeline.build_extraction_agent", return_value=_StableExtractionAgent()),
-            patch("vexic.pipeline.embed_texts", return_value=[_unit_vector(1.0)]),
             patch("vexic.rem.build_rem_agent", return_value=_NoOpRemAgent()),
             patch(
                 "vexic.deep.build_contradiction_agent",
                 return_value=_ContradictionAgent(contradicts=False),
             ),
         ):
-            await run_light_phase(self.db_path, "glm")
+            await run_light_phase(
+                self.db_path,
+                "glm",
+                embed=lambda texts: [_unit_vector(1.0) for _ in texts],
+            )
             await run_rem_phase(self.db_path, "glm")
             await run_deep_phase(self.db_path, "glm")
-            await run_light_phase(self.db_path, "glm")
+            await run_light_phase(
+                self.db_path,
+                "glm",
+                embed=lambda texts: [_unit_vector(1.0) for _ in texts],
+            )
             await run_rem_phase(self.db_path, "glm")
             await run_deep_phase(self.db_path, "glm")
 

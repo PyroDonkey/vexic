@@ -33,6 +33,7 @@ from vexic.contract import (
     LongTermFact as ContractLongTermFact,
     require_capability,
 )
+from vexic.ports import EmbedTexts
 from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage import (
     TranscriptRangeTooLarge,
@@ -54,10 +55,12 @@ class LocalMemoryService(MemoryService):
         db_path: str,
         tenant_id: str,
         forbidden_secret_values: tuple[str, ...] = (),
+        embed: EmbedTexts | None = None,
     ) -> None:
         self.db_path = db_path
         self.tenant_id = tenant_id
         self.forbidden_secret_values = forbidden_secret_values
+        self.embed = embed
 
     def init_schema(self) -> None:
         init_db(self.db_path)
@@ -143,6 +146,7 @@ class LocalMemoryService(MemoryService):
             request.query,
             session_id=request.scope.session_id or "default",
             return_k=request.limit,
+            embed=self.embed,
         )
         if facts:
             return SearchLongTermResult(
@@ -169,6 +173,7 @@ class LocalMemoryService(MemoryService):
             request.query,
             session_id=request.scope.session_id or "default",
             return_k=request.limit,
+            embed=self.embed,
         )
         return SearchLongTermResult(
             candidate_notes=[

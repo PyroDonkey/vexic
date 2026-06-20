@@ -38,8 +38,8 @@ consumer, not a dependency.
   canonical rows and code.
 - Explicit scope: requests carry `MemoryScope`, and the local adapter validates
   the opened SQLite context against it.
-- Host-neutral core: providers, secrets, auth, and managed operations live in
-  adapters or hosts.
+- Host-neutral core: providers, embeddings, secrets, auth, and managed
+  operations live in adapters or hosts.
 
 ## Non-goals
 
@@ -102,8 +102,9 @@ package, but model-backed work requires host-supplied agents through ports.
 
 `vexic.pipeline.run_light_phase` reads transcript rows since the last
 watermark, renders stable message ids, asks a host-supplied extraction agent for
-structured `FactCandidate` output, validates source ids, embeds fact text, and
-commits candidate inserts/merges with a `dream_runs` audit row.
+structured `FactCandidate` output, validates source ids, embeds fact text
+through a host-supplied embedding port, and commits candidate inserts/merges
+with a `dream_runs` audit row.
 
 ### REM
 
@@ -132,7 +133,8 @@ Long-term search uses hybrid retrieval:
 
 1. Optional query rewrite through a host-supplied agent when available.
 2. FTS5 keyword search over `long_term_memory_fts`.
-3. sqlite-vec KNN over `long_term_memory_embeddings`.
+3. sqlite-vec KNN over `long_term_memory_embeddings` using host-supplied query
+   embeddings.
 4. Reciprocal Rank Fusion.
 5. Top facts returned with provenance.
 6. One `retrieval_events` row per surfaced fact plus `retrieved_count`
@@ -160,6 +162,8 @@ The v0.1 local core uses SQLite:
 - sqlite-vec backs candidate and long-term vector search.
 - `embedding_metadata` guards embedding model, dimension, and distance metric
   compatibility.
+- Vexic core stores and validates vectors but does not load embedding models.
+  Missing embedding adapters fail with `HostPortNotConfigured`.
 
 Current local isolation is one opened SQLite database per memory context, with
 `LocalMemoryService` validating `MemoryScope.tenant_id` against the service's

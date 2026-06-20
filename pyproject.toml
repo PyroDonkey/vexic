@@ -3,12 +3,16 @@ name = "vexic"
 version = "0.1.0"
 description = "Provenance-first memory core for long-running agents."
 readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.13"
 dependencies = [
     "pydantic-ai==1.84.1",
-    "sentence-transformers>=5.5.1",
     "sqlite-vec>=0.1.9",
 ]
+
+[project.urls]
+Repository = "https://github.com/PyroDonkey/vexic"
+Issues = "https://github.com/PyroDonkey/vexic/issues"
 
 [dependency-groups]
 dev = [

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from vexic.formatting import UNVERIFIED_NOTES_PREAMBLE, format_candidate_note
+from vexic.ports import HostPortNotConfigured
 from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage import (
     LongTermFact,
@@ -157,27 +158,32 @@ def _format_fact(fact: LongTermFact) -> str:
 async def search_long_term(ctx_or_deps: Any, query: str) -> str:
     deps = _deps(ctx_or_deps)
     authority = getattr(deps, "authority", None)
-    facts = await retrieve_long_term_facts(
-        deps.db_path,
-        query,
-        session_id=deps.session_id,
-        model_group=authority.model_group if authority is not None else None,
-        secrets=deps.secrets,
-        usage=_usage(ctx_or_deps),
-        sink=deps.retrieved_facts_this_turn,
-    )
+    try:
+        facts = await retrieve_long_term_facts(
+            deps.db_path,
+            query,
+            session_id=deps.session_id,
+            model_group=authority.model_group if authority is not None else None,
+            secrets=deps.secrets,
+            usage=_usage(ctx_or_deps),
+            sink=deps.retrieved_facts_this_turn,
+            embed=getattr(deps, "embed", None),
+        )
 
-    if facts:
-        rendered = "\n---\n".join(_format_fact(fact) for fact in facts)
-        assert_no_forbidden_secret_values(deps.secrets.values(), rendered)
-        return rendered
+        if facts:
+            rendered = "\n---\n".join(_format_fact(fact) for fact in facts)
+            assert_no_forbidden_secret_values(deps.secrets.values(), rendered)
+            return rendered
 
-    notes = await retrieve_candidate_fallback(
-        deps.db_path,
-        query,
-        session_id=deps.session_id,
-        secrets=deps.secrets,
-    )
+        notes = await retrieve_candidate_fallback(
+            deps.db_path,
+            query,
+            session_id=deps.session_id,
+            secrets=deps.secrets,
+            embed=getattr(deps, "embed", None),
+        )
+    except HostPortNotConfigured as exc:
+        return str(exc)
 
     if not notes:
         return "No long-term memories found."

@@ -5,12 +5,12 @@ query-rewrite box. The requesting agent sees only the returned facts — BM25
 scores, vector distances, and the rewrite never leave this module.
 """
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from vexic.embeddings import embed_texts
 from vexic.models import QueryRewrite, RetrievedFact
-from vexic.ports import AgentFactory, missing_host_port
+from vexic.ports import AgentFactory, EmbedTexts, missing_host_port
 from vexic.storage import (
     CandidateNote,
     LongTermFact,
@@ -87,6 +87,13 @@ async def _rewrite_query(
         return None
 
 
+def _embed_query(embedder: EmbedTexts, query: str) -> list[float]:
+    embeddings = embedder([query])
+    if len(embeddings) != 1:
+        raise ValueError("Embedder must return exactly one embedding for one query.")
+    return embeddings[0]
+
+
 async def retrieve_long_term_facts(
     db_path: str,
     query: str,
@@ -99,7 +106,7 @@ async def retrieve_long_term_facts(
     return_k: int = RETURN_K,
     sink: list[RetrievedFact] | None = None,
     query_rewrite_agent_factory: AgentFactory | None = None,
-    embed: Callable[[list[str]], list[list[float]]] | None = None,
+    embed: EmbedTexts | None = None,
 ) -> list[LongTermFact]:
     """Hybrid Tier 3 retrieval: FTS5 keyword + sqlite-vec KNN, fused via RRF.
 
@@ -124,7 +131,7 @@ async def retrieve_long_term_facts(
             keyword_query = rewritten
 
     embedder = embed or embed_texts
-    [query_embedding] = embedder([query])
+    query_embedding = _embed_query(embedder, query)
     keyword_ids = keyword_long_term_fact_ids(db_path, keyword_query, k=retrieve_k)
     vector_ids = [
         neighbor.fact_id
@@ -160,7 +167,7 @@ async def retrieve_candidate_fallback(
     secrets: Mapping[str, str] | None = None,
     retrieve_k: int = RETRIEVE_K,
     return_k: int = RETURN_K,
-    embed: Callable[[list[str]], list[list[float]]] | None = None,
+    embed: EmbedTexts | None = None,
 ) -> list[CandidateNote]:
     """Tier 2 candidate-fallback retrieval (ADR-0010, COA-95).
 
@@ -172,7 +179,7 @@ async def retrieve_candidate_fallback(
     to present as unverified, never as durable facts.
     """
     embedder = embed or embed_texts
-    [query_embedding] = embedder([query])
+    query_embedding = _embed_query(embedder, query)
     keyword_ids = keyword_candidate_ids(db_path, query, k=retrieve_k)
     vector_ids = nearest_candidate_ids(db_path, query_embedding, k=retrieve_k)
 

@@ -144,11 +144,12 @@ Vexic core does not:
 - authenticate network callers
 - read provider secrets from the environment
 - build provider-backed model clients directly
+- load or download embedding models directly
 - choose hosted storage backends
 - own host-specific extension tables
 
-Those are adapter or host responsibilities. Model-backed operations use host
-ports from `src/vexic/ports.py`.
+Those are adapter or host responsibilities. Model-backed operations, including
+embedding text for vector search, use host ports from `src/vexic/ports.py`.
 
 ## Coalescent Compatibility Map
 
