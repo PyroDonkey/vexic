@@ -5,6 +5,8 @@ import tomllib
 from pathlib import Path
 from types import ModuleType
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 CHECK_SCRIPT = ROOT / "scripts" / "check_release_tag.py"
@@ -45,6 +47,30 @@ def test_release_tag_checker_accepts_matching_version_tag(monkeypatch) -> None:
     monkeypatch.setenv("RELEASE_TAG", f"v{version}")
 
     assert checker.main() == 0
+
+
+@pytest.mark.parametrize(
+    "pyproject_text",
+    [
+        None,
+        "project =",
+        "[project]\nname = \"vexic\"\n",
+    ],
+)
+def test_release_tag_checker_reports_project_version_load_errors(
+    monkeypatch, tmp_path, capsys, pyproject_text: str | None
+) -> None:
+    checker = _load_checker()
+    if pyproject_text is not None:
+        (tmp_path / "pyproject.toml").write_text(pyproject_text, encoding="utf-8")
+    monkeypatch.setenv("PROJECT_DIR", str(tmp_path))
+
+    assert checker.main() == 1
+    captured = capsys.readouterr()
+    assert (
+        f"::error::unable to read project version from {tmp_path / 'pyproject.toml'}:"
+        in captured.err
+    )
 
 
 def test_publish_workflow_requires_matching_version_tag() -> None:

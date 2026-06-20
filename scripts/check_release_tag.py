@@ -8,7 +8,15 @@ from pathlib import Path
 
 def main() -> int:
     project_dir = Path(os.environ.get("PROJECT_DIR", "."))
-    version = _project_version(project_dir / "pyproject.toml")
+    pyproject_path = project_dir / "pyproject.toml"
+    try:
+        version = _project_version(pyproject_path)
+    except (FileNotFoundError, tomllib.TOMLDecodeError, KeyError) as error:
+        print(
+            f"::error::unable to read project version from {pyproject_path}: {error}",
+            file=sys.stderr,
+        )
+        return 1
     expected = f"v{version}"
     release_tag = os.environ.get("RELEASE_TAG", "")
     ref_name = os.environ.get("GITHUB_REF_NAME", "")
