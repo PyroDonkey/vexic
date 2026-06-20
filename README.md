@@ -32,7 +32,9 @@ uv run python scripts\vexic-mcp-stdio.py --db-path .\memory.db --tenant-id local
 
 The MVP exposes `search_transcript` and `search_long_term` only. Transcript
 writes, verbatim history expansion, export, delete, rebuild, and admin tools are
-intentionally not registered.
+intentionally not registered. Long-term vector search requires a host-supplied
+embedding adapter; without one, `search_long_term` returns a configuration
+error instead of loading a model from Vexic core.
 
 Codex-style MCP config:
 

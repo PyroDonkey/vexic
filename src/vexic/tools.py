@@ -165,6 +165,7 @@ async def search_long_term(ctx_or_deps: Any, query: str) -> str:
         secrets=deps.secrets,
         usage=_usage(ctx_or_deps),
         sink=deps.retrieved_facts_this_turn,
+        embed=getattr(deps, "embed", None),
     )
 
     if facts:
@@ -177,6 +178,7 @@ async def search_long_term(ctx_or_deps: Any, query: str) -> str:
         query,
         session_id=deps.session_id,
         secrets=deps.secrets,
+        embed=getattr(deps, "embed", None),
     )
 
     if not notes:

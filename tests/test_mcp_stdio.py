@@ -92,6 +92,22 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response["result"]["isError"])
         self.assertIn("forbidden", response["result"]["content"][0]["text"])
 
+    async def test_search_long_term_without_embedder_returns_tool_error(self) -> None:
+        response = await self._request(
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "search_long_term",
+                    "arguments": {"query": "compact reports"},
+                },
+            }
+        )
+
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("Embeddings", response["result"]["content"][0]["text"])
+
     async def test_notifications_do_not_emit_responses(self) -> None:
         response = await self._request(
             {"jsonrpc": "2.0", "method": "notifications/initialized"}

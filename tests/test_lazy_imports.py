@@ -4,6 +4,9 @@ import unittest
 import os
 from pathlib import Path
 
+from vexic.embeddings import embed_texts
+from vexic.ports import HostPortNotConfigured
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -23,6 +26,10 @@ class VexicLazyImportTests(unittest.TestCase):
             env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_embed_texts_without_host_port_fails_closed(self) -> None:
+        with self.assertRaisesRegex(HostPortNotConfigured, "Embeddings"):
+            embed_texts(["compact reports"])
 
 
 if __name__ == "__main__":

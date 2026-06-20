@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 import traceback
 from typing import Any
 
@@ -13,7 +13,7 @@ from pydantic_ai.messages import (
 
 from vexic.embeddings import embed_texts
 from vexic.models import FactCandidate
-from vexic.ports import AgentFactory, missing_host_port
+from vexic.ports import AgentFactory, EmbedTexts, missing_host_port
 from vexic.storage import (
     backfill_missing_candidate_embeddings,
     commit_dream_cycle,
@@ -95,7 +95,7 @@ async def run_light_phase(
     batch_size: int = LIGHT_PHASE_BATCH_SIZE,
     secrets: Mapping[str, str] | None = None,
     extraction_agent_factory: AgentFactory | None = None,
-    embed: Callable[[list[str]], list[list[float]]] | None = None,
+    embed: EmbedTexts | None = None,
 ) -> None:
     started_at = utc_now_iso()
     watermark = 0
