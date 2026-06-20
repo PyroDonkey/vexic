@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vexic"
+version = "0.0.0"
+description = "PyPI name reservation for Vexic."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.13"
+
+[project.urls]
+Repository = "https://github.com/PyroDonkey/vexic"
+
+[tool.setuptools]
+packages = []

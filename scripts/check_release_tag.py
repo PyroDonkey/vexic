@@ -7,7 +7,8 @@ from pathlib import Path
 
 
 def main() -> int:
-    version = _project_version(Path("pyproject.toml"))
+    project_dir = Path(os.environ.get("PROJECT_DIR", "."))
+    version = _project_version(project_dir / "pyproject.toml")
     expected = f"v{version}"
     release_tag = os.environ.get("RELEASE_TAG", "")
     ref_name = os.environ.get("GITHUB_REF_NAME", "")
