@@ -113,15 +113,20 @@ class LocalMemoryService(MemoryService):
     async def expand_history(
         self,
         request: ExpandHistoryRequest,
+        *,
+        max_rows: int | None = None,
     ) -> ExpandHistoryResult:
         self._authorize(request.scope, request.required_capability)
+        row_cap = max_rows if max_rows is not None else EXPAND_HISTORY_MAX_ROWS
+        if row_cap < 1:
+            raise ValueError("max_rows must be at least 1.")
         try:
             rows = load_messages_in_id_range(
                 self.db_path,
                 request.first_message_id,
                 request.last_message_id,
                 session_id=request.scope.session_id or "default",
-                max_rows=EXPAND_HISTORY_MAX_ROWS,
+                max_rows=row_cap,
             )
         except TranscriptRangeTooLarge:
             return ExpandHistoryResult(text="", truncated=True)

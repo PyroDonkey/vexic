@@ -33,11 +33,18 @@ uv run python scripts\vexic-mcp-stdio.py --db-path .\memory.db --tenant-id local
 For v0.1, `scripts\vexic-mcp-stdio.py` is the supported launcher. A package
 entry point can wait for release packaging.
 
-The MVP exposes `search_transcript` and `search_long_term` only. Transcript
-writes, verbatim history expansion, export, delete, rebuild, and admin tools are
-intentionally not registered. Long-term vector search requires a host-supplied
-embedding adapter; without one, `search_long_term` returns a configuration
-error instead of loading a model from Vexic core.
+By default, the MVP exposes `search_transcript` and `search_long_term` only.
+Transcript writes, export, delete, rebuild, and admin tools are intentionally
+not registered. Long-term vector search requires a host-supplied embedding
+adapter; without one, `search_long_term` returns a configuration error instead
+of loading a model from Vexic core.
+
+Privileged verbatim history egress is disabled by default. For a local,
+session-bound agent that explicitly needs it, pass `--enable-expand-history` to
+register `expand_history`. That tool requires `MemoryCapability.EXPAND_HISTORY`,
+uses the configured scope only, applies forbidden-value redaction before
+egress, and caps both returned messages and returned text. The local stdio MVP
+does not yet have a dedicated audit hook for this privileged egress path.
 
 Codex-style MCP config:
 
@@ -54,6 +61,8 @@ args = [
   "local",
   "--session-id",
   "default",
+  # Optional privileged egress:
+  # "--enable-expand-history",
 ]
 cwd = "C:\\Users\\Ryan\\Documents\\GitHub\\Vexic"
 ```
@@ -64,8 +73,9 @@ Claude Code local MCP config:
 claude mcp add --scope local vexic -- uv run python scripts\vexic-mcp-stdio.py --db-path .\memory.db --tenant-id local --session-id default
 ```
 
-The stdio tool schemas cap `query` at 1000 characters and `limit` at 1-20
-results.
+The stdio tool schemas cap `query` at 1000 characters, `limit` at 1-20 results,
+and privileged `expand_history` responses at 100 returned messages and 20000
+characters.
 
 <!-- memory-reliability-gate -->
 
