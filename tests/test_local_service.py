@@ -164,6 +164,28 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.facts[0].category, MemoryCategory.PREFERENCE)
         self.assertEqual(result.facts[0].fact_text, "Ryan prefers compact reports.")
 
+    async def test_search_long_term_rejects_wrong_embedder_result_count(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        cases = [
+            [],
+            [_unit_vector(1.0), _unit_vector(1.0)],
+        ]
+
+        for embeddings in cases:
+            with self.subTest(count=len(embeddings)):
+                service = LocalMemoryService(
+                    db_path=self.db_path,
+                    tenant_id="tenant-a",
+                    embed=lambda texts, embeddings=embeddings: embeddings,
+                )
+                service.init_schema()
+
+                with self.assertRaisesRegex(ValueError, "exactly one embedding"):
+                    await service.search_long_term(
+                        SearchLongTermRequest(scope=_scope(), query="compact reports")
+                    )
+
     async def test_tenant_scope_must_match_opened_sqlite_context(self) -> None:
         from vexic.service import LocalMemoryService
 

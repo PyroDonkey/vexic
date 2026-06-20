@@ -87,6 +87,13 @@ async def _rewrite_query(
         return None
 
 
+def _embed_query(embedder: EmbedTexts, query: str) -> list[float]:
+    embeddings = embedder([query])
+    if len(embeddings) != 1:
+        raise ValueError("Embedder must return exactly one embedding for one query.")
+    return embeddings[0]
+
+
 async def retrieve_long_term_facts(
     db_path: str,
     query: str,
@@ -124,7 +131,7 @@ async def retrieve_long_term_facts(
             keyword_query = rewritten
 
     embedder = embed or embed_texts
-    [query_embedding] = embedder([query])
+    query_embedding = _embed_query(embedder, query)
     keyword_ids = keyword_long_term_fact_ids(db_path, keyword_query, k=retrieve_k)
     vector_ids = [
         neighbor.fact_id
@@ -172,7 +179,7 @@ async def retrieve_candidate_fallback(
     to present as unverified, never as durable facts.
     """
     embedder = embed or embed_texts
-    [query_embedding] = embedder([query])
+    query_embedding = _embed_query(embedder, query)
     keyword_ids = keyword_candidate_ids(db_path, query, k=retrieve_k)
     vector_ids = nearest_candidate_ids(db_path, query_embedding, k=retrieve_k)
 
