@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import json
 import sqlite3
 from contextlib import closing
-from pathlib import Path
-from uuid import uuid4
 
 from vexic.contract import (
     AppendTranscriptRequest,
@@ -38,12 +35,11 @@ from vexic.contract import (
     SearchTranscriptRequest,
     SearchTranscriptResult,
     SourceTranscriptIngestItemResult,
-    TombstoneRecord,
     TranscriptHit,
     LongTermFact as ContractLongTermFact,
     require_capability,
 )
-from vexic.ports import EmbedTexts, missing_host_port
+from vexic.ports import EmbedTexts
 from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage import (
     TranscriptRangeTooLarge,
@@ -52,15 +48,10 @@ from vexic.storage import (
     init_db,
     load_messages_in_id_range,
     message_search_text,
-    record_fact_use_verdict,
-    record_long_term_retrieval,
-    create_memory_rebuild_copy,
-    repair_memory_projections,
     save_messages,
     search_messages,
     single_message_adapter,
 )
-from vexic.storage.longterm import retire_long_term_fact
 from vexic.subagents.retrieval import retrieve_candidate_fallback, retrieve_long_term_facts
 
 EXPAND_HISTORY_MAX_ROWS = 2_000
@@ -127,99 +118,6 @@ class LocalMemoryService(MemoryService):
             ).fetchall()
         if any(self._scope_matches_tombstone(scope, row) for row in rows):
             raise PermissionError(f"Memory scope is tombstoned for {operation}.")
-
-    def _load_replay_hits(self, scope: MemoryScope) -> list[TranscriptHit]:
-        with closing(sqlite3.connect(self.db_path)) as conn:
-            rows = conn.execute(
-                """
-                SELECT id, session_id, timestamp, message_json
-                FROM messages
-                WHERE session_id = ?
-                ORDER BY id ASC
-                """,
-                (scope.session_id or "default",),
-            ).fetchall()
-
-        hits: list[TranscriptHit] = []
-        for row in rows:
-            body = message_search_text(single_message_adapter.validate_json(row[3]))
-            if body:
-                hits.append(
-                    TranscriptHit(
-                        message_id=int(row[0]),
-                        session_id=str(row[1]),
-                        timestamp=None if row[2] is None else str(row[2]),
-                        body=body,
-                    )
-                )
-        return hits
-
-    def _export_payload(self, scope: MemoryScope) -> dict[str, object]:
-        messages = self._load_replay_hits(scope)
-        exported_message_ids = {hit.message_id for hit in messages}
-        with closing(sqlite3.connect(self.db_path)) as conn:
-            fact_rows = conn.execute(
-                """
-                SELECT id, fact_text, subject, category, importance, confidence,
-                       source_message_ids, promoted_from_candidate_id,
-                       retrieved_count, used_count, retired, retired_at,
-                       retired_by_fact_id, editable, created_at
-                FROM long_term_memory
-                ORDER BY id ASC
-                """
-            ).fetchall()
-
-        facts: list[dict[str, object]] = []
-        for row in fact_rows:
-            source_message_ids = [int(value) for value in json.loads(row[6])]
-            if exported_message_ids and not exported_message_ids.intersection(source_message_ids):
-                continue
-            facts.append(
-                {
-                    "fact_id": int(row[0]),
-                    "fact_text": str(row[1]),
-                    "subject": str(row[2]),
-                    "category": str(row[3]),
-                    "importance": int(row[4]),
-                    "confidence": float(row[5]),
-                    "source_message_ids": source_message_ids,
-                    "promoted_from_candidate_id": int(row[7]),
-                    "retrieved_count": int(row[8]),
-                    "used_count": int(row[9]),
-                    "retired": bool(row[10]),
-                    "retired_at": None if row[11] is None else str(row[11]),
-                    "retired_by_fact_id": None if row[12] is None else int(row[12]),
-                    "editable": bool(row[13]),
-                    "created_at": str(row[14]),
-                }
-            )
-        return {
-            "scope": scope.model_dump(mode="json"),
-            "messages": [hit.model_dump(mode="json") for hit in messages],
-            "long_term_memory": facts,
-        }
-
-    def _write_export_artifact(
-        self,
-        payload: dict[str, object],
-        redaction: RedactionContext,
-    ) -> Path:
-        target = Path(self.db_path).with_name(
-            f"{Path(self.db_path).stem}-export-{uuid4().hex}.json"
-        )
-        rendered = json.dumps(payload, indent=2, sort_keys=True)
-        assert_no_forbidden_secret_values(
-            self._redaction_values(redaction),
-            rendered,
-        )
-        temp_path = target.with_name(f".{target.name}.tmp")
-        try:
-            temp_path.write_text(rendered, encoding="utf-8")
-            temp_path.replace(target)
-        except Exception:
-            temp_path.unlink(missing_ok=True)
-            raise
-        return target
 
     async def append_transcript(
         self,
@@ -385,147 +283,40 @@ class LocalMemoryService(MemoryService):
         self,
         request: RecordRetrievalEventRequest,
     ) -> RecordRetrievalEventResult:
-        self._authorize(request.scope, request.required_capability)
-        event_scope = request.scope.model_copy(
-            update={"session_id": request.event.session_id}
-        )
-        self._assert_not_tombstoned(event_scope, "retrieval")
-        event_ids = record_long_term_retrieval(
-            self.db_path,
-            [request.event.referent_id],
-            session_id=request.event.session_id,
-            query=request.event.query,
-            forbidden_secret_values=self._redaction_values(request.redaction),
-        )
-        event_id = event_ids[0]
-        if request.event.used is True:
-            record_fact_use_verdict(
-                self.db_path,
-                used_event_ids=[event_id],
-                unused_event_ids=[],
-            )
-        elif request.event.used is False:
-            record_fact_use_verdict(
-                self.db_path,
-                used_event_ids=[],
-                unused_event_ids=[event_id],
-            )
-        return RecordRetrievalEventResult(event_id=event_id)
+        raise NotImplementedError
 
     async def retire_fact(
         self,
         request: RetireFactRequest,
     ) -> RetireFactResult:
-        self._authorize(request.scope, request.required_capability)
-        with closing(sqlite3.connect(self.db_path)) as conn:
-            with conn:
-                retired = retire_long_term_fact(
-                    conn,
-                    fact_id=request.fact_id,
-                    superseded_by_fact_id=request.superseded_by_fact_id,
-                )
-        return RetireFactResult(retired=retired)
+        raise NotImplementedError
 
     async def run_dream_phase(
         self,
         request: RunDreamPhaseRequest,
     ) -> RunDreamPhaseResult:
-        self._authorize(request.scope, request.required_capability)
-        self._assert_not_tombstoned(request.scope, "rebuild")
-        raise missing_host_port("Dream phase execution")
+        raise NotImplementedError
 
     async def export_scope(
         self,
         request: ExportScopeRequest,
     ) -> ExportScopeResult:
-        self._authorize(request.scope, request.required_capability)
-        scope = self._with_default_session(request.scope)
-        self._assert_not_tombstoned(scope, "export")
-        artifact = self._write_export_artifact(
-            self._export_payload(scope),
-            request.redaction,
-        )
-        return ExportScopeResult(artifact_ref=str(artifact))
+        raise NotImplementedError
 
     async def replay_scope(
         self,
         request: ReplayScopeRequest,
     ) -> ReplayScopeResult:
-        self._authorize(request.scope, request.required_capability)
-        scope = self._with_default_session(request.scope)
-        self._assert_not_tombstoned(scope, "replay")
-        messages = self._load_replay_hits(scope)
-        assert_no_forbidden_secret_values(
-            self._redaction_values(request.redaction),
-            *(hit.body for hit in messages),
-        )
-        return ReplayScopeResult(messages=messages)
+        raise NotImplementedError
 
     async def rebuild(
         self,
         request: RebuildRequest,
     ) -> RebuildResult:
-        self._authorize(request.scope, request.required_capability)
-        self._assert_not_tombstoned(request.scope, "rebuild")
-        forbidden_values = self._redaction_values(request.redaction)
-        if request.return_artifacts:
-            target = Path(self.db_path).with_name(
-                f"{Path(self.db_path).stem}-rebuild-{uuid4().hex}.db"
-            )
-            report = create_memory_rebuild_copy(
-                self.db_path,
-                target,
-                forbidden_secret_values=forbidden_values,
-            )
-            return RebuildResult(artifact_ref=str(report.output_path))
-
-        repair_memory_projections(
-            self.db_path,
-            forbidden_secret_values=forbidden_values,
-        )
-        return RebuildResult()
+        raise NotImplementedError
 
     async def delete_scope(
         self,
         request: DeleteScopeRequest,
     ) -> DeleteScopeResult:
-        self._authorize(request.scope, request.required_capability)
-        assert_no_forbidden_secret_values(
-            self._redaction_values(request.redaction),
-            request.reason,
-        )
-        with closing(sqlite3.connect(self.db_path)) as conn:
-            with conn:
-                cursor = conn.execute(
-                    """
-                    INSERT INTO scope_tombstones
-                        (target_tenant_id, target_project_id, target_user_id,
-                         target_session_id, created_by_principal_id,
-                         created_by_principal_type, reason)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        request.target_scope.tenant_id,
-                        request.target_scope.project_id,
-                        request.target_scope.user_id,
-                        request.target_scope.session_id,
-                        request.scope.principal.principal_id,
-                        request.scope.principal.principal_type.value,
-                        request.reason,
-                    ),
-                )
-                tombstone_id = str(cursor.lastrowid)
-
-        return DeleteScopeResult(
-            tombstone=TombstoneRecord(
-                tombstone_id=tombstone_id,
-                target_scope=request.target_scope,
-                created_by=request.scope.principal,
-                reason=request.reason,
-                retrieval_blocked=True,
-                export_blocked=True,
-                replay_blocked=True,
-                rebuild_blocked=True,
-                physical_purge_deferred=True,
-            )
-        )
+        raise NotImplementedError
