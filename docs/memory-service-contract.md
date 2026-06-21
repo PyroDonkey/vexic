@@ -137,11 +137,17 @@ one SQLite database per opened memory context.
 | --- | --- |
 | Current SQLite | Tenant identity is validated from the opened local context and `MemoryScope`; memory tables do not need `tenant_id` columns while the database file is the isolation boundary. |
 | Local/self-host SQLite | Default v0.1 adapter shape. Strong simple isolation is one SQLite file per customer or scope boundary. |
-| Early hosted storage | Prefer isolated per-customer storage before shared tables. |
+| Hosted v1 storage | One isolated SQLite-compatible Customer Memory Database per customer. The hosted adapter binds tenant identity from credentials or authorized tenant selection to exactly one database handle. |
 | Future shared storage | Shared tables require explicit tenant-isolation tests, audit logging, lifecycle guarantees, and operational maturity. |
 
 Future adapters must pass the same behavior and scope tests. Physical schema
 parity is not required.
+
+Hosted v1 storage should remain Postgres-ready without making Postgres a v1
+dependency. Storage-sensitive API, migration, export, and rebuild decisions
+should keep canonical memory rows portable through the public contract, so a
+future Postgres database-per-customer adapter can be introduced for concrete
+operational requirements without changing Vexic memory semantics.
 
 ## Host Boundary
 
