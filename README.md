@@ -18,9 +18,11 @@ uv run pytest
 
 ## Agent Workflow
 
-Agents should follow `AGENTS.md`: sync `main` and `dev` before edits, land work
-on `dev`, push completed updates to `origin/dev`, and keep Linear issues current
-for non-trivial plans and changes.
+Agents should follow `AGENTS.md`: sync `main` and `dev` before edits, do all
+project work on `dev`, push completed updates to `origin/dev`, and keep Linear
+issues current for non-trivial plans and changes. Do not create feature,
+`codex/*`, worktree, cleanup, or recovery branches unless Ryan explicitly names
+that branch in the same request.
 
 ## Local MCP MVP
 

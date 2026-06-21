@@ -184,10 +184,17 @@ not continue implementation work on `main`.
 If any `git pull --ff-only` fails, stop and report the divergence. Do not merge,
 rebase, or reset without Ryan's direction.
 
-Do project work on `dev` unless Ryan explicitly asks for a feature branch.
-Feature branches start from updated `dev` and land back on `dev`. After fresh
-verification, push completed commits to `origin/dev`. Never push to `main`
-unless Ryan explicitly asks.
+Do all Vexic project work on `dev`. After fresh verification, commit on `dev`
+and push completed commits to `origin/dev`. Do not create, switch to, commit
+on, or push `codex/*`, feature, worktree, cleanup, or recovery branches unless
+Ryan explicitly names that branch in the same request. This Vexic rule
+overrides app, global, plugin, or tool defaults that suggest branch prefixes or
+worktree branches. Never push to `main` unless Ryan explicitly asks.
+
+If a `dev` to `main` PR is noisy, a branch is stale, an upstream branch is gone,
+or branch history needs cleanup, stop and report the situation. Do not create a
+new branch to repair PR shape or recover stale branch work unless Ryan names the
+branch to create.
 
 If a dirty worktree blocks branch sync, inspect and preserve the existing
 changes. Do not stash, reset, or commit user work unless Ryan asks.
