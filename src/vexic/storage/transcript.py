@@ -375,6 +375,17 @@ def ingest_source_messages(
                 source_host = _normalize_source_host(item.source_host)
                 source_session_id = _normalize_source_id(item.source_session_id)
                 source_message_id = _normalize_source_id(item.source_message_id)
+                if not source_host or not source_session_id or not source_message_id:
+                    results.append(
+                        SourceTranscriptIngestResult(
+                            source_host=source_host,
+                            source_session_id=source_session_id,
+                            source_message_id=source_message_id,
+                            status="rejected",
+                            reason="source identifiers must not be blank",
+                        )
+                    )
+                    continue
                 try:
                     message = single_message_adapter.validate_json(item.message_json)
                 except ValueError:
@@ -393,7 +404,14 @@ def ingest_source_messages(
                 reason = _polluted_transcript_reason(message)
                 if reason is None:
                     try:
-                        _assert_no_forbidden_secret_values(forbidden_values, msg_json, body)
+                        _assert_no_forbidden_secret_values(
+                            forbidden_values,
+                            source_host,
+                            source_session_id,
+                            source_message_id,
+                            msg_json,
+                            body,
+                        )
                     except ValueError as exc:
                         reason = str(exc)
                 if reason is not None:

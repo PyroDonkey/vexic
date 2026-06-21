@@ -8,7 +8,10 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+if __name__ == "__main__":
+    src_path = str(Path(__file__).resolve().parents[1] / "src")
+    if src_path not in sys.path:
+        sys.path.insert(0, src_path)
 
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 
@@ -150,7 +153,7 @@ async def _run(args: argparse.Namespace) -> dict[str, int]:
     service = LocalMemoryService(
         db_path=args.db_path,
         tenant_id=args.tenant_id,
-        forbidden_secret_values=tuple(args.forbidden_value),
+        forbidden_secret_values=(),
     )
     service.init_schema()
     counts = {"inserted": 0, "skipped": 0, "rejected": 0, "ignored": 0}

@@ -13,6 +13,7 @@ from pydantic_ai.messages import (
     ToolReturnPart,
     UserPromptPart,
 )
+from pydantic_ai.usage import RequestUsage
 
 from vexic.contract import (
     ExpandHistoryRequest,
@@ -32,8 +33,11 @@ from vexic.embeddings import EMBEDDING_DIM
 from vexic.models import FactCandidate
 from vexic.ports import HostPortNotConfigured
 from vexic.storage import (
+    SourceTranscriptInput,
     commit_deep_cycle,
     commit_dream_cycle,
+    ingest_source_messages,
+    init_db,
     save_messages,
     search_messages,
     single_message_adapter,
@@ -327,11 +331,11 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         message_json = single_message_adapter.dump_json(
             ModelRequest(parts=[UserPromptPart(content="duplicate cedar")])
         ).decode()
-        request = IngestSourceTranscriptRequest(
+        first_request = IngestSourceTranscriptRequest(
             scope=_scope().model_copy(update={"capabilities": {MemoryCapability.WRITE}}),
             messages=[
                 SourceTranscriptMessage(
-                    source_host="claude-code",
+                    source_host="Claude-Code",
                     source_session_id="session-1",
                     source_message_id="uuid-1",
                     message_json=message_json,
@@ -339,9 +343,18 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             ],
             redaction=RedactionContext(forbidden_values=()),
         )
+        second_request = first_request.model_copy(
+            update={
+                "messages": [
+                    first_request.messages[0].model_copy(
+                        update={"source_host": "claude-code"}
+                    )
+                ]
+            }
+        )
 
-        first = await service.ingest_source_transcript(request)
-        second = await service.ingest_source_transcript(request)
+        first = await service.ingest_source_transcript(first_request)
+        second = await service.ingest_source_transcript(second_request)
 
         self.assertEqual(first.items[0].status, "inserted")
         self.assertEqual(second.items[0].status, "skipped")
@@ -575,6 +588,13 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                         ),
                     ),
                     source_message(
+                        "usage",
+                        ModelResponse(
+                            parts=[TextPart(content="assistant text")],
+                            usage=RequestUsage(input_tokens=1, output_tokens=1),
+                        ),
+                    ),
+                    source_message(
                         "secret",
                         ModelRequest(parts=[UserPromptPart(content="secret-token")]),
                     ),
@@ -589,7 +609,15 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [row.status for row in result.items],
-            ["rejected", "rejected", "rejected", "rejected", "rejected", "inserted"],
+            [
+                "rejected",
+                "rejected",
+                "rejected",
+                "rejected",
+                "rejected",
+                "rejected",
+                "inserted",
+            ],
         )
         with closing(sqlite3.connect(self.db_path)) as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 1)
@@ -597,6 +625,65 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 conn.execute("SELECT COUNT(*) FROM source_transcript_ledger").fetchone()[0],
                 1,
+            )
+
+    async def test_ingest_source_transcript_rejects_forbidden_source_keys(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+
+        result = await service.ingest_source_transcript(
+            IngestSourceTranscriptRequest(
+                scope=_scope().model_copy(
+                    update={"capabilities": {MemoryCapability.WRITE}}
+                ),
+                messages=[
+                    SourceTranscriptMessage(
+                        source_host="claude-code",
+                        source_session_id="session-secret",
+                        source_message_id="uuid-1",
+                        message_json=single_message_adapter.dump_json(
+                            ModelRequest(parts=[UserPromptPart(content="clean cedar")])
+                        ).decode(),
+                    )
+                ],
+                redaction=RedactionContext(forbidden_values=("secret",)),
+            )
+        )
+
+        self.assertEqual(result.items[0].status, "rejected")
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 0)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM source_transcript_ledger").fetchone()[0],
+                0,
+            )
+
+    def test_ingest_source_messages_rejects_blank_source_identifiers(self) -> None:
+        init_db(self.db_path)
+
+        result = ingest_source_messages(
+            self.db_path,
+            [
+                SourceTranscriptInput(
+                    source_host="claude-code",
+                    source_session_id="   ",
+                    source_message_id="uuid-1",
+                    message_json=single_message_adapter.dump_json(
+                        ModelRequest(parts=[UserPromptPart(content="clean cedar")])
+                    ).decode(),
+                )
+            ],
+        )
+
+        self.assertEqual(result[0].status, "rejected")
+        self.assertEqual(result[0].reason, "source identifiers must not be blank")
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 0)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM source_transcript_ledger").fetchone()[0],
+                0,
             )
 
     async def test_ingest_source_transcript_rejects_invalid_json_per_row(self) -> None:
