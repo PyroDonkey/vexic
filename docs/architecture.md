@@ -26,8 +26,8 @@ Key modules:
 - `vexic.ports` - host-supplied model-agent ports
 - `vexic.redaction` - persistence and egress secret guard
 
-The package must not import Coalescent `engine.*` modules. Coalescent is a host
-consumer, not a dependency.
+The package must not import legacy `engine.*` modules. The private source host
+is a consumer, not a dependency.
 
 ## Goals
 
@@ -43,7 +43,7 @@ consumer, not a dependency.
 
 ## Non-goals
 
-- Coalescent AgentOS runtime wiring.
+- Private host runtime wiring.
 - Tenant-folder management, Telegram, Blog Writer, skills, teammates, or model
   routing.
 - Hosted auth, billing, dashboards, public HTTP, or remote MCP in the v0.1 core.
@@ -180,7 +180,7 @@ retirement, export, replay, rebuild, and scope tombstones. Dream phase
 orchestration is deliberately host-port backed: the local adapter authorizes and
 checks lifecycle state, then fails closed with `HostPortNotConfigured` when no
 host execution adapter is supplied. This is not an invitation to import
-Coalescent runtime code.
+private host runtime code.
 
 ## Data Flow
 

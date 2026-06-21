@@ -7,7 +7,7 @@ Plain markdown, no tool-specific syntax.
 
 ## Project
 
-Vexic is the standalone memory system extracted from Coalescent: a
+Vexic is the standalone memory system extracted from a private source host: a
 provenance-first, replayable memory core for long-running agents.
 
 The current v0.1 package is a local Python core with:
@@ -19,25 +19,25 @@ The current v0.1 package is a local Python core with:
 
 Hosted auth, billing, dashboards, public HTTP, remote MCP, and managed
 operations are out of scope for v0.1. The read-only local stdio MCP MVP is the
-narrow in-scope adapter slice. Coalescent remains the private AgentOS host and
-first-party consumer; see `docs/provenance.md` for extraction provenance.
+narrow in-scope adapter slice. The private source host remains the first-party
+consumer; see `docs/provenance.md` for extraction provenance.
 
 ---
 
 ## Architecture Boundaries
 
-These are settled boundaries. Do not reintroduce Coalescent host runtime code
+These are settled boundaries. Do not reintroduce private host runtime code
 into Vexic.
 
 ### Package Boundary
 
 - Vexic code lives under `src/vexic`.
-- Runtime code must not import `engine.*` from Coalescent.
-- Coalescent paths may appear in provenance or compatibility docs, not as
+- Runtime code must not import legacy `engine.*` modules.
+- Private source-host paths may appear in provenance or compatibility docs, not as
   operational dependencies.
 - `LocalMemoryService` is a reference local adapter, not a hosted service.
 - Host-owned extension tables in an existing SQLite database must be preserved.
-  Vexic schema initialization must not create or take ownership of Coalescent
+  Vexic schema initialization must not create or take ownership of private-host
   extension tables such as `background_tool_audit`.
 
 ### Host Ports
@@ -49,7 +49,7 @@ models directly. Model-backed operations depend on host-supplied ports.
 - A missing model-backed host adapter should fail with
   `HostPortNotConfigured` through `missing_host_port`.
 - Do not replace host ports with ambient environment reads, provider SDK wiring,
-  process globals, or Coalescent runtime imports.
+  process globals, or private host runtime imports.
 
 ### Contract Source Of Truth
 
@@ -91,7 +91,7 @@ not part of the public `MemoryService` Protocol.
 with `HostPortNotConfigured` through `missing_host_port` when no host adapter is
 provided.
 
-Do not "fix" model-backed dream execution by importing Coalescent runtime code.
+Do not "fix" model-backed dream execution by importing private host runtime code.
 Implement a scoped Vexic adapter slice only when Ryan asks for that work.
 
 ---
@@ -139,7 +139,7 @@ Each doc owns one thing. Avoid duplicate status and copied platform history.
 
 - `README.md` - short project overview and test commands.
 - `AGENTS.md` - agent rules, settled boundaries, and working conventions.
-- `docs/provenance.md` - extraction provenance from Coalescent.
+- `docs/provenance.md` - extraction provenance from the private source host.
 - `docs/memory-service-contract.md` - human-readable contract reference.
 - `docs/architecture.md` - Vexic memory architecture and local-core design.
 - `tests/` - executable conformance and reliability specification.
@@ -251,11 +251,11 @@ For boundary-sensitive changes, inspect these explicitly:
 
 ```powershell
 rg -n "^(from|import) engine\\." src/vexic tests
-rg -n "Coalescent|AgentOS|Telegram|Blog Writer|teammate|COA-" AGENTS.md docs src/vexic tests
+rg -n "C[o]alescent|A[g]entOS|Telegram|Blog Writer|teammate|COA-" AGENTS.md docs src/vexic tests
 rg -n "Linear" src/vexic tests
 ```
 
-Coalescent references are allowed in `docs/provenance.md` and compatibility
+Private source-host references are allowed in `docs/provenance.md` and compatibility
 sections. They should not become Vexic runtime instructions.
 Linear references are allowed as project-tracking workflow in `AGENTS.md`,
 `README.md`, and `docs/provenance.md`. They should not become Vexic runtime
