@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -17,11 +18,21 @@ from pydantic_ai.usage import RequestUsage
 
 from vexic.contract import (
     ExpandHistoryRequest,
+    DeleteScopeRequest,
+    DreamPhase,
+    ExportScopeRequest,
     IngestSourceTranscriptRequest,
+    RecordRetrievalEventRequest,
+    RebuildRequest,
+    ReplayScopeRequest,
+    RetireFactRequest,
+    RetrievalEvent,
+    RunDreamPhaseRequest,
     SourceTranscriptMessage,
     MemoryCapability,
     MemoryCategory,
     MemoryScope,
+    MemoryScopeSelector,
     Principal,
     PrincipalType,
     RedactionContext,
@@ -199,6 +210,335 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                     await service.search_long_term(
                         SearchLongTermRequest(scope=_scope(), query="compact reports")
                     )
+
+    async def test_record_retrieval_event_persists_telemetry(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            with conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO long_term_memory
+                        (fact_text, subject, category, importance, confidence,
+                         source_message_ids, promoted_from_candidate_id)
+                    VALUES ('Ryan likes compact reports.', 'Ryan', 'preference', 6, 0.8, '[1]', 1)
+                    """
+                )
+                fact_id = int(cursor.lastrowid)
+
+        result = await service.record_retrieval_event(
+            RecordRetrievalEventRequest(
+                scope=_scope().model_copy(
+                    update={"capabilities": {MemoryCapability.WRITE}}
+                ),
+                event=RetrievalEvent(
+                    event_id=0,
+                    referent_id=fact_id,
+                    session_id="default",
+                    query="compact reports",
+                    retrieved_at="2026-06-20T00:00:00Z",
+                    used=True,
+                ),
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            event = conn.execute(
+                """
+                SELECT fact_id, session_id, query, used, judged_at
+                FROM retrieval_events
+                WHERE id = ?
+                """,
+                (result.event_id,),
+            ).fetchone()
+            counts = conn.execute(
+                """
+                SELECT retrieved_count, used_count
+                FROM long_term_memory
+                WHERE id = ?
+                """,
+                (fact_id,),
+            ).fetchone()
+
+        self.assertEqual(event[:4], (fact_id, "default", "compact reports", 1))
+        self.assertIsNotNone(event[4])
+        self.assertEqual(counts, (1, 1))
+
+    async def test_retire_fact_marks_fact_without_deleting_it(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            with conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO long_term_memory
+                        (fact_text, subject, category, importance, confidence,
+                         source_message_ids, promoted_from_candidate_id)
+                    VALUES ('Ryan likes compact reports.', 'Ryan', 'preference', 6, 0.8, '[1]', 1)
+                    """
+                )
+                fact_id = int(cursor.lastrowid)
+
+        result = await service.retire_fact(
+            RetireFactRequest(
+                scope=_scope().model_copy(
+                    update={"capabilities": {MemoryCapability.WRITE}}
+                ),
+                fact_id=fact_id,
+            )
+        )
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            row = conn.execute(
+                """
+                SELECT fact_text, retired, retired_at, retired_by_fact_id
+                FROM long_term_memory
+                WHERE id = ?
+                """,
+                (fact_id,),
+            ).fetchone()
+            fact_count = conn.execute(
+                "SELECT COUNT(*) FROM long_term_memory"
+            ).fetchone()[0]
+
+        self.assertTrue(result.retired)
+        self.assertEqual(row[0], "Ryan likes compact reports.")
+        self.assertEqual(row[1], 1)
+        self.assertIsNotNone(row[2])
+        self.assertIsNone(row[3])
+        self.assertEqual(fact_count, 1)
+
+    async def test_replay_scope_returns_clean_transcript_rows(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        save_messages(
+            self.db_path,
+            [
+                ModelRequest(parts=[UserPromptPart(content="cedar preference")]),
+                ModelResponse(parts=[TextPart(content="noted cedar preference")]),
+            ],
+            session_id="default",
+            timestamp="2026-06-20 00:00:00",
+        )
+
+        result = await service.replay_scope(
+            ReplayScopeRequest(
+                scope=_scope().model_copy(
+                    update={"capabilities": {MemoryCapability.REPLAY}}
+                ),
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+
+        self.assertEqual([hit.body for hit in result.messages], [
+            "User: cedar preference",
+            "Assistant: noted cedar preference",
+        ])
+        self.assertEqual({hit.session_id for hit in result.messages}, {"default"})
+
+    async def test_export_scope_writes_transcript_and_fact_provenance_artifact(
+        self,
+    ) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        message_id = save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="cedar preference")])],
+            session_id="default",
+        )[0]
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO long_term_memory
+                        (fact_text, subject, category, importance, confidence,
+                         source_message_ids, promoted_from_candidate_id)
+                    VALUES (?, 'Ryan', 'preference', 6, 0.8, ?, 1)
+                    """,
+                    ("Ryan likes cedar.", json.dumps([message_id])),
+                )
+
+        result = await service.export_scope(
+            ExportScopeRequest(
+                scope=_scope().model_copy(
+                    update={"capabilities": {MemoryCapability.EXPORT}}
+                ),
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+
+        artifact = json.loads(Path(result.artifact_ref).read_text())
+        self.assertEqual(artifact["messages"][0]["body"], "User: cedar preference")
+        self.assertEqual(artifact["long_term_memory"][0]["source_message_ids"], [message_id])
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0],
+                1,
+            )
+
+    async def test_rebuild_repairs_projections_without_mutating_transcript(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="cedar preference")])],
+            session_id="default",
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            with conn:
+                conn.execute("DELETE FROM messages_fts")
+                cursor = conn.execute(
+                    """
+                    INSERT INTO long_term_memory
+                        (fact_text, subject, category, importance, confidence,
+                         source_message_ids, promoted_from_candidate_id,
+                         retrieved_count)
+                    VALUES ('Ryan likes cedar.', 'Ryan', 'preference', 6, 0.8, '[1]', 1, 99)
+                    """
+                )
+                fact_id = int(cursor.lastrowid)
+                conn.execute(
+                    """
+                    INSERT INTO retrieval_events (fact_id, session_id, query)
+                    VALUES (?, 'default', 'cedar')
+                    """,
+                    (fact_id,),
+                )
+                before = conn.execute(
+                    "SELECT id, session_id, message_json FROM messages"
+                ).fetchall()
+
+        result = await service.rebuild(
+            RebuildRequest(
+                scope=_scope().model_copy(
+                    update={"capabilities": {MemoryCapability.ADMIN_REBUILD}}
+                ),
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            after = conn.execute(
+                "SELECT id, session_id, message_json FROM messages"
+            ).fetchall()
+            fts_rows = conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0]
+            retrieved_count = conn.execute(
+                "SELECT retrieved_count FROM long_term_memory WHERE id = ?",
+                (fact_id,),
+            ).fetchone()[0]
+
+        self.assertIsNone(result.artifact_ref)
+        self.assertEqual(after, before)
+        self.assertEqual(fts_rows, 1)
+        self.assertEqual(retrieved_count, 1)
+
+    async def test_delete_scope_tombstone_blocks_retrieval_egress_and_rebuild(
+        self,
+    ) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="cedar preference")])],
+            session_id="default",
+        )
+
+        result = await service.delete_scope(
+            DeleteScopeRequest(
+                scope=_scope().model_copy(
+                    update={
+                        "capabilities": {MemoryCapability.ADMIN_LIFECYCLE},
+                    }
+                ),
+                target_scope=MemoryScopeSelector(
+                    tenant_id="tenant-a",
+                    session_id="default",
+                ),
+                reason="test deletion",
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+
+        self.assertTrue(result.tombstone.retrieval_blocked)
+        self.assertTrue(result.tombstone.export_blocked)
+        self.assertTrue(result.tombstone.replay_blocked)
+        self.assertTrue(result.tombstone.rebuild_blocked)
+        self.assertTrue(result.tombstone.physical_purge_deferred)
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0],
+                1,
+            )
+
+        with self.assertRaisesRegex(PermissionError, "tombstoned"):
+            await service.search_transcript(
+                SearchTranscriptRequest(scope=_scope(), query="cedar")
+            )
+        blocked_scope = _scope().model_copy(
+            update={"capabilities": {MemoryCapability.REPLAY}}
+        )
+        with self.assertRaisesRegex(PermissionError, "tombstoned"):
+            await service.replay_scope(
+                ReplayScopeRequest(
+                    scope=blocked_scope,
+                    redaction=RedactionContext(forbidden_values=()),
+                )
+            )
+        with self.assertRaisesRegex(PermissionError, "tombstoned"):
+            await service.replay_scope(
+                ReplayScopeRequest(
+                    scope=blocked_scope.model_copy(update={"session_id": None}),
+                    redaction=RedactionContext(forbidden_values=()),
+                )
+            )
+        with self.assertRaisesRegex(PermissionError, "tombstoned"):
+            await service.export_scope(
+                ExportScopeRequest(
+                    scope=blocked_scope.model_copy(
+                        update={"capabilities": {MemoryCapability.EXPORT}}
+                    ),
+                    redaction=RedactionContext(forbidden_values=()),
+                )
+            )
+        with self.assertRaisesRegex(PermissionError, "tombstoned"):
+            await service.rebuild(
+                RebuildRequest(
+                    scope=blocked_scope.model_copy(
+                        update={"capabilities": {MemoryCapability.ADMIN_REBUILD}}
+                    ),
+                    redaction=RedactionContext(forbidden_values=()),
+                )
+            )
+
+    async def test_run_dream_phase_fails_closed_without_host_port(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+
+        with self.assertRaisesRegex(HostPortNotConfigured, "Dream phase execution"):
+            await service.run_dream_phase(
+                RunDreamPhaseRequest(
+                    scope=_scope().model_copy(
+                        update={"capabilities": {MemoryCapability.ADMIN_REBUILD}}
+                    ),
+                    phase=DreamPhase.LIGHT,
+                    redaction=RedactionContext(forbidden_values=()),
+                )
+            )
 
     async def test_tenant_scope_must_match_opened_sqlite_context(self) -> None:
         from vexic.service import LocalMemoryService

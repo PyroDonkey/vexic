@@ -368,7 +368,7 @@ def retire_long_term_fact(
     conn: sqlite3.Connection,
     *,
     fact_id: int,
-    superseded_by_fact_id: int,
+    superseded_by_fact_id: int | None,
 ) -> bool:
     # `AND retired = 0` makes this idempotent: if two promotions in one cycle
     # both target the same neighbor, only the first retire counts and keeps the

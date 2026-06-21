@@ -175,16 +175,12 @@ scope contract, but does not need to match the physical SQLite schema.
 ## v0.1 Service Surface
 
 `LocalMemoryService` implements the local read/write core for transcript ingest,
-source-ledger transcript ingest, and long-term search. It intentionally leaves
-several `MemoryService` protocol operations deferred:
-
-- retrieval-event direct recording
-- fact retirement
-- dream phase orchestration through the service protocol
-- export, replay, rebuild, and delete-scope operations
-
-Those protocol surfaces exist so future adapters have a common shape. They are
-not invitations to import Coalescent runtime code.
+source-ledger transcript ingest, long-term search, retrieval telemetry, fact
+retirement, export, replay, rebuild, and scope tombstones. Dream phase
+orchestration is deliberately host-port backed: the local adapter authorizes and
+checks lifecycle state, then fails closed with `HostPortNotConfigured` when no
+host execution adapter is supplied. This is not an invitation to import
+Coalescent runtime code.
 
 ## Data Flow
 
@@ -204,8 +200,7 @@ rows are retained.
 
 ## Repair And Rebuild Posture
 
-Vexic v0.1 includes storage primitives and tests for reliability, but the public
-service operations for export, replay, rebuild, and lifecycle deletion are
-deferred. Future repair/rebuild work should preserve the lossless invariant:
-build new projections or repaired copies without deleting canonical transcript,
-candidate, fact, or retrieval-event history.
+Vexic v0.1 includes storage primitives, service operations, and tests for
+export, replay, rebuild, and lifecycle tombstones. Repair/rebuild work preserves
+the lossless invariant: build new projections or repaired copies without
+deleting canonical transcript, candidate, fact, or retrieval-event history.

@@ -76,23 +76,23 @@ operations:
 - `search_transcript`
 - `expand_history`
 - `search_long_term`
-
-It also exposes `init_schema()` as a local adapter helper. `init_schema()` is
-not part of the public `MemoryService` Protocol.
-
-The following protocol operations are intentionally deferred or wired elsewhere
-in v0.1 and currently raise `NotImplementedError` on `LocalMemoryService`:
-
 - `record_retrieval_event`
 - `retire_fact`
-- `run_dream_phase`
 - `export_scope`
 - `replay_scope`
 - `rebuild`
 - `delete_scope`
 
-Do not "fix" these by importing Coalescent runtime code. Implement a scoped
-Vexic adapter slice only when Ryan asks for that work.
+It also exposes `init_schema()` as a local adapter helper. `init_schema()` is
+not part of the public `MemoryService` Protocol.
+
+`run_dream_phase` is deliberately settled as a host-port operation in v0.1:
+`LocalMemoryService` authorizes and checks lifecycle state, then fails closed
+with `HostPortNotConfigured` through `missing_host_port` when no host adapter is
+provided.
+
+Do not "fix" model-backed dream execution by importing Coalescent runtime code.
+Implement a scoped Vexic adapter slice only when Ryan asks for that work.
 
 ---
 
