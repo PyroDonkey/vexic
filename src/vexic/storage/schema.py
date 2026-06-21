@@ -440,6 +440,40 @@ def _ensure_candidate_retrieval_events(conn: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_scope_tombstones(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scope_tombstones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            target_tenant_id TEXT NOT NULL,
+            target_project_id TEXT,
+            target_user_id TEXT,
+            target_session_id TEXT,
+            created_by_principal_id TEXT NOT NULL,
+            created_by_principal_type TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            retrieval_blocked INTEGER NOT NULL DEFAULT 1 CHECK (retrieval_blocked IN (0, 1)),
+            export_blocked INTEGER NOT NULL DEFAULT 1 CHECK (export_blocked IN (0, 1)),
+            replay_blocked INTEGER NOT NULL DEFAULT 1 CHECK (replay_blocked IN (0, 1)),
+            rebuild_blocked INTEGER NOT NULL DEFAULT 1 CHECK (rebuild_blocked IN (0, 1)),
+            physical_purge_deferred INTEGER NOT NULL DEFAULT 1 CHECK (physical_purge_deferred IN (0, 1))
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_scope_tombstones_target
+        ON scope_tombstones(
+            target_tenant_id,
+            target_project_id,
+            target_user_id,
+            target_session_id
+        )
+        """
+    )
+
+
 def _ensure_promotion_labels(conn: sqlite3.Connection) -> None:
     # Human promote/reject judgments over candidates (COA-93): the eval corpus
     # that will eventually tune Deep scoring weights. fact_text is snapshotted
@@ -626,6 +660,7 @@ def init_db(db_path: str) -> None:
             _ensure_long_term_memory(conn)
             _ensure_retrieval_events(conn)
             _ensure_candidate_retrieval_events(conn)
+            _ensure_scope_tombstones(conn)
             _ensure_promotion_labels(conn)
             _ensure_session_summaries(conn)
 

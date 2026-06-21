@@ -17,11 +17,21 @@ from pydantic_ai.usage import RequestUsage
 
 from vexic.contract import (
     ExpandHistoryRequest,
+    DeleteScopeRequest,
+    DreamPhase,
+    ExportScopeRequest,
     IngestSourceTranscriptRequest,
+    RecordRetrievalEventRequest,
+    RebuildRequest,
+    ReplayScopeRequest,
+    RetireFactRequest,
+    RetrievalEvent,
+    RunDreamPhaseRequest,
     SourceTranscriptMessage,
     MemoryCapability,
     MemoryCategory,
     MemoryScope,
+    MemoryScopeSelector,
     Principal,
     PrincipalType,
     RedactionContext,
@@ -199,6 +209,94 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                     await service.search_long_term(
                         SearchLongTermRequest(scope=_scope(), query="compact reports")
                     )
+
+    async def test_v0_1_deferred_protocol_operations_raise_not_implemented_only(
+        self,
+    ) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        deferred_scope = _scope().model_copy(update={"tenant_id": "other-tenant"})
+        redaction = RedactionContext(forbidden_values=())
+        requests = (
+            (
+                "record_retrieval_event",
+                RecordRetrievalEventRequest(
+                    scope=deferred_scope,
+                    event=RetrievalEvent(
+                        event_id=0,
+                        referent_id=1,
+                        session_id="default",
+                        query="compact reports",
+                        retrieved_at="2026-06-20T00:00:00Z",
+                        used=True,
+                    ),
+                    redaction=redaction,
+                ),
+            ),
+            ("retire_fact", RetireFactRequest(scope=deferred_scope, fact_id=1)),
+            (
+                "run_dream_phase",
+                RunDreamPhaseRequest(
+                    scope=deferred_scope,
+                    phase=DreamPhase.LIGHT,
+                    redaction=redaction,
+                ),
+            ),
+            (
+                "export_scope",
+                ExportScopeRequest(scope=deferred_scope, redaction=redaction),
+            ),
+            (
+                "replay_scope",
+                ReplayScopeRequest(scope=deferred_scope, redaction=redaction),
+            ),
+            ("rebuild", RebuildRequest(scope=deferred_scope, redaction=redaction)),
+            (
+                "delete_scope",
+                DeleteScopeRequest(
+                    scope=deferred_scope,
+                    target_scope=MemoryScopeSelector(tenant_id="other-tenant"),
+                    reason="test deletion",
+                    redaction=redaction,
+                ),
+            ),
+        )
+
+        for method_name, request in requests:
+            with self.subTest(method_name=method_name):
+                with self.assertRaises(NotImplementedError):
+                    await getattr(service, method_name)(request)
+
+    async def test_tombstone_specific_scope_blocks_broader_request_scope(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="cedar preference")])],
+            session_id="default",
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO scope_tombstones
+                        (target_tenant_id, target_project_id, target_session_id,
+                         created_by_principal_id, created_by_principal_type, reason)
+                    VALUES ('tenant-a', 'project-a', 'default', 'operator', 'operator',
+                            'test deletion')
+                    """
+                )
+
+        with self.assertRaisesRegex(PermissionError, "tombstoned"):
+            await service.search_transcript(
+                SearchTranscriptRequest(
+                    scope=_scope().model_copy(update={"project_id": None}),
+                    query="cedar",
+                )
+            )
 
     async def test_tenant_scope_must_match_opened_sqlite_context(self) -> None:
         from vexic.service import LocalMemoryService

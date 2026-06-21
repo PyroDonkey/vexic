@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sqlite3
+from contextlib import closing
+
 from vexic.contract import (
     AppendTranscriptRequest,
     AppendTranscriptResult,
@@ -44,6 +47,7 @@ from vexic.storage import (
     ingest_source_messages,
     init_db,
     load_messages_in_id_range,
+    message_search_text,
     save_messages,
     search_messages,
     single_message_adapter,
@@ -51,6 +55,12 @@ from vexic.storage import (
 from vexic.subagents.retrieval import retrieve_candidate_fallback, retrieve_long_term_facts
 
 EXPAND_HISTORY_MAX_ROWS = 2_000
+_TOMBSTONE_FLAG_COLUMNS = {
+    "retrieval": "retrieval_blocked",
+    "export": "export_blocked",
+    "replay": "replay_blocked",
+    "rebuild": "rebuild_blocked",
+}
 
 
 class LocalMemoryService(MemoryService):
@@ -77,6 +87,42 @@ class LocalMemoryService(MemoryService):
 
     def _redaction_values(self, redaction: RedactionContext) -> tuple[str, ...]:
         return (*self.forbidden_secret_values, *redaction.forbidden_values)
+
+    def _with_default_session(self, scope: MemoryScope) -> MemoryScope:
+        if scope.session_id is not None:
+            return scope
+        return scope.model_copy(update={"session_id": "default"})
+
+    def _scope_matches_tombstone(self, scope: MemoryScope, row: sqlite3.Row) -> bool:
+        for field_name, column_name in (
+            ("project_id", "target_project_id"),
+            ("user_id", "target_user_id"),
+            ("session_id", "target_session_id"),
+        ):
+            target_value = row[column_name]
+            scope_value = getattr(scope, field_name)
+            if (
+                target_value is not None
+                and scope_value is not None
+                and target_value != scope_value
+            ):
+                return False
+        return True
+
+    def _assert_not_tombstoned(self, scope: MemoryScope, operation: str) -> None:
+        column_name = _TOMBSTONE_FLAG_COLUMNS[operation]
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"""
+                SELECT target_project_id, target_user_id, target_session_id
+                FROM scope_tombstones
+                WHERE target_tenant_id = ? AND {column_name} = 1
+                """,
+                (scope.tenant_id,),
+            ).fetchall()
+        if any(self._scope_matches_tombstone(scope, row) for row in rows):
+            raise PermissionError(f"Memory scope is tombstoned for {operation}.")
 
     async def append_transcript(
         self,
@@ -131,6 +177,7 @@ class LocalMemoryService(MemoryService):
         request: SearchTranscriptRequest,
     ) -> SearchTranscriptResult:
         self._authorize(request.scope, request.required_capability)
+        self._assert_not_tombstoned(request.scope, "retrieval")
         hits = search_messages(
             self.db_path,
             request.query,
@@ -156,6 +203,7 @@ class LocalMemoryService(MemoryService):
         max_rows: int | None = None,
     ) -> ExpandHistoryResult:
         self._authorize(request.scope, request.required_capability)
+        self._assert_not_tombstoned(request.scope, "replay")
         row_cap = max_rows if max_rows is not None else EXPAND_HISTORY_MAX_ROWS
         if row_cap < 1:
             raise ValueError("max_rows must be at least 1.")
@@ -185,6 +233,10 @@ class LocalMemoryService(MemoryService):
         request: SearchLongTermRequest,
     ) -> SearchLongTermResult:
         self._authorize(request.scope, request.required_capability)
+        self._assert_not_tombstoned(
+            self._with_default_session(request.scope),
+            "retrieval",
+        )
         facts = await retrieve_long_term_facts(
             self.db_path,
             request.query,
@@ -236,47 +288,40 @@ class LocalMemoryService(MemoryService):
         self,
         request: RecordRetrievalEventRequest,
     ) -> RecordRetrievalEventResult:
-        self._authorize(request.scope, request.required_capability)
-        raise NotImplementedError("record_retrieval_event is not a standalone v0.1 operation.")
+        raise NotImplementedError
 
     async def retire_fact(
         self,
         request: RetireFactRequest,
     ) -> RetireFactResult:
-        self._authorize(request.scope, request.required_capability)
-        raise NotImplementedError("retire_fact is wired in the lifecycle slice.")
+        raise NotImplementedError
 
     async def run_dream_phase(
         self,
         request: RunDreamPhaseRequest,
     ) -> RunDreamPhaseResult:
-        self._authorize(request.scope, request.required_capability)
-        raise NotImplementedError("run_dream_phase is wired in the dream slice.")
+        raise NotImplementedError
 
     async def export_scope(
         self,
         request: ExportScopeRequest,
     ) -> ExportScopeResult:
-        self._authorize(request.scope, request.required_capability)
-        raise NotImplementedError("export_scope is wired in the admin slice.")
+        raise NotImplementedError
 
     async def replay_scope(
         self,
         request: ReplayScopeRequest,
     ) -> ReplayScopeResult:
-        self._authorize(request.scope, request.required_capability)
-        raise NotImplementedError("replay_scope is wired in the admin slice.")
+        raise NotImplementedError
 
     async def rebuild(
         self,
         request: RebuildRequest,
     ) -> RebuildResult:
-        self._authorize(request.scope, request.required_capability)
-        raise NotImplementedError("rebuild is wired in the admin slice.")
+        raise NotImplementedError
 
     async def delete_scope(
         self,
         request: DeleteScopeRequest,
     ) -> DeleteScopeResult:
-        self._authorize(request.scope, request.required_capability)
-        raise NotImplementedError("delete_scope is deferred for v0.1 local core.")
+        raise NotImplementedError

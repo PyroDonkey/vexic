@@ -82,17 +82,18 @@ behavioral contract and the current `LocalMemoryService` v0.1 surface.
 | Search transcript | `SearchTranscriptRequest` | `memory:search` | Implemented |
 | Expand history | `ExpandHistoryRequest` | `memory:expand` | Implemented |
 | Search long-term | `SearchLongTermRequest` | `memory:search` | Implemented |
-| Record retrieval event | `RecordRetrievalEventRequest` | `memory:write` | Deferred |
-| Retire fact | `RetireFactRequest` | `memory:write` | Deferred |
-| Run dream phase | `RunDreamPhaseRequest` | `memory:admin:rebuild` | Deferred |
-| Export scope | `ExportScopeRequest` | `memory:export` | Deferred |
-| Replay scope | `ReplayScopeRequest` | `memory:replay` | Deferred |
-| Rebuild | `RebuildRequest` | `memory:admin:rebuild` | Deferred |
-| Delete scope | `DeleteScopeRequest` | `memory:admin:lifecycle` | Deferred |
+| Record retrieval event | `RecordRetrievalEventRequest` | `memory:write` | Implemented |
+| Retire fact | `RetireFactRequest` | `memory:write` | Implemented |
+| Run dream phase | `RunDreamPhaseRequest` | `memory:admin:rebuild` | Host-port deferred |
+| Export scope | `ExportScopeRequest` | `memory:export` | Implemented |
+| Replay scope | `ReplayScopeRequest` | `memory:replay` | Implemented |
+| Rebuild | `RebuildRequest` | `memory:admin:rebuild` | Implemented |
+| Delete scope | `DeleteScopeRequest` | `memory:admin:lifecycle` | Implemented |
 
-Deferred means the protocol surface exists, but the local v0.1 adapter is not
-the implementation point yet. Do not wire these by importing Coalescent runtime
-code.
+Host-port deferred means `LocalMemoryService` authorizes and checks lifecycle
+state, then fails closed with `HostPortNotConfigured` through
+`missing_host_port` unless a host supplies the model-backed execution adapter.
+Do not wire this by importing private host runtime code.
 
 ## Redaction
 
@@ -120,6 +121,8 @@ Memory is retained by default.
 - Long-term facts are retired or superseded, not physically removed by ordinary
   retrieval or promotion.
 - Scope deletion is modeled as a tombstone/scope-deny contract.
+- The local SQLite adapter records tombstones in `scope_tombstones` and blocks
+  retrieval, export, replay, and rebuild for matching scopes.
 - Physical purge is backend and SLA specific, and remains deferred.
 
 Audit records for lifecycle operations should retain actor, scope, operation,
