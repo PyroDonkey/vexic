@@ -72,6 +72,7 @@ do not let them drift.
 operations:
 
 - `append_transcript`
+- `ingest_source_transcript`
 - `search_transcript`
 - `expand_history`
 - `search_long_term`
