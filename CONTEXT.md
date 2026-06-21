@@ -42,7 +42,8 @@ session memory a caller may access.
 _Avoid_: Account, workspace
 
 **Customer Memory Database**:
-The isolated storage boundary that contains one customer's Vexic memory data
-behind the hosted memory API. Control-plane catalog, auth, billing, and routing
-metadata live outside it.
+The isolated storage boundary that contains one customer tenant's Vexic memory
+data behind the hosted memory API. Project, user, and session boundaries remain
+`MemoryScope` refinements inside it; control-plane catalog, auth, billing, and
+routing metadata live outside it.
 _Avoid_: Shared tenant rows, control-plane database
