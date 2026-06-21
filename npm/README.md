@@ -1,6 +1,6 @@
 # Vexic
 
-This npm package reserves the `vexic` package name for Vexic.
+This npm package reserves the `@pyrodonkey/vexic` package name for Vexic.
 
 The v0.1 implementation is the Python package:
 
