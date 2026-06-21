@@ -33,6 +33,7 @@ htmlcov/
 .env.*
 !.env.example
 !.env.sample
+.claude/settings.local.json
 
 # Local SQLite memory databases and sidecar files
 *.db
