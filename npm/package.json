@@ -1,5 +1,5 @@
 {
-  "name": "vexic",
+  "name": "@pyrodonkey/vexic",
   "version": "0.0.0",
   "description": "npm name reservation for Vexic, a provenance-first Python memory core.",
   "license": "Apache-2.0",
