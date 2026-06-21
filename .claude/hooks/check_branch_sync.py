@@ -25,16 +25,36 @@ def _git(*args: str, timeout: int = 10) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _left_right(left: str, right: str) -> tuple[int, int] | None:
+def _comparison_error(
+    left: str, right: str, result: subprocess.CompletedProcess[str]
+) -> str:
+    detail = result.stderr.strip() or result.stdout.strip()
+    if not detail:
+        detail = f"git rev-list exited {result.returncode}"
+    return (
+        f"Unable to compute drift for `{left}...{right}` "
+        f"(missing ref/branch?): {detail}"
+    )
+
+
+def _left_right(
+    left: str, right: str, notes: list[str] | None = None
+) -> tuple[int, int] | None:
     result = _git("rev-list", "--left-right", "--count", f"{left}...{right}")
     if result.returncode != 0:
+        if notes is not None:
+            notes.append(_comparison_error(left, right, result))
         return None
     parts = result.stdout.split()
     if len(parts) != 2:
+        if notes is not None:
+            notes.append(_comparison_error(left, right, result))
         return None
     try:
         return int(parts[0]), int(parts[1])
     except ValueError:
+        if notes is not None:
+            notes.append(_comparison_error(left, right, result))
         return None
 
 
@@ -63,9 +83,11 @@ def main() -> int:
         )
 
     warnings: list[str] = []
+    comparisons_ok = 0
 
-    dev_vs_main = _left_right(f"origin/{DEFAULT_BRANCH}", WORK_BRANCH)
+    dev_vs_main = _left_right(f"origin/{DEFAULT_BRANCH}", WORK_BRANCH, notes)
     if dev_vs_main is not None:
+        comparisons_ok += 1
         behind, _ = dev_vs_main
         if behind > 0:
             warnings.append(
@@ -75,8 +97,9 @@ def main() -> int:
                 f"git merge origin/{DEFAULT_BRANCH} && git push origin {WORK_BRANCH}"
             )
 
-    dev_vs_origin_dev = _left_right(f"origin/{WORK_BRANCH}", WORK_BRANCH)
+    dev_vs_origin_dev = _left_right(f"origin/{WORK_BRANCH}", WORK_BRANCH, notes)
     if dev_vs_origin_dev is not None:
+        comparisons_ok += 1
         behind, _ = dev_vs_origin_dev
         if behind > 0:
             warnings.append(
@@ -85,8 +108,9 @@ def main() -> int:
                 f"    git pull --ff-only origin {WORK_BRANCH}"
             )
 
-    local_main = _left_right(f"origin/{DEFAULT_BRANCH}", DEFAULT_BRANCH)
+    local_main = _left_right(f"origin/{DEFAULT_BRANCH}", DEFAULT_BRANCH, notes)
     if local_main is not None:
+        comparisons_ok += 1
         behind, _ = local_main
         if behind > 0:
             warnings.append(
@@ -95,7 +119,7 @@ def main() -> int:
                 f"    git fetch origin {DEFAULT_BRANCH}:{DEFAULT_BRANCH}"
             )
 
-    if not warnings and not notes:
+    if comparisons_ok == 3 and not warnings and not notes:
         _emit(
             f"Branch sync check: `{WORK_BRANCH}` is up to date with "
             f"`origin/{DEFAULT_BRANCH}` and `origin/{WORK_BRANCH}`.",
