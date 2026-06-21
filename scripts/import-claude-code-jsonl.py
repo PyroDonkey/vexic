@@ -153,7 +153,7 @@ async def _run(args: argparse.Namespace) -> dict[str, int]:
     service = LocalMemoryService(
         db_path=args.db_path,
         tenant_id=args.tenant_id,
-        forbidden_secret_values=tuple(args.forbidden_value),
+        forbidden_secret_values=(),
     )
     service.init_schema()
     counts = {"inserted": 0, "skipped": 0, "rejected": 0, "ignored": 0}

@@ -305,6 +305,48 @@ class ClaudeCodeJsonlImporterTests(unittest.IsolatedAsyncioTestCase):
             {"inserted": 5, "skipped": 0, "rejected": 0, "ignored": 1},
         )
 
+    async def test_run_uses_request_redaction_for_forbidden_values(self) -> None:
+        row = {
+            "type": "user",
+            "sessionId": "session-1",
+            "uuid": "uuid-clean",
+            "message": {"role": "user", "content": "clean cedar"},
+        }
+        self.jsonl_path.write_text(json.dumps(row), encoding="utf-8")
+        importer = _load_importer()
+        service_kwargs = {}
+        request_redactions = []
+
+        class FakeMemoryService:
+            def __init__(self, **kwargs) -> None:
+                service_kwargs.update(kwargs)
+
+            def init_schema(self) -> None:
+                pass
+
+            async def ingest_source_transcript(self, request):
+                request_redactions.append(request.redaction.forbidden_values)
+                return IngestSourceTranscriptResult(items=[])
+
+        importer.LocalMemoryService = FakeMemoryService
+
+        await importer._run(
+            importer._parse_args(
+                [
+                    "--db-path",
+                    str(self.db_path),
+                    "--tenant-id",
+                    "tenant-a",
+                    "--forbidden-value",
+                    "cedar-secret",
+                    str(self.jsonl_path),
+                ]
+            )
+        )
+
+        self.assertEqual(service_kwargs["forbidden_secret_values"], ())
+        self.assertEqual(request_redactions, [("cedar-secret",)])
+
     def test_missing_file_returns_clean_error(self) -> None:
         completed = subprocess.run(
             [
