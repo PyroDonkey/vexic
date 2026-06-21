@@ -268,6 +268,36 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(NotImplementedError):
                     await getattr(service, method_name)(request)
 
+    async def test_tombstone_specific_scope_blocks_broader_request_scope(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="cedar preference")])],
+            session_id="default",
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO scope_tombstones
+                        (target_tenant_id, target_project_id, target_session_id,
+                         created_by_principal_id, created_by_principal_type, reason)
+                    VALUES ('tenant-a', 'project-a', 'default', 'operator', 'operator',
+                            'test deletion')
+                    """
+                )
+
+        with self.assertRaisesRegex(PermissionError, "tombstoned"):
+            await service.search_transcript(
+                SearchTranscriptRequest(
+                    scope=_scope().model_copy(update={"project_id": None}),
+                    query="cedar",
+                )
+            )
+
     async def test_tenant_scope_must_match_opened_sqlite_context(self) -> None:
         from vexic.service import LocalMemoryService
 

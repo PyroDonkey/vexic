@@ -100,7 +100,12 @@ class LocalMemoryService(MemoryService):
             ("session_id", "target_session_id"),
         ):
             target_value = row[column_name]
-            if target_value is not None and target_value != getattr(scope, field_name):
+            scope_value = getattr(scope, field_name)
+            if (
+                target_value is not None
+                and scope_value is not None
+                and target_value != scope_value
+            ):
                 return False
         return True
 
