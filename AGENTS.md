@@ -17,10 +17,13 @@ The current v0.1 package is a local Python core with:
 - memory storage, retrieval, and Light/REM/Deep primitives under `src/vexic`
 - conformance and reliability tests under `tests`
 
-Hosted auth, billing, dashboards, public HTTP, remote MCP, and managed
-operations are out of scope for v0.1. The read-only local stdio MCP MVP is the
-narrow in-scope adapter slice. The private source host remains the first-party
-consumer; see `docs/provenance.md` for extraction provenance.
+Managed hosted auth stacks, billing, dashboards, public HTTP, remote MCP, and
+managed operations are out of scope for v0.1. The read-only local stdio MCP MVP
+is the narrow local adapter slice. The in-process hosted MVP shell in
+`src/vexic/hosted.py` may bind Vexic-scoped API keys to tenant/project/capability
+scope for internal staging, but it is not a public HTTP service or production
+control plane. The private source host remains the first-party consumer; see
+`docs/provenance.md` for extraction provenance.
 
 ---
 

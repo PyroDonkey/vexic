@@ -18,3 +18,19 @@ def test_vexic_runtime_does_not_import_coalescent_engine() -> None:
             offenders.append(f"{path.relative_to(ROOT)}: {lines}")
 
     assert offenders == []
+
+
+def test_hosted_core_does_not_own_infrastructure_provisioning() -> None:
+    text = (ROOT / "src" / "vexic" / "hosted.py").read_text(encoding="utf-8")
+
+    for forbidden in (
+        "class HostedTenantCatalog",
+        "class HostedApiKeyStore",
+        "class HostedApiKey:",
+        "class ProvisionedApiKey",
+        "import hashlib",
+        "import hmac",
+        "self.audit_events",
+        "self.usage_events",
+    ):
+        assert forbidden not in text
