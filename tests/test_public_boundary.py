@@ -30,5 +30,7 @@ def test_hosted_core_does_not_own_infrastructure_provisioning() -> None:
         "class ProvisionedApiKey",
         "import hashlib",
         "import hmac",
+        "self.audit_events",
+        "self.usage_events",
     ):
         assert forbidden not in text

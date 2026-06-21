@@ -23,8 +23,10 @@ boundary without changing the memory contract.
 - `HostedBackgroundJobRunner` records dream-phase job lifecycle events and
   fails closed with `HostPortNotConfigured` while model-backed host ports are
   absent.
-- Request and job usage/audit ledgers record operation metadata without raw API
-  keys or request payload text.
+- `HostedMemoryService` can send sanitized request audit and usage metadata to
+  a telemetry sink without storing tenant metadata in shared service lists.
+- The local staging adapter stores request audit and usage rows in each tenant
+  SQLite database without raw API keys or request payload text.
 
 ## Local Staging
 
@@ -48,7 +50,7 @@ api_key = keys.create_key(
     project_ids={"project-a"},
 )
 
-service = HostedMemoryService(catalog, keys)
+service = HostedMemoryService(catalog, keys, telemetry=catalog)
 ```
 
 The returned `api_key.raw_key` is shown once. Store it in the caller's secret
@@ -78,14 +80,16 @@ Internal-only today:
 - in-process Python API boundary;
 - local SQLite-compatible tenant databases;
 - repo-local in-memory tenant catalog and API-key adapter;
-- in-memory audit, usage, and job ledgers;
+- tenant-local SQLite audit and usage telemetry in the local adapter;
+- in-memory job lifecycle events;
 - one `LocalMemoryService` instance is created per hosted request;
 - fail-closed dream jobs without host model ports.
 
 Not production/customer-data ready yet:
 
 - no public HTTP adapter in this package;
-- no durable hosted key/catalog/audit/usage store;
+- no durable hosted key/catalog/job store or production control-plane
+  audit/usage store;
 - no restore drill, network hardening, rate limiting, support-access policy, or
   incident runbook;
 - no billing, dashboard, portal, enterprise SSO, or compliance claims;

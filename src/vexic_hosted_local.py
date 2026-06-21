@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+import sqlite3
+from contextlib import closing
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 from vexic.contract import MemoryCapability, Principal, PrincipalType
-from vexic.hosted import HostedAuthContext, HostedTenant
+from vexic.hosted import HostedAuditEvent, HostedAuthContext, HostedTenant, HostedUsageEvent
 from vexic.service import LocalMemoryService
 
 
@@ -57,6 +59,7 @@ class HostedTenantCatalog:
             project_ids=frozenset(project_ids),
         )
         LocalMemoryService(db_path=str(tenant.db_path), tenant_id=tenant_id).init_schema()
+        self._init_telemetry_schema(tenant.db_path)
         self._tenants[tenant_id] = tenant
         return tenant
 
@@ -77,6 +80,120 @@ class HostedTenantCatalog:
             return self._tenants[tenant_id]
         except KeyError as exc:
             raise PermissionError("Unknown hosted tenant.") from exc
+
+    def record_audit_event(self, event: HostedAuditEvent) -> None:
+        if event.tenant_id is None:
+            return
+        tenant = self.get_tenant(event.tenant_id)
+        with closing(sqlite3.connect(tenant.db_path)) as conn:
+            conn.execute(
+                """
+                INSERT INTO hosted_audit_events (
+                    operation, tenant_id, principal_id, status, recorded_at, error_type
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.operation,
+                    event.tenant_id,
+                    event.principal_id,
+                    event.status,
+                    event.recorded_at,
+                    event.error_type,
+                ),
+            )
+            conn.commit()
+
+    def record_usage_event(self, event: HostedUsageEvent) -> None:
+        if event.tenant_id is None:
+            return
+        tenant = self.get_tenant(event.tenant_id)
+        with closing(sqlite3.connect(tenant.db_path)) as conn:
+            conn.execute(
+                """
+                INSERT INTO hosted_usage_events (
+                    kind, operation, tenant_id, principal_id, status, recorded_at,
+                    model_requests, input_tokens, output_tokens, total_tokens,
+                    estimated_cost_micros, error_type
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.kind,
+                    event.operation,
+                    event.tenant_id,
+                    event.principal_id,
+                    event.status,
+                    event.recorded_at,
+                    event.model_requests,
+                    event.input_tokens,
+                    event.output_tokens,
+                    event.total_tokens,
+                    event.estimated_cost_micros,
+                    event.error_type,
+                ),
+            )
+            conn.commit()
+
+    def audit_events(self, tenant_id: str) -> list[HostedAuditEvent]:
+        tenant = self.get_tenant(tenant_id)
+        with closing(sqlite3.connect(tenant.db_path)) as conn:
+            rows = conn.execute(
+                """
+                SELECT operation, tenant_id, principal_id, status, recorded_at, error_type
+                FROM hosted_audit_events
+                ORDER BY id
+                """
+            ).fetchall()
+        return [HostedAuditEvent(*row) for row in rows]
+
+    def usage_events(self, tenant_id: str) -> list[HostedUsageEvent]:
+        tenant = self.get_tenant(tenant_id)
+        with closing(sqlite3.connect(tenant.db_path)) as conn:
+            rows = conn.execute(
+                """
+                SELECT kind, operation, tenant_id, principal_id, status, recorded_at,
+                       model_requests, input_tokens, output_tokens, total_tokens,
+                       estimated_cost_micros, error_type
+                FROM hosted_usage_events
+                ORDER BY id
+                """
+            ).fetchall()
+        return [HostedUsageEvent(*row) for row in rows]
+
+    @staticmethod
+    def _init_telemetry_schema(db_path: Path) -> None:
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS hosted_audit_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    operation TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    principal_id TEXT,
+                    status TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL,
+                    error_type TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS hosted_usage_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    principal_id TEXT,
+                    status TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL,
+                    model_requests INTEGER NOT NULL DEFAULT 0,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    estimated_cost_micros INTEGER NOT NULL DEFAULT 0,
+                    error_type TEXT
+                );
+                """
+            )
+            conn.commit()
 
 
 class HostedApiKeyStore:

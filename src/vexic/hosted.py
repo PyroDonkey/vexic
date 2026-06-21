@@ -105,16 +105,22 @@ class HostedApiKeyAuthenticator(Protocol):
     def authenticate(self, raw_key: str) -> HostedAuthContext: ...
 
 
+class HostedTelemetrySink(Protocol):
+    def record_audit_event(self, event: HostedAuditEvent) -> None: ...
+
+    def record_usage_event(self, event: HostedUsageEvent) -> None: ...
+
+
 class HostedMemoryService:
     def __init__(
         self,
         catalog: HostedTenantDirectory,
         api_keys: HostedApiKeyAuthenticator,
+        telemetry: HostedTelemetrySink | None = None,
     ) -> None:
         self.catalog = catalog
         self.api_keys = api_keys
-        self.audit_events: list[HostedAuditEvent] = []
-        self.usage_events: list[HostedUsageEvent] = []
+        self.telemetry = telemetry
 
     async def append_transcript(
         self,
@@ -338,10 +344,12 @@ class HostedMemoryService:
         status: str,
         error_type: str | None = None,
     ) -> None:
+        if self.telemetry is None:
+            return
         tenant_id = request.scope.tenant_id if request is not None else None
         principal_id = request.scope.principal.principal_id if request is not None else None
         recorded_at = _now()
-        self.audit_events.append(
+        self.telemetry.record_audit_event(
             HostedAuditEvent(
                 operation=operation,
                 tenant_id=tenant_id,
@@ -351,7 +359,7 @@ class HostedMemoryService:
                 error_type=error_type,
             )
         )
-        self.usage_events.append(
+        self.telemetry.record_usage_event(
             HostedUsageEvent(
                 kind="request",
                 operation=operation,
@@ -372,7 +380,9 @@ class HostedMemoryService:
         status: str,
         error_type: str | None = None,
     ) -> None:
-        self.usage_events.append(
+        if self.telemetry is None:
+            return
+        self.telemetry.record_usage_event(
             HostedUsageEvent(
                 kind="job",
                 operation=operation,

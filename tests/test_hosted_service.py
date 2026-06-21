@@ -50,7 +50,7 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         root = Path(self.temp_dir.name)
         self.catalog = HostedTenantCatalog(root)
         self.keys = HostedApiKeyStore()
-        self.service = HostedMemoryService(self.catalog, self.keys)
+        self.service = HostedMemoryService(self.catalog, self.keys, telemetry=self.catalog)
         self.jobs = HostedBackgroundJobRunner(self.service)
 
     def tearDown(self) -> None:
@@ -123,18 +123,58 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        self.assertEqual(len(self.service.audit_events), 1)
-        self.assertEqual(self.service.audit_events[0].operation, "search_transcript")
-        self.assertEqual(self.service.audit_events[0].tenant_id, "tenant-a")
-        self.assertEqual(self.service.audit_events[0].principal_id, "agent-a")
-        self.assertEqual(self.service.audit_events[0].status, "ok")
-        self.assertEqual(len(self.service.usage_events), 1)
-        self.assertEqual(self.service.usage_events[0].kind, "request")
-        self.assertEqual(self.service.usage_events[0].operation, "search_transcript")
+        audit_events = self.catalog.audit_events("tenant-a")
+        usage_events = self.catalog.usage_events("tenant-a")
+        self.assertEqual(len(audit_events), 1)
+        self.assertEqual(audit_events[0].operation, "search_transcript")
+        self.assertEqual(audit_events[0].tenant_id, "tenant-a")
+        self.assertEqual(audit_events[0].principal_id, "agent-a")
+        self.assertEqual(audit_events[0].status, "ok")
+        self.assertEqual(len(usage_events), 1)
+        self.assertEqual(usage_events[0].kind, "request")
+        self.assertEqual(usage_events[0].operation, "search_transcript")
 
-        ledger_text = repr(self.service.audit_events) + repr(self.service.usage_events)
+        ledger_text = repr(audit_events) + repr(usage_events)
         self.assertNotIn(api_key.raw_key, ledger_text)
         self.assertNotIn("cedar", ledger_text)
+
+    async def test_telemetry_is_stored_per_tenant_database(self) -> None:
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        self.catalog.provision_tenant("tenant-b", project_ids={"project-b"})
+        key_a = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.SEARCH},
+            project_ids={"project-a"},
+        )
+        key_b = self.keys.create_key(
+            tenant_id="tenant-b",
+            principal_id="agent-b",
+            capabilities={MemoryCapability.SEARCH},
+            project_ids={"project-b"},
+        )
+
+        await self.service.search_transcript(
+            key_a.raw_key,
+            SearchTranscriptRequest(
+                scope=_scope(capabilities={MemoryCapability.SEARCH}),
+                query="cedar",
+            ),
+        )
+        await self.service.search_transcript(
+            key_b.raw_key,
+            SearchTranscriptRequest(
+                scope=_scope(
+                    tenant_id="tenant-b",
+                    project_id="project-b",
+                    capabilities={MemoryCapability.SEARCH},
+                ),
+                query="cedar",
+            ),
+        )
+
+        self.assertEqual([event.tenant_id for event in self.catalog.audit_events("tenant-a")], ["tenant-a"])
+        self.assertEqual([event.tenant_id for event in self.catalog.audit_events("tenant-b")], ["tenant-b"])
 
     async def test_tenant_scoped_api_key_accepts_scope_without_project_id(self) -> None:
         self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
@@ -284,10 +324,12 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         self.assertEqual(result.hits, [])
-        self.assertEqual(self.service.audit_events[0].status, "error")
+        audit_events = self.catalog.audit_events("tenant-a")
+        usage_events = self.catalog.usage_events("tenant-a")
+        self.assertEqual(audit_events[0].status, "error")
         self.assertNotIn(
             "cedar-secret",
-            repr(self.service.audit_events) + repr(self.service.usage_events),
+            repr(audit_events) + repr(usage_events),
         )
 
     def test_tenant_database_path_is_catalog_mapped_not_tenant_interpolated(self) -> None:
@@ -330,4 +372,4 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([event.status for event in self.jobs.job_events], ["running", "error"])
         self.assertEqual(self.jobs.job_events[-1].error_type, "HostPortNotConfigured")
-        self.assertEqual(self.service.usage_events[-1].kind, "job")
+        self.assertEqual(self.catalog.usage_events("tenant-a")[-1].kind, "job")
