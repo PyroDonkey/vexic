@@ -116,4 +116,5 @@ scope before delegation and can route sanitized request/job usage events to an
 adapter-owned telemetry sink. Concrete tenant provisioning and API-key storage
 live in adapters outside `src/vexic`.
 It is an internal in-process boundary, not a public HTTP service. See
-`docs/hosted-mvp.md`.
+`docs/hosted-mvp.md`. External customer-memory readiness is blocked by the
+hosted readiness gate in Linear.

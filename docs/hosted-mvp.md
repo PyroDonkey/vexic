@@ -75,6 +75,10 @@ For one internal hosted environment:
 
 ## Readiness
 
+External customer-memory readiness is blocked by the hosted readiness gate in
+Linear. This hosted shell remains internal-only until that gate is satisfied or
+an explicit Ryan-approved risk acceptance is recorded.
+
 Internal-only today:
 
 - in-process Python API boundary;
