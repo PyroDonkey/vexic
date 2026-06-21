@@ -77,6 +77,19 @@ The stdio tool schemas cap `query` at 1000 characters, `limit` at 1-20 results,
 and privileged `expand_history` responses at 100 returned messages and 20000
 characters.
 
+## Claude Code Transcript Import
+
+Import cleaned Claude Code JSONL transcript rows into a local Vexic database:
+
+```powershell
+uv run python scripts\import-claude-code-jsonl.py --db-path .\memory.db --tenant-id local --session-id default <path-to-session.jsonl>
+```
+
+The importer is a repo-local host transcript recorder. It reads Claude Code
+JSONL, keeps visible user/assistant text, maps source keys as
+`claude-code`/`sessionId`/`uuid`, and delegates writes to
+`LocalMemoryService.ingest_source_transcript`. It does not expose MCP writes.
+
 <!-- memory-reliability-gate -->
 
 The memory reliability gate is:
