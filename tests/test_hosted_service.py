@@ -372,4 +372,9 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([event.status for event in self.jobs.job_events], ["running", "error"])
         self.assertEqual(self.jobs.job_events[-1].error_type, "HostPortNotConfigured")
-        self.assertEqual(self.catalog.usage_events("tenant-a")[-1].kind, "job")
+        audit_events = self.catalog.audit_events("tenant-a")
+        usage_events = self.catalog.usage_events("tenant-a")
+        self.assertEqual(audit_events[-1].error_type, "HostPortNotConfigured")
+        self.assertEqual(usage_events[-2].error_type, "HostPortNotConfigured")
+        self.assertEqual(usage_events[-1].kind, "job")
+        self.assertEqual(usage_events[-1].error_type, "HostPortNotConfigured")

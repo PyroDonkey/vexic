@@ -223,7 +223,7 @@ class HostedMemoryService:
             api_key,
             request,
             request.required_capability,
-            lambda bound: self._local_service(bound).run_dream_phase(bound),
+            lambda bound: self._run_dream_phase(bound),
         )
 
     async def export_scope(
@@ -336,6 +336,12 @@ class HostedMemoryService:
         tenant = self.catalog.get_tenant(request.scope.tenant_id)
         return LocalMemoryService(db_path=str(tenant.db_path), tenant_id=tenant.tenant_id)
 
+    async def _run_dream_phase(self, request: RunDreamPhaseRequest) -> RunDreamPhaseResult:
+        try:
+            return await self._local_service(request).run_dream_phase(request)
+        except NotImplementedError as exc:
+            raise missing_host_port("Dream phase") from exc
+
     def _record_request(
         self,
         operation: str,
@@ -415,23 +421,6 @@ class HostedBackgroundJobRunner:
         )
         try:
             result = await self.service.run_dream_phase(api_key, request)
-        except NotImplementedError as exc:
-            error = missing_host_port("Dream phase")
-            self._record_job(
-                job_id,
-                request,
-                auth,
-                status="error",
-                error_type=type(error).__name__,
-            )
-            self.service.record_job_usage(
-                operation="run_dream_phase",
-                tenant_id=auth.tenant_id,
-                principal_id=auth.principal.principal_id,
-                status="error",
-                error_type=type(error).__name__,
-            )
-            raise error from exc
         except Exception as exc:
             self._record_job(
                 job_id,
