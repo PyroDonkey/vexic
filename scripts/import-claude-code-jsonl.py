@@ -8,7 +8,10 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+if __name__ == "__main__":
+    src_path = str(Path(__file__).resolve().parents[1] / "src")
+    if src_path not in sys.path:
+        sys.path.insert(0, src_path)
 
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 

@@ -54,6 +54,16 @@ class ClaudeCodeJsonlImporterTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def test_module_import_does_not_mutate_sys_path(self) -> None:
+        original_path = sys.path.copy()
+        try:
+            _load_importer()
+            after_import = sys.path.copy()
+        finally:
+            sys.path[:] = original_path
+
+        self.assertEqual(after_import, original_path)
+
     async def test_imports_clean_user_and_assistant_text(self) -> None:
         rows = [
             {
