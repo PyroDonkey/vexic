@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ from vexic.service import LocalMemoryService
 from vexic.storage import single_message_adapter
 
 SOURCE_HOST = "claude-code"
+DEFAULT_BATCH_SIZE = 500
 
 
 def _content_text(content: object) -> str | None:
@@ -58,6 +60,10 @@ def _source_message(row: dict[str, Any]) -> SourceTranscriptMessage | None:
         and isinstance(message, dict)
     ):
         return None
+    source_session_id = source_session_id.strip()
+    source_message_id = source_message_id.strip()
+    if not source_session_id or not source_message_id:
+        return None
 
     text = _content_text(message.get("content"))
     if text is None:
@@ -71,17 +77,18 @@ def _source_message(row: dict[str, Any]) -> SourceTranscriptMessage | None:
     else:
         return None
 
-    return SourceTranscriptMessage(
-        source_host=SOURCE_HOST,
-        source_session_id=source_session_id,
-        source_message_id=source_message_id,
-        message_json=single_message_adapter.dump_json(model_message).decode(),
-    )
+    try:
+        return SourceTranscriptMessage(
+            source_host=SOURCE_HOST,
+            source_session_id=source_session_id,
+            source_message_id=source_message_id,
+            message_json=single_message_adapter.dump_json(model_message).decode(),
+        )
+    except ValueError:
+        return None
 
 
-def _read_messages(paths: list[Path]) -> tuple[list[SourceTranscriptMessage], int]:
-    messages: list[SourceTranscriptMessage] = []
-    ignored = 0
+def _read_messages(paths: list[Path]) -> Iterator[SourceTranscriptMessage | None]:
     for path in paths:
         with path.open("r", encoding="utf-8") as handle:
             for line in handle:
@@ -90,17 +97,16 @@ def _read_messages(paths: list[Path]) -> tuple[list[SourceTranscriptMessage], in
                 try:
                     row = json.loads(line)
                 except json.JSONDecodeError:
-                    ignored += 1
+                    yield None
                     continue
                 if not isinstance(row, dict):
-                    ignored += 1
+                    yield None
                     continue
                 message = _source_message(row)
                 if message is None:
-                    ignored += 1
+                    yield None
                 else:
-                    messages.append(message)
-    return messages, ignored
+                    yield message
 
 
 def _scope(args: argparse.Namespace) -> MemoryScope:
@@ -118,24 +124,48 @@ def _scope(args: argparse.Namespace) -> MemoryScope:
     )
 
 
+async def _ingest_batch(
+    service: LocalMemoryService,
+    scope: MemoryScope,
+    redaction: RedactionContext,
+    messages: list[SourceTranscriptMessage],
+    counts: dict[str, int],
+) -> None:
+    if not messages:
+        return
+    result = await service.ingest_source_transcript(
+        IngestSourceTranscriptRequest(
+            scope=scope,
+            messages=messages,
+            redaction=redaction,
+        )
+    )
+    for item in result.items:
+        counts[item.status] += 1
+
+
 async def _run(args: argparse.Namespace) -> dict[str, int]:
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be greater than 0")
     service = LocalMemoryService(
         db_path=args.db_path,
         tenant_id=args.tenant_id,
         forbidden_secret_values=tuple(args.forbidden_value),
     )
     service.init_schema()
-    messages, ignored = _read_messages(args.jsonl_path)
-    result = await service.ingest_source_transcript(
-        IngestSourceTranscriptRequest(
-            scope=_scope(args),
-            messages=messages,
-            redaction=RedactionContext(forbidden_values=tuple(args.forbidden_value)),
-        )
-    )
-    counts = {"inserted": 0, "skipped": 0, "rejected": 0, "ignored": ignored}
-    for item in result.items:
-        counts[item.status] += 1
+    counts = {"inserted": 0, "skipped": 0, "rejected": 0, "ignored": 0}
+    scope = _scope(args)
+    redaction = RedactionContext(forbidden_values=tuple(args.forbidden_value))
+    batch: list[SourceTranscriptMessage] = []
+    for message in _read_messages(args.jsonl_path):
+        if message is None:
+            counts["ignored"] += 1
+            continue
+        batch.append(message)
+        if len(batch) >= args.batch_size:
+            await _ingest_batch(service, scope, redaction, batch, counts)
+            batch = []
+    await _ingest_batch(service, scope, redaction, batch, counts)
     return counts
 
 
@@ -149,6 +179,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--user-id")
     parser.add_argument("--principal-id", default="vexic-claude-code-importer")
     parser.add_argument("--forbidden-value", action="append", default=[])
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     return parser.parse_args(argv)
 
 

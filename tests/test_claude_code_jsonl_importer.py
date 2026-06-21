@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import subprocess
 import sys
@@ -6,11 +7,13 @@ import unittest
 from pathlib import Path
 
 from vexic.contract import (
+    IngestSourceTranscriptResult,
     MemoryCapability,
     MemoryScope,
     Principal,
     PrincipalType,
     SearchTranscriptRequest,
+    SourceTranscriptIngestItemResult,
     TrustBoundary,
 )
 from vexic.service import LocalMemoryService
@@ -18,6 +21,14 @@ from vexic.service import LocalMemoryService
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "import-claude-code-jsonl.py"
+
+
+def _load_importer():
+    spec = importlib.util.spec_from_file_location("claude_code_jsonl_importer", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _scope() -> MemoryScope:
@@ -170,6 +181,119 @@ class ClaudeCodeJsonlImporterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual([hit.body for hit in clean.hits], ["User: clean cedar"])
         self.assertEqual([hit.body for hit in polluted.hits], ["User: clean cedar"])
+
+    async def test_ignores_rows_with_blank_source_identifiers(self) -> None:
+        rows = [
+            {
+                "type": "user",
+                "sessionId": "   ",
+                "uuid": "blank-session",
+                "message": {"role": "user", "content": "ignored cedar"},
+            },
+            {
+                "type": "user",
+                "sessionId": "session-1",
+                "uuid": "\t",
+                "message": {"role": "user", "content": "ignored birch"},
+            },
+            {
+                "type": "user",
+                "sessionId": " session-1 ",
+                "uuid": " uuid-clean ",
+                "message": {"role": "user", "content": "clean maple"},
+            },
+        ]
+        self.jsonl_path.write_text(
+            "\n".join(json.dumps(row) for row in rows),
+            encoding="utf-8",
+        )
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--db-path",
+                str(self.db_path),
+                "--tenant-id",
+                "tenant-a",
+                str(self.jsonl_path),
+            ],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        summary = json.loads(completed.stdout)
+        self.assertEqual(summary["inserted"], 1)
+        self.assertEqual(summary["ignored"], 2)
+
+        service = LocalMemoryService(db_path=str(self.db_path), tenant_id="tenant-a")
+        clean = await service.search_transcript(
+            SearchTranscriptRequest(scope=_scope(), query="maple")
+        )
+        self.assertEqual([hit.body for hit in clean.hits], ["User: clean maple"])
+
+    async def test_run_ingests_configured_batches(self) -> None:
+        rows = [
+            {
+                "type": "user",
+                "sessionId": "session-1",
+                "uuid": f"uuid-{index}",
+                "message": {"role": "user", "content": f"clean {index}"},
+            }
+            for index in range(5)
+        ]
+        self.jsonl_path.write_text(
+            "\n".join([*(json.dumps(row) for row in rows), "not-json"]),
+            encoding="utf-8",
+        )
+        importer = _load_importer()
+        batch_sizes = []
+
+        class FakeMemoryService:
+            def __init__(self, **_kwargs) -> None:
+                pass
+
+            def init_schema(self) -> None:
+                pass
+
+            async def ingest_source_transcript(self, request):
+                batch_sizes.append(len(request.messages))
+                return IngestSourceTranscriptResult(
+                    items=[
+                        SourceTranscriptIngestItemResult(
+                            source_host=message.source_host,
+                            source_session_id=message.source_session_id,
+                            source_message_id=message.source_message_id,
+                            status="inserted",
+                        )
+                        for message in request.messages
+                    ]
+                )
+
+        importer.LocalMemoryService = FakeMemoryService
+
+        summary = await importer._run(
+            importer._parse_args(
+                [
+                    "--db-path",
+                    str(self.db_path),
+                    "--tenant-id",
+                    "tenant-a",
+                    "--batch-size",
+                    "2",
+                    str(self.jsonl_path),
+                ]
+            )
+        )
+
+        self.assertEqual(batch_sizes, [2, 2, 1])
+        self.assertEqual(
+            summary,
+            {"inserted": 5, "skipped": 0, "rejected": 0, "ignored": 1},
+        )
 
     def test_missing_file_returns_clean_error(self) -> None:
         completed = subprocess.run(
