@@ -3,20 +3,23 @@
 Role: deployment and readiness notes for the first hosted boundary around the
 Vexic memory core.
 
-The hosted MVP shell is an in-process Python boundary in `vexic.hosted`. It is
-not a public HTTP server, dashboard, billing system, or production customer-data
-service. A future web/API process can wrap this boundary without changing the
-memory contract.
+The hosted MVP shell is an in-process Python boundary in `vexic.hosted`.
+Concrete tenant catalog and API-key provisioning live in adapters outside
+`src/vexic`; the repository-local `vexic_hosted_local` module is for local
+staging and tests. This is not a public HTTP server, dashboard, billing system,
+or production customer-data service. A future web/API process can wrap this
+boundary without changing the memory contract.
 
 ## What Exists
 
-- `HostedTenantCatalog` provisions one isolated SQLite-compatible Customer
-  Memory Database per tenant and maps tenant ids to opaque database paths.
-- `HostedApiKeyStore` creates high-entropy scoped API keys, stores only SHA-256
-  hashes, authenticates with constant-time hash comparison, and can revoke keys.
 - `HostedMemoryService` exposes the public memory contract operation names,
-  binds tenant/principal/capability scope from the authenticated API key, and
-  delegates to `LocalMemoryService`.
+  binds tenant/principal/capability scope from an adapter-supplied auth context,
+  and delegates to `LocalMemoryService`.
+- `vexic_hosted_local.HostedTenantCatalog` provisions one isolated
+  SQLite-compatible Customer Memory Database per tenant for local staging.
+- `vexic_hosted_local.HostedApiKeyStore` creates high-entropy scoped API keys,
+  stores only SHA-256 hashes, authenticates with constant-time hash comparison,
+  and can revoke keys for local staging.
 - `HostedBackgroundJobRunner` records dream-phase job lifecycle events and
   fails closed with `HostPortNotConfigured` while model-backed host ports are
   absent.
@@ -31,7 +34,8 @@ Use a throwaway directory for tenant databases:
 from pathlib import Path
 
 from vexic.contract import MemoryCapability
-from vexic.hosted import HostedApiKeyStore, HostedMemoryService, HostedTenantCatalog
+from vexic.hosted import HostedMemoryService
+from vexic_hosted_local import HostedApiKeyStore, HostedTenantCatalog
 
 catalog = HostedTenantCatalog(Path(".hosted-memory"))
 catalog.provision_tenant("tenant-a", project_ids={"project-a"})
@@ -73,7 +77,8 @@ Internal-only today:
 
 - in-process Python API boundary;
 - local SQLite-compatible tenant databases;
-- in-memory API key, audit, usage, and job ledgers;
+- repo-local in-memory tenant catalog and API-key adapter;
+- in-memory audit, usage, and job ledgers;
 - one `LocalMemoryService` instance is created per hosted request;
 - fail-closed dream jobs without host model ports.
 

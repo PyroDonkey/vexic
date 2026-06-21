@@ -17,11 +17,10 @@ from vexic.contract import (
     TrustBoundary,
 )
 from vexic.hosted import (
-    HostedApiKeyStore,
     HostedBackgroundJobRunner,
     HostedMemoryService,
-    HostedTenantCatalog,
 )
+from vexic_hosted_local import HostedApiKeyStore, HostedTenantCatalog
 from vexic.ports import HostPortNotConfigured
 from vexic.storage import single_message_adapter
 

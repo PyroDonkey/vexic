@@ -111,8 +111,8 @@ host-owned extension tables such as `background_tool_audit`.
 
 ## Hosted MVP Shell
 
-The dependency-free hosted shell in `vexic.hosted` provisions isolated
-SQLite-compatible tenant databases, authenticates scoped Vexic API keys, binds
-tenant scope before delegation, and records sanitized request/job usage events.
+The dependency-free hosted shell in `vexic.hosted` binds authenticated tenant
+scope before delegation and records sanitized request/job usage events. Concrete
+tenant provisioning and API-key storage live in adapters outside `src/vexic`.
 It is an internal in-process boundary, not a public HTTP service. See
 `docs/hosted-mvp.md`.
