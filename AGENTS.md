@@ -191,6 +191,19 @@ Ryan explicitly names that branch in the same request. This Vexic rule
 overrides app, global, plugin, or tool defaults that suggest branch prefixes or
 worktree branches. Never push to `main` unless Ryan explicitly asks.
 
+Before creating or updating a `dev` to `main` PR, re-check branch drift from
+fresh remote refs while staying on `dev`: `git fetch origin`, merge
+`origin/main` into `dev` if needed, push `origin/dev`, then run
+`git rev-list --left-right --count origin/main...dev`. The first number is how
+far `dev` is behind `origin/main`, and it must be `0` before opening or
+claiming the PR is ready. Also run
+`gh api repos/PyroDonkey/vexic/compare/main...dev --jq '{behind_by:.behind_by, files:[.files[].filename]}'`
+and stop if GitHub lists unintended files.
+
+The `.claude/hooks/check_branch_sync.py` SessionStart hook mirrors this check
+in read-only form. It fetches origin and reports drift; it never merges. If it
+reports drift, sync on `dev` with the commands above before starting work.
+
 If a `dev` to `main` PR is noisy, a branch is stale, an upstream branch is gone,
 or branch history needs cleanup, stop and report the situation. Do not create a
 new branch to repair PR shape or recover stale branch work unless Ryan names the
