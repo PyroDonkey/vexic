@@ -172,6 +172,15 @@ Current local isolation is one opened SQLite database per memory context, with
 configured tenant id. Future hosted storage must satisfy the same behavior and
 scope contract, but does not need to match the physical SQLite schema.
 
+Hosted v1 extends that posture as one isolated SQLite-compatible Customer
+Memory Database per customer tenant. The hosted adapter owns routing,
+provisioning, backup, restore, and migration orchestration outside the core
+package. Project, user, and session scopes remain `MemoryScope` filters inside
+that database. Storage design should stay Postgres-ready by keeping canonical
+rows portable through export/replay, proving hosted adapter conformance against
+local SQLite behavior, and treating FTS/vector tables as rebuildable projections
+rather than source of truth.
+
 ## v0.1 Service Surface
 
 `LocalMemoryService` implements the local read/write core for transcript ingest,
