@@ -29,7 +29,7 @@ from vexic.storage import single_message_adapter
 def _scope(
     *,
     tenant_id: str = "tenant-a",
-    project_id: str = "project-a",
+    project_id: str | None = "project-a",
     capabilities: set[MemoryCapability],
 ) -> MemoryScope:
     return MemoryScope(
@@ -136,6 +136,51 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         ledger_text = repr(self.service.audit_events) + repr(self.service.usage_events)
         self.assertNotIn(api_key.raw_key, ledger_text)
         self.assertNotIn("cedar", ledger_text)
+
+    async def test_tenant_scoped_api_key_accepts_scope_without_project_id(self) -> None:
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.SEARCH},
+        )
+
+        result = await self.service.search_transcript(
+            api_key.raw_key,
+            SearchTranscriptRequest(
+                scope=_scope(
+                    project_id=None,
+                    capabilities={MemoryCapability.SEARCH},
+                ),
+                query="cedar",
+            ),
+        )
+
+        self.assertEqual(result.hits, [])
+
+    async def test_project_scoped_api_key_requires_project_id(self) -> None:
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.SEARCH},
+            project_ids={"project-a"},
+        )
+
+        with self.assertRaisesRegex(
+            PermissionError,
+            "project_id is required for project-scoped API key",
+        ):
+            await self.service.search_transcript(
+                api_key.raw_key,
+                SearchTranscriptRequest(
+                    scope=_scope(
+                        project_id=None,
+                        capabilities={MemoryCapability.SEARCH},
+                    ),
+                    query="cedar",
+                ),
+            )
 
     async def test_api_key_rejects_tenant_switch_and_capability_escalation(self) -> None:
         self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})

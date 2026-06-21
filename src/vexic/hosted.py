@@ -421,10 +421,15 @@ class HostedMemoryService:
         tenant = self.catalog.get_tenant(auth.tenant_id)
         if request.scope.tenant_id != auth.tenant_id:
             raise PermissionError("Memory scope tenant_id does not match API key.")
-        if request.scope.project_id is not None and request.scope.project_id not in tenant.project_ids:
-            raise PermissionError("Memory scope project_id is not provisioned for tenant.")
-        if request.scope.project_id not in auth.project_ids:
-            raise PermissionError("Memory scope project_id is not allowed for API key.")
+        project_id = request.scope.project_id
+        if project_id is None:
+            if auth.project_ids:
+                raise PermissionError("Memory scope project_id is required for project-scoped API key.")
+        else:
+            if project_id not in tenant.project_ids:
+                raise PermissionError("Memory scope project_id is not provisioned for tenant.")
+            if project_id not in auth.project_ids:
+                raise PermissionError("Memory scope project_id is not allowed for API key.")
         effective_capabilities = request.scope.capabilities & auth.capabilities
         if capability not in effective_capabilities:
             raise PermissionError(f"Memory capability required: {capability.value}")
