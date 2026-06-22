@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -405,63 +406,432 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                         SearchLongTermRequest(scope=_scope(), query="compact reports")
                     )
 
-    async def test_v0_1_deferred_protocol_operations_raise_not_implemented_only(
-        self,
-    ) -> None:
+    async def test_dream_phase_fails_closed_without_host_port(self) -> None:
         from vexic.service import LocalMemoryService
 
         service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
-        deferred_scope = _scope().model_copy(update={"tenant_id": "other-tenant"})
         redaction = RedactionContext(forbidden_values=())
-        requests = (
-            (
-                "record_retrieval_event",
-                RecordRetrievalEventRequest(
-                    scope=deferred_scope,
-                    event=RetrievalEvent(
-                        event_id=0,
-                        referent_id=1,
-                        session_id="default",
-                        query="compact reports",
-                        retrieved_at="2026-06-20T00:00:00Z",
-                        used=True,
-                    ),
-                    redaction=redaction,
-                ),
-            ),
-            ("retire_fact", RetireFactRequest(scope=deferred_scope, fact_id=1)),
-            (
-                "run_dream_phase",
+
+        with self.assertRaises(HostPortNotConfigured):
+            await service.run_dream_phase(
                 RunDreamPhaseRequest(
-                    scope=deferred_scope,
+                    scope=_scope(capabilities={MemoryCapability.ADMIN_REBUILD}),
                     phase=DreamPhase.LIGHT,
                     redaction=redaction,
-                ),
-            ),
-            (
-                "export_scope",
-                ExportScopeRequest(scope=deferred_scope, redaction=redaction),
-            ),
-            (
-                "replay_scope",
-                ReplayScopeRequest(scope=deferred_scope, redaction=redaction),
-            ),
-            ("rebuild", RebuildRequest(scope=deferred_scope, redaction=redaction)),
-            (
-                "delete_scope",
-                DeleteScopeRequest(
-                    scope=deferred_scope,
-                    target_scope=MemoryScopeSelector(tenant_id="other-tenant"),
-                    reason="test deletion",
-                    redaction=redaction,
-                ),
-            ),
+                )
+            )
+
+    async def test_lifecycle_export_replay_and_rebuild_are_agent_scoped(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        message_ids = {
+            agent_id: save_messages(
+                self.db_path,
+                [ModelRequest(parts=[UserPromptPart(content=content)])],
+                agent_id=agent_id,
+            )[0]
+            for agent_id, content in (
+                ("agent-a", "cedar agent a transcript"),
+                ("agent-b", "cedar agent b transcript"),
+                (None, "cedar shared transcript"),
+            )
+        }
+        for agent_id, fact_text in (
+            ("agent-a", "cedar agent a candidate"),
+            ("agent-b", "cedar agent b candidate"),
+            (None, "cedar shared candidate"),
+        ):
+            commit_dream_cycle(
+                self.db_path,
+                [
+                    FactCandidate(
+                        fact_text=fact_text,
+                        subject="Ryan",
+                        category="fact",
+                        importance=5,
+                        confidence=0.8,
+                        source_message_ids=[message_ids[agent_id]],
+                    )
+                ],
+                candidate_embeddings=[_unit_vector(1.0)],
+                agent_id=agent_id,
+                status="ok",
+                started_at="2026-06-01T00:00:00+00:00",
+                finished_at="2026-06-01T00:00:01+00:00",
+                messages_processed=1,
+                last_processed_message_id=message_ids[agent_id],
+            )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            candidate_ids = {
+                row[1]: row[0]
+                for row in conn.execute(
+                    "SELECT id, agent_id FROM memory_candidates ORDER BY id"
+                )
+            }
+        for agent_id in ("agent-a", "agent-b", None):
+            commit_deep_cycle(
+                self.db_path,
+                [PromotionDecision(candidate_ids[agent_id], _unit_vector(1.0))],
+                started_at="2026-06-01T00:01:00+00:00",
+                finished_at="2026-06-01T00:01:01+00:00",
+            )
+
+        redaction = RedactionContext(forbidden_values=())
+        agent_a_scope = _scope(
+            agent_id="agent-a",
+            capabilities={
+                MemoryCapability.SEARCH,
+                MemoryCapability.EXPORT,
+                MemoryCapability.REPLAY,
+                MemoryCapability.ADMIN_REBUILD,
+                MemoryCapability.ADMIN_LIFECYCLE,
+            },
+        )
+        replay = await service.replay_scope(
+            ReplayScopeRequest(scope=agent_a_scope, redaction=redaction)
+        )
+        export = await service.export_scope(
+            ExportScopeRequest(scope=agent_a_scope, redaction=redaction)
+        )
+        rebuild = await service.rebuild(
+            RebuildRequest(scope=agent_a_scope, redaction=redaction)
+        )
+        rebuild_artifact = await service.rebuild(
+            RebuildRequest(
+                scope=agent_a_scope,
+                redaction=redaction,
+                return_artifacts=True,
+            )
         )
 
-        for method_name, request in requests:
-            with self.subTest(method_name=method_name):
-                with self.assertRaises(NotImplementedError):
-                    await getattr(service, method_name)(request)
+        export_text = Path(export.artifact_ref).read_text()
+        rebuild_text = Path(rebuild_artifact.artifact_ref or "").read_text()
+        self.assertIsNone(rebuild.artifact_ref)
+        self.assertEqual(json.loads(rebuild_text)["repair_report_scope"], "database")
+        self.assertNotIn("agent b", rebuild_text)
+        self.assertNotIn("shared", rebuild_text)
+        self.assertEqual([hit.body for hit in replay.messages], ["User: cedar agent a transcript"])
+        self.assertIn("cedar agent a transcript", export_text)
+        self.assertIn("cedar agent a candidate", export_text)
+        self.assertNotIn("agent b", export_text)
+        self.assertNotIn("shared", export_text)
+        self.assertEqual(json.loads(export_text)["scope"]["agent_id"], "agent-a")
+
+        invalid_delete = DeleteScopeRequest.model_construct(
+            scope=agent_a_scope,
+            target_scope=MemoryScopeSelector(tenant_id="other-tenant", agent_id="agent-a"),
+            reason="bad target",
+            redaction=redaction,
+        )
+        with self.assertRaisesRegex(PermissionError, "target_scope tenant_id"):
+            await service.delete_scope(invalid_delete)
+
+        delete = await service.delete_scope(
+            DeleteScopeRequest(
+                scope=agent_a_scope,
+                target_scope=MemoryScopeSelector(tenant_id="tenant-a", agent_id="agent-a"),
+                reason="test deletion",
+                redaction=redaction,
+            )
+        )
+        self.assertEqual(delete.tombstone.target_scope.agent_id, "agent-a")
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            flags = conn.execute(
+                """
+                SELECT retrieval_blocked, export_blocked, replay_blocked,
+                       rebuild_blocked, physical_purge_deferred
+                FROM scope_tombstones
+                WHERE id = ?
+                """,
+                (int(delete.tombstone.tombstone_id),),
+            ).fetchone()
+        self.assertEqual(flags, (1, 1, 1, 1, 1))
+
+        with self.assertRaisesRegex(PermissionError, "tombstoned"):
+            await service.replay_scope(
+                ReplayScopeRequest(scope=agent_a_scope, redaction=redaction)
+            )
+        with self.assertRaisesRegex(PermissionError, "tombstoned"):
+            await service.export_scope(
+                ExportScopeRequest(scope=agent_a_scope, redaction=redaction)
+            )
+        with self.assertRaisesRegex(PermissionError, "tombstoned"):
+            await service.rebuild(
+                RebuildRequest(scope=agent_a_scope, redaction=redaction)
+            )
+
+        agent_b = await service.search_transcript(
+            SearchTranscriptRequest(scope=_scope(agent_id="agent-b"), query="cedar")
+        )
+        shared = await service.search_transcript(
+            SearchTranscriptRequest(scope=_scope(agent_id=None), query="cedar")
+        )
+        self.assertEqual([hit.body for hit in agent_b.hits], ["User: cedar agent b transcript"])
+        self.assertEqual([hit.body for hit in shared.hits], ["User: cedar shared transcript"])
+
+    async def test_retrieval_event_and_retire_fact_use_agent_scope(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            with conn:
+                facts = {}
+                for promoted_from_candidate_id, agent_id, fact_text in (
+                    (100, "agent-a", "cedar agent a fact"),
+                    (200, "agent-b", "cedar agent b fact"),
+                ):
+                    cursor = conn.execute(
+                        """
+                        INSERT INTO long_term_memory
+                            (fact_text, subject, category, importance, confidence,
+                             source_message_ids, agent_id, promoted_from_candidate_id)
+                        VALUES (?, 'Ryan', 'fact', 5, 0.8, '[1]', ?, ?)
+                        """,
+                        (fact_text, agent_id, promoted_from_candidate_id),
+                    )
+                    facts[agent_id] = int(cursor.lastrowid)
+
+        write_scope = _scope(
+            agent_id="agent-a",
+            capabilities={MemoryCapability.WRITE},
+        )
+        event = await service.record_retrieval_event(
+            RecordRetrievalEventRequest(
+                scope=write_scope,
+                event=RetrievalEvent(
+                    event_id=0,
+                    referent_id=facts["agent-a"],
+                    session_id="default",
+                    query="cedar",
+                    retrieved_at="2026-06-20T00:00:00Z",
+                    used=True,
+                ),
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+        with self.assertRaisesRegex(PermissionError, "outside memory scope"):
+            await service.record_retrieval_event(
+                RecordRetrievalEventRequest(
+                    scope=write_scope,
+                    event=RetrievalEvent(
+                        event_id=0,
+                        referent_id=facts["agent-b"],
+                        session_id="default",
+                        query="cedar",
+                        retrieved_at="2026-06-20T00:00:00Z",
+                    ),
+                    redaction=RedactionContext(forbidden_values=()),
+                )
+            )
+        retired = await service.retire_fact(
+            RetireFactRequest(scope=write_scope, fact_id=facts["agent-a"])
+        )
+        other_agent_retired = await service.retire_fact(
+            RetireFactRequest(scope=write_scope, fact_id=facts["agent-b"])
+        )
+
+        self.assertGreater(event.event_id, 0)
+        self.assertTrue(retired.retired)
+        self.assertFalse(other_agent_retired.retired)
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            rows = {
+                row[0]: row[1:]
+                for row in conn.execute(
+                    """
+                    SELECT agent_id, retrieved_count, used_count, retired
+                    FROM long_term_memory
+                    ORDER BY agent_id
+                    """
+                )
+            }
+        self.assertEqual(rows["agent-a"], (1, 1, 1))
+        self.assertEqual(rows["agent-b"], (0, 0, 0))
+
+        admin_scope = _scope(
+            agent_id="agent-a",
+            capabilities={MemoryCapability.WRITE, MemoryCapability.ADMIN_LIFECYCLE},
+        )
+        await service.delete_scope(
+            DeleteScopeRequest(
+                scope=admin_scope,
+                target_scope=MemoryScopeSelector(tenant_id="tenant-a", agent_id="agent-a"),
+                reason="test deletion",
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+        with self.assertRaisesRegex(PermissionError, "tombstoned"):
+            await service.record_retrieval_event(
+                RecordRetrievalEventRequest(
+                    scope=write_scope,
+                    event=RetrievalEvent(
+                        event_id=0,
+                        referent_id=facts["agent-a"],
+                        session_id="default",
+                        query="cedar",
+                        retrieved_at="2026-06-20T00:00:00Z",
+                    ),
+                    redaction=RedactionContext(forbidden_values=()),
+                )
+            )
+        with self.assertRaisesRegex(PermissionError, "tombstoned"):
+            await service.retire_fact(
+                RetireFactRequest(scope=write_scope, fact_id=facts["agent-a"])
+            )
+
+    async def test_partial_tombstone_flags_gate_matching_lifecycle_operations(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            with conn:
+                facts = {}
+                for promoted_from_candidate_id, agent_id in (
+                    (300, "agent-a"),
+                    (400, "agent-b"),
+                ):
+                    cursor = conn.execute(
+                        """
+                        INSERT INTO long_term_memory
+                            (fact_text, subject, category, importance, confidence,
+                             source_message_ids, agent_id, promoted_from_candidate_id)
+                        VALUES ('cedar fact', 'Ryan', 'fact', 5, 0.8, '[1]', ?, ?)
+                        """,
+                        (agent_id, promoted_from_candidate_id),
+                    )
+                    facts[agent_id] = int(cursor.lastrowid)
+                conn.execute(
+                    """
+                    INSERT INTO scope_tombstones
+                        (target_tenant_id, target_agent_id,
+                         created_by_principal_id, created_by_principal_type, reason,
+                         retrieval_blocked, export_blocked, replay_blocked,
+                         rebuild_blocked, physical_purge_deferred)
+                    VALUES ('tenant-a', 'agent-a', 'operator', 'operator',
+                            'retrieval only', 1, 0, 0, 0, 1)
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO scope_tombstones
+                        (target_tenant_id, target_agent_id,
+                         created_by_principal_id, created_by_principal_type, reason,
+                         retrieval_blocked, export_blocked, replay_blocked,
+                         rebuild_blocked, physical_purge_deferred)
+                    VALUES ('tenant-a', 'agent-b', 'operator', 'operator',
+                            'rebuild only', 0, 0, 0, 1, 1)
+                    """
+                )
+
+        agent_a_write = _scope(agent_id="agent-a", capabilities={MemoryCapability.WRITE})
+        agent_b_write = _scope(agent_id="agent-b", capabilities={MemoryCapability.WRITE})
+        with self.assertRaisesRegex(PermissionError, "tombstoned"):
+            await service.record_retrieval_event(
+                RecordRetrievalEventRequest(
+                    scope=agent_a_write,
+                    event=RetrievalEvent(
+                        event_id=0,
+                        referent_id=facts["agent-a"],
+                        session_id="default",
+                        query="cedar",
+                        retrieved_at="2026-06-20T00:00:00Z",
+                    ),
+                    redaction=RedactionContext(forbidden_values=()),
+                )
+            )
+        self.assertTrue(
+            (
+                await service.retire_fact(
+                    RetireFactRequest(scope=agent_a_write, fact_id=facts["agent-a"])
+                )
+            ).retired
+        )
+        self.assertGreater(
+            (
+                await service.record_retrieval_event(
+                    RecordRetrievalEventRequest(
+                        scope=agent_b_write,
+                        event=RetrievalEvent(
+                            event_id=0,
+                            referent_id=facts["agent-b"],
+                            session_id="default",
+                            query="cedar",
+                            retrieved_at="2026-06-20T00:00:00Z",
+                        ),
+                        redaction=RedactionContext(forbidden_values=()),
+                    )
+                )
+            ).event_id,
+            0,
+        )
+        with self.assertRaisesRegex(PermissionError, "tombstoned"):
+            await service.retire_fact(
+                RetireFactRequest(scope=agent_b_write, fact_id=facts["agent-b"])
+            )
+
+    def test_session_summary_helpers_use_agent_scope(self) -> None:
+        from vexic.storage import (
+            fetch_session_summary_frontier,
+            list_compactable_session_ids,
+            record_session_summary,
+            render_session_recap,
+        )
+
+        init_db(self.db_path)
+        for agent_id, content in (
+            ("agent-a", "cedar agent a message"),
+            ("agent-b", "cedar agent b message"),
+            (None, "cedar shared message"),
+        ):
+            save_messages(
+                self.db_path,
+                [ModelRequest(parts=[UserPromptPart(content=content)])],
+                agent_id=agent_id,
+            )
+            record_session_summary(
+                self.db_path,
+                session_id="default",
+                agent_id=agent_id,
+                kind="leaf",
+                first_message_id=1,
+                last_message_id=1,
+                summary_text=f"summary for {agent_id or 'shared'}",
+            )
+        save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="agent b other session")])],
+            session_id="agent-b-only",
+            agent_id="agent-b",
+        )
+
+        self.assertEqual(
+            [summary.summary_text for summary in fetch_session_summary_frontier(
+                self.db_path,
+                session_id="default",
+                agent_id="agent-a",
+            )],
+            ["summary for agent-a"],
+        )
+        shared_recap = render_session_recap(
+            self.db_path,
+            session_id="default",
+            agent_id=None,
+        )
+        self.assertIn("summary for shared", shared_recap)
+        self.assertNotIn("agent-a", shared_recap)
+        self.assertNotIn("agent-b", shared_recap)
+        self.assertEqual(list_compactable_session_ids(self.db_path), ["default"])
+        self.assertEqual(
+            list_compactable_session_ids(self.db_path, agent_id="agent-a"),
+            ["default"],
+        )
+        self.assertEqual(
+            list_compactable_session_ids(self.db_path, agent_id="agent-b"),
+            ["agent-b-only", "default"],
+        )
 
     async def test_tombstone_specific_scope_blocks_broader_request_scope(self) -> None:
         from vexic.service import LocalMemoryService

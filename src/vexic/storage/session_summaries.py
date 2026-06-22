@@ -79,6 +79,7 @@ def record_session_summary(
     db_path: str,
     *,
     session_id: str,
+    agent_id: str | None = None,
     kind: SessionSummaryKind,
     first_message_id: int,
     last_message_id: int,
@@ -95,14 +96,15 @@ def record_session_summary(
             cursor = conn.execute(
                 """
                 INSERT INTO session_summaries
-                    (session_id, kind, first_message_id, last_message_id,
+                    (session_id, agent_id, kind, first_message_id, last_message_id,
                      summary_text, token_estimate, replaces_summary_ids,
                      model_requests, input_tokens, output_tokens, total_tokens,
                      estimated_cost_micros)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
+                    agent_id,
                     kind,
                     first_message_id,
                     last_message_id,
@@ -123,6 +125,7 @@ def fetch_session_summary_frontier(
     db_path: str,
     *,
     session_id: str,
+    agent_id: str | None = None,
 ) -> list[SessionSummary]:
     with closing(sqlite3.connect(db_path)) as conn:
         rows = conn.execute(
@@ -133,9 +136,10 @@ def fetch_session_summary_frontier(
                    estimated_cost_micros
             FROM session_summaries
             WHERE session_id = ?
+                AND agent_id IS ?
             ORDER BY first_message_id ASC, last_message_id ASC, id ASC
             """,
-            (session_id,),
+            (session_id, agent_id),
         ).fetchall()
 
     summaries = [_summary_from_row(row) for row in rows]
@@ -160,6 +164,7 @@ def _message_rows(
     db_path: str,
     *,
     session_id: str,
+    agent_id: str | None = None,
 ) -> list[tuple[int, datetime | None]]:
     with closing(sqlite3.connect(db_path)) as conn:
         rows = conn.execute(
@@ -167,9 +172,10 @@ def _message_rows(
             SELECT id, timestamp
             FROM messages
             WHERE session_id = ?
+                AND agent_id IS ?
             ORDER BY id ASC
             """,
-            (session_id,),
+            (session_id, agent_id),
         ).fetchall()
     return [(int(row[0]), _parse_timestamp(row[1])) for row in rows]
 
@@ -178,6 +184,7 @@ def _first_message_id(
     db_path: str,
     *,
     session_id: str,
+    agent_id: str | None = None,
 ) -> int | None:
     with closing(sqlite3.connect(db_path)) as conn:
         row = conn.execute(
@@ -185,10 +192,11 @@ def _first_message_id(
             SELECT id
             FROM messages
             WHERE session_id = ?
+                AND agent_id IS ?
             ORDER BY id ASC
             LIMIT 1
             """,
-            (session_id,),
+            (session_id, agent_id),
         ).fetchone()
     if row is None:
         return None
@@ -286,10 +294,12 @@ def estimate_session_tokens(
     db_path: str,
     *,
     session_id: str,
+    agent_id: str | None = None,
 ) -> int:
     return _estimate_session_tokens_from_id(
         db_path,
         session_id=session_id,
+        agent_id=agent_id,
         first_message_id=None,
     )
 
@@ -298,14 +308,15 @@ def _estimate_session_tokens_from_id(
     db_path: str,
     *,
     session_id: str,
+    agent_id: str | None,
     first_message_id: int | None,
 ) -> int:
     total = 0
-    where_clause = "session_id = ?"
-    params: tuple[object, ...] = (session_id,)
+    where_clause = "session_id = ? AND agent_id IS ?"
+    params: tuple[object, ...] = (session_id, agent_id)
     if first_message_id is not None:
-        where_clause = "session_id = ? AND id >= ?"
-        params = (session_id, first_message_id)
+        where_clause = "session_id = ? AND agent_id IS ? AND id >= ?"
+        params = (session_id, agent_id, first_message_id)
 
     with closing(sqlite3.connect(db_path)) as conn:
         rows = conn.execute(
@@ -329,19 +340,24 @@ def find_session_compaction_span(
     db_path: str,
     *,
     session_id: str,
+    agent_id: str | None = None,
     timezone_name: str,
     now_utc: datetime | None = None,
     tau_soft: int = TAU_SOFT,
 ) -> tuple[int, int] | None:
     if session_id.startswith("onboarding:"):
         return None
-    rows = _message_rows(db_path, session_id=session_id)
+    rows = _message_rows(db_path, session_id=session_id, agent_id=agent_id)
     if not rows:
         return None
 
     first_message_id = rows[0][0]
     last_message_id = rows[-1][0]
-    frontier = fetch_session_summary_frontier(db_path, session_id=session_id)
+    frontier = fetch_session_summary_frontier(
+        db_path,
+        session_id=session_id,
+        agent_id=agent_id,
+    )
     covered_until = _frontier_covered_prefix(
         frontier,
         first_message_id=first_message_id,
@@ -361,6 +377,7 @@ def find_session_compaction_span(
     uncovered_tokens = _estimate_session_tokens_from_id(
         db_path,
         session_id=session_id,
+        agent_id=agent_id,
         first_message_id=next_uncovered,
     )
     if uncovered_tokens > tau_soft:
@@ -372,6 +389,7 @@ def render_compaction_source(
     db_path: str,
     *,
     session_id: str,
+    agent_id: str | None = None,
     first_message_id: int,
     last_message_id: int,
 ) -> str:
@@ -380,19 +398,26 @@ def render_compaction_source(
         first_message_id,
         last_message_id,
         session_id=session_id,
+        agent_id=agent_id,
     )
     return "\n---\n".join(hit.body for hit in hits)
 
 
-def list_compactable_session_ids(db_path: str) -> list[str]:
+def list_compactable_session_ids(
+    db_path: str,
+    *,
+    agent_id: str | None = None,
+) -> list[str]:
     with closing(sqlite3.connect(db_path)) as conn:
         rows = conn.execute(
             """
             SELECT DISTINCT session_id
             FROM messages
             WHERE session_id NOT LIKE 'onboarding:%'
+                AND agent_id IS ?
             ORDER BY session_id ASC
-            """
+            """,
+            (agent_id,),
         ).fetchall()
     return [str(row[0]) for row in rows]
 
@@ -402,12 +427,14 @@ def _load_messages_after_id_by_token_budget(
     *,
     token_budget: int,
     session_id: str,
+    agent_id: str | None,
     after_id: int,
 ) -> list[ModelMessage]:
     rows = _load_active_context_rows_by_token_budget(
         db_path,
         token_budget=token_budget,
         session_id=session_id,
+        agent_id=agent_id,
         after_id=after_id,
     )
     return _trim_unpaired_tool_messages([row.message for row in rows])
@@ -418,6 +445,7 @@ def _load_active_context_rows_by_token_budget(
     *,
     token_budget: int,
     session_id: str,
+    agent_id: str | None = None,
     after_id: int | None = None,
 ) -> list[_ActiveContextRow]:
     if token_budget < 0:
@@ -427,11 +455,11 @@ def _load_active_context_rows_by_token_budget(
 
     selected: list[_ActiveContextRow] = []
     total = 0
-    where_clause = "session_id = ?"
-    params: tuple[object, ...] = (session_id,)
+    where_clause = "session_id = ? AND agent_id IS ?"
+    params: tuple[object, ...] = (session_id, agent_id)
     if after_id is not None:
-        where_clause = "session_id = ? AND id > ?"
-        params = (session_id, after_id)
+        where_clause = "session_id = ? AND agent_id IS ? AND id > ?"
+        params = (session_id, agent_id, after_id)
 
     with closing(sqlite3.connect(db_path)) as conn:
         rows = conn.execute(
@@ -468,6 +496,7 @@ def load_active_context_messages(
     *,
     token_budget: int,
     session_id: str = "default",
+    agent_id: str | None = None,
     timezone_name: str = "UTC",
     now_utc: datetime | None = None,
 ) -> list[ModelMessage]:
@@ -475,6 +504,7 @@ def load_active_context_messages(
         db_path,
         token_budget=token_budget,
         session_id=session_id,
+        agent_id=agent_id,
     )
     if not tail_rows:
         return []
@@ -488,10 +518,18 @@ def load_active_context_messages(
     if boundary_id is None:
         return _trim_unpaired_tool_messages([row.message for row in tail_rows])
 
-    first_message_id = _first_message_id(db_path, session_id=session_id)
+    first_message_id = _first_message_id(
+        db_path,
+        session_id=session_id,
+        agent_id=agent_id,
+    )
     if first_message_id is None:
         return []
-    frontier = fetch_session_summary_frontier(db_path, session_id=session_id)
+    frontier = fetch_session_summary_frontier(
+        db_path,
+        session_id=session_id,
+        agent_id=agent_id,
+    )
     if not _frontier_covers(
         frontier,
         first_message_id=first_message_id,
@@ -503,6 +541,7 @@ def load_active_context_messages(
         db_path,
         token_budget=token_budget,
         session_id=session_id,
+        agent_id=agent_id,
         after_id=boundary_id,
     )
 
@@ -511,6 +550,7 @@ def render_session_recap(
     db_path: str,
     *,
     session_id: str,
+    agent_id: str | None = None,
     forbidden_secret_values: tuple[str, ...] = (),
 ) -> str:
     if session_id.startswith("onboarding:"):
@@ -518,7 +558,11 @@ def render_session_recap(
     if not os.path.exists(db_path):
         return ""
     try:
-        frontier = fetch_session_summary_frontier(db_path, session_id=session_id)
+        frontier = fetch_session_summary_frontier(
+            db_path,
+            session_id=session_id,
+            agent_id=agent_id,
+        )
     except sqlite3.Error:
         return ""
     if not frontier:
