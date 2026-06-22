@@ -427,7 +427,10 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         result = await service.ingest_source_transcript(
             IngestSourceTranscriptRequest(
                 scope=_scope().model_copy(
-                    update={"capabilities": {MemoryCapability.WRITE}}
+                    update={
+                        "agent_id": "agent-a",
+                        "capabilities": {MemoryCapability.WRITE},
+                    }
                 ),
                 messages=[
                     SourceTranscriptMessage(
@@ -446,20 +449,21 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.items[0].status, "inserted")
         self.assertEqual(result.items[0].message_id, 1)
         self.assertEqual(result.items[0].source_host, "claude-code")
-        self.assertEqual(len(search_messages(self.db_path, "cedar")), 1)
+        self.assertEqual(len(search_messages(self.db_path, "cedar")), 0)
+        self.assertEqual(len(search_messages(self.db_path, "cedar", agent_id="agent-a")), 1)
         with closing(sqlite3.connect(self.db_path)) as conn:
             message_columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(messages)")
             }
             ledger_row = conn.execute(
                 """
-                SELECT source_host, source_session_id, source_message_id, message_id
+                SELECT source_host, source_session_id, source_message_id, agent_id, message_id
                 FROM source_transcript_ledger
                 """
             ).fetchone()
 
         self.assertNotIn("source_host", message_columns)
-        self.assertEqual(ledger_row, ("claude-code", "session-1", "uuid-1", 1))
+        self.assertEqual(ledger_row, ("claude-code", "session-1", "uuid-1", "agent-a", 1))
 
     async def test_ingest_source_transcript_accepts_assistant_text(self) -> None:
         from vexic.service import LocalMemoryService
