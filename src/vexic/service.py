@@ -107,7 +107,7 @@ class LocalMemoryService(MemoryService):
                 and target_value != scope_value
             ):
                 return False
-        return True
+        return row["target_agent_id"] == scope.agent_id
 
     def _assert_not_tombstoned(self, scope: MemoryScope, operation: str) -> None:
         column_name = _TOMBSTONE_FLAG_COLUMNS[operation]
@@ -115,7 +115,7 @@ class LocalMemoryService(MemoryService):
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 f"""
-                SELECT target_project_id, target_user_id, target_session_id
+                SELECT target_project_id, target_user_id, target_session_id, target_agent_id
                 FROM scope_tombstones
                 WHERE target_tenant_id = ? AND {column_name} = 1
                 """,
@@ -134,6 +134,7 @@ class LocalMemoryService(MemoryService):
             self.db_path,
             messages,
             session_id=request.scope.session_id or "default",
+            agent_id=request.scope.agent_id,
             forbidden_secret_values=self._redaction_values(request.redaction),
         )
         return AppendTranscriptResult(message_ids=message_ids)
@@ -155,6 +156,7 @@ class LocalMemoryService(MemoryService):
                 for item in request.messages
             ],
             session_id=request.scope.session_id or "default",
+            agent_id=request.scope.agent_id,
             forbidden_secret_values=self._redaction_values(request.redaction),
         )
         return IngestSourceTranscriptResult(
@@ -182,6 +184,7 @@ class LocalMemoryService(MemoryService):
             self.db_path,
             request.query,
             session_id=request.scope.session_id or "default",
+            agent_id=request.scope.agent_id,
             limit=request.limit,
         )
         return SearchTranscriptResult(
@@ -213,6 +216,7 @@ class LocalMemoryService(MemoryService):
                 request.first_message_id,
                 request.last_message_id,
                 session_id=request.scope.session_id or "default",
+                agent_id=request.scope.agent_id,
                 max_rows=row_cap,
             )
         except TranscriptRangeTooLarge:
@@ -241,6 +245,7 @@ class LocalMemoryService(MemoryService):
             self.db_path,
             request.query,
             session_id=request.scope.session_id or "default",
+            agent_id=request.scope.agent_id,
             return_k=request.limit,
             embed=self.embed,
         )
@@ -268,6 +273,7 @@ class LocalMemoryService(MemoryService):
             self.db_path,
             request.query,
             session_id=request.scope.session_id or "default",
+            agent_id=request.scope.agent_id,
             return_k=request.limit,
             embed=self.embed,
         )

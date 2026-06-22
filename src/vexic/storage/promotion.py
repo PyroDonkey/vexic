@@ -74,9 +74,9 @@ def _retire_candidate(
     if row is None:
         raise ValueError(f"Missing memory candidate {decision.candidate_id}.")
 
-    promoted = bool(row[9])
-    retired = bool(row[10])
-    stale = bool(row[11])
+    promoted = bool(row[10])
+    retired = bool(row[11])
+    stale = bool(row[12])
     if promoted:
         if long_term_fact_exists_for_candidate(conn, decision.candidate_id):
             return False
@@ -125,6 +125,7 @@ def _promote_candidate(
         importance,
         confidence,
         source_ids_json,
+        agent_id,
         editable,
         retrieved_count,
         used_count,
@@ -176,6 +177,7 @@ def _promote_candidate(
         importance=importance,
         confidence=confidence,
         source_message_ids=source_message_ids,
+        agent_id=agent_id,
         promoted_from_candidate_id=decision.candidate_id,
         retrieved_count=retrieved_count,
         used_count=used_count,

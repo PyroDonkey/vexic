@@ -163,6 +163,7 @@ async def search_long_term(ctx_or_deps: Any, query: str) -> str:
             deps.db_path,
             query,
             session_id=deps.session_id,
+            agent_id=getattr(deps, "agent_id", None),
             model_group=authority.model_group if authority is not None else None,
             secrets=deps.secrets,
             usage=_usage(ctx_or_deps),
@@ -179,6 +180,7 @@ async def search_long_term(ctx_or_deps: Any, query: str) -> str:
             deps.db_path,
             query,
             session_id=deps.session_id,
+            agent_id=getattr(deps, "agent_id", None),
             secrets=deps.secrets,
             embed=getattr(deps, "embed", None),
         )

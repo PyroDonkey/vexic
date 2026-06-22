@@ -64,12 +64,18 @@ class MemoryContractScopeTests(unittest.TestCase):
 
     def test_optional_scope_fields_are_nullable_but_nonblank_when_present(self) -> None:
         scope = self._scope().model_copy(
-            update={"project_id": None, "user_id": None, "session_id": None}
+            update={
+                "project_id": None,
+                "user_id": None,
+                "session_id": None,
+                "agent_id": None,
+            }
         )
         payload = scope.model_dump(mode="json")
         self.assertIsNone(payload["project_id"])
         self.assertIsNone(payload["user_id"])
         self.assertIsNone(payload["session_id"])
+        self.assertIsNone(payload["agent_id"])
 
         with self.assertRaises(ValidationError):
             MemoryScope(
@@ -82,6 +88,59 @@ class MemoryContractScopeTests(unittest.TestCase):
                 trust_boundary=TrustBoundary.LOCAL_TRUSTED,
                 capabilities=set(),
             )
+
+        with self.assertRaises(ValidationError):
+            MemoryScope(
+                tenant_id="tenant-a",
+                agent_id=" ",
+                principal=Principal(
+                    principal_id="operator-1",
+                    principal_type=PrincipalType.OPERATOR,
+                ),
+                trust_boundary=TrustBoundary.LOCAL_TRUSTED,
+                capabilities=set(),
+            )
+
+    def test_agent_scope_round_trips_without_using_principal_identity(self) -> None:
+        scope = self._scope(capabilities={MemoryCapability.SEARCH}).model_copy(
+            update={
+                "session_id": "session-a",
+                "agent_id": "agent-memory-a",
+                "principal": Principal(
+                    principal_id="runtime-agent-1",
+                    principal_type=PrincipalType.AGENT,
+                ),
+            }
+        )
+        request = SearchTranscriptRequest(scope=scope, query="cedar")
+
+        round_tripped = SearchTranscriptRequest.model_validate_json(
+            request.model_dump_json()
+        )
+
+        self.assertEqual(round_tripped.scope.agent_id, "agent-memory-a")
+        self.assertEqual(round_tripped.scope.principal.principal_id, "runtime-agent-1")
+        self.assertNotEqual(
+            round_tripped.scope.agent_id,
+            round_tripped.scope.principal.principal_id,
+        )
+
+    def test_scope_selector_includes_agent_identifier_only(self) -> None:
+        selector = MemoryScopeSelector(
+            tenant_id="tenant-a",
+            session_id="session-a",
+            agent_id="agent-memory-a",
+        )
+
+        round_tripped = MemoryScopeSelector.model_validate_json(
+            selector.model_dump_json()
+        )
+
+        self.assertEqual(round_tripped.agent_id, "agent-memory-a")
+        self.assertNotIn("principal", round_tripped.model_dump(mode="json"))
+
+        with self.assertRaises(ValidationError):
+            MemoryScopeSelector(tenant_id="tenant-a", agent_id="")
 
     def test_contract_models_round_trip_as_json_safe_payloads(self) -> None:
         request = SearchLongTermRequest(

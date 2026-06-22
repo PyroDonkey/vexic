@@ -91,6 +91,7 @@ def _ensure_memory_candidate_columns(conn: sqlite3.Connection) -> None:
     if not columns:
         return
 
+    _ensure_column(conn, "memory_candidates", "agent_id", "agent_id TEXT")
     _ensure_column(conn, "memory_candidates", "hit_count", "hit_count INTEGER NOT NULL DEFAULT 1")
     _ensure_column(conn, "memory_candidates", "retrieved_count", "retrieved_count INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "memory_candidates", "used_count", "used_count INTEGER NOT NULL DEFAULT 0")
@@ -196,6 +197,7 @@ def _ensure_long_term_memory(conn: sqlite3.Connection) -> None:
             importance INTEGER NOT NULL CHECK (importance BETWEEN 1 AND 10),
             confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
             source_message_ids TEXT NOT NULL,
+            agent_id TEXT,
             promoted_from_candidate_id INTEGER NOT NULL,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             retrieved_count INTEGER NOT NULL DEFAULT 0,
@@ -207,6 +209,7 @@ def _ensure_long_term_memory(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    _ensure_column(conn, "long_term_memory", "agent_id", "agent_id TEXT")
     # Idempotency backstop for promotion: at most one Tier 3 fact per source
     # candidate. The atomic claim in _promote_candidate is the primary guard;
     # this UNIQUE index is the schema-level safety net so even a racy double
@@ -318,6 +321,7 @@ def _ensure_retrieval_events(conn: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             fact_id INTEGER NOT NULL,
             session_id TEXT NOT NULL,
+            agent_id TEXT,
             query TEXT NOT NULL,
             rewritten_query TEXT,
             keyword_fact_ids TEXT NOT NULL DEFAULT '[]',
@@ -329,6 +333,7 @@ def _ensure_retrieval_events(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    _ensure_column(conn, "retrieval_events", "agent_id", "agent_id TEXT")
     _ensure_column(conn, "retrieval_events", "rewritten_query", "rewritten_query TEXT")
     _ensure_column(
         conn,
@@ -425,6 +430,7 @@ def _ensure_candidate_retrieval_events(conn: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             candidate_id INTEGER NOT NULL,
             session_id TEXT NOT NULL,
+            agent_id TEXT,
             query TEXT NOT NULL,
             retrieved_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             used INTEGER CHECK (used IN (0, 1)),
@@ -432,6 +438,7 @@ def _ensure_candidate_retrieval_events(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    _ensure_column(conn, "candidate_retrieval_events", "agent_id", "agent_id TEXT")
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_candidate_retrieval_events_candidate
@@ -449,6 +456,7 @@ def _ensure_scope_tombstones(conn: sqlite3.Connection) -> None:
             target_project_id TEXT,
             target_user_id TEXT,
             target_session_id TEXT,
+            target_agent_id TEXT,
             created_by_principal_id TEXT NOT NULL,
             created_by_principal_type TEXT NOT NULL,
             reason TEXT NOT NULL,
@@ -461,6 +469,8 @@ def _ensure_scope_tombstones(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    _ensure_column(conn, "scope_tombstones", "target_agent_id", "target_agent_id TEXT")
+    conn.execute("DROP INDEX IF EXISTS idx_scope_tombstones_target")
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_scope_tombstones_target
@@ -468,7 +478,8 @@ def _ensure_scope_tombstones(conn: sqlite3.Connection) -> None:
             target_tenant_id,
             target_project_id,
             target_user_id,
-            target_session_id
+            target_session_id,
+            target_agent_id
         )
         """
     )
@@ -514,6 +525,7 @@ def _ensure_session_summaries(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS session_summaries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL,
+            agent_id TEXT,
             kind TEXT NOT NULL CHECK (kind IN ('leaf', 'condensed')),
             first_message_id INTEGER NOT NULL CHECK (first_message_id >= 1),
             last_message_id INTEGER NOT NULL CHECK (last_message_id >= first_message_id),
@@ -529,10 +541,12 @@ def _ensure_session_summaries(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    _ensure_column(conn, "session_summaries", "agent_id", "agent_id TEXT")
+    conn.execute("DROP INDEX IF EXISTS idx_session_summaries_session_range")
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_session_summaries_session_range
-        ON session_summaries(session_id, first_message_id, last_message_id)
+        ON session_summaries(session_id, agent_id, first_message_id, last_message_id)
         """
     )
 
@@ -545,7 +559,7 @@ def _ensure_vector_memory_schema(conn: sqlite3.Connection) -> None:
     _ensure_long_term_memory_embeddings(conn)
 
 
-def _ensure_source_transcript_ledger(conn: sqlite3.Connection) -> None:
+def _create_source_transcript_ledger(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS source_transcript_ledger (
@@ -553,10 +567,65 @@ def _ensure_source_transcript_ledger(conn: sqlite3.Connection) -> None:
             source_host TEXT NOT NULL,
             source_session_id TEXT NOT NULL,
             source_message_id TEXT NOT NULL,
+            agent_id TEXT,
             message_id INTEGER NOT NULL REFERENCES messages(id),
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE (source_host, source_session_id, source_message_id)
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
+        """
+    )
+
+
+def _source_transcript_ledger_has_legacy_unique(conn: sqlite3.Connection) -> bool:
+    for row in conn.execute("PRAGMA index_list(source_transcript_ledger)"):
+        if not row[2] or (len(row) > 4 and row[4]):
+            continue
+        columns = [
+            column[0]
+            for column in conn.execute(
+                "SELECT name FROM pragma_index_info(?) ORDER BY seqno",
+                (row[1],),
+            )
+        ]
+        if columns == ["source_host", "source_session_id", "source_message_id"]:
+            return True
+    return False
+
+
+def _migrate_source_transcript_ledger_unique(conn: sqlite3.Connection) -> None:
+    if not _source_transcript_ledger_has_legacy_unique(conn):
+        return
+
+    conn.execute("ALTER TABLE source_transcript_ledger RENAME TO source_transcript_ledger_old")
+    _create_source_transcript_ledger(conn)
+    conn.execute(
+        """
+        INSERT INTO source_transcript_ledger
+            (id, source_host, source_session_id, source_message_id,
+             agent_id, message_id, created_at)
+        SELECT id, source_host, source_session_id, source_message_id,
+               agent_id, message_id, created_at
+        FROM source_transcript_ledger_old
+        """
+    )
+    conn.execute("DROP TABLE source_transcript_ledger_old")
+
+
+def _ensure_source_transcript_ledger(conn: sqlite3.Connection) -> None:
+    _create_source_transcript_ledger(conn)
+    _ensure_column(conn, "source_transcript_ledger", "agent_id", "agent_id TEXT")
+    _migrate_source_transcript_ledger_unique(conn)
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_source_transcript_ledger_agent_unique
+        ON source_transcript_ledger(source_host, source_session_id, source_message_id, agent_id)
+        WHERE agent_id IS NOT NULL
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_source_transcript_ledger_shared_unique
+        ON source_transcript_ledger(source_host, source_session_id, source_message_id)
+        WHERE agent_id IS NULL
         """
     )
 
@@ -579,16 +648,24 @@ def init_db(db_path: str) -> None:
                 CREATE TABLE IF NOT EXISTS messages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     session_id TEXT NOT NULL DEFAULT 'default',
+                    agent_id TEXT,
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                     message_json TEXT NOT NULL
                 )
                 """
             )
             _ensure_column(conn, "messages", "session_id", "session_id TEXT NOT NULL DEFAULT 'default'")
+            _ensure_column(conn, "messages", "agent_id", "agent_id TEXT")
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_messages_session_id_id
                 ON messages(session_id, id)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_messages_session_agent_id
+                ON messages(session_id, agent_id, id)
                 """
             )
 
@@ -608,6 +685,7 @@ def init_db(db_path: str) -> None:
                     importance INTEGER NOT NULL CHECK (importance BETWEEN 1 AND 10),
                     confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
                     source_message_ids TEXT NOT NULL,
+                    agent_id TEXT,
                     hit_count INTEGER NOT NULL DEFAULT 1,
                     retrieved_count INTEGER NOT NULL DEFAULT 0,
                     used_count INTEGER NOT NULL DEFAULT 0,
@@ -637,6 +715,7 @@ def init_db(db_path: str) -> None:
                     started_at DATETIME NOT NULL,
                     finished_at DATETIME,
                     status TEXT NOT NULL CHECK (status IN ('ok', 'error', 'partial')),
+                    agent_id TEXT,
                     messages_processed INTEGER NOT NULL DEFAULT 0 CHECK (messages_processed >= 0),
                     candidates_inserted INTEGER NOT NULL DEFAULT 0 CHECK (candidates_inserted >= 0),
                     candidates_merged INTEGER NOT NULL DEFAULT 0 CHECK (candidates_merged >= 0),
@@ -647,6 +726,7 @@ def init_db(db_path: str) -> None:
                 """
             )
             _ensure_column(conn, "dream_runs", "candidates_merged", "candidates_merged INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(conn, "dream_runs", "agent_id", "agent_id TEXT")
             _ensure_column(conn, "dream_runs", "candidates_review", "candidates_review INTEGER NOT NULL DEFAULT 0")
             _ensure_column(conn, "dream_runs", "candidates_boosted", "candidates_boosted INTEGER NOT NULL DEFAULT 0")
             _ensure_column(conn, "dream_runs", "promotions", "promotions INTEGER NOT NULL DEFAULT 0")
@@ -656,8 +736,20 @@ def init_db(db_path: str) -> None:
             _ensure_column(conn, "dream_runs", "output_tokens", "output_tokens INTEGER NOT NULL DEFAULT 0")
             _ensure_column(conn, "dream_runs", "total_tokens", "total_tokens INTEGER NOT NULL DEFAULT 0")
             _ensure_column(conn, "dream_runs", "estimated_cost_micros", "estimated_cost_micros INTEGER NOT NULL DEFAULT 0")
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_dream_runs_agent_status_watermark
+                ON dream_runs(agent_id, status, last_processed_message_id)
+                """
+            )
 
             _ensure_long_term_memory(conn)
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_long_term_memory_agent_active
+                ON long_term_memory(agent_id, retired, id)
+                """
+            )
             _ensure_retrieval_events(conn)
             _ensure_candidate_retrieval_events(conn)
             _ensure_scope_tombstones(conn)

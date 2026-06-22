@@ -92,6 +92,7 @@ async def run_light_phase(
     db_path: str,
     model_group: str,
     batch_size: int = LIGHT_PHASE_BATCH_SIZE,
+    agent_id: str | None = None,
     secrets: Mapping[str, str] | None = None,
     extraction_agent_factory: AgentFactory | None = None,
     embed: EmbedTexts | None = None,
@@ -106,12 +107,13 @@ async def run_light_phase(
 
     try:
         init_db(db_path)
-        watermark = get_watermark(db_path)
+        watermark = get_watermark(db_path, agent_id=agent_id)
 
         rows = load_messages_since(
             db_path,
             watermark,
             limit=batch_size,
+            agent_id=agent_id,
             exclude_session_prefixes=("onboarding:",),
         )
         if not rows:
@@ -126,6 +128,7 @@ async def run_light_phase(
             commit_dream_cycle(
                 db_path,
                 [],
+                agent_id=agent_id,
                 status="ok",
                 started_at=started_at,
                 finished_at=utc_now_iso(),
@@ -159,6 +162,7 @@ async def run_light_phase(
         commit_dream_cycle(
             db_path,
             candidates,
+            agent_id=agent_id,
             status="ok",
             started_at=started_at,
             finished_at=utc_now_iso(),
@@ -178,6 +182,7 @@ async def run_light_phase(
         commit_dream_cycle(
             db_path,
             [],
+            agent_id=agent_id,
             status="error",
             started_at=started_at,
             finished_at=utc_now_iso(),
@@ -196,10 +201,11 @@ def _main() -> None:
     parser = argparse.ArgumentParser(description="Run the Light memory extraction phase once.")
     parser.add_argument("--db", required=True, help="Path to a Vexic SQLite memory database.")
     parser.add_argument("--model-group", required=True, help="Host model group label.")
+    parser.add_argument("--agent-id", help="Optional agent memory scope. Omit for shared scope.")
     args = parser.parse_args()
 
     try:
-        asyncio.run(run_light_phase(args.db, args.model_group))
+        asyncio.run(run_light_phase(args.db, args.model_group, agent_id=args.agent_id))
     except HostPortNotConfigured as exc:
         parser.exit(2, f"{exc}\n")
 

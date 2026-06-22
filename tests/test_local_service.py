@@ -16,6 +16,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.usage import RequestUsage
 
 from vexic.contract import (
+    AppendTranscriptRequest,
     ExpandHistoryRequest,
     DeleteScopeRequest,
     DreamPhase,
@@ -61,16 +62,22 @@ def _unit_vector(first: float) -> list[float]:
     return vector
 
 
-def _scope(*, session_id: str = "default") -> MemoryScope:
+def _scope(
+    *,
+    session_id: str = "default",
+    agent_id: str | None = None,
+    capabilities: set[MemoryCapability] | None = None,
+) -> MemoryScope:
     return MemoryScope(
         tenant_id="tenant-a",
         session_id=session_id,
+        agent_id=agent_id,
         principal=Principal(
             principal_id="test-operator",
             principal_type=PrincipalType.OPERATOR,
         ),
         trust_boundary=TrustBoundary.LOCAL_TRUSTED,
-        capabilities={MemoryCapability.SEARCH},
+        capabilities=capabilities or {MemoryCapability.SEARCH},
     )
 
 
@@ -104,6 +111,67 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(result.hits), 1)
         self.assertIn("telegram cedar detail", result.hits[0].body)
+
+    async def test_transcript_operations_use_exact_agent_scope(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+
+        async def append(agent_id: str | None, text: str) -> int:
+            result = await service.append_transcript(
+                AppendTranscriptRequest(
+                    scope=_scope(
+                        session_id="session-a",
+                        agent_id=agent_id,
+                        capabilities={MemoryCapability.WRITE},
+                    ),
+                    messages_json=[
+                        single_message_adapter.dump_json(
+                            ModelRequest(parts=[UserPromptPart(content=text)])
+                        ).decode()
+                    ],
+                    redaction=RedactionContext(forbidden_values=()),
+                )
+            )
+            return result.message_ids[0]
+
+        agent_a_id = await append("agent-a", "cedar agent a detail")
+        await append("agent-b", "cedar agent b detail")
+        await append(None, "cedar shared detail")
+
+        agent_a = await service.search_transcript(
+            SearchTranscriptRequest(
+                scope=_scope(session_id="session-a", agent_id="agent-a"),
+                query="cedar",
+            )
+        )
+        shared = await service.search_transcript(
+            SearchTranscriptRequest(
+                scope=_scope(session_id="session-a", agent_id=None),
+                query="cedar",
+            )
+        )
+        expanded = await service.expand_history(
+            ExpandHistoryRequest(
+                scope=_scope(
+                    session_id="session-a",
+                    agent_id="agent-a",
+                    capabilities={MemoryCapability.EXPAND_HISTORY},
+                ),
+                first_message_id=1,
+                last_message_id=3,
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+
+        self.assertEqual([hit.message_id for hit in agent_a.hits], [agent_a_id])
+        self.assertIn("agent a", agent_a.hits[0].body)
+        self.assertEqual(len(shared.hits), 1)
+        self.assertIn("shared", shared.hits[0].body)
+        self.assertIn("agent a", expanded.text)
+        self.assertNotIn("agent b", expanded.text)
+        self.assertNotIn("shared", expanded.text)
 
     async def test_search_transcript_honors_limit_above_storage_default(self) -> None:
         from vexic.service import LocalMemoryService
@@ -167,6 +235,7 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                 )
             ],
             candidate_embeddings=[_unit_vector(1.0)],
+            agent_id=None,
             status="ok",
             started_at="2026-06-01T00:00:00+00:00",
             finished_at="2026-06-01T00:00:01+00:00",
@@ -187,6 +256,132 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result.facts), 1)
         self.assertEqual(result.facts[0].category, MemoryCategory.PREFERENCE)
         self.assertEqual(result.facts[0].fact_text, "Ryan prefers compact reports.")
+
+    async def test_search_long_term_uses_exact_agent_scope_for_facts(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(
+            db_path=self.db_path,
+            tenant_id="tenant-a",
+            embed=lambda texts: [_unit_vector(1.0) for _ in texts],
+        )
+        service.init_schema()
+        for message_id, agent_id, fact_text in (
+            (1, "agent-a", "Ryan agent a cedar fact."),
+            (2, "agent-b", "Ryan agent b cedar fact."),
+            (3, None, "Ryan shared cedar fact."),
+        ):
+            commit_dream_cycle(
+                self.db_path,
+                [
+                    FactCandidate(
+                        fact_text=fact_text,
+                        subject="Ryan",
+                        category="fact",
+                        importance=6,
+                        confidence=0.8,
+                        source_message_ids=[message_id],
+                    )
+                ],
+                candidate_embeddings=[_unit_vector(1.0)],
+                agent_id=agent_id,
+                status="ok",
+                started_at="2026-06-01T00:00:00+00:00",
+                finished_at="2026-06-01T00:00:01+00:00",
+                messages_processed=1,
+                last_processed_message_id=message_id,
+            )
+            commit_deep_cycle(
+                self.db_path,
+                [PromotionDecision(candidate_id=message_id, embedding=_unit_vector(1.0))],
+                started_at="2026-06-01T00:01:00+00:00",
+                finished_at="2026-06-01T00:01:01+00:00",
+            )
+
+        results = {
+            agent_id: await service.search_long_term(
+                SearchLongTermRequest(scope=_scope(agent_id=agent_id), query="cedar")
+            )
+            for agent_id in ("agent-a", "agent-b", None)
+        }
+
+        self.assertEqual(
+            {agent_id: [fact.fact_text for fact in result.facts] for agent_id, result in results.items()},
+            {
+                "agent-a": ["Ryan agent a cedar fact."],
+                "agent-b": ["Ryan agent b cedar fact."],
+                None: ["Ryan shared cedar fact."],
+            },
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            event_agents = conn.execute(
+                """
+                SELECT agent_id, COUNT(*)
+                FROM retrieval_events
+                GROUP BY agent_id
+                """
+            ).fetchall()
+        self.assertEqual(sorted(event_agents, key=lambda row: "" if row[0] is None else row[0]), [(None, 1), ("agent-a", 1), ("agent-b", 1)])
+
+    async def test_search_long_term_uses_exact_agent_scope_for_candidate_fallback(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(
+            db_path=self.db_path,
+            tenant_id="tenant-a",
+            embed=lambda texts: [_unit_vector(1.0) for _ in texts],
+        )
+        service.init_schema()
+        for message_id, agent_id, fact_text in (
+            (1, "agent-a", "Ryan agent a cedar candidate."),
+            (2, "agent-b", "Ryan agent b cedar candidate."),
+            (3, None, "Ryan shared cedar candidate."),
+        ):
+            commit_dream_cycle(
+                self.db_path,
+                [
+                    FactCandidate(
+                        fact_text=fact_text,
+                        subject="Ryan",
+                        category="fact",
+                        importance=6,
+                        confidence=0.8,
+                        source_message_ids=[message_id],
+                    )
+                ],
+                candidate_embeddings=[_unit_vector(1.0)],
+                agent_id=agent_id,
+                status="ok",
+                started_at="2026-06-01T00:00:00+00:00",
+                finished_at="2026-06-01T00:00:01+00:00",
+                messages_processed=1,
+                last_processed_message_id=message_id,
+            )
+
+        results = {
+            agent_id: await service.search_long_term(
+                SearchLongTermRequest(scope=_scope(agent_id=agent_id), query="cedar")
+            )
+            for agent_id in ("agent-a", "agent-b", None)
+        }
+
+        self.assertEqual(
+            {agent_id: [note.fact_text for note in result.candidate_notes] for agent_id, result in results.items()},
+            {
+                "agent-a": ["Ryan agent a cedar candidate."],
+                "agent-b": ["Ryan agent b cedar candidate."],
+                None: ["Ryan shared cedar candidate."],
+            },
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            event_agents = conn.execute(
+                """
+                SELECT agent_id, COUNT(*)
+                FROM candidate_retrieval_events
+                GROUP BY agent_id
+                """
+            ).fetchall()
+        self.assertEqual(sorted(event_agents, key=lambda row: "" if row[0] is None else row[0]), [(None, 1), ("agent-a", 1), ("agent-b", 1)])
 
     async def test_search_long_term_rejects_wrong_embedder_result_count(self) -> None:
         from vexic.service import LocalMemoryService
@@ -298,6 +493,52 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
+    async def test_agent_tombstone_blocks_only_matching_agent_scope(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        for agent_id, content in (
+            ("agent-a", "cedar agent a detail"),
+            ("agent-b", "cedar agent b detail"),
+            (None, "cedar shared detail"),
+        ):
+            save_messages(
+                self.db_path,
+                [ModelRequest(parts=[UserPromptPart(content=content)])],
+                agent_id=agent_id,
+            )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO scope_tombstones
+                        (target_tenant_id, target_session_id, target_agent_id,
+                         created_by_principal_id, created_by_principal_type, reason)
+                    VALUES ('tenant-a', 'default', 'agent-a',
+                            'operator', 'operator', 'test deletion')
+                    """
+                )
+
+        with self.assertRaisesRegex(PermissionError, "tombstoned"):
+            await service.search_transcript(
+                SearchTranscriptRequest(
+                    scope=_scope(agent_id="agent-a"),
+                    query="cedar",
+                )
+            )
+        agent_b = await service.search_transcript(
+            SearchTranscriptRequest(scope=_scope(agent_id="agent-b"), query="cedar")
+        )
+        shared = await service.search_transcript(
+            SearchTranscriptRequest(scope=_scope(agent_id=None), query="cedar")
+        )
+
+        self.assertEqual(len(agent_b.hits), 1)
+        self.assertIn("agent b", agent_b.hits[0].body)
+        self.assertEqual(len(shared.hits), 1)
+        self.assertIn("shared", shared.hits[0].body)
+
     async def test_tenant_scope_must_match_opened_sqlite_context(self) -> None:
         from vexic.service import LocalMemoryService
 
@@ -359,7 +600,10 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         result = await service.ingest_source_transcript(
             IngestSourceTranscriptRequest(
                 scope=_scope().model_copy(
-                    update={"capabilities": {MemoryCapability.WRITE}}
+                    update={
+                        "agent_id": "agent-a",
+                        "capabilities": {MemoryCapability.WRITE},
+                    }
                 ),
                 messages=[
                     SourceTranscriptMessage(
@@ -378,20 +622,21 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.items[0].status, "inserted")
         self.assertEqual(result.items[0].message_id, 1)
         self.assertEqual(result.items[0].source_host, "claude-code")
-        self.assertEqual(len(search_messages(self.db_path, "cedar")), 1)
+        self.assertEqual(len(search_messages(self.db_path, "cedar")), 0)
+        self.assertEqual(len(search_messages(self.db_path, "cedar", agent_id="agent-a")), 1)
         with closing(sqlite3.connect(self.db_path)) as conn:
             message_columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(messages)")
             }
             ledger_row = conn.execute(
                 """
-                SELECT source_host, source_session_id, source_message_id, message_id
+                SELECT source_host, source_session_id, source_message_id, agent_id, message_id
                 FROM source_transcript_ledger
                 """
             ).fetchone()
 
         self.assertNotIn("source_host", message_columns)
-        self.assertEqual(ledger_row, ("claude-code", "session-1", "uuid-1", 1))
+        self.assertEqual(ledger_row, ("claude-code", "session-1", "uuid-1", "agent-a", 1))
 
     async def test_ingest_source_transcript_accepts_assistant_text(self) -> None:
         from vexic.service import LocalMemoryService
@@ -467,6 +712,58 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message_count, 1)
         self.assertEqual(fts_count, 1)
         self.assertEqual(ledger_count, 1)
+
+    async def test_ingest_source_transcript_scopes_source_key_by_agent(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+
+        def request(agent_id: str | None, content: str) -> IngestSourceTranscriptRequest:
+            return IngestSourceTranscriptRequest(
+                scope=_scope().model_copy(
+                    update={
+                        "agent_id": agent_id,
+                        "capabilities": {MemoryCapability.WRITE},
+                    }
+                ),
+                messages=[
+                    SourceTranscriptMessage(
+                        source_host="claude-code",
+                        source_session_id="session-1",
+                        source_message_id="uuid-1",
+                        message_json=single_message_adapter.dump_json(
+                            ModelRequest(parts=[UserPromptPart(content=content)])
+                        ).decode(),
+                    )
+                ],
+                redaction=RedactionContext(forbidden_values=()),
+            )
+
+        inserted = {
+            agent_id: (await service.ingest_source_transcript(request(agent_id, content))).items[0]
+            for agent_id, content in (
+                ("agent-a", "agent a cedar"),
+                ("agent-b", "agent b cedar"),
+                (None, "shared cedar"),
+            )
+        }
+        skipped = {
+            agent_id: (await service.ingest_source_transcript(request(agent_id, content))).items[0]
+            for agent_id, content in (
+                ("agent-a", "agent a retry"),
+                ("agent-b", "agent b retry"),
+                (None, "shared retry"),
+            )
+        }
+
+        self.assertEqual([item.status for item in inserted.values()], ["inserted"] * 3)
+        self.assertEqual([item.status for item in skipped.values()], ["skipped"] * 3)
+        self.assertEqual(
+            {agent_id: item.message_id for agent_id, item in skipped.items()},
+            {agent_id: item.message_id for agent_id, item in inserted.items()},
+        )
+        self.assertEqual(len(set(item.message_id for item in inserted.values())), 3)
 
     async def test_ingest_source_transcript_partial_retry_inserts_only_missing_rows(self) -> None:
         from vexic.service import LocalMemoryService

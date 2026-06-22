@@ -38,6 +38,8 @@ is a consumer, not a dependency.
   canonical rows and code.
 - Explicit scope: requests carry `MemoryScope`, and the local adapter validates
   the opened SQLite context against it.
+- Agent isolation: `agent_id` is an optional `MemoryScope` refinement. `NULL`
+  means shared memory inside the same parent scope, never a wildcard.
 - Host-neutral core: providers, embeddings, secrets, auth, and managed
   operations live in adapters or hosts.
 
@@ -60,10 +62,12 @@ is a consumer, not a dependency.
 - Writers append serialized Pydantic AI messages.
 - Existing rows are never updated or deleted.
 - Stored text is cleaned replay material, not raw provider payload.
+- Agent scope is stored as nullable `agent_id`; existing `NULL` rows are shared
+  agent-scope transcript rows and are not backfilled.
 - `source_transcript_ledger` records idempotent host-recorder source keys and
   points to `messages`; source columns do not live on `messages`.
 - `messages_fts` is a rebuildable FTS5 projection over clean user/assistant
-  text.
+  text and transcript scope metadata.
 - Session-scoped transcript search maps to `SearchTranscriptRequest`.
 - Verbatim egress maps to `ExpandHistoryRequest` and requires privileged
   capability plus redaction context.
@@ -108,6 +112,9 @@ structured `FactCandidate` output, validates source ids, embeds fact text
 through a host-supplied embedding port, and commits candidate inserts/merges
 with a `dream_runs` audit row.
 
+Dream watermarks are scoped by compatible memory scope including `agent_id`.
+Existing `NULL` dream-run rows are shared agent-scope progress rows.
+
 ### REM
 
 `vexic.rem.run_rem_phase` loads active unpromoted candidates and asks a
@@ -126,8 +133,9 @@ Vexic has two retrieval families.
 
 ### Transcript Search
 
-Transcript search reads `messages_fts`, scoped by session, and returns clean
-message hits with message-id provenance.
+Transcript search reads `messages_fts`, scoped by session and agent scope, and
+returns clean message hits with message-id provenance. Agent-specific reads do
+not implicitly union shared rows; shared memory is fetched explicitly.
 
 ### Long-term Search
 
@@ -171,6 +179,11 @@ Current local isolation is one opened SQLite database per memory context, with
 `LocalMemoryService` validating `MemoryScope.tenant_id` against the service's
 configured tenant id. Future hosted storage must satisfy the same behavior and
 scope contract, but does not need to match the physical SQLite schema.
+
+SQLite schema migrations add nullable `agent_id` columns to scope-bearing
+canonical rows, projections, and telemetry. Rebuildable projections may be
+recreated from canonical rows; append-only transcript rows are not updated to
+assign agent scope.
 
 Hosted v1 extends that posture as one isolated SQLite-compatible Customer
 Memory Database per customer tenant. The hosted adapter owns routing,

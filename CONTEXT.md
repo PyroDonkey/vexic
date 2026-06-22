@@ -38,8 +38,19 @@ _Avoid_: Memory core
 
 **Memory Scope**:
 The customer-visible boundary that limits which tenant, project, user, or
-session memory a caller may access.
+session memory a caller may access. Agent identity can further refine this
+scope when a host runs multiple agents inside the same parent memory boundary.
 _Avoid_: Account, workspace
+
+**Agent Scope**:
+The optional memory refinement that separates one agent's private memory from
+shared memory inside the same tenant, project, user, and session parent scope.
+_Avoid_: Principal, actor identity
+
+**Shared Agent Scope**:
+Memory rows with no `agent_id`, visible only when callers explicitly request
+the shared scope for the same parent memory boundary.
+_Avoid_: Wildcard, legacy unscoped memory
 
 **Customer Memory Database**:
 The isolated storage boundary that contains one customer tenant's Vexic memory
