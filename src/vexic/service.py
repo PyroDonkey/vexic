@@ -5,6 +5,7 @@ import os
 import sqlite3
 import tempfile
 import uuid
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import closing
 from pathlib import Path
 
@@ -61,6 +62,25 @@ from vexic.storage import (
 from vexic.storage.longterm import record_fact_use_verdict, record_long_term_retrieval
 from vexic.storage.operators import repair_memory_projections
 from vexic.subagents.retrieval import retrieve_candidate_fallback, retrieve_long_term_facts
+
+def _iter_payload_strings(value: object) -> Iterator[str]:
+    """Yield every raw string (mapping keys and values) in a JSON-able payload.
+
+    The redaction guard is a plain substring check, so it must run against the
+    unescaped values. Serialized JSON can escape forbidden secrets (newlines to
+    `\\n`, non-ASCII to `\\uXXXX`) and hide them from the substring match.
+    """
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, Mapping):
+        for key, item in value.items():
+            if isinstance(key, str):
+                yield key
+            yield from _iter_payload_strings(item)
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for item in value:
+            yield from _iter_payload_strings(item)
+
 
 EXPAND_HISTORY_MAX_ROWS = 2_000
 _TOMBSTONE_FLAG_COLUMNS = {
@@ -142,7 +162,14 @@ class LocalMemoryService(MemoryService):
         forbidden_secret_values: tuple[str, ...],
     ) -> str:
         text = json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True)
-        assert_no_forbidden_secret_values(forbidden_secret_values, text)
+        # Check the structured (unescaped) strings first: the substring guard
+        # cannot see secrets hidden behind JSON escaping. The serialized text is
+        # checked too as a belt-and-suspenders pass.
+        assert_no_forbidden_secret_values(
+            forbidden_secret_values,
+            *_iter_payload_strings(payload),
+            text,
+        )
         path = self._artifact_path(kind)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as artifact:
@@ -435,15 +462,19 @@ class LocalMemoryService(MemoryService):
     ) -> RecordRetrievalEventResult:
         init_db(self.db_path)
         self._authorize(request.scope, request.required_capability)
-        self._assert_not_tombstoned(
-            self._with_default_session(request.scope),
-            "retrieval",
-        )
         if (
             request.scope.session_id is not None
             and request.scope.session_id != request.event.session_id
         ):
             raise PermissionError("Retrieval event session_id is outside memory scope.")
+        # The event is persisted under request.event.session_id, so the tombstone
+        # check must run against that exact session. Using the defaulted scope
+        # session would let a session-specific tombstone be bypassed whenever the
+        # caller omits scope.session_id.
+        self._assert_not_tombstoned(
+            request.scope.model_copy(update={"session_id": request.event.session_id}),
+            "retrieval",
+        )
         event_ids = record_long_term_retrieval(
             self.db_path,
             [request.event.referent_id],
