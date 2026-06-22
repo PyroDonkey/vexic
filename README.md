@@ -117,4 +117,6 @@ adapter-owned telemetry sink. Concrete tenant provisioning and API-key storage
 live in adapters outside `src/vexic`.
 It is an internal in-process boundary, not a public HTTP service. See
 `docs/hosted-mvp.md`. External customer-memory readiness is blocked by the
-hosted readiness gate in Linear.
+hosted readiness gate
+([COA-177](https://linear.app/ryan-boissonnault/issue/COA-177/define-hosted-security-privacy-backup-and-abuse-readiness-gate))
+in Linear.
