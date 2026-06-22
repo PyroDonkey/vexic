@@ -498,6 +498,38 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertGreaterEqual(caught.exception.retry_after_seconds, 1)
 
+    def test_rate_limiter_defers_prune_until_oldest_bucket_expires(self) -> None:
+        prune_calls = 0
+        now = 0.0
+
+        class CountingRateLimiter(HostedInMemoryRateLimiter):
+            def _prune(self, current_time: float) -> None:
+                nonlocal prune_calls
+                prune_calls += 1
+                super()._prune(current_time)
+
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.SEARCH},
+        )
+        limiter = CountingRateLimiter(
+            default_rule=HostedRateLimitRule(limit=10, window_seconds=10),
+            clock=lambda: now,
+        )
+        auth = self.keys.authenticate(api_key.raw_key)
+
+        limiter.check("search_transcript", auth)
+        now = 1.0
+        limiter.check("search_transcript", auth)
+
+        self.assertEqual(prune_calls, 0)
+
+        now = 10.0
+        limiter.check("search_transcript", auth)
+
+        self.assertEqual(prune_calls, 1)
+
     def test_tenant_database_path_is_catalog_mapped_not_tenant_interpolated(self) -> None:
         tenant = self.catalog.provision_tenant("../tenant-a", project_ids={"project-a"})
 

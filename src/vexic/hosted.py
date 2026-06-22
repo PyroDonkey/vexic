@@ -154,6 +154,7 @@ class HostedInMemoryRateLimiter:
         self.clock = clock
         self._lock = threading.Lock()
         self._buckets: dict[tuple[str, str, str, str], _RateBucket] = {}
+        self._next_prune_at = float("inf")
 
     def check(self, operation: str, auth: HostedAuthContext) -> None:
         rule = self.operation_rules.get(operation, self.default_rule)
@@ -165,19 +166,24 @@ class HostedInMemoryRateLimiter:
             operation,
         )
         with self._lock:
-            self._prune(now)
+            if now >= self._next_prune_at:
+                self._prune(now)
             bucket = self._buckets.get(key)
             if bucket is None:
                 if len(self._buckets) >= self.max_buckets:
                     raise HostedRateLimitExceeded(self._shortest_retry_after(now))
+                expires_at = now + rule.window_seconds
                 self._buckets[key] = _RateBucket(
                     count=1,
-                    expires_at=now + rule.window_seconds,
+                    expires_at=expires_at,
                 )
+                self._next_prune_at = min(self._next_prune_at, expires_at)
                 return
             if bucket.expires_at <= now:
+                expires_at = now + rule.window_seconds
                 bucket.count = 1
-                bucket.expires_at = now + rule.window_seconds
+                bucket.expires_at = expires_at
+                self._next_prune_at = min(self._next_prune_at, expires_at)
                 return
             if bucket.count >= rule.limit:
                 raise HostedRateLimitExceeded(int(bucket.expires_at - now) + 1)
@@ -192,6 +198,10 @@ class HostedInMemoryRateLimiter:
         # ponytail: O(n) prune is fine for staging; production needs a durable limiter.
         for key in expired:
             del self._buckets[key]
+        self._next_prune_at = min(
+            (bucket.expires_at for bucket in self._buckets.values()),
+            default=float("inf"),
+        )
 
     def _shortest_retry_after(self, now: float) -> int:
         return min(
