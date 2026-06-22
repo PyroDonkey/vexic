@@ -235,6 +235,7 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                 )
             ],
             candidate_embeddings=[_unit_vector(1.0)],
+            agent_id=None,
             status="ok",
             started_at="2026-06-01T00:00:00+00:00",
             finished_at="2026-06-01T00:00:01+00:00",

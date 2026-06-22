@@ -655,11 +655,12 @@ def load_messages_since(
     after_id: int,
     limit: int | None = None,
     *,
+    agent_id: str | None = None,
     exclude_session_prefixes: tuple[str, ...] = (),
 ) -> list[tuple[int, ModelMessage]]:
     with closing(sqlite3.connect(db_path)) as conn:
-        filters = ["id > ?"]
-        params: list[object] = [after_id]
+        filters = ["id > ?", "agent_id IS ?"]
+        params: list[object] = [after_id, agent_id]
         for prefix in exclude_session_prefixes:
             filters.append("session_id NOT LIKE ?")
             params.append(f"{prefix}%")
@@ -692,9 +693,15 @@ def load_messages_since(
         ]
 
 
-def get_watermark(db_path: str) -> int:
+def get_watermark(db_path: str, *, agent_id: str | None) -> int:
     with closing(sqlite3.connect(db_path)) as conn:
         row = conn.execute(
-            "SELECT MAX(last_processed_message_id) FROM dream_runs WHERE status = 'ok'"
+            """
+            SELECT MAX(last_processed_message_id)
+            FROM dream_runs
+            WHERE agent_id IS ?
+                AND status = 'ok'
+            """,
+            (agent_id,),
         ).fetchone()
         return row[0] if row[0] is not None else 0

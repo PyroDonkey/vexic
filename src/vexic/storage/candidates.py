@@ -101,6 +101,8 @@ def _nearest_candidate(
     conn: sqlite3.Connection,
     candidate: FactCandidate,
     embedding: list[float],
+    *,
+    agent_id: str | None,
 ) -> DedupMatch | None:
     rows = conn.execute(
         """
@@ -115,6 +117,7 @@ def _nearest_candidate(
             AND c.retired = 0
             AND c.stale = 0
             AND c.needs_review = 0
+            AND c.agent_id IS ?
         ORDER BY distance
         """,
         (
@@ -122,6 +125,7 @@ def _nearest_candidate(
             DEDUP_NEIGHBOR_COUNT,
             candidate.subject,
             candidate.category,
+            agent_id,
         ),
     ).fetchall()
 
@@ -166,6 +170,7 @@ def _insert_candidate(
     candidate: FactCandidate,
     embedding: list[float],
     *,
+    agent_id: str | None,
     needs_review: bool,
     review_neighbor_id: int | None,
     best_similarity: float | None,
@@ -174,9 +179,9 @@ def _insert_candidate(
         """
         INSERT INTO memory_candidates
             (fact_text, subject, category, importance, confidence,
-             source_message_ids, editable, needs_review, review_neighbor_id,
+             source_message_ids, agent_id, editable, needs_review, review_neighbor_id,
              best_similarity, last_seen_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """,
         (
             candidate.fact_text,
@@ -185,6 +190,7 @@ def _insert_candidate(
             candidate.importance,
             candidate.confidence,
             json.dumps(sorted(set(candidate.source_message_ids))),
+            agent_id,
             candidate.editable,
             needs_review,
             review_neighbor_id,
@@ -362,6 +368,8 @@ def _commit_candidates_with_dedup(
     conn: sqlite3.Connection,
     candidates: list[FactCandidate],
     candidate_embeddings: list[list[float]],
+    *,
+    agent_id: str | None,
 ) -> DedupStats:
     inserted = 0
     merged = 0
@@ -372,12 +380,13 @@ def _commit_candidates_with_dedup(
             raise ValueError(f"Expected {EMBEDDING_DIM}-dim embedding; got {len(embedding)}.")
 
         embedding = _normalize_embedding(embedding)
-        match = _nearest_candidate(conn, candidate, embedding)
+        match = _nearest_candidate(conn, candidate, embedding, agent_id=agent_id)
         if match is None or match.similarity < DEDUP_NO_MATCH_THRESHOLD:
             candidate_id = _insert_candidate(
                 conn,
                 candidate,
                 embedding,
+                agent_id=agent_id,
                 needs_review=False,
                 review_neighbor_id=None,
                 best_similarity=None if match is None else match.similarity,
@@ -409,6 +418,7 @@ def _commit_candidates_with_dedup(
                 conn,
                 candidate,
                 embedding,
+                agent_id=agent_id,
                 needs_review=True,
                 review_neighbor_id=match.candidate_id,
                 best_similarity=match.similarity,
@@ -452,6 +462,16 @@ def _load_candidate_by_id(conn: sqlite3.Connection, candidate_id: int) -> FactCa
     )
 
 
+def _candidate_agent_id(conn: sqlite3.Connection, candidate_id: int) -> str | None:
+    row = conn.execute(
+        "SELECT agent_id FROM memory_candidates WHERE id = ?",
+        (candidate_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"Missing memory candidate {candidate_id}.")
+    return row[0]
+
+
 def backfill_missing_candidate_embeddings(
     db_path: str,
     candidate_embeddings: list[tuple[int, list[float]]],
@@ -469,7 +489,12 @@ def backfill_missing_candidate_embeddings(
                 candidate = _load_candidate_by_id(conn, candidate_id)
                 _guard_candidate_texts(forbidden_secret_values, [candidate])
                 embedding = _normalize_embedding(embedding)
-                match = _nearest_candidate(conn, candidate, embedding)
+                match = _nearest_candidate(
+                    conn,
+                    candidate,
+                    embedding,
+                    agent_id=_candidate_agent_id(conn, candidate_id),
+                )
 
                 if match is None or match.similarity < DEDUP_NO_MATCH_THRESHOLD:
                     _replace_candidate_embedding(conn, candidate_id, embedding)
@@ -723,7 +748,7 @@ def load_promotion_candidates(db_path: str) -> list[PromotionCandidate]:
     ]
 
 
-def load_rem_candidates(db_path: str) -> list[RemCandidate]:
+def load_rem_candidates(db_path: str, *, agent_id: str | None) -> list[RemCandidate]:
     init_db(db_path)
     with closing(sqlite3.connect(db_path)) as conn:
         rows = conn.execute(
@@ -734,8 +759,10 @@ def load_rem_candidates(db_path: str) -> list[RemCandidate]:
                 AND retired = 0
                 AND stale = 0
                 AND needs_review = 0
+                AND agent_id IS ?
             ORDER BY id ASC
-            """
+            """,
+            (agent_id,),
         ).fetchall()
 
     return [
@@ -752,6 +779,7 @@ def commit_rem_cycle(
     db_path: str,
     boosts: dict[int, float],
     *,
+    agent_id: str | None,
     started_at: str,
     finished_at: str | None,
     status: DreamStatus = "ok",
@@ -780,27 +808,29 @@ def commit_rem_cycle(
                     UPDATE memory_candidates
                     SET rem_boost = ?
                     WHERE id = ?
+                        AND agent_id IS ?
                         AND promoted = 0
                         AND retired = 0
                         AND stale = 0
                     """,
-                    (boost, candidate_id),
+                    (boost, candidate_id, agent_id),
                 )
                 boosted += updated.rowcount
 
             conn.execute(
                 """
                 INSERT INTO dream_runs
-                    (started_at, finished_at, status, messages_processed,
+                    (started_at, finished_at, status, agent_id, messages_processed,
                      last_processed_message_id, candidates_boosted, error_detail,
                      model_requests, input_tokens, output_tokens, total_tokens,
                      estimated_cost_micros)
-                VALUES (?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     started_at,
                     finished_at,
                     status,
+                    agent_id,
                     boosted,
                     error_detail,
                     model_requests,
@@ -818,6 +848,7 @@ def commit_dream_cycle(
     db_path: str,
     candidates: list[FactCandidate],
     *,
+    agent_id: str | None,
     status: DreamStatus,
     started_at: str,
     finished_at: str | None,
@@ -851,21 +882,23 @@ def commit_dream_cycle(
                     conn,
                     candidates,
                     candidate_embeddings or [],
+                    agent_id=agent_id,
                 )
 
             conn.execute(
                 """
                 INSERT INTO dream_runs
-                    (started_at, finished_at, status, messages_processed,
+                    (started_at, finished_at, status, agent_id, messages_processed,
                      candidates_inserted, candidates_merged, candidates_review,
                      last_processed_message_id, error_detail, model_requests,
                      input_tokens, output_tokens, total_tokens, estimated_cost_micros)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     started_at,
                     finished_at,
                     status,
+                    agent_id,
                     messages_processed,
                     stats.inserted + stats.review,
                     stats.merged,

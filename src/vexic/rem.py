@@ -97,6 +97,7 @@ async def run_rem_phase(
     db_path: str,
     model_group: str,
     *,
+    agent_id: str | None = None,
     secrets: Mapping[str, str] | None = None,
     max_candidates_per_batch: int = REM_MAX_CANDIDATES_PER_BATCH,
     max_prompt_tokens_per_batch: int = REM_MAX_PROMPT_TOKENS_PER_BATCH,
@@ -111,11 +112,12 @@ async def run_rem_phase(
         if max_prompt_tokens_per_batch <= 0:
             raise ValueError("max_prompt_tokens_per_batch must be greater than 0.")
 
-        candidates = load_rem_candidates(db_path)
+        candidates = load_rem_candidates(db_path, agent_id=agent_id)
         if not candidates:
             commit_rem_cycle(
                 db_path,
                 {},
+                agent_id=agent_id,
                 started_at=started_at,
                 finished_at=utc_now_iso(),
                 status="ok",
@@ -154,6 +156,7 @@ async def run_rem_phase(
         stats = commit_rem_cycle(
             db_path,
             boosts,
+            agent_id=agent_id,
             started_at=started_at,
             finished_at=utc_now_iso(),
             status="ok",
@@ -170,6 +173,7 @@ async def run_rem_phase(
             commit_rem_cycle(
                 db_path,
                 {},
+                agent_id=agent_id,
                 started_at=started_at,
                 finished_at=utc_now_iso(),
                 status="error",
@@ -191,9 +195,10 @@ def _main() -> None:
     parser = argparse.ArgumentParser(description="Run the REM memory boost phase once.")
     parser.add_argument("--db", required=True, help="Path to a Vexic SQLite memory database.")
     parser.add_argument("--model-group", required=True, help="Host model group label.")
+    parser.add_argument("--agent-id", help="Optional agent memory scope. Omit for shared scope.")
     args = parser.parse_args()
 
-    asyncio.run(run_rem_phase(args.db, args.model_group))
+    asyncio.run(run_rem_phase(args.db, args.model_group, agent_id=args.agent_id))
 
 
 if __name__ == "__main__":
