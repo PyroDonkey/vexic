@@ -394,6 +394,7 @@ class HostedMemoryService:
         capability: MemoryCapability,
         delegate: Callable[[_RequestT], Awaitable[object]],
     ) -> object:
+        auth: HostedAuthContext | None = None
         bound: _RequestT | None = None
         try:
             auth = self.api_keys.authenticate(api_key)
@@ -406,6 +407,7 @@ class HostedMemoryService:
                 bound,
                 status="rate_limited",
                 error_type=type(exc).__name__,
+                auth=auth,
             )
             raise
         except Exception as exc:
@@ -414,6 +416,7 @@ class HostedMemoryService:
                 bound,
                 status="error",
                 error_type=type(exc).__name__,
+                auth=auth,
             )
             raise
         self._record_request(operation, bound, status="ok")
@@ -466,11 +469,19 @@ class HostedMemoryService:
         *,
         status: str,
         error_type: str | None = None,
+        auth: HostedAuthContext | None = None,
     ) -> None:
         if self.telemetry is None:
             return
-        tenant_id = request.scope.tenant_id if request is not None else None
-        principal_id = request.scope.principal.principal_id if request is not None else None
+        if request is not None:
+            tenant_id = request.scope.tenant_id
+            principal_id = request.scope.principal.principal_id
+        elif auth is not None:
+            tenant_id = auth.tenant_id
+            principal_id = auth.principal.principal_id
+        else:
+            tenant_id = None
+            principal_id = None
         recorded_at = _now()
         self.telemetry.record_audit_event(
             HostedAuditEvent(

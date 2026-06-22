@@ -225,6 +225,24 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                 ),
             )
 
+        audit_events = self.catalog.audit_events("tenant-a")
+        usage_events = self.catalog.usage_events("tenant-a")
+        self.assertEqual(len(audit_events), 1)
+        self.assertEqual(audit_events[0].operation, "search_transcript")
+        self.assertEqual(audit_events[0].tenant_id, "tenant-a")
+        self.assertEqual(audit_events[0].principal_id, "agent-a")
+        self.assertEqual(audit_events[0].status, "error")
+        self.assertEqual(audit_events[0].error_type, "PermissionError")
+        self.assertEqual(len(usage_events), 1)
+        self.assertEqual(usage_events[0].kind, "request")
+        self.assertEqual(usage_events[0].operation, "search_transcript")
+        self.assertEqual(usage_events[0].tenant_id, "tenant-a")
+        self.assertEqual(usage_events[0].principal_id, "agent-a")
+        self.assertEqual(usage_events[0].status, "error")
+        self.assertEqual(usage_events[0].error_type, "PermissionError")
+        self.assertNotIn(api_key.raw_key, repr(audit_events) + repr(usage_events))
+        self.assertNotIn("cedar", repr(audit_events) + repr(usage_events))
+
     async def test_api_key_rejects_tenant_switch_and_capability_escalation(self) -> None:
         self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
         self.catalog.provision_tenant("tenant-b", project_ids={"project-b"})
