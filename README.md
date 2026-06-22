@@ -110,9 +110,37 @@ uv run pytest tests/test_memory_reliability.py
 
 <!-- memory-reliability-live-smoke -->
 
-For existing tenant database smoke tests, open a current `memory.db` with the
-Vexic SQLite adapter and verify memory tables continue working without touching
-host-owned extension tables such as `background_tool_audit`.
+The opt-in live provider retrieval smoke is:
+
+```powershell
+uv run --with-editable . python -m vexic.live_retrieval_baseline `
+  --allow-live `
+  --fixture .\longmemeval_s_smoke.jsonl `
+  --adapter .\host_live_adapter.py `
+  --provider openai `
+  --model-group retrieval-smoke `
+  --output-dir .\artifacts\live-retrieval `
+  --max-rows 1 `
+  --max-provider-calls 6 `
+  --timeout-seconds 120
+```
+
+Without `--allow-live`, the command exits 0 before importing the adapter or
+calling providers. The host-owned adapter file supplies `build_extraction_agent`,
+`build_rem_agent`, `build_contradiction_agent`, and `embed_texts`; Vexic core
+does not load provider SDKs or read provider secrets.
+
+Fixture rows are JSONL objects with `id`, `transcript`, `question`, and
+`expected_fact`. `transcript` may be a list of strings or `{ "role": "user" |
+"assistant", "content": "..." }` objects mapped from a host-supplied
+LongMemEval_S artifact. Do not vendor the benchmark artifact into this repo.
+
+The harness runs each row in a disposable SQLite database and writes
+`retrieval_metrics.json` and `answer_synthesis_metrics.json` under
+`--output-dir`. Retrieval metrics classify failures as extraction miss,
+promotion miss, retrieval miss, candidate fallback, or provider/runtime failure;
+answer synthesis is recorded separately as `not_run` with the reserved
+`judge_synthesis_issue` taxonomy slot for this retrieval-only smoke.
 
 ## Hosted MVP Shell
 
