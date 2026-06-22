@@ -53,30 +53,38 @@ class HostedTenantCatalog:
         with closing(self._connect_control()) as conn:
             row = conn.execute(
                 """
-                SELECT db_filename
+                SELECT db_filename, active
                 FROM tenants
-                WHERE tenant_id = ? AND active = 1
+                WHERE tenant_id = ?
                 """,
                 (tenant_id,),
             ).fetchone()
             if row is None:
                 db_filename = self._allocate_db_filename(conn)
-                tenant = HostedTenant(
-                    tenant_id=tenant_id,
-                    db_path=self.root_path / db_filename,
-                    project_ids=frozenset(),
-                )
-                LocalMemoryService(db_path=str(tenant.db_path), tenant_id=tenant_id).init_schema()
-                self._init_telemetry_schema(tenant.db_path)
                 conn.execute(
                     """
-                    INSERT INTO tenants (tenant_id, db_filename)
-                    VALUES (?, ?)
+                    INSERT INTO tenants (tenant_id, db_filename, active)
+                    VALUES (?, ?, 0)
                     """,
                     (tenant_id, db_filename),
                 )
+                conn.commit()
+                needs_customer_init = True
             else:
                 db_filename = row[0]
+                needs_customer_init = not bool(row[1])
+            if needs_customer_init:
+                tenant_db_path = self.root_path / db_filename
+                LocalMemoryService(db_path=str(tenant_db_path), tenant_id=tenant_id).init_schema()
+                self._init_telemetry_schema(tenant_db_path)
+            conn.execute(
+                """
+                UPDATE tenants
+                SET active = 1
+                WHERE tenant_id = ?
+                """,
+                (tenant_id,),
+            )
             self._insert_projects(conn, tenant_id, project_ids)
             conn.commit()
             return self._tenant_from_filename(conn, tenant_id, db_filename)

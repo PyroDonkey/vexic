@@ -1,7 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
@@ -697,6 +700,41 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-b"})
 
         self.assertEqual(tenant.project_ids, frozenset({"project-a", "project-b"}))
+
+    def test_inactive_tenant_can_be_provisioned_again_with_existing_database(self) -> None:
+        original = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        with closing(sqlite3.connect(Path(self.temp_dir.name) / "control-plane.db")) as conn:
+            conn.execute("UPDATE tenants SET active = 0 WHERE tenant_id = ?", ("tenant-a",))
+            conn.commit()
+
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-b"})
+
+        self.assertEqual(tenant.db_path, original.db_path)
+        self.assertEqual(tenant.project_ids, frozenset({"project-a", "project-b"}))
+        self.assertEqual(self.catalog.get_tenant("tenant-a"), tenant)
+
+    def test_failed_tenant_initialization_retries_existing_database_path(self) -> None:
+        created_paths: list[Path] = []
+
+        def fail_once(service: object) -> None:
+            db_path = Path(getattr(service, "db_path"))
+            created_paths.append(db_path)
+            db_path.touch()
+            raise RuntimeError("customer db init failed")
+
+        with patch("vexic_hosted_local.LocalMemoryService.init_schema", fail_once):
+            with self.assertRaisesRegex(RuntimeError, "customer db init failed"):
+                self.catalog.provision_tenant("tenant-a")
+
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+
+        self.assertEqual(tenant.db_path, created_paths[0])
+        self.assertEqual(tenant.project_ids, frozenset({"project-a"}))
+        self.assertEqual(self.catalog.get_tenant("tenant-a"), tenant)
+        self.assertEqual(
+            sorted(path.name for path in Path(self.temp_dir.name).glob("customer-*.db")),
+            [created_paths[0].name],
+        )
 
     async def test_dream_job_fails_closed_without_host_port(self) -> None:
         self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
