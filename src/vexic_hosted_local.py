@@ -35,7 +35,8 @@ class HostedTenantCatalog:
     def __init__(self, root_path: str | Path) -> None:
         self.root_path = Path(root_path)
         self.root_path.mkdir(parents=True, exist_ok=True)
-        self._tenants: dict[str, HostedTenant] = {}
+        self._control_db_path = self.root_path / "control-plane.db"
+        self._init_control_plane_schema()
 
     def provision_tenant(
         self,
@@ -45,42 +46,80 @@ class HostedTenantCatalog:
     ) -> HostedTenant:
         if not tenant_id.strip():
             raise ValueError("tenant_id must not be blank.")
-        if tenant_id in self._tenants:
-            tenant = self._tenants[tenant_id]
-            updated = replace(
-                tenant,
-                project_ids=tenant.project_ids | frozenset(project_ids),
+        project_ids = frozenset(project_ids)
+        for project_id in project_ids:
+            if not project_id.strip():
+                raise ValueError("project_id must not be blank.")
+        with closing(self._connect_control()) as conn:
+            row = conn.execute(
+                """
+                SELECT db_filename, active
+                FROM tenants
+                WHERE tenant_id = ?
+                """,
+                (tenant_id,),
+            ).fetchone()
+            if row is None:
+                db_filename = self._allocate_db_filename(conn)
+                conn.execute(
+                    """
+                    INSERT INTO tenants (tenant_id, db_filename, active)
+                    VALUES (?, ?, 0)
+                    """,
+                    (tenant_id, db_filename),
+                )
+                conn.commit()
+                needs_customer_init = True
+            else:
+                db_filename = row[0]
+                needs_customer_init = not bool(row[1])
+            if needs_customer_init:
+                tenant_db_path = self.root_path / db_filename
+                LocalMemoryService(db_path=str(tenant_db_path), tenant_id=tenant_id).init_schema()
+                self._init_telemetry_schema(tenant_db_path)
+            conn.execute(
+                """
+                UPDATE tenants
+                SET active = 1
+                WHERE tenant_id = ?
+                """,
+                (tenant_id,),
             )
-            self._tenants[tenant_id] = updated
-            return updated
-        digest = hashlib.sha256(tenant_id.encode("utf-8")).hexdigest()[:24]
-        tenant = HostedTenant(
-            tenant_id=tenant_id,
-            db_path=self.root_path / f"customer-{digest}.db",
-            project_ids=frozenset(project_ids),
-        )
-        LocalMemoryService(db_path=str(tenant.db_path), tenant_id=tenant_id).init_schema()
-        self._init_telemetry_schema(tenant.db_path)
-        self._tenants[tenant_id] = tenant
-        return tenant
+            self._insert_projects(conn, tenant_id, project_ids)
+            conn.commit()
+            return self._tenant_from_filename(conn, tenant_id, db_filename)
 
     def provision_project(self, tenant_id: str, project_id: str) -> HostedTenant:
         if not project_id.strip():
             raise ValueError("project_id must not be blank.")
-        tenant = self.get_tenant(tenant_id)
-        updated = HostedTenant(
-            tenant_id=tenant.tenant_id,
-            db_path=tenant.db_path,
-            project_ids=tenant.project_ids | {project_id},
-        )
-        self._tenants[tenant_id] = updated
-        return updated
+        with closing(self._connect_control()) as conn:
+            row = conn.execute(
+                """
+                SELECT db_filename
+                FROM tenants
+                WHERE tenant_id = ? AND active = 1
+                """,
+                (tenant_id,),
+            ).fetchone()
+            if row is None:
+                raise PermissionError("Unknown hosted tenant.")
+            self._insert_projects(conn, tenant_id, {project_id})
+            conn.commit()
+            return self._tenant_from_filename(conn, tenant_id, row[0])
 
     def get_tenant(self, tenant_id: str) -> HostedTenant:
-        try:
-            return self._tenants[tenant_id]
-        except KeyError as exc:
-            raise PermissionError("Unknown hosted tenant.") from exc
+        with closing(self._connect_control()) as conn:
+            row = conn.execute(
+                """
+                SELECT db_filename
+                FROM tenants
+                WHERE tenant_id = ? AND active = 1
+                """,
+                (tenant_id,),
+            ).fetchone()
+            if row is None:
+                raise PermissionError("Unknown hosted tenant.")
+            return self._tenant_from_filename(conn, tenant_id, row[0])
 
     def record_audit_event(self, event: HostedAuditEvent) -> None:
         if event.tenant_id is None:
@@ -161,6 +200,87 @@ class HostedTenantCatalog:
                 """
             ).fetchall()
         return [HostedUsageEvent(*row) for row in rows]
+
+    def _connect_control(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self._control_db_path, timeout=30)
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+
+    def _init_control_plane_schema(self) -> None:
+        with closing(self._connect_control()) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS tenants (
+                    tenant_id TEXT PRIMARY KEY,
+                    db_filename TEXT NOT NULL UNIQUE,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS tenant_projects (
+                    tenant_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    PRIMARY KEY (tenant_id, project_id),
+                    FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
+                );
+                """
+            )
+            conn.commit()
+
+    def _allocate_db_filename(self, conn: sqlite3.Connection) -> str:
+        # ponytail: local staging assumes serialized provisioning; retry INSERT on
+        # IntegrityError if concurrent tenant creation becomes a real workload.
+        for _ in range(100):
+            db_filename = f"customer-{secrets.token_hex(16)}.db"
+            exists = conn.execute(
+                """
+                SELECT 1
+                FROM tenants
+                WHERE db_filename = ?
+                """,
+                (db_filename,),
+            ).fetchone()
+            if exists is None:
+                return db_filename
+        raise RuntimeError("Unable to allocate hosted tenant database path.")
+
+    def _insert_projects(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        project_ids: set[str] | frozenset[str],
+    ) -> None:
+        for project_id in project_ids:
+            if not project_id.strip():
+                raise ValueError("project_id must not be blank.")
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO tenant_projects (tenant_id, project_id)
+                VALUES (?, ?)
+                """,
+                (tenant_id, project_id),
+            )
+
+    def _tenant_from_filename(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        db_filename: str,
+    ) -> HostedTenant:
+        project_rows = conn.execute(
+            """
+            SELECT project_id
+            FROM tenant_projects
+            WHERE tenant_id = ?
+            ORDER BY project_id
+            """,
+            (tenant_id,),
+        ).fetchall()
+        return HostedTenant(
+            tenant_id=tenant_id,
+            db_path=self.root_path / db_filename,
+            project_ids=frozenset(row[0] for row in project_rows),
+        )
 
     @staticmethod
     def _init_telemetry_schema(db_path: Path) -> None:

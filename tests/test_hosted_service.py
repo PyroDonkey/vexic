@@ -1,7 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
@@ -48,6 +51,16 @@ def _scope(
         trust_boundary=TrustBoundary.LOCAL_TRUSTED,
         capabilities=capabilities,
     )
+
+
+class _CountingTenantCatalog:
+    def __init__(self, catalog: HostedTenantCatalog) -> None:
+        self.catalog = catalog
+        self.get_tenant_calls = 0
+
+    def get_tenant(self, tenant_id: str):
+        self.get_tenant_calls += 1
+        return self.catalog.get_tenant(tenant_id)
 
 
 class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -111,6 +124,103 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual([hit.body for hit in result.hits], ["User: hosted cedar memory"])
+
+    async def test_catalog_reload_preserves_routing_projects_and_isolation(self) -> None:
+        tenant_a = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        tenant_b = self.catalog.provision_tenant("tenant-b", project_ids={"project-b"})
+        key_a = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH},
+            project_ids={"project-a", "project-b"},
+        )
+        key_b = self.keys.create_key(
+            tenant_id="tenant-b",
+            principal_id="agent-b",
+            capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH},
+            project_ids={"project-b"},
+        )
+
+        await self.service.append_transcript(
+            key_a.raw_key,
+            AppendTranscriptRequest(
+                scope=_scope(capabilities={MemoryCapability.WRITE}),
+                messages_json=[
+                    single_message_adapter.dump_json(
+                        ModelRequest(parts=[UserPromptPart(content="tenant a reload cedar")])
+                    )
+                ],
+                redaction=RedactionContext(forbidden_values=()),
+            ),
+        )
+        await self.service.append_transcript(
+            key_b.raw_key,
+            AppendTranscriptRequest(
+                scope=_scope(
+                    tenant_id="tenant-b",
+                    project_id="project-b",
+                    capabilities={MemoryCapability.WRITE},
+                ),
+                messages_json=[
+                    single_message_adapter.dump_json(
+                        ModelRequest(parts=[UserPromptPart(content="tenant b reload cedar")])
+                    )
+                ],
+                redaction=RedactionContext(forbidden_values=()),
+            ),
+        )
+
+        reloaded_catalog = HostedTenantCatalog(Path(self.temp_dir.name))
+        self.assertEqual(reloaded_catalog.get_tenant("tenant-a").db_path, tenant_a.db_path)
+        self.assertEqual(reloaded_catalog.get_tenant("tenant-b").db_path, tenant_b.db_path)
+        self.assertEqual(
+            reloaded_catalog.get_tenant("tenant-a").project_ids,
+            frozenset({"project-a"}),
+        )
+        merged = reloaded_catalog.provision_tenant(
+            "tenant-a",
+            project_ids={"project-c"},
+        )
+        self.assertEqual(merged.db_path, tenant_a.db_path)
+        self.assertEqual(merged.project_ids, frozenset({"project-a", "project-c"}))
+        reloaded_service = HostedMemoryService(
+            reloaded_catalog,
+            self.keys,
+            telemetry=reloaded_catalog,
+        )
+
+        result_a = await reloaded_service.search_transcript(
+            key_a.raw_key,
+            SearchTranscriptRequest(
+                scope=_scope(capabilities={MemoryCapability.SEARCH}),
+                query="cedar",
+            ),
+        )
+        result_b = await reloaded_service.search_transcript(
+            key_b.raw_key,
+            SearchTranscriptRequest(
+                scope=_scope(
+                    tenant_id="tenant-b",
+                    project_id="project-b",
+                    capabilities={MemoryCapability.SEARCH},
+                ),
+                query="cedar",
+            ),
+        )
+
+        self.assertEqual([hit.body for hit in result_a.hits], ["User: tenant a reload cedar"])
+        self.assertEqual([hit.body for hit in result_b.hits], ["User: tenant b reload cedar"])
+        with self.assertRaisesRegex(PermissionError, "project_id is not provisioned"):
+            await reloaded_service.search_transcript(
+                key_a.raw_key,
+                SearchTranscriptRequest(
+                    scope=_scope(
+                        project_id="project-b",
+                        capabilities={MemoryCapability.SEARCH},
+                    ),
+                    query="cedar",
+                ),
+            )
 
     async def test_successful_request_records_sanitized_audit_and_usage(self) -> None:
         self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
@@ -202,6 +312,28 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result.hits, [])
+
+    async def test_hosted_request_reuses_catalog_tenant_lookup(self) -> None:
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        counting_catalog = _CountingTenantCatalog(self.catalog)
+        service = HostedMemoryService(counting_catalog, self.keys)
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.SEARCH},
+            project_ids={"project-a"},
+        )
+
+        result = await service.search_transcript(
+            api_key.raw_key,
+            SearchTranscriptRequest(
+                scope=_scope(capabilities={MemoryCapability.SEARCH}),
+                query="cedar",
+            ),
+        )
+
+        self.assertEqual(result.hits, [])
+        self.assertEqual(counting_catalog.get_tenant_calls, 1)
 
     async def test_project_scoped_api_key_requires_project_id(self) -> None:
         self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
@@ -600,6 +732,41 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-b"})
 
         self.assertEqual(tenant.project_ids, frozenset({"project-a", "project-b"}))
+
+    def test_inactive_tenant_can_be_provisioned_again_with_existing_database(self) -> None:
+        original = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        with closing(sqlite3.connect(Path(self.temp_dir.name) / "control-plane.db")) as conn:
+            conn.execute("UPDATE tenants SET active = 0 WHERE tenant_id = ?", ("tenant-a",))
+            conn.commit()
+
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-b"})
+
+        self.assertEqual(tenant.db_path, original.db_path)
+        self.assertEqual(tenant.project_ids, frozenset({"project-a", "project-b"}))
+        self.assertEqual(self.catalog.get_tenant("tenant-a"), tenant)
+
+    def test_failed_tenant_initialization_retries_existing_database_path(self) -> None:
+        created_paths: list[Path] = []
+
+        def fail_once(service: object) -> None:
+            db_path = Path(getattr(service, "db_path"))
+            created_paths.append(db_path)
+            db_path.touch()
+            raise RuntimeError("customer db init failed")
+
+        with patch("vexic_hosted_local.LocalMemoryService.init_schema", fail_once):
+            with self.assertRaisesRegex(RuntimeError, "customer db init failed"):
+                self.catalog.provision_tenant("tenant-a")
+
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+
+        self.assertEqual(tenant.db_path, created_paths[0])
+        self.assertEqual(tenant.project_ids, frozenset({"project-a"}))
+        self.assertEqual(self.catalog.get_tenant("tenant-a"), tenant)
+        self.assertEqual(
+            sorted(path.name for path in Path(self.temp_dir.name).glob("customer-*.db")),
+            [created_paths[0].name],
+        )
 
     async def test_dream_job_fails_closed_without_host_port(self) -> None:
         self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
