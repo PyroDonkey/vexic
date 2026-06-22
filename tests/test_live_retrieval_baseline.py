@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import importlib.util
+import importlib
 import io
 import json
 from pathlib import Path
@@ -13,16 +13,11 @@ import unittest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT_PATH = REPO_ROOT / "scripts" / "live_retrieval_baseline.py"
+MODULE_NAME = "vexic.live_retrieval_baseline"
 
 
 def _load_baseline_module() -> object:
-    spec = importlib.util.spec_from_file_location("live_retrieval_baseline", SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise RuntimeError("Could not load live retrieval baseline script.")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return importlib.import_module(MODULE_NAME)
 
 
 class LiveRetrievalBaselineTests(unittest.TestCase):
@@ -82,6 +77,12 @@ class LiveRetrievalBaselineTests(unittest.TestCase):
             self.assertEqual(sys.path, before)
         finally:
             sys.path[:] = original_path
+
+    def test_live_baseline_entrypoint_lives_under_vexic_package(self) -> None:
+        module_path = Path(self.baseline.__file__).resolve()
+
+        self.assertEqual(module_path, REPO_ROOT / "src" / "vexic" / "live_retrieval_baseline.py")
+        self.assertFalse((REPO_ROOT / "scripts" / "live_retrieval_baseline.py").exists())
 
     def test_cap_rejection_happens_before_adapter_import(self) -> None:
         marker = self.root / "imported.txt"
@@ -377,7 +378,8 @@ class LiveRetrievalBaselineDocumentationTests(unittest.TestCase):
     def test_readme_documents_live_provider_smoke_command_and_artifacts(self) -> None:
         readme = (REPO_ROOT / "README.md").read_text()
 
-        self.assertIn("scripts\\live_retrieval_baseline.py", readme)
+        self.assertIn("uv run --with-editable . python -m vexic.live_retrieval_baseline", readme)
+        self.assertNotIn("scripts\\live_retrieval_baseline.py", readme)
         self.assertIn("--allow-live", readme)
         self.assertIn("--provider", readme)
         self.assertIn("--model-group", readme)

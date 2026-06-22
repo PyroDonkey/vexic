@@ -14,11 +14,6 @@ from types import ModuleType
 from typing import Any, Iterable, Literal
 import uuid
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = REPO_ROOT / "src"
-if __name__ == "__main__" and str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
-
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 from pydantic_ai.usage import UsageLimits

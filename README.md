@@ -113,7 +113,7 @@ uv run pytest tests/test_memory_reliability.py
 The opt-in live provider retrieval smoke is:
 
 ```powershell
-uv run python scripts\live_retrieval_baseline.py `
+uv run --with-editable . python -m vexic.live_retrieval_baseline `
   --allow-live `
   --fixture .\longmemeval_s_smoke.jsonl `
   --adapter .\host_live_adapter.py `
