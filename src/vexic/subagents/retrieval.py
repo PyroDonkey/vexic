@@ -99,6 +99,7 @@ async def retrieve_long_term_facts(
     query: str,
     *,
     session_id: str = "default",
+    agent_id: str | None = None,
     model_group: str | None = None,
     secrets: Mapping[str, str] | None = None,
     usage: Any = None,
@@ -132,18 +133,29 @@ async def retrieve_long_term_facts(
 
     embedder = embed or embed_texts
     query_embedding = _embed_query(embedder, query)
-    keyword_ids = keyword_long_term_fact_ids(db_path, keyword_query, k=retrieve_k)
+    keyword_ids = keyword_long_term_fact_ids(
+        db_path,
+        keyword_query,
+        k=retrieve_k,
+        agent_id=agent_id,
+    )
     vector_ids = [
         neighbor.fact_id
-        for neighbor in nearest_long_term_facts(db_path, query_embedding, k=retrieve_k)
+        for neighbor in nearest_long_term_facts(
+            db_path,
+            query_embedding,
+            k=retrieve_k,
+            agent_id=agent_id,
+        )
     ]
 
     fused_ids = reciprocal_rank_fusion([keyword_ids, vector_ids])[:return_k]
-    facts = fetch_long_term_facts(db_path, fused_ids)
+    facts = fetch_long_term_facts(db_path, fused_ids, agent_id=agent_id)
     event_ids = record_long_term_retrieval(
         db_path,
         [fact.fact_id for fact in facts],
         session_id=session_id,
+        agent_id=agent_id,
         query=query,
         rewritten_query=rewritten_query,
         keyword_fact_ids=keyword_ids,
@@ -164,6 +176,7 @@ async def retrieve_candidate_fallback(
     query: str,
     *,
     session_id: str = "default",
+    agent_id: str | None = None,
     secrets: Mapping[str, str] | None = None,
     retrieve_k: int = RETRIEVE_K,
     return_k: int = RETURN_K,
@@ -180,15 +193,21 @@ async def retrieve_candidate_fallback(
     """
     embedder = embed or embed_texts
     query_embedding = _embed_query(embedder, query)
-    keyword_ids = keyword_candidate_ids(db_path, query, k=retrieve_k)
-    vector_ids = nearest_candidate_ids(db_path, query_embedding, k=retrieve_k)
+    keyword_ids = keyword_candidate_ids(db_path, query, k=retrieve_k, agent_id=agent_id)
+    vector_ids = nearest_candidate_ids(
+        db_path,
+        query_embedding,
+        k=retrieve_k,
+        agent_id=agent_id,
+    )
 
     fused_ids = reciprocal_rank_fusion([keyword_ids, vector_ids])[:return_k]
-    notes = fetch_candidate_notes(db_path, fused_ids)
+    notes = fetch_candidate_notes(db_path, fused_ids, agent_id=agent_id)
     record_candidate_retrieval(
         db_path,
         [note.candidate_id for note in notes],
         session_id=session_id,
+        agent_id=agent_id,
         query=query,
         forbidden_secret_values=(secrets or {}).values(),
     )

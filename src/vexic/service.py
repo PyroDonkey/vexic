@@ -245,6 +245,7 @@ class LocalMemoryService(MemoryService):
             self.db_path,
             request.query,
             session_id=request.scope.session_id or "default",
+            agent_id=request.scope.agent_id,
             return_k=request.limit,
             embed=self.embed,
         )
@@ -272,6 +273,7 @@ class LocalMemoryService(MemoryService):
             self.db_path,
             request.query,
             session_id=request.scope.session_id or "default",
+            agent_id=request.scope.agent_id,
             return_k=request.limit,
             embed=self.embed,
         )

@@ -53,6 +53,7 @@ def keyword_long_term_fact_ids(
     query: str,
     *,
     k: int,
+    agent_id: str | None = None,
 ) -> list[int]:
     """BM25-ranked live Tier 3 fact ids for a free-text query, best first."""
     safe_query = _fts_match_query(query, any_token=True)
@@ -69,17 +70,23 @@ def keyword_long_term_fact_ids(
                 JOIN long_term_memory AS l ON l.id = f.rowid
                 WHERE long_term_memory_fts MATCH ?
                     AND l.retired = 0
+                    AND l.agent_id IS ?
                 ORDER BY rank
                 LIMIT ?
                 """,
-                (safe_query, k),
+                (safe_query, agent_id, k),
             ).fetchall()
         except sqlite3.OperationalError:
             return []
     return [int(row[0]) for row in rows]
 
 
-def fetch_long_term_facts(db_path: str, fact_ids: list[int]) -> list[LongTermFact]:
+def fetch_long_term_facts(
+    db_path: str,
+    fact_ids: list[int],
+    *,
+    agent_id: str | None = None,
+) -> list[LongTermFact]:
     """Load Tier 3 facts by id, preserving the given order; unknown ids skipped."""
     if not fact_ids:
         return []
@@ -93,8 +100,9 @@ def fetch_long_term_facts(db_path: str, fact_ids: list[int]) -> list[LongTermFac
                    source_message_ids, retrieved_count, used_count, editable, created_at
             FROM long_term_memory
             WHERE id IN ({placeholders})
+                AND agent_id IS ?
             """,
-            fact_ids,
+            [*fact_ids, agent_id],
         ).fetchall()
 
     by_id = {
@@ -137,6 +145,7 @@ def record_long_term_retrieval(
     fact_ids: list[int],
     *,
     session_id: str,
+    agent_id: str | None = None,
     query: str,
     rewritten_query: str | None = None,
     keyword_fact_ids: Sequence[int] = (),
@@ -160,24 +169,41 @@ def record_long_term_retrieval(
         query,
         "" if rewritten_query is None else rewritten_query,
     )
-    placeholders = ", ".join("?" for _ in fact_ids)
     keyword_fact_ids_json = json.dumps(list(keyword_fact_ids))
     vector_fact_ids_json = json.dumps(list(vector_fact_ids))
     fused_fact_ids_json = json.dumps(list(fused_fact_ids))
     event_ids: list[int] = []
     with closing(sqlite3.connect(db_path)) as conn:
         with conn:
-            for fact_id in fact_ids:
+            placeholders = ", ".join("?" for _ in fact_ids)
+            scoped_ids = {
+                int(row[0])
+                for row in conn.execute(
+                    f"""
+                    SELECT id
+                    FROM long_term_memory
+                    WHERE id IN ({placeholders})
+                        AND agent_id IS ?
+                    """,
+                    [*fact_ids, agent_id],
+                )
+            }
+            scoped_fact_ids = [fact_id for fact_id in fact_ids if fact_id in scoped_ids]
+            if not scoped_fact_ids:
+                return []
+
+            for fact_id in scoped_fact_ids:
                 cursor = conn.execute(
                     """
                     INSERT INTO retrieval_events
-                        (fact_id, session_id, query, rewritten_query,
+                        (fact_id, session_id, agent_id, query, rewritten_query,
                          keyword_fact_ids, vector_fact_ids, fused_fact_ids)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         fact_id,
                         session_id,
+                        agent_id,
                         query,
                         rewritten_query,
                         keyword_fact_ids_json,
@@ -186,13 +212,15 @@ def record_long_term_retrieval(
                     ),
                 )
                 event_ids.append(int(cursor.lastrowid))
+            scoped_placeholders = ", ".join("?" for _ in scoped_fact_ids)
             conn.execute(
                 f"""
                 UPDATE long_term_memory
                 SET retrieved_count = retrieved_count + 1
-                WHERE id IN ({placeholders})
+                WHERE id IN ({scoped_placeholders})
+                    AND agent_id IS ?
                 """,
-                fact_ids,
+                [*scoped_fact_ids, agent_id],
             )
     return event_ids
 
@@ -261,6 +289,7 @@ def nearest_long_term_facts(
     embedding: list[float],
     *,
     k: int = 3,
+    agent_id: str | None = None,
 ) -> list[LongTermNeighbor]:
     if len(embedding) != EMBEDDING_DIM:
         raise ValueError(f"Expected {EMBEDDING_DIM}-dim embedding; got {len(embedding)}.")
@@ -281,10 +310,11 @@ def nearest_long_term_facts(
             JOIN long_term_memory AS l ON l.id = e.fact_id
             WHERE e.embedding MATCH ? AND k = ?
                 AND l.retired = 0
+                AND l.agent_id IS ?
             ORDER BY distance
             LIMIT ?
             """,
-            (_serialize_float32(normalized), fetch_k, k),
+            (_serialize_float32(normalized), fetch_k, agent_id, k),
         ).fetchall()
 
     return [
@@ -322,6 +352,7 @@ def insert_long_term_fact(
     importance: int,
     confidence: float,
     source_message_ids: list[int],
+    agent_id: str | None,
     promoted_from_candidate_id: int,
     retrieved_count: int,
     used_count: int,
@@ -336,9 +367,9 @@ def insert_long_term_fact(
         """
         INSERT INTO long_term_memory
             (fact_text, subject, category, importance, confidence,
-             source_message_ids, promoted_from_candidate_id,
+             source_message_ids, agent_id, promoted_from_candidate_id,
              retrieved_count, used_count, editable)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             fact_text,
@@ -347,6 +378,7 @@ def insert_long_term_fact(
             importance,
             confidence,
             json.dumps(source_message_ids),
+            agent_id,
             promoted_from_candidate_id,
             retrieved_count,
             used_count,

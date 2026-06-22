@@ -81,6 +81,7 @@ class CandidateNote:
     fact_text: str
     category: str
     source_message_ids: list[int]
+    created_at: str
 
 
 @dataclass(frozen=True)
@@ -544,7 +545,13 @@ def backfill_missing_candidate_embeddings(
             return count
 
 
-def keyword_candidate_ids(db_path: str, query: str, *, k: int) -> list[int]:
+def keyword_candidate_ids(
+    db_path: str,
+    query: str,
+    *,
+    k: int,
+    agent_id: str | None = None,
+) -> list[int]:
     """BM25-ranked active candidate ids for a free-text query, best first.
 
     The keyword half of the candidate-fallback hybrid retriever (ADR-0010).
@@ -565,10 +572,11 @@ def keyword_candidate_ids(db_path: str, query: str, *, k: int) -> list[int]:
                 JOIN memory_candidates AS c ON c.id = f.rowid
                 WHERE memory_candidates_fts MATCH ?
                     AND {_ACTIVE_CANDIDATE_PREDICATE}
+                    AND c.agent_id IS ?
                 ORDER BY rank
                 LIMIT ?
                 """,
-                (safe_query, k),
+                (safe_query, agent_id, k),
             ).fetchall()
         except sqlite3.OperationalError:
             return []
@@ -580,6 +588,7 @@ def record_candidate_retrieval(
     candidate_ids: list[int],
     *,
     session_id: str,
+    agent_id: str | None = None,
     query: str,
     forbidden_secret_values: Iterable[str],
 ) -> list[int]:
@@ -596,32 +605,58 @@ def record_candidate_retrieval(
     # Persistence secret guard (AGENTS.md): the query is the one new piece of
     # text this path persists, so it fails closed exactly like save_messages.
     assert_no_forbidden_secret_values(forbidden_secret_values, query)
-    placeholders = ", ".join("?" for _ in candidate_ids)
     event_ids: list[int] = []
     init_db(db_path)
     with closing(sqlite3.connect(db_path)) as conn:
         with conn:
-            for candidate_id in candidate_ids:
+            placeholders = ", ".join("?" for _ in candidate_ids)
+            scoped_ids = {
+                int(row[0])
+                for row in conn.execute(
+                    f"""
+                    SELECT id
+                    FROM memory_candidates
+                    WHERE id IN ({placeholders})
+                        AND agent_id IS ?
+                    """,
+                    [*candidate_ids, agent_id],
+                )
+            }
+            scoped_candidate_ids = [
+                candidate_id for candidate_id in candidate_ids if candidate_id in scoped_ids
+            ]
+            if not scoped_candidate_ids:
+                return []
+
+            for candidate_id in scoped_candidate_ids:
                 cursor = conn.execute(
                     """
-                    INSERT INTO candidate_retrieval_events (candidate_id, session_id, query)
-                    VALUES (?, ?, ?)
+                    INSERT INTO candidate_retrieval_events
+                        (candidate_id, session_id, agent_id, query)
+                    VALUES (?, ?, ?, ?)
                     """,
-                    (candidate_id, session_id, query),
+                    (candidate_id, session_id, agent_id, query),
                 )
                 event_ids.append(int(cursor.lastrowid))
+            scoped_placeholders = ", ".join("?" for _ in scoped_candidate_ids)
             conn.execute(
                 f"""
                 UPDATE memory_candidates
                 SET retrieved_count = retrieved_count + 1
-                WHERE id IN ({placeholders})
+                WHERE id IN ({scoped_placeholders})
+                    AND agent_id IS ?
                 """,
-                candidate_ids,
+                [*scoped_candidate_ids, agent_id],
             )
     return event_ids
 
 
-def fetch_candidate_notes(db_path: str, candidate_ids: list[int]) -> list[CandidateNote]:
+def fetch_candidate_notes(
+    db_path: str,
+    candidate_ids: list[int],
+    *,
+    agent_id: str | None = None,
+) -> list[CandidateNote]:
     """Load candidates by id as unverified notes, preserving order; unknown skipped.
 
     Mirrors fetch_long_term_facts: load only note-visible fields, and re-check
@@ -635,12 +670,13 @@ def fetch_candidate_notes(db_path: str, candidate_ids: list[int]) -> list[Candid
     with closing(sqlite3.connect(db_path)) as conn:
         rows = conn.execute(
             f"""
-            SELECT c.id, c.fact_text, c.category, c.source_message_ids
+            SELECT c.id, c.fact_text, c.category, c.source_message_ids, c.created_at
             FROM memory_candidates AS c
             WHERE c.id IN ({placeholders})
                 AND {_ACTIVE_CANDIDATE_PREDICATE}
+                AND c.agent_id IS ?
             """,
-            candidate_ids,
+            [*candidate_ids, agent_id],
         ).fetchall()
 
     by_id = {
@@ -649,13 +685,20 @@ def fetch_candidate_notes(db_path: str, candidate_ids: list[int]) -> list[Candid
             fact_text=str(row[1]),
             category=str(row[2]),
             source_message_ids=_load_source_message_ids(row[3]),
+            created_at=str(row[4]),
         )
         for row in rows
     }
     return [by_id[candidate_id] for candidate_id in candidate_ids if candidate_id in by_id]
 
 
-def nearest_candidate_ids(db_path: str, embedding: list[float], *, k: int) -> list[int]:
+def nearest_candidate_ids(
+    db_path: str,
+    embedding: list[float],
+    *,
+    k: int,
+    agent_id: str | None = None,
+) -> list[int]:
     """sqlite-vec KNN over active candidate embeddings, nearest first.
 
     The vector half of the candidate-fallback hybrid retriever (ADR-0010).
@@ -677,10 +720,11 @@ def nearest_candidate_ids(db_path: str, embedding: list[float], *, k: int) -> li
             JOIN memory_candidates AS c ON c.id = e.candidate_id
             WHERE e.embedding MATCH ? AND k = ?
                 AND {_ACTIVE_CANDIDATE_PREDICATE}
+                AND c.agent_id IS ?
             ORDER BY distance
             LIMIT ?
             """,
-            (_serialize_float32(normalized), fetch_k, k),
+            (_serialize_float32(normalized), fetch_k, agent_id, k),
         ).fetchall()
     return [int(row[0]) for row in rows]
 
@@ -924,7 +968,7 @@ def read_candidate_for_promotion(
     return conn.execute(
         """
         SELECT fact_text, subject, category, importance, confidence,
-               source_message_ids, editable, retrieved_count, used_count,
+               source_message_ids, agent_id, editable, retrieved_count, used_count,
                promoted, retired, stale
         FROM memory_candidates
         WHERE id = ?

@@ -257,6 +257,132 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.facts[0].category, MemoryCategory.PREFERENCE)
         self.assertEqual(result.facts[0].fact_text, "Ryan prefers compact reports.")
 
+    async def test_search_long_term_uses_exact_agent_scope_for_facts(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(
+            db_path=self.db_path,
+            tenant_id="tenant-a",
+            embed=lambda texts: [_unit_vector(1.0) for _ in texts],
+        )
+        service.init_schema()
+        for message_id, agent_id, fact_text in (
+            (1, "agent-a", "Ryan agent a cedar fact."),
+            (2, "agent-b", "Ryan agent b cedar fact."),
+            (3, None, "Ryan shared cedar fact."),
+        ):
+            commit_dream_cycle(
+                self.db_path,
+                [
+                    FactCandidate(
+                        fact_text=fact_text,
+                        subject="Ryan",
+                        category="fact",
+                        importance=6,
+                        confidence=0.8,
+                        source_message_ids=[message_id],
+                    )
+                ],
+                candidate_embeddings=[_unit_vector(1.0)],
+                agent_id=agent_id,
+                status="ok",
+                started_at="2026-06-01T00:00:00+00:00",
+                finished_at="2026-06-01T00:00:01+00:00",
+                messages_processed=1,
+                last_processed_message_id=message_id,
+            )
+            commit_deep_cycle(
+                self.db_path,
+                [PromotionDecision(candidate_id=message_id, embedding=_unit_vector(1.0))],
+                started_at="2026-06-01T00:01:00+00:00",
+                finished_at="2026-06-01T00:01:01+00:00",
+            )
+
+        results = {
+            agent_id: await service.search_long_term(
+                SearchLongTermRequest(scope=_scope(agent_id=agent_id), query="cedar")
+            )
+            for agent_id in ("agent-a", "agent-b", None)
+        }
+
+        self.assertEqual(
+            {agent_id: [fact.fact_text for fact in result.facts] for agent_id, result in results.items()},
+            {
+                "agent-a": ["Ryan agent a cedar fact."],
+                "agent-b": ["Ryan agent b cedar fact."],
+                None: ["Ryan shared cedar fact."],
+            },
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            event_agents = conn.execute(
+                """
+                SELECT agent_id, COUNT(*)
+                FROM retrieval_events
+                GROUP BY agent_id
+                """
+            ).fetchall()
+        self.assertEqual(sorted(event_agents, key=lambda row: "" if row[0] is None else row[0]), [(None, 1), ("agent-a", 1), ("agent-b", 1)])
+
+    async def test_search_long_term_uses_exact_agent_scope_for_candidate_fallback(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(
+            db_path=self.db_path,
+            tenant_id="tenant-a",
+            embed=lambda texts: [_unit_vector(1.0) for _ in texts],
+        )
+        service.init_schema()
+        for message_id, agent_id, fact_text in (
+            (1, "agent-a", "Ryan agent a cedar candidate."),
+            (2, "agent-b", "Ryan agent b cedar candidate."),
+            (3, None, "Ryan shared cedar candidate."),
+        ):
+            commit_dream_cycle(
+                self.db_path,
+                [
+                    FactCandidate(
+                        fact_text=fact_text,
+                        subject="Ryan",
+                        category="fact",
+                        importance=6,
+                        confidence=0.8,
+                        source_message_ids=[message_id],
+                    )
+                ],
+                candidate_embeddings=[_unit_vector(1.0)],
+                agent_id=agent_id,
+                status="ok",
+                started_at="2026-06-01T00:00:00+00:00",
+                finished_at="2026-06-01T00:00:01+00:00",
+                messages_processed=1,
+                last_processed_message_id=message_id,
+            )
+
+        results = {
+            agent_id: await service.search_long_term(
+                SearchLongTermRequest(scope=_scope(agent_id=agent_id), query="cedar")
+            )
+            for agent_id in ("agent-a", "agent-b", None)
+        }
+
+        self.assertEqual(
+            {agent_id: [note.fact_text for note in result.candidate_notes] for agent_id, result in results.items()},
+            {
+                "agent-a": ["Ryan agent a cedar candidate."],
+                "agent-b": ["Ryan agent b cedar candidate."],
+                None: ["Ryan shared cedar candidate."],
+            },
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            event_agents = conn.execute(
+                """
+                SELECT agent_id, COUNT(*)
+                FROM candidate_retrieval_events
+                GROUP BY agent_id
+                """
+            ).fetchall()
+        self.assertEqual(sorted(event_agents, key=lambda row: "" if row[0] is None else row[0]), [(None, 1), ("agent-a", 1), ("agent-b", 1)])
+
     async def test_search_long_term_rejects_wrong_embedder_result_count(self) -> None:
         from vexic.service import LocalMemoryService
 
