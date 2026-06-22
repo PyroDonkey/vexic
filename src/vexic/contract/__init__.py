@@ -93,6 +93,7 @@ class MemoryScope(MemoryContractModel):
     project_id: str | None = None
     user_id: str | None = None
     session_id: str | None = None
+    agent_id: str | None = None
     principal: Principal
     trust_boundary: TrustBoundary
     capabilities: set[MemoryCapability] = Field(default_factory=set)
@@ -103,6 +104,7 @@ class MemoryScope(MemoryContractModel):
         "project_id",
         "user_id",
         "session_id",
+        "agent_id",
         "correlation_id",
     )
     @classmethod
@@ -115,12 +117,14 @@ class MemoryScopeSelector(MemoryContractModel):
     project_id: str | None = None
     user_id: str | None = None
     session_id: str | None = None
+    agent_id: str | None = None
 
     @field_validator(
         "tenant_id",
         "project_id",
         "user_id",
         "session_id",
+        "agent_id",
     )
     @classmethod
     def _ids_must_not_be_blank(cls, value: str | None) -> str | None:

@@ -134,6 +134,7 @@ class LocalMemoryService(MemoryService):
             self.db_path,
             messages,
             session_id=request.scope.session_id or "default",
+            agent_id=request.scope.agent_id,
             forbidden_secret_values=self._redaction_values(request.redaction),
         )
         return AppendTranscriptResult(message_ids=message_ids)
@@ -155,6 +156,7 @@ class LocalMemoryService(MemoryService):
                 for item in request.messages
             ],
             session_id=request.scope.session_id or "default",
+            agent_id=request.scope.agent_id,
             forbidden_secret_values=self._redaction_values(request.redaction),
         )
         return IngestSourceTranscriptResult(
@@ -182,6 +184,7 @@ class LocalMemoryService(MemoryService):
             self.db_path,
             request.query,
             session_id=request.scope.session_id or "default",
+            agent_id=request.scope.agent_id,
             limit=request.limit,
         )
         return SearchTranscriptResult(
@@ -213,6 +216,7 @@ class LocalMemoryService(MemoryService):
                 request.first_message_id,
                 request.last_message_id,
                 session_id=request.scope.session_id or "default",
+                agent_id=request.scope.agent_id,
                 max_rows=row_cap,
             )
         except TranscriptRangeTooLarge:

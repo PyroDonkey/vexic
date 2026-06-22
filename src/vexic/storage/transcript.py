@@ -115,7 +115,7 @@ def _ensure_messages_fts(conn: sqlite3.Connection) -> None:
     ).fetchone()
     needs_rebuild = False
 
-    if exists and _messages_fts_columns(conn) != ["message_id", "session_id", "body"]:
+    if exists and _messages_fts_columns(conn) != ["message_id", "session_id", "agent_id", "body"]:
         conn.execute("DROP TRIGGER IF EXISTS messages_after_insert")
         conn.execute("DROP TABLE IF EXISTS messages_fts")
         exists = None
@@ -125,7 +125,7 @@ def _ensure_messages_fts(conn: sqlite3.Connection) -> None:
         conn.execute(
             """
             CREATE VIRTUAL TABLE messages_fts
-            USING fts5(message_id UNINDEXED, session_id UNINDEXED, body)
+            USING fts5(message_id UNINDEXED, session_id UNINDEXED, agent_id UNINDEXED, body)
             """
         )
         needs_rebuild = True
@@ -137,15 +137,18 @@ def _ensure_messages_fts(conn: sqlite3.Connection) -> None:
 def _rebuild_messages_fts(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM messages_fts")
     rows = conn.execute(
-        "SELECT id, session_id, message_json FROM messages ORDER BY id ASC"
+        "SELECT id, session_id, agent_id, message_json FROM messages ORDER BY id ASC"
     ).fetchall()
-    for message_id, session_id, message_json in rows:
+    for message_id, session_id, agent_id, message_json in rows:
         msg = single_message_adapter.validate_python(json.loads(message_json))
         body = message_search_text(msg)
         if body:
             conn.execute(
-                "INSERT INTO messages_fts (message_id, session_id, body) VALUES (?, ?, ?)",
-                (message_id, session_id, body),
+                """
+                INSERT INTO messages_fts (message_id, session_id, agent_id, body)
+                VALUES (?, ?, ?, ?)
+                """,
+                (message_id, session_id, agent_id, body),
             )
 
 
@@ -160,6 +163,7 @@ def load_messages(
     limit: int | None = None,
     *,
     session_id: str = "default",
+    agent_id: str | None = None,
 ) -> list[ModelMessage]:
     with closing(sqlite3.connect(db_path)) as conn:
         if limit is None:
@@ -168,9 +172,10 @@ def load_messages(
                 SELECT message_json
                 FROM messages
                 WHERE session_id = ?
+                    AND agent_id IS ?
                 ORDER BY id ASC
                 """,
-                (session_id,),
+                (session_id, agent_id),
             ).fetchall()
         else:
             rows = conn.execute(
@@ -180,12 +185,13 @@ def load_messages(
                     SELECT id, message_json
                     FROM messages
                     WHERE session_id = ?
+                        AND agent_id IS ?
                     ORDER BY id DESC
                     LIMIT ?
                 )
                 ORDER BY id ASC
                 """,
-                (session_id, limit),
+                (session_id, agent_id, limit),
             ).fetchall()
         json_list = [json.loads(row[0]) for row in rows]
         messages = [
@@ -205,6 +211,7 @@ def load_messages_by_token_budget(
     token_budget: int,
     *,
     session_id: str = "default",
+    agent_id: str | None = None,
 ) -> list[ModelMessage]:
     if token_budget < 0:
         raise ValueError("token_budget must be greater than or equal to 0.")
@@ -219,9 +226,10 @@ def load_messages_by_token_budget(
             SELECT message_json
             FROM messages
             WHERE session_id = ?
+                AND agent_id IS ?
             ORDER BY id DESC
             """,
-            (session_id,),
+            (session_id, agent_id),
         )
         for row in rows:
             msg = strip_prompt_payloads(
@@ -242,6 +250,7 @@ def save_messages(
     messages: list[ModelMessage],
     *,
     session_id: str = "default",
+    agent_id: str | None = None,
     forbidden_secret_values: Iterable[str] = (),
     timestamp: str | None = None,
 ) -> list[int]:
@@ -259,18 +268,27 @@ def save_messages(
                 )
                 if timestamp is None:
                     cursor = conn.execute(
-                        "INSERT INTO messages (session_id, message_json) VALUES (?, ?)",
-                        (session_id, msg_json),
+                        """
+                        INSERT INTO messages (session_id, agent_id, message_json)
+                        VALUES (?, ?, ?)
+                        """,
+                        (session_id, agent_id, msg_json),
                     )
                 else:
                     cursor = conn.execute(
-                        "INSERT INTO messages (session_id, timestamp, message_json) VALUES (?, ?, ?)",
-                        (session_id, timestamp, msg_json),
+                        """
+                        INSERT INTO messages (session_id, agent_id, timestamp, message_json)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (session_id, agent_id, timestamp, msg_json),
                     )
                 if body:
                     conn.execute(
-                        "INSERT INTO messages_fts (message_id, session_id, body) VALUES (?, ?, ?)",
-                        (cursor.lastrowid, session_id, body),
+                        """
+                        INSERT INTO messages_fts (message_id, session_id, agent_id, body)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (cursor.lastrowid, session_id, agent_id, body),
                     )
                 if cursor.lastrowid is not None:
                     message_ids.append(int(cursor.lastrowid))
@@ -364,6 +382,7 @@ def ingest_source_messages(
     inputs: list[SourceTranscriptInput],
     *,
     session_id: str = "default",
+    agent_id: str | None = None,
     forbidden_secret_values: Iterable[str] = (),
 ) -> list[SourceTranscriptIngestResult]:
     results: list[SourceTranscriptIngestResult] = []
@@ -454,21 +473,27 @@ def ingest_source_messages(
                 conn.execute("SAVEPOINT source_ingest_row")
                 try:
                     cursor = conn.execute(
-                        "INSERT INTO messages (session_id, message_json) VALUES (?, ?)",
-                        (session_id, msg_json),
+                        """
+                        INSERT INTO messages (session_id, agent_id, message_json)
+                        VALUES (?, ?, ?)
+                        """,
+                        (session_id, agent_id, msg_json),
                     )
                     message_id = int(cursor.lastrowid)
                     conn.execute(
-                        "INSERT INTO messages_fts (message_id, session_id, body) VALUES (?, ?, ?)",
-                        (message_id, session_id, body),
+                        """
+                        INSERT INTO messages_fts (message_id, session_id, agent_id, body)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (message_id, session_id, agent_id, body),
                     )
                     conn.execute(
                         """
                         INSERT INTO source_transcript_ledger
-                            (source_host, source_session_id, source_message_id, message_id)
-                        VALUES (?, ?, ?, ?)
+                            (source_host, source_session_id, source_message_id, agent_id, message_id)
+                        VALUES (?, ?, ?, ?, ?)
                         """,
-                        (source_host, source_session_id, source_message_id, message_id),
+                        (source_host, source_session_id, source_message_id, agent_id, message_id),
                     )
                 except sqlite3.IntegrityError:
                     conn.execute("ROLLBACK TO SAVEPOINT source_ingest_row")
@@ -535,6 +560,7 @@ def search_messages(
     query: str,
     *,
     session_id: str = "default",
+    agent_id: str | None = None,
     limit: int = 5,
 ) -> list[TranscriptHit]:
     if limit < 1:
@@ -553,10 +579,12 @@ def search_messages(
                 JOIN messages ON messages.id = messages_fts.message_id
                 WHERE messages_fts MATCH ?
                     AND messages_fts.session_id = ?
+                    AND messages_fts.agent_id IS ?
+                    AND messages.agent_id IS ?
                 ORDER BY rank
                 LIMIT ?
                 """,
-                (safe_query, session_id, limit),
+                (safe_query, session_id, agent_id, agent_id, limit),
             ).fetchall()
         except sqlite3.OperationalError:
             return []
@@ -577,10 +605,11 @@ def load_messages_in_id_range(
     last_message_id: int,
     *,
     session_id: str = "default",
+    agent_id: str | None = None,
     max_rows: int | None = None,
 ) -> list[TranscriptHit]:
     with closing(sqlite3.connect(db_path)) as conn:
-        params: list[object] = [session_id, first_message_id, last_message_id]
+        params: list[object] = [session_id, agent_id, first_message_id, last_message_id]
         limit_clause = ""
         if max_rows is not None:
             limit_clause = "LIMIT ?"
@@ -590,6 +619,7 @@ def load_messages_in_id_range(
             SELECT id, timestamp, message_json
             FROM messages
             WHERE session_id = ?
+                AND agent_id IS ?
                 AND id BETWEEN ? AND ?
             ORDER BY id ASC
             {limit_clause}

@@ -16,6 +16,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.usage import RequestUsage
 
 from vexic.contract import (
+    AppendTranscriptRequest,
     ExpandHistoryRequest,
     DeleteScopeRequest,
     DreamPhase,
@@ -61,16 +62,22 @@ def _unit_vector(first: float) -> list[float]:
     return vector
 
 
-def _scope(*, session_id: str = "default") -> MemoryScope:
+def _scope(
+    *,
+    session_id: str = "default",
+    agent_id: str | None = None,
+    capabilities: set[MemoryCapability] | None = None,
+) -> MemoryScope:
     return MemoryScope(
         tenant_id="tenant-a",
         session_id=session_id,
+        agent_id=agent_id,
         principal=Principal(
             principal_id="test-operator",
             principal_type=PrincipalType.OPERATOR,
         ),
         trust_boundary=TrustBoundary.LOCAL_TRUSTED,
-        capabilities={MemoryCapability.SEARCH},
+        capabilities=capabilities or {MemoryCapability.SEARCH},
     )
 
 
@@ -104,6 +111,67 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(result.hits), 1)
         self.assertIn("telegram cedar detail", result.hits[0].body)
+
+    async def test_transcript_operations_use_exact_agent_scope(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+
+        async def append(agent_id: str | None, text: str) -> int:
+            result = await service.append_transcript(
+                AppendTranscriptRequest(
+                    scope=_scope(
+                        session_id="session-a",
+                        agent_id=agent_id,
+                        capabilities={MemoryCapability.WRITE},
+                    ),
+                    messages_json=[
+                        single_message_adapter.dump_json(
+                            ModelRequest(parts=[UserPromptPart(content=text)])
+                        ).decode()
+                    ],
+                    redaction=RedactionContext(forbidden_values=()),
+                )
+            )
+            return result.message_ids[0]
+
+        agent_a_id = await append("agent-a", "cedar agent a detail")
+        await append("agent-b", "cedar agent b detail")
+        await append(None, "cedar shared detail")
+
+        agent_a = await service.search_transcript(
+            SearchTranscriptRequest(
+                scope=_scope(session_id="session-a", agent_id="agent-a"),
+                query="cedar",
+            )
+        )
+        shared = await service.search_transcript(
+            SearchTranscriptRequest(
+                scope=_scope(session_id="session-a", agent_id=None),
+                query="cedar",
+            )
+        )
+        expanded = await service.expand_history(
+            ExpandHistoryRequest(
+                scope=_scope(
+                    session_id="session-a",
+                    agent_id="agent-a",
+                    capabilities={MemoryCapability.EXPAND_HISTORY},
+                ),
+                first_message_id=1,
+                last_message_id=3,
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+
+        self.assertEqual([hit.message_id for hit in agent_a.hits], [agent_a_id])
+        self.assertIn("agent a", agent_a.hits[0].body)
+        self.assertEqual(len(shared.hits), 1)
+        self.assertIn("shared", shared.hits[0].body)
+        self.assertIn("agent a", expanded.text)
+        self.assertNotIn("agent b", expanded.text)
+        self.assertNotIn("shared", expanded.text)
 
     async def test_search_transcript_honors_limit_above_storage_default(self) -> None:
         from vexic.service import LocalMemoryService

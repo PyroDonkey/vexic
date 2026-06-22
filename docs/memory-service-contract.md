@@ -29,11 +29,19 @@ with tests.
 Every public request carries an actor/auth `MemoryScope`.
 
 - `tenant_id` is required and nonblank.
-- `project_id`, `user_id`, and `session_id` are optional refinements.
+- `project_id`, `user_id`, `session_id`, and `agent_id` are optional
+  refinements.
 - Transcript and `expand_history` operations require `session_id`.
 - Scope means the conjunction of all non-null identifier fields.
+- `agent_id = None` is the explicit shared agent scope inside the same
+  tenant/project/user/session parent scope. It is not a wildcard.
+- Agent reads are exact by default. To combine shared and agent-specific memory,
+  a caller must issue explicit shared and agent-specific reads, or use an
+  adapter helper that performs those reads explicitly.
 - `principal`, `trust_boundary`, `capabilities`, and optional
   `correlation_id` travel with the scope for authorization and audit metadata.
+  `principal_id` identifies who acted; it is not a memory-scope identifier and
+  must not be used as a fallback `agent_id`.
 
 Lifecycle deletion uses two shapes:
 
@@ -52,6 +60,11 @@ The v0.1 contract uses `CONTRACT_VERSION = "0.1.0"`. Request and result models
 carry the contract version so future adapters can reject unsupported payloads
 explicitly. Breaking changes require a new contract version rather than silent
 request semantic changes.
+
+`agent_id` remains in the v0.1 contract version because the package has not
+shipped through public package registries and omitted values map to the
+explicit shared agent scope. A future incompatible request semantic change
+should still bump the contract version.
 
 ## Capabilities
 
@@ -117,6 +130,8 @@ it does not discover provider secrets itself.
 Memory is retained by default.
 
 - Transcript rows are append-only.
+- Existing transcript rows are never backfilled to assign an `agent_id`.
+  Pre-agent rows keep `agent_id = NULL` and are shared-scope rows.
 - Candidates are promoted, retired, marked stale, or marked for review.
 - Long-term facts are retired or superseded, not physically removed by ordinary
   retrieval or promotion.
@@ -154,6 +169,22 @@ Before launch, the hosted storage adapter should pass conformance tests against
 the local SQLite reference behavior, including FTS/vector retrieval, export,
 replay, rebuild, tombstones, and redaction. Project, user, and session scopes
 remain `MemoryScope` filters inside a Customer Memory Database.
+
+## Agent Scope Test Matrix
+
+Agent-scoped adapters must prove:
+
+- contract JSON round trips and blank-value validation for `agent_id`
+- fresh and pre-existing database migration with unchanged transcript rows
+- exact-read isolation between Agent A, Agent B, and shared rows
+- source-ledger ingest and idempotency within the decided scope
+- scoped Light watermarks, including retry/no-op behavior
+- scoped candidate insertion, merge, retirement, promotion, and supersession
+- long-term keyword, vector, fused retrieval, and candidate fallback isolation
+- retrieval and candidate-retrieval telemetry scoped enough for audit/rebuild
+- tombstones, export, replay, rebuild, and summaries do not leak other agents
+- local MCP and hosted-shell adapters bind configured agent scope and reject
+  caller widening
 
 ## Host Boundary
 
