@@ -335,6 +335,123 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fact_count, 0)
         self.assertEqual(promotion_runs, [])
 
+    def test_deep_commit_rejects_fact_references_outside_requested_agent_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            commit_dream_cycle(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="Ryan agent a cedar fact.",
+                        subject="Ryan",
+                        category="fact",
+                        importance=5,
+                        confidence=0.8,
+                        source_message_ids=[1],
+                    )
+                ],
+                candidate_embeddings=[_unit_vector(1.0)],
+                agent_id="agent-a",
+                status="ok",
+                started_at="2026-01-01T00:00:00Z",
+                finished_at="2026-01-01T00:00:01Z",
+                messages_processed=1,
+                last_processed_message_id=1,
+            )
+            with closing(sqlite3.connect(db_path)) as conn, conn:
+                agent_a_candidate_id = int(
+                    conn.execute(
+                        "SELECT id FROM memory_candidates WHERE agent_id = 'agent-a'"
+                    ).fetchone()[0]
+                )
+                agent_b_fact_id = int(
+                    conn.execute(
+                        """
+                        INSERT INTO long_term_memory
+                            (fact_text, subject, category, importance, confidence,
+                             source_message_ids, agent_id, promoted_from_candidate_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            "Ryan agent b cedar fact.",
+                            "Ryan",
+                            "fact",
+                            5,
+                            0.8,
+                            "[1]",
+                            "agent-b",
+                            999,
+                        ),
+                    ).lastrowid
+                )
+
+            for started_at, decision, message in (
+                (
+                    "2026-01-01T00:01:00Z",
+                    PromotionDecision(
+                        agent_a_candidate_id,
+                        _unit_vector(1.0),
+                        retired_fact_id=999,
+                    ),
+                    "Missing retiring fact",
+                ),
+                (
+                    "2026-01-01T00:02:00Z",
+                    CandidateRetirementDecision(
+                        agent_a_candidate_id,
+                        retired_by_fact_id=999,
+                    ),
+                    "Missing retiring fact",
+                ),
+                (
+                    "2026-01-01T00:03:00Z",
+                    PromotionDecision(
+                        agent_a_candidate_id,
+                        _unit_vector(1.0),
+                        retired_fact_id=agent_b_fact_id,
+                    ),
+                    "agent scope",
+                ),
+                (
+                    "2026-01-01T00:04:00Z",
+                    CandidateRetirementDecision(
+                        agent_a_candidate_id,
+                        retired_by_fact_id=agent_b_fact_id,
+                    ),
+                    "agent scope",
+                ),
+            ):
+                with self.subTest(started_at=started_at):
+                    with self.assertRaisesRegex(ValueError, message):
+                        commit_deep_cycle(
+                            db_path,
+                            [decision],
+                            agent_id="agent-a",
+                            started_at=started_at,
+                            finished_at=started_at,
+                        )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                invalid_run_count = conn.execute(
+                    """
+                    SELECT COUNT(*) FROM dream_runs
+                    WHERE agent_id = 'agent-a'
+                        AND status = 'ok'
+                        AND started_at >= '2026-01-01T00:01:00Z'
+                    """
+                ).fetchone()[0]
+                agent_a_promoted = conn.execute(
+                    """
+                    SELECT promoted FROM memory_candidates
+                    WHERE id = ?
+                    """,
+                    (agent_a_candidate_id,),
+                ).fetchone()[0]
+
+        self.assertEqual(invalid_run_count, 0)
+        self.assertEqual(agent_a_promoted, 0)
+
 
 class PipelineCliTests(unittest.TestCase):
     def test_cli_without_embedding_adapter_exits_with_configuration_message(self) -> None:
