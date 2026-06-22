@@ -59,6 +59,7 @@ class HostedAuthContext:
     principal: Principal
     capabilities: frozenset[MemoryCapability]
     project_ids: frozenset[str]
+    agent_ids: frozenset[str | None] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -450,6 +451,8 @@ class HostedMemoryService:
                 raise PermissionError("Memory scope project_id is not provisioned for tenant.")
             if project_id not in auth.project_ids:
                 raise PermissionError("Memory scope project_id is not allowed for API key.")
+        if auth.agent_ids and request.scope.agent_id not in auth.agent_ids:
+            raise PermissionError("Memory scope agent_id is not allowed for API key.")
         effective_capabilities = request.scope.capabilities & auth.capabilities
         if capability not in effective_capabilities:
             raise PermissionError(f"Memory capability required: {capability.value}")

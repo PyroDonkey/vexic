@@ -50,6 +50,7 @@ api_key = keys.create_key(
     principal_id="agent-a",
     capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH},
     project_ids={"project-a"},
+    agent_ids={"agent-memory-a"},
 )
 
 service = HostedMemoryService(catalog, keys, telemetry=catalog)
@@ -59,6 +60,9 @@ The returned `api_key.raw_key` is shown once. Store it in the caller's secret
 store. The in-memory key store is for local staging and tests only. SHA-256 is
 used here because generated API keys are high-entropy random tokens; do not
 reuse this as a password hashing pattern.
+Omit `agent_ids` for an unrestricted staging key, or include `None` alongside
+agent ids to allow explicit shared-memory reads. `principal_id` stays actor
+identity and is never used as a fallback memory `agent_id`.
 
 ## Hosted Environment
 

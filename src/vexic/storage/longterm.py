@@ -401,6 +401,7 @@ def retire_long_term_fact(
     *,
     fact_id: int,
     superseded_by_fact_id: int | None,
+    agent_id: str | None,
 ) -> bool:
     # `AND retired = 0` makes this idempotent: if two promotions in one cycle
     # both target the same neighbor, only the first retire counts and keeps the
@@ -411,8 +412,10 @@ def retire_long_term_fact(
         SET retired = 1,
             retired_at = CURRENT_TIMESTAMP,
             retired_by_fact_id = ?
-        WHERE id = ? AND retired = 0
+        WHERE id = ?
+            AND agent_id IS ?
+            AND retired = 0
         """,
-        (superseded_by_fact_id, fact_id),
+        (superseded_by_fact_id, fact_id, agent_id),
     )
     return cursor.rowcount > 0

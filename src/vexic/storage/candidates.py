@@ -756,7 +756,11 @@ def _parse_db_datetime(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def load_promotion_candidates(db_path: str) -> list[PromotionCandidate]:
+def load_promotion_candidates(
+    db_path: str,
+    *,
+    agent_id: str | None = None,
+) -> list[PromotionCandidate]:
     init_vector_memory(db_path)
     with closing(sqlite3.connect(db_path)) as conn:
         _ensure_vector_memory_schema(conn)
@@ -771,8 +775,10 @@ def load_promotion_candidates(db_path: str) -> list[PromotionCandidate]:
                 AND c.retired = 0
                 AND c.stale = 0
                 AND c.needs_review = 0
+                AND c.agent_id IS ?
             ORDER BY c.id ASC
-            """
+            """,
+            (agent_id,),
         ).fetchall()
 
     return [
@@ -1000,6 +1006,8 @@ def retire_candidate_for_fact(
     conn: sqlite3.Connection,
     candidate_id: int,
     retired_by_fact_id: int,
+    *,
+    agent_id: str | None,
 ) -> bool:
     # Conn-scoped retirement used by the promotion module. The winning Tier 3
     # fact id is known only inside the cross-tier transaction, so candidate
@@ -1011,11 +1019,12 @@ def retire_candidate_for_fact(
             retired_at = CURRENT_TIMESTAMP,
             retired_by_fact_id = ?
         WHERE id = ?
+            AND agent_id IS ?
             AND promoted = 0
             AND retired = 0
             AND stale = 0
         """,
-        (retired_by_fact_id, candidate_id),
+        (retired_by_fact_id, candidate_id, agent_id),
     )
     return retired.rowcount > 0
 

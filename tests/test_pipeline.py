@@ -14,10 +14,15 @@ from unittest.mock import patch
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 from vexic.embeddings import EMBEDDING_DIM
+from vexic.deep import run_deep_phase
 from vexic.models import FactCandidate
 from vexic.pipeline import _main, run_light_phase
 from vexic.ports import HostPortNotConfigured
-from vexic.storage import init_db, save_messages
+from vexic.storage import commit_dream_cycle, init_db, save_messages
+
+
+def _unit_vector(first: float) -> list[float]:
+    return [first] + [0.0] * (EMBEDDING_DIM - 1)
 
 
 class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
@@ -127,6 +132,57 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             self.assertFalse(agent_factory_called)
+
+    async def test_deep_phase_promotes_only_requested_agent_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            for agent_id, fact_text, first in (
+                ("agent-a", "Ryan agent a cedar fact.", 1.0),
+                ("agent-b", "Ryan agent b cedar fact.", 0.5),
+            ):
+                commit_dream_cycle(
+                    db_path,
+                    [
+                        FactCandidate(
+                            fact_text=fact_text,
+                            subject="Ryan",
+                            category="fact",
+                            importance=5,
+                            confidence=0.8,
+                            source_message_ids=[1],
+                        )
+                    ],
+                    candidate_embeddings=[_unit_vector(first)],
+                    agent_id=agent_id,
+                    status="ok",
+                    started_at="2026-01-01T00:00:00Z",
+                    finished_at="2026-01-01T00:00:01Z",
+                    messages_processed=1,
+                    last_processed_message_id=1,
+                )
+
+            await run_deep_phase(
+                db_path,
+                "glm",
+                agent_id="agent-a",
+                contradiction_agent_factory=lambda *_args, **_kwargs: SimpleNamespace(),
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                facts = conn.execute(
+                    "SELECT agent_id, fact_text FROM long_term_memory ORDER BY id"
+                ).fetchall()
+                candidates = conn.execute(
+                    "SELECT agent_id, promoted FROM memory_candidates ORDER BY id"
+                ).fetchall()
+                deep_runs = conn.execute(
+                    "SELECT agent_id, promotions FROM dream_runs WHERE promotions > 0"
+                ).fetchall()
+
+        self.assertEqual(facts, [("agent-a", "Ryan agent a cedar fact.")])
+        self.assertEqual(candidates, [("agent-a", 1), ("agent-b", 0)])
+        self.assertEqual(deep_runs, [("agent-a", 1)])
 
 
 class PipelineCliTests(unittest.TestCase):
