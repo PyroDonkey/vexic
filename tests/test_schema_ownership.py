@@ -113,7 +113,7 @@ class VexicSchemaOwnershipTests(unittest.TestCase):
         self.assertIn("messages", tables)
         self.assertNotIn("background_tool_audit", tables)
 
-    def test_source_transcript_ledger_has_unique_source_key(self) -> None:
+    def test_source_transcript_ledger_has_agent_scoped_unique_source_key(self) -> None:
         from vexic.storage import init_db
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -127,6 +127,22 @@ class VexicSchemaOwnershipTests(unittest.TestCase):
                 conn.execute(
                     """
                     INSERT INTO source_transcript_ledger
+                        (source_host, source_session_id, source_message_id, agent_id, message_id)
+                    VALUES ('claude-code', 'session-1', 'uuid-1', 'agent-a', ?)
+                    """,
+                    (message_id,),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO source_transcript_ledger
+                        (source_host, source_session_id, source_message_id, agent_id, message_id)
+                    VALUES ('claude-code', 'session-1', 'uuid-1', 'agent-b', ?)
+                    """,
+                    (message_id,),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO source_transcript_ledger
                         (source_host, source_session_id, source_message_id, message_id)
                     VALUES ('claude-code', 'session-1', 'uuid-1', ?)
                     """,
@@ -136,11 +152,91 @@ class VexicSchemaOwnershipTests(unittest.TestCase):
                     conn.execute(
                         """
                         INSERT INTO source_transcript_ledger
+                            (source_host, source_session_id, source_message_id, agent_id, message_id)
+                        VALUES ('claude-code', 'session-1', 'uuid-1', 'agent-a', ?)
+                        """,
+                        (message_id,),
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    conn.execute(
+                        """
+                        INSERT INTO source_transcript_ledger
                             (source_host, source_session_id, source_message_id, message_id)
                         VALUES ('claude-code', 'session-1', 'uuid-1', ?)
                         """,
                         (message_id,),
                     )
+
+    def test_legacy_source_transcript_ledger_unique_key_migrates_to_agent_scope(self) -> None:
+        from vexic.storage import init_db
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            with closing(sqlite3.connect(db_path)) as conn:
+                with conn:
+                    conn.execute(
+                        """
+                        CREATE TABLE messages (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            message_json TEXT NOT NULL
+                        )
+                        """
+                    )
+                    message_json = single_message_adapter.dump_json(
+                        ModelRequest(parts=[UserPromptPart(content="legacy cedar")])
+                    ).decode()
+                    message_id = conn.execute(
+                        "INSERT INTO messages (message_json) VALUES (?)",
+                        (message_json,),
+                    ).lastrowid
+                    conn.execute(
+                        """
+                        CREATE TABLE source_transcript_ledger (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            source_host TEXT NOT NULL,
+                            source_session_id TEXT NOT NULL,
+                            source_message_id TEXT NOT NULL,
+                            agent_id TEXT,
+                            message_id INTEGER NOT NULL REFERENCES messages(id),
+                            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            UNIQUE (source_host, source_session_id, source_message_id)
+                        )
+                        """
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO source_transcript_ledger
+                            (source_host, source_session_id, source_message_id, message_id)
+                        VALUES ('claude-code', 'session-1', 'uuid-1', ?)
+                        """,
+                        (message_id,),
+                    )
+
+            init_db(db_path)
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO source_transcript_ledger
+                        (source_host, source_session_id, source_message_id, agent_id, message_id)
+                    VALUES ('claude-code', 'session-1', 'uuid-1', 'agent-a', ?)
+                    """,
+                    (message_id,),
+                )
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM source_transcript_ledger"
+                ).fetchone()[0]
+                with self.assertRaises(sqlite3.IntegrityError):
+                    conn.execute(
+                        """
+                        INSERT INTO source_transcript_ledger
+                            (source_host, source_session_id, source_message_id, agent_id, message_id)
+                        VALUES ('claude-code', 'session-1', 'uuid-1', 'agent-a', ?)
+                        """,
+                        (message_id,),
+                    )
+
+        self.assertEqual(count, 2)
 
 
 if __name__ == "__main__":

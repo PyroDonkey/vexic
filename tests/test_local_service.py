@@ -540,6 +540,58 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fts_count, 1)
         self.assertEqual(ledger_count, 1)
 
+    async def test_ingest_source_transcript_scopes_source_key_by_agent(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+
+        def request(agent_id: str | None, content: str) -> IngestSourceTranscriptRequest:
+            return IngestSourceTranscriptRequest(
+                scope=_scope().model_copy(
+                    update={
+                        "agent_id": agent_id,
+                        "capabilities": {MemoryCapability.WRITE},
+                    }
+                ),
+                messages=[
+                    SourceTranscriptMessage(
+                        source_host="claude-code",
+                        source_session_id="session-1",
+                        source_message_id="uuid-1",
+                        message_json=single_message_adapter.dump_json(
+                            ModelRequest(parts=[UserPromptPart(content=content)])
+                        ).decode(),
+                    )
+                ],
+                redaction=RedactionContext(forbidden_values=()),
+            )
+
+        inserted = {
+            agent_id: (await service.ingest_source_transcript(request(agent_id, content))).items[0]
+            for agent_id, content in (
+                ("agent-a", "agent a cedar"),
+                ("agent-b", "agent b cedar"),
+                (None, "shared cedar"),
+            )
+        }
+        skipped = {
+            agent_id: (await service.ingest_source_transcript(request(agent_id, content))).items[0]
+            for agent_id, content in (
+                ("agent-a", "agent a retry"),
+                ("agent-b", "agent b retry"),
+                (None, "shared retry"),
+            )
+        }
+
+        self.assertEqual([item.status for item in inserted.values()], ["inserted"] * 3)
+        self.assertEqual([item.status for item in skipped.values()], ["skipped"] * 3)
+        self.assertEqual(
+            {agent_id: item.message_id for agent_id, item in skipped.items()},
+            {agent_id: item.message_id for agent_id, item in inserted.items()},
+        )
+        self.assertEqual(len(set(item.message_id for item in inserted.values())), 3)
+
     async def test_ingest_source_transcript_partial_retry_inserts_only_missing_rows(self) -> None:
         from vexic.service import LocalMemoryService
 

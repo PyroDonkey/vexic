@@ -559,7 +559,7 @@ def _ensure_vector_memory_schema(conn: sqlite3.Connection) -> None:
     _ensure_long_term_memory_embeddings(conn)
 
 
-def _ensure_source_transcript_ledger(conn: sqlite3.Connection) -> None:
+def _create_source_transcript_ledger(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS source_transcript_ledger (
@@ -569,16 +569,63 @@ def _ensure_source_transcript_ledger(conn: sqlite3.Connection) -> None:
             source_message_id TEXT NOT NULL,
             agent_id TEXT,
             message_id INTEGER NOT NULL REFERENCES messages(id),
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE (source_host, source_session_id, source_message_id)
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
-    _ensure_column(conn, "source_transcript_ledger", "agent_id", "agent_id TEXT")
+
+
+def _source_transcript_ledger_has_legacy_unique(conn: sqlite3.Connection) -> bool:
+    for row in conn.execute("PRAGMA index_list(source_transcript_ledger)"):
+        if not row[2] or (len(row) > 4 and row[4]):
+            continue
+        columns = [
+            column[0]
+            for column in conn.execute(
+                "SELECT name FROM pragma_index_info(?) ORDER BY seqno",
+                (row[1],),
+            )
+        ]
+        if columns == ["source_host", "source_session_id", "source_message_id"]:
+            return True
+    return False
+
+
+def _migrate_source_transcript_ledger_unique(conn: sqlite3.Connection) -> None:
+    if not _source_transcript_ledger_has_legacy_unique(conn):
+        return
+
+    conn.execute("ALTER TABLE source_transcript_ledger RENAME TO source_transcript_ledger_old")
+    _create_source_transcript_ledger(conn)
     conn.execute(
         """
-        CREATE INDEX IF NOT EXISTS idx_source_transcript_ledger_agent
+        INSERT INTO source_transcript_ledger
+            (id, source_host, source_session_id, source_message_id,
+             agent_id, message_id, created_at)
+        SELECT id, source_host, source_session_id, source_message_id,
+               agent_id, message_id, created_at
+        FROM source_transcript_ledger_old
+        """
+    )
+    conn.execute("DROP TABLE source_transcript_ledger_old")
+
+
+def _ensure_source_transcript_ledger(conn: sqlite3.Connection) -> None:
+    _create_source_transcript_ledger(conn)
+    _ensure_column(conn, "source_transcript_ledger", "agent_id", "agent_id TEXT")
+    _migrate_source_transcript_ledger_unique(conn)
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_source_transcript_ledger_agent_unique
         ON source_transcript_ledger(source_host, source_session_id, source_message_id, agent_id)
+        WHERE agent_id IS NOT NULL
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_source_transcript_ledger_shared_unique
+        ON source_transcript_ledger(source_host, source_session_id, source_message_id)
+        WHERE agent_id IS NULL
         """
     )
 

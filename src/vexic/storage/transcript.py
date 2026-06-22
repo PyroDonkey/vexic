@@ -453,8 +453,9 @@ def ingest_source_messages(
                     WHERE l.source_host = ?
                         AND l.source_session_id = ?
                         AND l.source_message_id = ?
+                        AND l.agent_id IS ?
                     """,
-                    (source_host, source_session_id, source_message_id),
+                    (source_host, source_session_id, source_message_id, agent_id),
                 ).fetchone()
                 if existing is not None:
                     warning = _source_duplicate_warning(existing[1], msg_json)
@@ -506,8 +507,9 @@ def ingest_source_messages(
                         WHERE l.source_host = ?
                             AND l.source_session_id = ?
                             AND l.source_message_id = ?
+                            AND l.agent_id IS ?
                         """,
-                        (source_host, source_session_id, source_message_id),
+                        (source_host, source_session_id, source_message_id, agent_id),
                     ).fetchone()
                     if existing is None:
                         raise
