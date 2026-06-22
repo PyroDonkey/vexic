@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import secrets
+import threading
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -97,6 +99,120 @@ class HostedJobEvent:
     error_type: str | None = None
 
 
+@dataclass(frozen=True)
+class HostedRateLimitRule:
+    limit: int = 120
+    window_seconds: int = 60
+
+    def __post_init__(self) -> None:
+        if self.limit < 1:
+            raise ValueError("rate limit must be at least 1.")
+        if self.window_seconds < 1:
+            raise ValueError("rate limit window_seconds must be at least 1.")
+
+
+class HostedRateLimitExceeded(RuntimeError):
+    def __init__(self, retry_after_seconds: int) -> None:
+        self.retry_after_seconds = max(1, retry_after_seconds)
+        super().__init__(
+            f"Hosted rate limit exceeded. Retry after {self.retry_after_seconds} seconds."
+        )
+
+
+@dataclass
+class _RateBucket:
+    count: int
+    expires_at: float
+
+
+_EXPENSIVE_OPERATION_LIMITS = {
+    "expand_history": HostedRateLimitRule(limit=30, window_seconds=60),
+    "run_dream_phase": HostedRateLimitRule(limit=6, window_seconds=3600),
+    "export_scope": HostedRateLimitRule(limit=6, window_seconds=3600),
+    "replay_scope": HostedRateLimitRule(limit=6, window_seconds=3600),
+    "rebuild": HostedRateLimitRule(limit=6, window_seconds=3600),
+    "delete_scope": HostedRateLimitRule(limit=6, window_seconds=3600),
+}
+
+
+class HostedInMemoryRateLimiter:
+    def __init__(
+        self,
+        *,
+        default_rule: HostedRateLimitRule = HostedRateLimitRule(),
+        operation_rules: dict[str, HostedRateLimitRule] | None = None,
+        max_buckets: int = 10_000,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if max_buckets < 1:
+            raise ValueError("max_buckets must be at least 1.")
+        self.default_rule = default_rule
+        self.operation_rules = dict(_EXPENSIVE_OPERATION_LIMITS)
+        if operation_rules is not None:
+            self.operation_rules.update(operation_rules)
+        self.max_buckets = max_buckets
+        self.clock = clock
+        self._lock = threading.Lock()
+        self._buckets: dict[tuple[str, str, str, str], _RateBucket] = {}
+        self._next_prune_at = float("inf")
+
+    def check(self, operation: str, auth: HostedAuthContext) -> None:
+        rule = self.operation_rules.get(operation, self.default_rule)
+        now = self.clock()
+        key = (
+            auth.tenant_id,
+            auth.principal.principal_id,
+            auth.key_id,
+            operation,
+        )
+        with self._lock:
+            if now >= self._next_prune_at:
+                self._prune(now)
+            bucket = self._buckets.get(key)
+            if bucket is None:
+                if len(self._buckets) >= self.max_buckets:
+                    raise HostedRateLimitExceeded(self._shortest_retry_after(now))
+                expires_at = now + rule.window_seconds
+                self._buckets[key] = _RateBucket(
+                    count=1,
+                    expires_at=expires_at,
+                )
+                self._next_prune_at = min(self._next_prune_at, expires_at)
+                return
+            if bucket.expires_at <= now:
+                expires_at = now + rule.window_seconds
+                bucket.count = 1
+                bucket.expires_at = expires_at
+                self._next_prune_at = min(self._next_prune_at, expires_at)
+                return
+            if bucket.count >= rule.limit:
+                raise HostedRateLimitExceeded(int(bucket.expires_at - now) + 1)
+            bucket.count += 1
+
+    def _prune(self, now: float) -> None:
+        expired = [
+            key
+            for key, bucket in self._buckets.items()
+            if bucket.expires_at <= now
+        ]
+        # ponytail: O(n) prune is fine for staging; production needs a durable limiter.
+        for key in expired:
+            del self._buckets[key]
+        self._next_prune_at = min(
+            (bucket.expires_at for bucket in self._buckets.values()),
+            default=float("inf"),
+        )
+
+    def _shortest_retry_after(self, now: float) -> int:
+        return min(
+            (
+                max(1, int(bucket.expires_at - now) + 1)
+                for bucket in self._buckets.values()
+            ),
+            default=1,
+        )
+
+
 class HostedTenantDirectory(Protocol):
     def get_tenant(self, tenant_id: str) -> HostedTenant: ...
 
@@ -117,10 +233,12 @@ class HostedMemoryService:
         catalog: HostedTenantDirectory,
         api_keys: HostedApiKeyAuthenticator,
         telemetry: HostedTelemetrySink | None = None,
+        rate_limiter: HostedInMemoryRateLimiter | None = None,
     ) -> None:
         self.catalog = catalog
         self.api_keys = api_keys
         self.telemetry = telemetry
+        self.rate_limiter = rate_limiter or HostedInMemoryRateLimiter()
 
     async def append_transcript(
         self,
@@ -286,16 +404,29 @@ class HostedMemoryService:
         capability: MemoryCapability,
         delegate: Callable[[_RequestT], Awaitable[object]],
     ) -> object:
+        auth: HostedAuthContext | None = None
         bound: _RequestT | None = None
         try:
-            bound = self._bind_request(api_key, request, capability)
+            auth = self.api_keys.authenticate(api_key)
+            bound = self._bind_request(auth, request, capability)
+            self.rate_limiter.check(operation, auth)
             result = await delegate(bound)
+        except HostedRateLimitExceeded as exc:
+            self._record_request(
+                operation,
+                bound,
+                status="rate_limited",
+                error_type=type(exc).__name__,
+                auth=auth,
+            )
+            raise
         except Exception as exc:
             self._record_request(
                 operation,
                 bound,
                 status="error",
                 error_type=type(exc).__name__,
+                auth=auth,
             )
             raise
         self._record_request(operation, bound, status="ok")
@@ -303,11 +434,10 @@ class HostedMemoryService:
 
     def _bind_request(
         self,
-        api_key: str,
+        auth: HostedAuthContext,
         request: _RequestT,
         capability: MemoryCapability,
     ) -> _RequestT:
-        auth = self.api_keys.authenticate(api_key)
         tenant = self.catalog.get_tenant(auth.tenant_id)
         if request.scope.tenant_id != auth.tenant_id:
             raise PermissionError("Memory scope tenant_id does not match API key.")
@@ -349,11 +479,19 @@ class HostedMemoryService:
         *,
         status: str,
         error_type: str | None = None,
+        auth: HostedAuthContext | None = None,
     ) -> None:
         if self.telemetry is None:
             return
-        tenant_id = request.scope.tenant_id if request is not None else None
-        principal_id = request.scope.principal.principal_id if request is not None else None
+        if request is not None:
+            tenant_id = request.scope.tenant_id
+            principal_id = request.scope.principal.principal_id
+        elif auth is not None:
+            tenant_id = auth.tenant_id
+            principal_id = auth.principal.principal_id
+        else:
+            tenant_id = None
+            principal_id = None
         recorded_at = _now()
         self.telemetry.record_audit_event(
             HostedAuditEvent(

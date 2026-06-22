@@ -27,6 +27,8 @@ boundary without changing the memory contract.
   a telemetry sink without storing tenant metadata in shared service lists.
 - The local staging adapter stores request audit and usage rows in each tenant
   SQLite database without raw API keys or request payload text.
+- `HostedMemoryService` applies single-process in-memory operation quotas for
+  authenticated local staging traffic before delegating to the memory core.
 
 ## Local Staging
 
@@ -84,6 +86,7 @@ Internal-only today:
 - in-process Python API boundary;
 - local SQLite-compatible tenant databases;
 - repo-local in-memory tenant catalog and API-key adapter;
+- single-process in-memory authenticated request limiter;
 - tenant-local SQLite audit and usage telemetry in the local adapter;
 - in-memory job lifecycle events;
 - one `LocalMemoryService` instance is created per hosted request;
@@ -94,8 +97,10 @@ Not production/customer-data ready yet:
 - no public HTTP adapter in this package;
 - no durable hosted key/catalog/job store or production control-plane
   audit/usage store;
-- no restore drill, network hardening, rate limiting, support-access policy, or
-  incident runbook;
+- no restore drill, network hardening, distributed rate limiting, support-access
+  policy, or incident runbook;
+- no Cloudflare/WAF configuration, origin lock-down, auth-failure throttling,
+  alerting, or abuse override workflow;
 - no billing, dashboard, portal, enterprise SSO, or compliance claims;
 - export/delete/retention depend on the underlying `MemoryService` methods and
   remain limited by the current local service implementation.
