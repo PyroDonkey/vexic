@@ -15,9 +15,10 @@ from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 from vexic.embeddings import EMBEDDING_DIM
 from vexic.deep import run_deep_phase
-from vexic.models import FactCandidate
+from vexic.models import FactCandidate, RemBoost, RemBoostPlan
 from vexic.pipeline import _main, run_light_phase
 from vexic.ports import HostPortNotConfigured
+from vexic.rem import run_rem_phase
 from vexic.storage import (
     CandidateRetirementDecision,
     PromotionDecision,
@@ -204,6 +205,126 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                 repaired_state(),
                 [("agent-a", 1), ("agent-b", 0), (None, 1)],
             )
+
+    async def test_rem_phase_boosts_only_requested_agent_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            for agent_id, fact_text in (
+                ("agent-a", "Ryan agent a cedar candidate."),
+                ("agent-b", "Ryan agent b cedar candidate."),
+                (None, "Ryan shared cedar candidate."),
+            ):
+                commit_dream_cycle(
+                    db_path,
+                    [
+                        FactCandidate(
+                            fact_text=fact_text,
+                            subject="Ryan",
+                            category="fact",
+                            importance=5,
+                            confidence=0.8,
+                            source_message_ids=[1],
+                        )
+                    ],
+                    candidate_embeddings=[_unit_vector(1.0)],
+                    agent_id=agent_id,
+                    status="ok",
+                    started_at="2026-01-01T00:00:00Z",
+                    finished_at="2026-01-01T00:00:01Z",
+                    messages_processed=0,
+                    last_processed_message_id=0,
+                )
+            prompts: list[str] = []
+
+            class RemAgent:
+                async def run(self, prompt: str) -> object:
+                    prompts.append(prompt)
+                    candidate_ids = [
+                        int(candidate_id)
+                        for candidate_id in re.findall(r"candidate_id=(\d+)", prompt)
+                    ]
+                    if not candidate_ids:
+                        raise AssertionError("REM prompt did not include scoped candidates.")
+                    return SimpleNamespace(
+                        output=RemBoostPlan(
+                            boosts=[
+                                RemBoost(candidate_id=candidate_id, boost=0.5)
+                                for candidate_id in candidate_ids
+                            ]
+                        ),
+                        usage=lambda: SimpleNamespace(
+                            requests=1,
+                            input_tokens=1,
+                            output_tokens=1,
+                            total_tokens=2,
+                        ),
+                    )
+
+            def rem_state() -> tuple[list[tuple[str | None, str, float]], list[tuple[str | None, int]]]:
+                with closing(sqlite3.connect(db_path)) as conn:
+                    candidates = conn.execute(
+                        """
+                        SELECT agent_id, fact_text, rem_boost
+                        FROM memory_candidates
+                        ORDER BY id
+                        """
+                    ).fetchall()
+                    rem_runs = conn.execute(
+                        """
+                        SELECT agent_id, candidates_boosted
+                        FROM dream_runs
+                        WHERE candidates_boosted > 0
+                        ORDER BY id
+                        """
+                    ).fetchall()
+                return candidates, rem_runs
+
+            await run_rem_phase(
+                db_path,
+                "glm",
+                agent_id="agent-a",
+                rem_agent_factory=lambda *_args, **_kwargs: RemAgent(),
+            )
+            after_agent_a = rem_state()
+
+            await run_rem_phase(
+                db_path,
+                "glm",
+                agent_id=None,
+                rem_agent_factory=lambda *_args, **_kwargs: RemAgent(),
+            )
+            after_shared = rem_state()
+
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("Ryan agent a cedar candidate.", prompts[0])
+        self.assertNotIn("Ryan agent b cedar candidate.", prompts[0])
+        self.assertNotIn("Ryan shared cedar candidate.", prompts[0])
+        self.assertIn("Ryan shared cedar candidate.", prompts[1])
+        self.assertNotIn("Ryan agent a cedar candidate.", prompts[1])
+        self.assertNotIn("Ryan agent b cedar candidate.", prompts[1])
+        self.assertEqual(
+            after_agent_a,
+            (
+                [
+                    ("agent-a", "Ryan agent a cedar candidate.", 0.5),
+                    ("agent-b", "Ryan agent b cedar candidate.", 0.0),
+                    (None, "Ryan shared cedar candidate.", 0.0),
+                ],
+                [("agent-a", 1)],
+            ),
+        )
+        self.assertEqual(
+            after_shared,
+            (
+                [
+                    ("agent-a", "Ryan agent a cedar candidate.", 0.5),
+                    ("agent-b", "Ryan agent b cedar candidate.", 0.0),
+                    (None, "Ryan shared cedar candidate.", 0.5),
+                ],
+                [("agent-a", 1), (None, 1)],
+            ),
+        )
 
     async def test_deep_phase_promotes_only_requested_agent_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
