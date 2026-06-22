@@ -244,6 +244,8 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                         int(candidate_id)
                         for candidate_id in re.findall(r"candidate_id=(\d+)", prompt)
                     ]
+                    if not candidate_ids:
+                        raise AssertionError("REM prompt did not include scoped candidates.")
                     return SimpleNamespace(
                         output=RemBoostPlan(
                             boosts=[
@@ -259,43 +261,70 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                         ),
                     )
 
+            def rem_state() -> tuple[list[tuple[str | None, str, float]], list[tuple[str | None, int]]]:
+                with closing(sqlite3.connect(db_path)) as conn:
+                    candidates = conn.execute(
+                        """
+                        SELECT agent_id, fact_text, rem_boost
+                        FROM memory_candidates
+                        ORDER BY id
+                        """
+                    ).fetchall()
+                    rem_runs = conn.execute(
+                        """
+                        SELECT agent_id, candidates_boosted
+                        FROM dream_runs
+                        WHERE candidates_boosted > 0
+                        ORDER BY id
+                        """
+                    ).fetchall()
+                return candidates, rem_runs
+
             await run_rem_phase(
                 db_path,
                 "glm",
                 agent_id="agent-a",
                 rem_agent_factory=lambda *_args, **_kwargs: RemAgent(),
             )
+            after_agent_a = rem_state()
 
-            with closing(sqlite3.connect(db_path)) as conn:
-                candidates = conn.execute(
-                    """
-                    SELECT agent_id, fact_text, rem_boost
-                    FROM memory_candidates
-                    ORDER BY id
-                    """
-                ).fetchall()
-                rem_runs = conn.execute(
-                    """
-                    SELECT agent_id, candidates_boosted
-                    FROM dream_runs
-                    WHERE candidates_boosted > 0
-                    ORDER BY id
-                    """
-                ).fetchall()
+            await run_rem_phase(
+                db_path,
+                "glm",
+                agent_id=None,
+                rem_agent_factory=lambda *_args, **_kwargs: RemAgent(),
+            )
+            after_shared = rem_state()
 
-        self.assertEqual(len(prompts), 1)
+        self.assertEqual(len(prompts), 2)
         self.assertIn("Ryan agent a cedar candidate.", prompts[0])
         self.assertNotIn("Ryan agent b cedar candidate.", prompts[0])
         self.assertNotIn("Ryan shared cedar candidate.", prompts[0])
+        self.assertIn("Ryan shared cedar candidate.", prompts[1])
+        self.assertNotIn("Ryan agent a cedar candidate.", prompts[1])
+        self.assertNotIn("Ryan agent b cedar candidate.", prompts[1])
         self.assertEqual(
-            candidates,
-            [
-                ("agent-a", "Ryan agent a cedar candidate.", 0.5),
-                ("agent-b", "Ryan agent b cedar candidate.", 0.0),
-                (None, "Ryan shared cedar candidate.", 0.0),
-            ],
+            after_agent_a,
+            (
+                [
+                    ("agent-a", "Ryan agent a cedar candidate.", 0.5),
+                    ("agent-b", "Ryan agent b cedar candidate.", 0.0),
+                    (None, "Ryan shared cedar candidate.", 0.0),
+                ],
+                [("agent-a", 1)],
+            ),
         )
-        self.assertEqual(rem_runs, [("agent-a", 1)])
+        self.assertEqual(
+            after_shared,
+            (
+                [
+                    ("agent-a", "Ryan agent a cedar candidate.", 0.5),
+                    ("agent-b", "Ryan agent b cedar candidate.", 0.0),
+                    (None, "Ryan shared cedar candidate.", 0.5),
+                ],
+                [("agent-a", 1), (None, 1)],
+            ),
+        )
 
     async def test_deep_phase_promotes_only_requested_agent_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
