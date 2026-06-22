@@ -46,8 +46,8 @@ is a consumer, not a dependency.
 ## Non-goals
 
 - Private host runtime wiring.
-- Tenant-folder management, Telegram, Blog Writer, skills, teammates, or model
-  routing.
+- Host-specific application features and integrations layered on the private
+  source host (messaging, content generation, scheduling, or model routing).
 - Hosted auth, billing, dashboards, public HTTP, or remote MCP in the v0.1 core.
 - External vector databases for the local core.
 - Destructive chat-window compression.
