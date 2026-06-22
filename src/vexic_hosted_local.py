@@ -27,6 +27,7 @@ class _HostedApiKey:
     principal_id: str
     capabilities: frozenset[MemoryCapability]
     project_ids: frozenset[str]
+    agent_ids: frozenset[str | None]
     active: bool = True
 
 
@@ -207,6 +208,7 @@ class HostedApiKeyStore:
         principal_id: str,
         capabilities: set[MemoryCapability] | frozenset[MemoryCapability],
         project_ids: set[str] | frozenset[str] = frozenset(),
+        agent_ids: set[str | None] | frozenset[str | None] = frozenset(),
     ) -> ProvisionedApiKey:
         raw_key = f"vx_{secrets.token_urlsafe(32)}"
         key_id = secrets.token_hex(8)
@@ -217,6 +219,7 @@ class HostedApiKeyStore:
             principal_id=principal_id,
             capabilities=frozenset(capabilities),
             project_ids=frozenset(project_ids),
+            agent_ids=frozenset(agent_ids),
         )
         return ProvisionedApiKey(key_id=key_id, raw_key=raw_key)
 
@@ -234,6 +237,7 @@ class HostedApiKeyStore:
                     ),
                     capabilities=stored.capabilities,
                     project_ids=stored.project_ids,
+                    agent_ids=stored.agent_ids,
                 )
         raise PermissionError("Invalid hosted API key.")
 

@@ -77,6 +77,15 @@ def _retire_candidate(
     promoted = bool(row[10])
     retired = bool(row[11])
     stale = bool(row[12])
+    agent_id = row[6]
+    fact_row = conn.execute(
+        "SELECT agent_id FROM long_term_memory WHERE id = ?",
+        (decision.retired_by_fact_id,),
+    ).fetchone()
+    if fact_row is None:
+        raise ValueError(f"Missing retiring fact {decision.retired_by_fact_id}.")
+    if fact_row[0] != agent_id:
+        return False
     if promoted:
         if long_term_fact_exists_for_candidate(conn, decision.candidate_id):
             return False
@@ -90,6 +99,7 @@ def _retire_candidate(
         conn,
         decision.candidate_id,
         decision.retired_by_fact_id,
+        agent_id=agent_id,
     )
 
 
@@ -192,6 +202,7 @@ def _promote_candidate(
             conn,
             fact_id=decision.retired_fact_id,
             superseded_by_fact_id=fact_id,
+            agent_id=agent_id,
         )
     return (True, retired_flag)
 
@@ -200,6 +211,7 @@ def commit_deep_cycle(
     db_path: str,
     decisions: list[PromotionDecision | CandidateRetirementDecision],
     *,
+    agent_id: str | None = None,
     started_at: str,
     finished_at: str | None,
     status: DreamStatus = "ok",
@@ -255,16 +267,17 @@ def commit_deep_cycle(
             conn.execute(
                 """
                 INSERT INTO dream_runs
-                    (started_at, finished_at, status, messages_processed,
+                    (started_at, finished_at, status, agent_id, messages_processed,
                      last_processed_message_id, promotions, retirements, error_detail,
                      model_requests, input_tokens, output_tokens, total_tokens,
                      estimated_cost_micros)
-                VALUES (?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     started_at,
                     finished_at,
                     status,
+                    agent_id,
                     promotions,
                     retirements,
                     error_detail,

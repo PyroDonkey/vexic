@@ -36,6 +36,7 @@ class McpServerConfig:
     session_id: str = "default"
     project_id: str | None = None
     user_id: str | None = None
+    agent_id: str | None = None
     principal_id: str = "vexic-local-mcp"
     forbidden_secret_values: tuple[str, ...] = ()
     enable_expand_history: bool = False
@@ -56,6 +57,7 @@ class McpServerConfig:
             project_id=self.project_id,
             user_id=self.user_id,
             session_id=self.session_id,
+            agent_id=self.agent_id,
             principal=Principal(
                 principal_id=self.principal_id,
                 principal_type=PrincipalType.AGENT,
@@ -179,6 +181,12 @@ def _query(arguments: dict[str, Any]) -> str:
     return query
 
 
+def _reject_extra(arguments: dict[str, Any], allowed: set[str]) -> None:
+    extra_args = set(arguments) - allowed
+    if extra_args:
+        raise ValueError(f"unexpected argument: {sorted(extra_args)[0]}")
+
+
 def _limit(arguments: dict[str, Any]) -> int:
     limit = arguments.get("limit", 5)
     if isinstance(limit, bool) or not isinstance(limit, int):
@@ -218,6 +226,7 @@ async def _search_transcript(
     arguments: dict[str, Any],
     config: McpServerConfig,
 ) -> dict[str, Any]:
+    _reject_extra(arguments, {"query", "limit"})
     result = await config.service().search_transcript(
         SearchTranscriptRequest(
             scope=config.scope(),
@@ -266,6 +275,7 @@ async def _search_long_term(
     arguments: dict[str, Any],
     config: McpServerConfig,
 ) -> dict[str, Any]:
+    _reject_extra(arguments, {"query", "limit"})
     result = await config.service().search_long_term(
         SearchLongTermRequest(
             scope=config.scope(),
@@ -387,6 +397,7 @@ def _parse_args(argv: list[str] | None) -> McpServerConfig:
     parser.add_argument("--session-id", default="default")
     parser.add_argument("--project-id")
     parser.add_argument("--user-id")
+    parser.add_argument("--agent-id")
     parser.add_argument("--principal-id", default="vexic-local-mcp")
     parser.add_argument("--forbidden-value", action="append", default=[])
     parser.add_argument("--enable-expand-history", action="store_true")
@@ -397,6 +408,7 @@ def _parse_args(argv: list[str] | None) -> McpServerConfig:
         session_id=args.session_id,
         project_id=args.project_id,
         user_id=args.user_id,
+        agent_id=args.agent_id,
         principal_id=args.principal_id,
         forbidden_secret_values=tuple(args.forbidden_value),
         enable_expand_history=args.enable_expand_history,

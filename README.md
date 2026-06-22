@@ -37,6 +37,8 @@ uv run python scripts\vexic-mcp-stdio.py --db-path .\memory.db --tenant-id local
 
 For v0.1, `scripts\vexic-mcp-stdio.py` is the supported launcher. A package
 entry point can wait for release packaging.
+Pass `--agent-id <id>` to bind the server to one agent-specific memory scope;
+omit it to bind the server to the explicit shared agent scope.
 
 By default, the MVP exposes `search_transcript` and `search_long_term` only.
 Transcript writes, export, delete, rebuild, and admin tools are intentionally
@@ -66,6 +68,9 @@ args = [
   "local",
   "--session-id",
   "default",
+  # Optional agent-specific memory scope:
+  # "--agent-id",
+  # "agent-a",
   # Optional privileged egress:
   # "--enable-expand-history",
 ]

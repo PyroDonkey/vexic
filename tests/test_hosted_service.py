@@ -33,12 +33,14 @@ def _scope(
     *,
     tenant_id: str = "tenant-a",
     project_id: str | None = "project-a",
+    agent_id: str | None = None,
     capabilities: set[MemoryCapability],
 ) -> MemoryScope:
     return MemoryScope(
         tenant_id=tenant_id,
         project_id=project_id,
         session_id="default",
+        agent_id=agent_id,
         principal=Principal(
             principal_id="caller-supplied",
             principal_type=PrincipalType.HUMAN,
@@ -278,6 +280,56 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                     redaction=RedactionContext(forbidden_values=()),
                 ),
             )
+
+    async def test_api_key_restricts_agent_scope_without_principal_fallback(self) -> None:
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="runtime-agent",
+            capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH},
+            project_ids={"project-a"},
+            agent_ids={"memory-agent-a"},
+        )
+        message_json = single_message_adapter.dump_json(
+            ModelRequest(parts=[UserPromptPart(content="agent scoped cedar")])
+        )
+
+        await self.service.append_transcript(
+            api_key.raw_key,
+            AppendTranscriptRequest(
+                scope=_scope(
+                    capabilities={MemoryCapability.WRITE},
+                    agent_id="memory-agent-a",
+                ),
+                messages_json=[message_json],
+                redaction=RedactionContext(forbidden_values=()),
+            ),
+        )
+        result = await self.service.search_transcript(
+            api_key.raw_key,
+            SearchTranscriptRequest(
+                scope=_scope(
+                    capabilities={MemoryCapability.SEARCH},
+                    agent_id="memory-agent-a",
+                ),
+                query="cedar",
+            ),
+        )
+
+        self.assertEqual([hit.body for hit in result.hits], ["User: agent scoped cedar"])
+        for widened_agent_id in ("runtime-agent", "memory-agent-b", None):
+            with self.subTest(widened_agent_id=widened_agent_id):
+                with self.assertRaises(PermissionError):
+                    await self.service.search_transcript(
+                        api_key.raw_key,
+                        SearchTranscriptRequest(
+                            scope=_scope(
+                                capabilities={MemoryCapability.SEARCH},
+                                agent_id=widened_agent_id,
+                            ),
+                            query="cedar",
+                        ),
+                    )
 
     async def test_empty_project_scope_denies_project_access(self) -> None:
         self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})

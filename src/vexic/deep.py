@@ -162,6 +162,7 @@ async def run_deep_phase(
     db_path: str,
     model_group: str,
     *,
+    agent_id: str | None = None,
     secrets: Mapping[str, str] | None = None,
     top_n: int = DEFAULT_TOP_N,
     neighbor_k: int = DEFAULT_NEIGHBOR_K,
@@ -184,12 +185,13 @@ async def run_deep_phase(
         init_vector_memory(db_path)
         when = now or datetime.now(timezone.utc)
 
-        candidates = load_promotion_candidates(db_path)
+        candidates = load_promotion_candidates(db_path, agent_id=agent_id)
         selected = select_promotions(candidates, now=when, top_n=top_n)
         if not selected:
             commit_deep_cycle(
                 db_path,
                 [],
+                agent_id=agent_id,
                 started_at=started_at,
                 finished_at=utc_now_iso(),
                 status="ok",
@@ -203,7 +205,12 @@ async def run_deep_phase(
         pending_promotions: list[_PendingPromotion] = []
         usage = UsageSummary()
         for candidate in selected:
-            neighbors = nearest_long_term_facts(db_path, candidate.embedding, k=neighbor_k)
+            neighbors = nearest_long_term_facts(
+                db_path,
+                candidate.embedding,
+                k=neighbor_k,
+                agent_id=agent_id,
+            )
             contradicted_neighbors: list[LongTermNeighbor] = []
             candidate_retired = False
             for neighbor in neighbors:
@@ -291,6 +298,7 @@ async def run_deep_phase(
         stats = commit_deep_cycle(
             db_path,
             decisions,
+            agent_id=agent_id,
             started_at=started_at,
             finished_at=utc_now_iso(),
             status="ok",
@@ -312,6 +320,7 @@ async def run_deep_phase(
             commit_deep_cycle(
                 db_path,
                 [],
+                agent_id=agent_id,
                 started_at=started_at,
                 finished_at=utc_now_iso(),
                 status="error",
@@ -330,9 +339,10 @@ def _main() -> None:
     parser = argparse.ArgumentParser(description="Run the Deep memory promotion phase once.")
     parser.add_argument("--db", required=True, help="Path to a Vexic SQLite memory database.")
     parser.add_argument("--model-group", required=True, help="Host model group label.")
+    parser.add_argument("--agent-id", help="Optional agent memory scope. Omit for shared scope.")
     args = parser.parse_args()
 
-    asyncio.run(run_deep_phase(args.db, args.model_group))
+    asyncio.run(run_deep_phase(args.db, args.model_group, agent_id=args.agent_id))
 
 
 if __name__ == "__main__":

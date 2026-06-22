@@ -110,6 +110,20 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(config.enable_expand_history)
 
+    def test_cli_flag_binds_agent_scope(self) -> None:
+        config = _parse_args(
+            [
+                "--db-path",
+                self.db_path,
+                "--tenant-id",
+                "tenant-a",
+                "--agent-id",
+                "agent-a",
+            ]
+        )
+
+        self.assertEqual(config.agent_id, "agent-a")
+
     async def test_search_transcript_uses_configured_session_scope(self) -> None:
         save_messages(
             self.db_path,
@@ -137,6 +151,58 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
         text = response["result"]["content"][0]["text"]
         self.assertIn("session alpha cedar", text)
         self.assertNotIn("session beta cedar", text)
+
+    async def test_search_transcript_uses_configured_agent_scope(self) -> None:
+        save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="agent alpha cedar")])],
+            session_id="session-a",
+            agent_id="agent-a",
+        )
+        save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="agent beta cedar")])],
+            session_id="session-a",
+            agent_id="agent-b",
+        )
+
+        response = await handle_jsonrpc_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "search_transcript",
+                    "arguments": {"query": "cedar"},
+                },
+            },
+            McpServerConfig(
+                db_path=self.db_path,
+                tenant_id="tenant-a",
+                session_id="session-a",
+                agent_id="agent-a",
+            ),
+        )
+
+        text = response["result"]["content"][0]["text"]
+        self.assertIn("agent alpha cedar", text)
+        self.assertNotIn("agent beta cedar", text)
+
+    async def test_search_rejects_caller_supplied_agent_scope(self) -> None:
+        response = await self._request(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "search_transcript",
+                    "arguments": {"query": "cedar", "agent_id": "agent-b"},
+                },
+            }
+        )
+
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("unexpected argument", response["result"]["content"][0]["text"])
 
     async def test_expand_history_uses_configured_session_scope_when_enabled(self) -> None:
         alpha_ids = save_messages(
