@@ -53,6 +53,16 @@ def _scope(
     )
 
 
+class _CountingTenantCatalog:
+    def __init__(self, catalog: HostedTenantCatalog) -> None:
+        self.catalog = catalog
+        self.get_tenant_calls = 0
+
+    def get_tenant(self, tenant_id: str):
+        self.get_tenant_calls += 1
+        return self.catalog.get_tenant(tenant_id)
+
+
 class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -302,6 +312,28 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result.hits, [])
+
+    async def test_hosted_request_reuses_catalog_tenant_lookup(self) -> None:
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        counting_catalog = _CountingTenantCatalog(self.catalog)
+        service = HostedMemoryService(counting_catalog, self.keys)
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.SEARCH},
+            project_ids={"project-a"},
+        )
+
+        result = await service.search_transcript(
+            api_key.raw_key,
+            SearchTranscriptRequest(
+                scope=_scope(capabilities={MemoryCapability.SEARCH}),
+                query="cedar",
+            ),
+        )
+
+        self.assertEqual(result.hits, [])
+        self.assertEqual(counting_catalog.get_tenant_calls, 1)
 
     async def test_project_scoped_api_key_requires_project_id(self) -> None:
         self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})

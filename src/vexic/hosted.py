@@ -251,7 +251,7 @@ class HostedMemoryService:
             api_key,
             request,
             request.required_capability,
-            lambda bound: self._local_service(bound).append_transcript(bound),
+            lambda bound, tenant: self._local_service(tenant).append_transcript(bound),
         )
 
     async def ingest_source_transcript(
@@ -264,7 +264,7 @@ class HostedMemoryService:
             api_key,
             request,
             request.required_capability,
-            lambda bound: self._local_service(bound).ingest_source_transcript(bound),
+            lambda bound, tenant: self._local_service(tenant).ingest_source_transcript(bound),
         )
 
     async def search_transcript(
@@ -277,7 +277,7 @@ class HostedMemoryService:
             api_key,
             request,
             request.required_capability,
-            lambda bound: self._local_service(bound).search_transcript(bound),
+            lambda bound, tenant: self._local_service(tenant).search_transcript(bound),
         )
 
     async def expand_history(
@@ -290,7 +290,7 @@ class HostedMemoryService:
             api_key,
             request,
             request.required_capability,
-            lambda bound: self._local_service(bound).expand_history(bound),
+            lambda bound, tenant: self._local_service(tenant).expand_history(bound),
         )
 
     async def search_long_term(
@@ -303,7 +303,7 @@ class HostedMemoryService:
             api_key,
             request,
             request.required_capability,
-            lambda bound: self._local_service(bound).search_long_term(bound),
+            lambda bound, tenant: self._local_service(tenant).search_long_term(bound),
         )
 
     async def record_retrieval_event(
@@ -316,7 +316,7 @@ class HostedMemoryService:
             api_key,
             request,
             request.required_capability,
-            lambda bound: self._local_service(bound).record_retrieval_event(bound),
+            lambda bound, tenant: self._local_service(tenant).record_retrieval_event(bound),
         )
 
     async def retire_fact(
@@ -329,7 +329,7 @@ class HostedMemoryService:
             api_key,
             request,
             request.required_capability,
-            lambda bound: self._local_service(bound).retire_fact(bound),
+            lambda bound, tenant: self._local_service(tenant).retire_fact(bound),
         )
 
     async def run_dream_phase(
@@ -342,7 +342,7 @@ class HostedMemoryService:
             api_key,
             request,
             request.required_capability,
-            lambda bound: self._run_dream_phase(bound),
+            lambda bound, tenant: self._run_dream_phase(bound, tenant),
         )
 
     async def export_scope(
@@ -355,7 +355,7 @@ class HostedMemoryService:
             api_key,
             request,
             request.required_capability,
-            lambda bound: self._local_service(bound).export_scope(bound),
+            lambda bound, tenant: self._local_service(tenant).export_scope(bound),
         )
 
     async def replay_scope(
@@ -368,7 +368,7 @@ class HostedMemoryService:
             api_key,
             request,
             request.required_capability,
-            lambda bound: self._local_service(bound).replay_scope(bound),
+            lambda bound, tenant: self._local_service(tenant).replay_scope(bound),
         )
 
     async def rebuild(
@@ -381,7 +381,7 @@ class HostedMemoryService:
             api_key,
             request,
             request.required_capability,
-            lambda bound: self._local_service(bound).rebuild(bound),
+            lambda bound, tenant: self._local_service(tenant).rebuild(bound),
         )
 
     async def delete_scope(
@@ -394,7 +394,7 @@ class HostedMemoryService:
             api_key,
             request,
             request.required_capability,
-            lambda bound: self._local_service(bound).delete_scope(bound),
+            lambda bound, tenant: self._local_service(tenant).delete_scope(bound),
         )
 
     async def _call(
@@ -403,15 +403,15 @@ class HostedMemoryService:
         api_key: str,
         request: _RequestT,
         capability: MemoryCapability,
-        delegate: Callable[[_RequestT], Awaitable[object]],
+        delegate: Callable[[_RequestT, HostedTenant], Awaitable[object]],
     ) -> object:
         auth: HostedAuthContext | None = None
         bound: _RequestT | None = None
         try:
             auth = self.api_keys.authenticate(api_key)
-            bound = self._bind_request(auth, request, capability)
+            bound, tenant = self._bind_request(auth, request, capability)
             self.rate_limiter.check(operation, auth)
-            result = await delegate(bound)
+            result = await delegate(bound, tenant)
         except HostedRateLimitExceeded as exc:
             self._record_request(
                 operation,
@@ -438,7 +438,7 @@ class HostedMemoryService:
         auth: HostedAuthContext,
         request: _RequestT,
         capability: MemoryCapability,
-    ) -> _RequestT:
+    ) -> tuple[_RequestT, HostedTenant]:
         tenant = self.catalog.get_tenant(auth.tenant_id)
         if request.scope.tenant_id != auth.tenant_id:
             raise PermissionError("Memory scope tenant_id does not match API key.")
@@ -463,15 +463,18 @@ class HostedMemoryService:
                 "capabilities": effective_capabilities,
             }
         )
-        return request.model_copy(update={"scope": scope})
+        return request.model_copy(update={"scope": scope}), tenant
 
-    def _local_service(self, request: MemoryRequest) -> LocalMemoryService:
-        tenant = self.catalog.get_tenant(request.scope.tenant_id)
+    def _local_service(self, tenant: HostedTenant) -> LocalMemoryService:
         return LocalMemoryService(db_path=str(tenant.db_path), tenant_id=tenant.tenant_id)
 
-    async def _run_dream_phase(self, request: RunDreamPhaseRequest) -> RunDreamPhaseResult:
+    async def _run_dream_phase(
+        self,
+        request: RunDreamPhaseRequest,
+        tenant: HostedTenant,
+    ) -> RunDreamPhaseResult:
         try:
-            return await self._local_service(request).run_dream_phase(request)
+            return await self._local_service(tenant).run_dream_phase(request)
         except NotImplementedError as exc:
             raise missing_host_port("Dream phase") from exc
 
