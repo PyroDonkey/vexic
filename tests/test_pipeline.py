@@ -210,10 +210,10 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = str(Path(temp_dir) / "memory.db")
             init_db(db_path)
-            for agent_id, fact_text, first in (
-                ("agent-a", "Ryan agent a cedar candidate.", 1.0),
-                ("agent-b", "Ryan agent b cedar candidate.", 0.5),
-                (None, "Ryan shared cedar candidate.", 0.25),
+            for agent_id, fact_text in (
+                ("agent-a", "Ryan agent a cedar candidate."),
+                ("agent-b", "Ryan agent b cedar candidate."),
+                (None, "Ryan shared cedar candidate."),
             ):
                 commit_dream_cycle(
                     db_path,
@@ -227,7 +227,7 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                             source_message_ids=[1],
                         )
                     ],
-                    candidate_embeddings=[_unit_vector(first)],
+                    candidate_embeddings=[_unit_vector(1.0)],
                     agent_id=agent_id,
                     status="ok",
                     started_at="2026-01-01T00:00:00Z",
