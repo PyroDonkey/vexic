@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,7 +19,10 @@ from vexic.contract import (
 )
 from vexic.hosted import (
     HostedBackgroundJobRunner,
+    HostedInMemoryRateLimiter,
     HostedMemoryService,
+    HostedRateLimitRule,
+    HostedRateLimitExceeded,
 )
 from vexic_hosted_local import HostedApiKeyStore, HostedTenantCatalog
 from vexic.ports import HostPortNotConfigured
@@ -331,6 +335,150 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             "cedar-secret",
             repr(audit_events) + repr(usage_events),
         )
+
+    async def test_rate_limit_rejection_records_sanitized_audit_and_usage(self) -> None:
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.SEARCH},
+            project_ids={"project-a"},
+        )
+        service = HostedMemoryService(
+            self.catalog,
+            self.keys,
+            telemetry=self.catalog,
+            rate_limiter=HostedInMemoryRateLimiter(
+                default_rule=HostedRateLimitRule(limit=1, window_seconds=60),
+            ),
+        )
+        request = SearchTranscriptRequest(
+            scope=_scope(capabilities={MemoryCapability.SEARCH}),
+            query="cedar",
+        )
+
+        await service.search_transcript(api_key.raw_key, request)
+        with self.assertRaises(HostedRateLimitExceeded):
+            await service.search_transcript(api_key.raw_key, request)
+
+        audit_events = self.catalog.audit_events("tenant-a")
+        usage_events = self.catalog.usage_events("tenant-a")
+        self.assertEqual([event.status for event in audit_events], ["ok", "rate_limited"])
+        self.assertEqual(audit_events[-1].error_type, "HostedRateLimitExceeded")
+        self.assertEqual(usage_events[-1].error_type, "HostedRateLimitExceeded")
+        self.assertNotIn(api_key.raw_key, repr(audit_events) + repr(usage_events))
+        self.assertNotIn("cedar", repr(audit_events) + repr(usage_events))
+
+    async def test_rate_limit_window_allows_later_request(self) -> None:
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.SEARCH},
+            project_ids={"project-a"},
+        )
+        now = 0.0
+        service = HostedMemoryService(
+            self.catalog,
+            self.keys,
+            rate_limiter=HostedInMemoryRateLimiter(
+                default_rule=HostedRateLimitRule(limit=1, window_seconds=10),
+                clock=lambda: now,
+            ),
+        )
+        request = SearchTranscriptRequest(
+            scope=_scope(capabilities={MemoryCapability.SEARCH}),
+            query="cedar",
+        )
+
+        await service.search_transcript(api_key.raw_key, request)
+        with self.assertRaises(HostedRateLimitExceeded):
+            await service.search_transcript(api_key.raw_key, request)
+        now = 11.0
+
+        result = await service.search_transcript(api_key.raw_key, request)
+
+        self.assertEqual(result.hits, [])
+
+    async def test_expensive_operation_quota_blocks_before_dream_host_port(self) -> None:
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.ADMIN_REBUILD},
+            project_ids={"project-a"},
+        )
+        service = HostedMemoryService(
+            self.catalog,
+            self.keys,
+            telemetry=self.catalog,
+            rate_limiter=HostedInMemoryRateLimiter(
+                operation_rules={
+                    "run_dream_phase": HostedRateLimitRule(limit=1, window_seconds=60),
+                },
+            ),
+        )
+        request = RunDreamPhaseRequest(
+            scope=_scope(capabilities={MemoryCapability.ADMIN_REBUILD}),
+            phase=DreamPhase.LIGHT,
+            redaction=RedactionContext(forbidden_values=()),
+        )
+
+        with self.assertRaises(HostPortNotConfigured):
+            await service.run_dream_phase(api_key.raw_key, request)
+        with self.assertRaises(HostedRateLimitExceeded):
+            await service.run_dream_phase(api_key.raw_key, request)
+
+        audit_events = self.catalog.audit_events("tenant-a")
+        self.assertEqual([event.status for event in audit_events], ["error", "rate_limited"])
+        self.assertEqual(audit_events[0].error_type, "HostPortNotConfigured")
+        self.assertEqual(audit_events[1].error_type, "HostedRateLimitExceeded")
+
+    def test_rate_limiter_honors_limit_under_concurrent_calls(self) -> None:
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.SEARCH},
+        )
+        auth = self.keys.authenticate(api_key.raw_key)
+        limiter = HostedInMemoryRateLimiter(
+            default_rule=HostedRateLimitRule(limit=5, window_seconds=60),
+        )
+
+        def attempt(_: int) -> bool:
+            try:
+                limiter.check("search_transcript", auth)
+            except HostedRateLimitExceeded:
+                return False
+            return True
+
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            allowed = list(pool.map(attempt, range(20)))
+
+        self.assertEqual(sum(allowed), 5)
+
+    def test_rate_limiter_bucket_cap_returns_retry_after(self) -> None:
+        first_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.SEARCH},
+        )
+        second_key = self.keys.create_key(
+            tenant_id="tenant-b",
+            principal_id="agent-b",
+            capabilities={MemoryCapability.SEARCH},
+        )
+        limiter = HostedInMemoryRateLimiter(
+            default_rule=HostedRateLimitRule(limit=10, window_seconds=60),
+            max_buckets=1,
+            clock=lambda: 0.0,
+        )
+
+        limiter.check("search_transcript", self.keys.authenticate(first_key.raw_key))
+        with self.assertRaises(HostedRateLimitExceeded) as caught:
+            limiter.check("search_transcript", self.keys.authenticate(second_key.raw_key))
+
+        self.assertGreaterEqual(caught.exception.retry_after_seconds, 1)
 
     def test_tenant_database_path_is_catalog_mapped_not_tenant_interpolated(self) -> None:
         tenant = self.catalog.provision_tenant("../tenant-a", project_ids={"project-a"})
