@@ -112,6 +112,103 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([hit.body for hit in result.hits], ["User: hosted cedar memory"])
 
+    async def test_catalog_reload_preserves_routing_projects_and_isolation(self) -> None:
+        tenant_a = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        tenant_b = self.catalog.provision_tenant("tenant-b", project_ids={"project-b"})
+        key_a = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH},
+            project_ids={"project-a", "project-b"},
+        )
+        key_b = self.keys.create_key(
+            tenant_id="tenant-b",
+            principal_id="agent-b",
+            capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH},
+            project_ids={"project-b"},
+        )
+
+        await self.service.append_transcript(
+            key_a.raw_key,
+            AppendTranscriptRequest(
+                scope=_scope(capabilities={MemoryCapability.WRITE}),
+                messages_json=[
+                    single_message_adapter.dump_json(
+                        ModelRequest(parts=[UserPromptPart(content="tenant a reload cedar")])
+                    )
+                ],
+                redaction=RedactionContext(forbidden_values=()),
+            ),
+        )
+        await self.service.append_transcript(
+            key_b.raw_key,
+            AppendTranscriptRequest(
+                scope=_scope(
+                    tenant_id="tenant-b",
+                    project_id="project-b",
+                    capabilities={MemoryCapability.WRITE},
+                ),
+                messages_json=[
+                    single_message_adapter.dump_json(
+                        ModelRequest(parts=[UserPromptPart(content="tenant b reload cedar")])
+                    )
+                ],
+                redaction=RedactionContext(forbidden_values=()),
+            ),
+        )
+
+        reloaded_catalog = HostedTenantCatalog(Path(self.temp_dir.name))
+        self.assertEqual(reloaded_catalog.get_tenant("tenant-a").db_path, tenant_a.db_path)
+        self.assertEqual(reloaded_catalog.get_tenant("tenant-b").db_path, tenant_b.db_path)
+        self.assertEqual(
+            reloaded_catalog.get_tenant("tenant-a").project_ids,
+            frozenset({"project-a"}),
+        )
+        merged = reloaded_catalog.provision_tenant(
+            "tenant-a",
+            project_ids={"project-c"},
+        )
+        self.assertEqual(merged.db_path, tenant_a.db_path)
+        self.assertEqual(merged.project_ids, frozenset({"project-a", "project-c"}))
+        reloaded_service = HostedMemoryService(
+            reloaded_catalog,
+            self.keys,
+            telemetry=reloaded_catalog,
+        )
+
+        result_a = await reloaded_service.search_transcript(
+            key_a.raw_key,
+            SearchTranscriptRequest(
+                scope=_scope(capabilities={MemoryCapability.SEARCH}),
+                query="cedar",
+            ),
+        )
+        result_b = await reloaded_service.search_transcript(
+            key_b.raw_key,
+            SearchTranscriptRequest(
+                scope=_scope(
+                    tenant_id="tenant-b",
+                    project_id="project-b",
+                    capabilities={MemoryCapability.SEARCH},
+                ),
+                query="cedar",
+            ),
+        )
+
+        self.assertEqual([hit.body for hit in result_a.hits], ["User: tenant a reload cedar"])
+        self.assertEqual([hit.body for hit in result_b.hits], ["User: tenant b reload cedar"])
+        with self.assertRaisesRegex(PermissionError, "project_id is not provisioned"):
+            await reloaded_service.search_transcript(
+                key_a.raw_key,
+                SearchTranscriptRequest(
+                    scope=_scope(
+                        project_id="project-b",
+                        capabilities={MemoryCapability.SEARCH},
+                    ),
+                    query="cedar",
+                ),
+            )
+
     async def test_successful_request_records_sanitized_audit_and_usage(self) -> None:
         self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
         api_key = self.keys.create_key(
