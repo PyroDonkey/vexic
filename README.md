@@ -1,6 +1,6 @@
 # Vexic
 
-Vexic is the standalone memory system extracted from Coalescent: a
+Vexic is the standalone memory system extracted from a private source host: a
 provenance-first, replayable memory core for long-running agents.
 
 This first package slice is a local Python core with a SQLite adapter, public
