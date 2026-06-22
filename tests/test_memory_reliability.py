@@ -746,5 +746,103 @@ class MemoryIsolationAndRedactionReliabilityTests(unittest.IsolatedAsyncioTestCa
         self.assertNotIn("tenant A likes Python", tenant_b_result)
 
 
+class OfflineRetrievalBaselinePreflightTests(unittest.IsolatedAsyncioTestCase):
+    """Deterministic offline preflight for the live retrieval-quality baseline.
+
+    Drives a full Tier 1 -> Light -> REM -> Deep -> retrieve cycle against an
+    isolated disposable database with injected fake agents and embeddings, so
+    the plumbing the live provider-backed baseline depends on is exercised with
+    zero provider calls. Emits the per-row diagnostic taxonomy (Tier 1 found,
+    Tier 2 extracted, Tier 3 promoted, Tier 3 retrieved, candidate fallback
+    used) the live harness must reproduce, and asserts a planted preference is
+    recalled as a durable Tier 3 fact rather than an unverified fallback note.
+    """
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.temp_dir.name) / "memory.db")
+        init_db(self.db_path)
+        self.ctx = SimpleNamespace(
+            deps=SimpleNamespace(
+                db_path=self.db_path,
+                session_id="default",
+                secrets={},
+                authority=None,
+                retrieved_facts_this_turn=[],
+            ),
+            usage=None,
+        )
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _diagnostics(self, retrieval_text: str) -> dict[str, object]:
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            tier1_found = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+            tier2_extracted = conn.execute("SELECT COUNT(*) FROM memory_candidates").fetchone()[0]
+            tier3_promoted = conn.execute(
+                "SELECT COUNT(*) FROM long_term_memory WHERE retired = 0"
+            ).fetchone()[0]
+        return {
+            "tier1_found": tier1_found,
+            "tier2_extracted": tier2_extracted,
+            "tier3_promoted": tier3_promoted,
+            "tier3_retrieved": "[fact " in retrieval_text,
+            "candidate_fallback_used": "[unverified note]" in retrieval_text,
+        }
+
+    async def test_full_offline_cycle_recalls_planted_fact_as_durable_tier3(self) -> None:
+        save_messages(
+            self.db_path,
+            [
+                ModelRequest(
+                    parts=[
+                        UserPromptPart(
+                            content="I prefer compact reliability reports with provenance."
+                        )
+                    ]
+                )
+            ],
+        )
+
+        with (
+            patch("vexic.pipeline.build_extraction_agent", return_value=_StableExtractionAgent()),
+            patch("vexic.rem.build_rem_agent", return_value=_NoOpRemAgent()),
+            patch(
+                "vexic.deep.build_contradiction_agent",
+                return_value=_ContradictionAgent(contradicts=False),
+            ),
+        ):
+            await run_light_phase(
+                self.db_path,
+                "glm",
+                embed=lambda texts: [_unit_vector(1.0) for _ in texts],
+            )
+            await run_rem_phase(self.db_path, "glm")
+            await run_deep_phase(self.db_path, "glm")
+
+        with patch(
+            "vexic.subagents.retrieval.embed_texts",
+            return_value=[_unit_vector(1.0)],
+        ):
+            result = await search_long_term(self.ctx, "how should reliability be reported?")
+
+        self.assertEqual(
+            self._diagnostics(result),
+            {
+                "tier1_found": 1,
+                "tier2_extracted": 1,
+                "tier3_promoted": 1,
+                "tier3_retrieved": True,
+                "candidate_fallback_used": False,
+            },
+            "offline preflight must drive Tier 1 -> Tier 2 -> Tier 3 and recall a durable fact",
+        )
+        self.assertIn("[fact 1]", result)
+        self.assertIn("Ryan prefers compact reliability reports with provenance.", result)
+        self.assertIn("source messages: 1", result)
+        self.assertNotIn("[unverified note]", result)
+
+
 if __name__ == "__main__":
     unittest.main()
