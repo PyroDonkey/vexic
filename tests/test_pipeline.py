@@ -18,7 +18,15 @@ from vexic.deep import run_deep_phase
 from vexic.models import FactCandidate
 from vexic.pipeline import _main, run_light_phase
 from vexic.ports import HostPortNotConfigured
-from vexic.storage import commit_dream_cycle, init_db, save_messages
+from vexic.storage import (
+    CandidateRetirementDecision,
+    PromotionDecision,
+    commit_deep_cycle,
+    commit_dream_cycle,
+    init_db,
+    save_messages,
+)
+from vexic.storage.schema import _load_vec_extension
 
 
 def _unit_vector(first: float) -> list[float]:
@@ -133,6 +141,70 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertFalse(agent_factory_called)
 
+    async def test_light_phase_repairs_only_requested_agent_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            for agent_id, fact_text in (
+                ("agent-a", "agent a cedar candidate"),
+                ("agent-b", "agent b cedar candidate"),
+                (None, "shared cedar candidate"),
+            ):
+                commit_dream_cycle(
+                    db_path,
+                    [
+                        FactCandidate(
+                            fact_text=fact_text,
+                            subject="Ryan",
+                            category="fact",
+                            importance=5,
+                            confidence=0.8,
+                            source_message_ids=[1],
+                        )
+                    ],
+                    candidate_embeddings=[_unit_vector(1.0)],
+                    agent_id=agent_id,
+                    status="ok",
+                    started_at="2026-01-01T00:00:00Z",
+                    finished_at="2026-01-01T00:00:01Z",
+                    messages_processed=0,
+                    last_processed_message_id=0,
+                )
+            with closing(sqlite3.connect(db_path)) as conn:
+                _load_vec_extension(conn)
+                conn.execute("DELETE FROM memory_candidate_embeddings")
+                conn.commit()
+
+            def embed(texts: list[str]) -> list[list[float]]:
+                return [_unit_vector(1.0) for _ in texts]
+
+            def repaired_state() -> list[tuple[str | None, int]]:
+                with closing(sqlite3.connect(db_path)) as conn:
+                    _load_vec_extension(conn)
+                    return conn.execute(
+                        """
+                        SELECT c.agent_id, e.candidate_id IS NOT NULL
+                        FROM memory_candidates AS c
+                        LEFT JOIN memory_candidate_embeddings AS e
+                            ON e.candidate_id = c.id
+                        ORDER BY c.id
+                        """
+                    ).fetchall()
+
+            await run_light_phase(db_path, "glm", agent_id="agent-a", embed=embed)
+
+            self.assertEqual(
+                repaired_state(),
+                [("agent-a", 1), ("agent-b", 0), (None, 0)],
+            )
+
+            await run_light_phase(db_path, "glm", agent_id=None, embed=embed)
+
+            self.assertEqual(
+                repaired_state(),
+                [("agent-a", 1), ("agent-b", 0), (None, 1)],
+            )
+
     async def test_deep_phase_promotes_only_requested_agent_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = str(Path(temp_dir) / "memory.db")
@@ -183,6 +255,85 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(facts, [("agent-a", "Ryan agent a cedar fact.")])
         self.assertEqual(candidates, [("agent-a", 1), ("agent-b", 0)])
         self.assertEqual(deep_runs, [("agent-a", 1)])
+
+    def test_deep_commit_rejects_decisions_outside_requested_agent_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            for agent_id, fact_text, first in (
+                ("agent-a", "Ryan agent a cedar fact.", 1.0),
+                ("agent-b", "Ryan agent b cedar fact.", 0.5),
+            ):
+                commit_dream_cycle(
+                    db_path,
+                    [
+                        FactCandidate(
+                            fact_text=fact_text,
+                            subject="Ryan",
+                            category="fact",
+                            importance=5,
+                            confidence=0.8,
+                            source_message_ids=[1],
+                        )
+                    ],
+                    candidate_embeddings=[_unit_vector(first)],
+                    agent_id=agent_id,
+                    status="ok",
+                    started_at="2026-01-01T00:00:00Z",
+                    finished_at="2026-01-01T00:00:01Z",
+                    messages_processed=1,
+                    last_processed_message_id=1,
+                )
+            with closing(sqlite3.connect(db_path)) as conn:
+                candidate_ids = {
+                    row[1]: int(row[0])
+                    for row in conn.execute(
+                        "SELECT id, agent_id FROM memory_candidates ORDER BY id"
+                    )
+                }
+
+            with self.assertRaisesRegex(ValueError, "agent scope"):
+                commit_deep_cycle(
+                    db_path,
+                    [
+                        PromotionDecision(
+                            candidate_ids["agent-a"],
+                            _unit_vector(1.0),
+                        ),
+                        PromotionDecision(
+                            candidate_ids["agent-b"],
+                            _unit_vector(0.5),
+                        ),
+                    ],
+                    agent_id="agent-a",
+                    started_at="2026-01-01T00:01:00Z",
+                    finished_at="2026-01-01T00:01:01Z",
+                )
+
+            with self.assertRaisesRegex(ValueError, "agent scope"):
+                commit_deep_cycle(
+                    db_path,
+                    [
+                        CandidateRetirementDecision(
+                            candidate_ids["agent-b"],
+                            retired_by_fact_id=999,
+                        )
+                    ],
+                    agent_id="agent-a",
+                    started_at="2026-01-01T00:02:00Z",
+                    finished_at="2026-01-01T00:02:01Z",
+                )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                fact_count = conn.execute(
+                    "SELECT COUNT(*) FROM long_term_memory"
+                ).fetchone()[0]
+                promotion_runs = conn.execute(
+                    "SELECT agent_id, promotions FROM dream_runs WHERE promotions > 0"
+                ).fetchall()
+
+        self.assertEqual(fact_count, 0)
+        self.assertEqual(promotion_runs, [])
 
 
 class PipelineCliTests(unittest.TestCase):

@@ -66,6 +66,33 @@ def _promoted_fact_id_for_candidate(conn: sqlite3.Connection, candidate_id: int)
     return int(row[0])
 
 
+def _decision_candidate_ids(
+    decision: PromotionDecision | CandidateRetirementDecision,
+) -> list[int]:
+    if isinstance(decision, PromotionDecision):
+        return [decision.candidate_id, *decision.retired_candidate_ids]
+    return [decision.candidate_id]
+
+
+def _validate_decision_agent_scope(
+    conn: sqlite3.Connection,
+    decision: PromotionDecision | CandidateRetirementDecision,
+    *,
+    agent_id: str | None,
+) -> None:
+    for candidate_id in _decision_candidate_ids(decision):
+        row = conn.execute(
+            "SELECT agent_id FROM memory_candidates WHERE id = ?",
+            (candidate_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Missing memory candidate {candidate_id}.")
+        if row[0] != agent_id:
+            raise ValueError(
+                f"Candidate {candidate_id} is outside the requested agent scope."
+            )
+
+
 def _retire_candidate(
     conn: sqlite3.Connection,
     decision: CandidateRetirementDecision,
@@ -233,6 +260,12 @@ def commit_deep_cycle(
             promotions = 0
             retirements = 0
             if decisions:
+                for decision in decisions:
+                    _validate_decision_agent_scope(
+                        conn,
+                        decision,
+                        agent_id=agent_id,
+                    )
                 _ensure_vector_memory_schema(conn)
                 for decision in decisions:
                     if isinstance(decision, CandidateRetirementDecision):
