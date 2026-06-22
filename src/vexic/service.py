@@ -107,7 +107,7 @@ class LocalMemoryService(MemoryService):
                 and target_value != scope_value
             ):
                 return False
-        return True
+        return row["target_agent_id"] == scope.agent_id
 
     def _assert_not_tombstoned(self, scope: MemoryScope, operation: str) -> None:
         column_name = _TOMBSTONE_FLAG_COLUMNS[operation]
@@ -115,7 +115,7 @@ class LocalMemoryService(MemoryService):
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 f"""
-                SELECT target_project_id, target_user_id, target_session_id
+                SELECT target_project_id, target_user_id, target_session_id, target_agent_id
                 FROM scope_tombstones
                 WHERE target_tenant_id = ? AND {column_name} = 1
                 """,

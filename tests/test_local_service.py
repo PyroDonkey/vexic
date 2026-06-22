@@ -366,6 +366,52 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
+    async def test_agent_tombstone_blocks_only_matching_agent_scope(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        for agent_id, content in (
+            ("agent-a", "cedar agent a detail"),
+            ("agent-b", "cedar agent b detail"),
+            (None, "cedar shared detail"),
+        ):
+            save_messages(
+                self.db_path,
+                [ModelRequest(parts=[UserPromptPart(content=content)])],
+                agent_id=agent_id,
+            )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO scope_tombstones
+                        (target_tenant_id, target_session_id, target_agent_id,
+                         created_by_principal_id, created_by_principal_type, reason)
+                    VALUES ('tenant-a', 'default', 'agent-a',
+                            'operator', 'operator', 'test deletion')
+                    """
+                )
+
+        with self.assertRaisesRegex(PermissionError, "tombstoned"):
+            await service.search_transcript(
+                SearchTranscriptRequest(
+                    scope=_scope(agent_id="agent-a"),
+                    query="cedar",
+                )
+            )
+        agent_b = await service.search_transcript(
+            SearchTranscriptRequest(scope=_scope(agent_id="agent-b"), query="cedar")
+        )
+        shared = await service.search_transcript(
+            SearchTranscriptRequest(scope=_scope(agent_id=None), query="cedar")
+        )
+
+        self.assertEqual(len(agent_b.hits), 1)
+        self.assertIn("agent b", agent_b.hits[0].body)
+        self.assertEqual(len(shared.hits), 1)
+        self.assertIn("shared", shared.hits[0].body)
+
     async def test_tenant_scope_must_match_opened_sqlite_context(self) -> None:
         from vexic.service import LocalMemoryService
 
