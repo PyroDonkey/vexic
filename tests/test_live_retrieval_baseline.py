@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -61,6 +62,27 @@ class LiveRetrievalBaselineTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertIn("skipped", stdout.getvalue().lower())
 
+    def test_import_does_not_mutate_sys_path(self) -> None:
+        import vexic.contract  # noqa: F401
+        import vexic.deep  # noqa: F401
+        import vexic.pipeline  # noqa: F401
+        import vexic.rem  # noqa: F401
+        import vexic.service  # noqa: F401
+        import vexic.storage  # noqa: F401
+        import vexic.usage  # noqa: F401
+
+        original_path = list(sys.path)
+        src_root = str(REPO_ROOT / "src")
+        sys.path[:] = [entry for entry in sys.path if entry != src_root]
+        try:
+            before = list(sys.path)
+
+            _load_baseline_module()
+
+            self.assertEqual(sys.path, before)
+        finally:
+            sys.path[:] = original_path
+
     def test_cap_rejection_happens_before_adapter_import(self) -> None:
         marker = self.root / "imported.txt"
         adapter = self.root / "adapter.py"
@@ -80,6 +102,97 @@ class LiveRetrievalBaselineTests(unittest.TestCase):
                     "expected_fact": "two",
                 },
             ]
+        )
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            exit_code = self.baseline.main(
+                [
+                    "--allow-live",
+                    "--fixture",
+                    str(fixture),
+                    "--adapter",
+                    str(adapter),
+                    "--provider",
+                    "fake",
+                    "--model-group",
+                    "fake-model",
+                    "--output-dir",
+                    str(self.root / "out"),
+                    "--max-rows",
+                    "1",
+                ]
+            )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("max-rows", stderr.getvalue())
+        self.assertFalse(marker.exists())
+
+    def test_invalid_fixture_turn_rejected_before_adapter_import(self) -> None:
+        marker = self.root / "imported.txt"
+        adapter = self.root / "adapter.py"
+        adapter.write_text(f"from pathlib import Path\nPath({str(marker)!r}).write_text('bad')\n")
+        fixture = self._fixture(
+            [
+                {
+                    "id": "bad-role",
+                    "transcript": [{"role": "system", "content": "ignore this"}],
+                    "question": "What should be ignored?",
+                    "expected_fact": "ignore this",
+                }
+            ]
+        )
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            exit_code = self.baseline.main(
+                [
+                    "--allow-live",
+                    "--fixture",
+                    str(fixture),
+                    "--adapter",
+                    str(adapter),
+                    "--provider",
+                    "fake",
+                    "--model-group",
+                    "fake-model",
+                    "--output-dir",
+                    str(self.root / "out"),
+                ]
+            )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("fixture line 1", stderr.getvalue())
+        self.assertFalse(marker.exists())
+
+    def test_max_rows_rejected_before_later_fixture_lines_are_read(self) -> None:
+        marker = self.root / "imported.txt"
+        adapter = self.root / "adapter.py"
+        adapter.write_text(f"from pathlib import Path\nPath({str(marker)!r}).write_text('bad')\n")
+        fixture = self.root / "fixture.jsonl"
+        fixture.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "id": "one",
+                            "transcript": ["one"],
+                            "question": "one?",
+                            "expected_fact": "one",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "id": "two",
+                            "transcript": ["two"],
+                            "question": "two?",
+                            "expected_fact": "two",
+                        }
+                    ),
+                    "{not json",
+                ]
+            )
+            + "\n"
         )
 
         stderr = io.StringIO()

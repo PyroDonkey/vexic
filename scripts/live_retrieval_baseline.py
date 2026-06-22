@@ -11,14 +11,15 @@ import sys
 import tempfile
 import time
 from types import ModuleType
-from typing import Any, Iterable, NamedTuple
+from typing import Any, Iterable, Literal
 import uuid
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
+if __name__ == "__main__" and str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 from pydantic_ai.usage import UsageLimits
 
@@ -44,11 +45,40 @@ class BaselineConfigError(ValueError):
     pass
 
 
-class FixtureRow(NamedTuple):
-    row_id: str
-    transcript: list[object]
+class FixtureTurn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["user", "assistant"] = "user"
+    content: str
+
+    @field_validator("content")
+    @classmethod
+    def _content_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return value
+
+
+TranscriptTurn = str | FixtureTurn
+
+
+class FixtureRow(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    row_id: str = Field(alias="id")
+    transcript: list[TranscriptTurn] = Field(min_length=1)
     question: str
     expected_fact: str
+
+    @field_validator("row_id", "question", "expected_fact")
+    @classmethod
+    def _text_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return value
+
+
+FixtureRow.model_rebuild()
 
 
 class ProviderBudget:
@@ -135,6 +165,8 @@ def _require(value: str | None, name: str) -> str:
 def _turn_text(turn: object) -> str:
     if isinstance(turn, str):
         return turn
+    if isinstance(turn, FixtureTurn):
+        return turn.content
     if isinstance(turn, dict) and isinstance(turn.get("content"), str):
         return str(turn["content"])
     raise BaselineConfigError("transcript entries must be strings or role/content objects.")
@@ -143,6 +175,10 @@ def _turn_text(turn: object) -> str:
 def _message_from_turn(turn: object) -> ModelRequest | ModelResponse:
     if isinstance(turn, str):
         return ModelRequest(parts=[UserPromptPart(content=turn)])
+    if isinstance(turn, FixtureTurn):
+        if turn.role == "assistant":
+            return ModelResponse(parts=[TextPart(content=turn.content)])
+        return ModelRequest(parts=[UserPromptPart(content=turn.content)])
     if not isinstance(turn, dict):
         raise BaselineConfigError("transcript entries must be strings or role/content objects.")
     role = str(turn.get("role", "user")).lower()
@@ -154,42 +190,33 @@ def _message_from_turn(turn: object) -> ModelRequest | ModelResponse:
     raise BaselineConfigError("transcript role must be user or assistant.")
 
 
-def _load_fixture(path: Path) -> list[FixtureRow]:
+def _load_fixture(path: Path, *, max_rows: int | None = None) -> list[FixtureRow]:
     if not path.exists():
         raise BaselineConfigError(f"fixture not found: {path}")
     rows: list[FixtureRow] = []
-    for line_number, line in enumerate(path.read_text().splitlines(), start=1):
-        if not line.strip():
-            continue
-        try:
-            raw = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise BaselineConfigError(f"fixture line {line_number} is not valid JSON.") from exc
-        if not isinstance(raw, dict):
-            raise BaselineConfigError(f"fixture line {line_number} must be an object.")
-        transcript = raw.get("transcript")
-        if not isinstance(transcript, list) or not transcript:
-            raise BaselineConfigError(
-                f"fixture line {line_number} must include non-empty transcript list."
-            )
-        row_id = raw.get("id")
-        question = raw.get("question")
-        expected_fact = raw.get("expected_fact")
-        if not isinstance(row_id, str) or not row_id.strip():
-            raise BaselineConfigError(f"fixture line {line_number} must include id.")
-        if not isinstance(question, str) or not question.strip():
-            raise BaselineConfigError(f"fixture line {line_number} must include question.")
-        if not isinstance(expected_fact, str) or not expected_fact.strip():
-            raise BaselineConfigError(
-                f"fixture line {line_number} must include expected_fact."
-            )
-        rows.append(FixtureRow(row_id, transcript, question, expected_fact))
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                rows.append(FixtureRow.model_validate_json(line))
+            except ValidationError as exc:
+                first = exc.errors()[0]
+                location = ".".join(str(part) for part in first["loc"])
+                detail = f"{location}: {first['msg']}" if location else first["msg"]
+                raise BaselineConfigError(
+                    f"fixture line {line_number} is invalid: {detail}."
+                ) from exc
+            if max_rows is not None and len(rows) > max_rows:
+                raise BaselineConfigError(
+                    f"fixture has more than --max-rows {max_rows}."
+                )
     if not rows:
         raise BaselineConfigError("fixture must contain at least one row.")
     return rows
 
 
-def _validate_caps(args: argparse.Namespace, rows: list[FixtureRow]) -> None:
+def _validate_numeric_caps(args: argparse.Namespace) -> None:
     for name in (
         "max_rows",
         "max_messages_per_row",
@@ -202,6 +229,10 @@ def _validate_caps(args: argparse.Namespace, rows: list[FixtureRow]) -> None:
     ):
         if getattr(args, name) <= 0:
             raise BaselineConfigError(f"--{name.replace('_', '-')} must be greater than 0.")
+
+
+def _validate_caps(args: argparse.Namespace, rows: list[FixtureRow]) -> None:
+    _validate_numeric_caps(args)
     if len(rows) > args.max_rows:
         raise BaselineConfigError(
             f"fixture has {len(rows)} rows, above --max-rows {args.max_rows}."
@@ -520,7 +551,8 @@ def main(argv: list[str] | None = None) -> int:
         _require(args.provider, "--provider")
         _require(args.model_group, "--model-group")
         output_dir = Path(_require(args.output_dir, "--output-dir"))
-        rows = _load_fixture(fixture)
+        _validate_numeric_caps(args)
+        rows = _load_fixture(fixture, max_rows=args.max_rows)
         _validate_caps(args, rows)
         adapter = _load_adapter(adapter_path)
         retrieval = asyncio.run(_run_live(rows, args, adapter))
