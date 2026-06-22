@@ -295,6 +295,7 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             commit_deep_cycle(
                 self.db_path,
                 [PromotionDecision(candidate_id=message_id, embedding=_unit_vector(1.0))],
+                agent_id=agent_id,
                 started_at="2026-06-01T00:01:00+00:00",
                 finished_at="2026-06-01T00:01:01+00:00",
             )
@@ -474,6 +475,7 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             commit_deep_cycle(
                 self.db_path,
                 [PromotionDecision(candidate_ids[agent_id], _unit_vector(1.0))],
+                agent_id=agent_id,
                 started_at="2026-06-01T00:01:00+00:00",
                 finished_at="2026-06-01T00:01:01+00:00",
             )

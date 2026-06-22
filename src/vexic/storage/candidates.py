@@ -729,7 +729,11 @@ def nearest_candidate_ids(
     return [int(row[0]) for row in rows]
 
 
-def load_candidates_missing_embeddings(db_path: str) -> list[tuple[int, str]]:
+def load_candidates_missing_embeddings(
+    db_path: str,
+    *,
+    agent_id: str | None = None,
+) -> list[tuple[int, str]]:
     init_vector_memory(db_path)
     with closing(sqlite3.connect(db_path)) as conn:
         _ensure_vector_memory_schema(conn)
@@ -741,8 +745,10 @@ def load_candidates_missing_embeddings(db_path: str) -> list[tuple[int, str]]:
                 ON e.candidate_id = c.id
             WHERE e.candidate_id IS NULL
                 AND c.stale = 0
+                AND c.agent_id IS ?
             ORDER BY c.id ASC
-            """
+            """,
+            (agent_id,),
         ).fetchall()
         return [(int(row[0]), str(row[1])) for row in rows]
 

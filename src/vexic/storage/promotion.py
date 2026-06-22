@@ -66,6 +66,49 @@ def _promoted_fact_id_for_candidate(conn: sqlite3.Connection, candidate_id: int)
     return int(row[0])
 
 
+def _decision_candidate_ids(
+    decision: PromotionDecision | CandidateRetirementDecision,
+) -> list[int]:
+    if isinstance(decision, PromotionDecision):
+        return [decision.candidate_id, *decision.retired_candidate_ids]
+    return [decision.candidate_id]
+
+
+def _validate_decision_agent_scope(
+    conn: sqlite3.Connection,
+    decision: PromotionDecision | CandidateRetirementDecision,
+    *,
+    agent_id: str | None,
+) -> None:
+    for candidate_id in _decision_candidate_ids(decision):
+        row = conn.execute(
+            "SELECT agent_id FROM memory_candidates WHERE id = ?",
+            (candidate_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Missing memory candidate {candidate_id}.")
+        if row[0] != agent_id:
+            raise ValueError(
+                f"Candidate {candidate_id} is outside the requested agent scope."
+            )
+
+    if isinstance(decision, PromotionDecision):
+        fact_id = decision.retired_fact_id
+    else:
+        fact_id = decision.retired_by_fact_id
+    if fact_id is not None:
+        row = conn.execute(
+            "SELECT agent_id FROM long_term_memory WHERE id = ?",
+            (fact_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Missing retiring fact {fact_id}.")
+        if row[0] != agent_id:
+            raise ValueError(
+                f"Retiring fact {fact_id} is outside the requested agent scope."
+            )
+
+
 def _retire_candidate(
     conn: sqlite3.Connection,
     decision: CandidateRetirementDecision,
@@ -85,7 +128,9 @@ def _retire_candidate(
     if fact_row is None:
         raise ValueError(f"Missing retiring fact {decision.retired_by_fact_id}.")
     if fact_row[0] != agent_id:
-        return False
+        raise ValueError(
+            f"Retiring fact {decision.retired_by_fact_id} is outside candidate agent scope."
+        )
     if promoted:
         if long_term_fact_exists_for_candidate(conn, decision.candidate_id):
             return False
@@ -233,6 +278,12 @@ def commit_deep_cycle(
             promotions = 0
             retirements = 0
             if decisions:
+                for decision in decisions:
+                    _validate_decision_agent_scope(
+                        conn,
+                        decision,
+                        agent_id=agent_id,
+                    )
                 _ensure_vector_memory_schema(conn)
                 for decision in decisions:
                     if isinstance(decision, CandidateRetirementDecision):

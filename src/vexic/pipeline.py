@@ -117,7 +117,10 @@ async def run_light_phase(
             exclude_session_prefixes=("onboarding:",),
         )
         if not rows:
-            missing_embeddings = load_candidates_missing_embeddings(db_path)
+            missing_embeddings = load_candidates_missing_embeddings(
+                db_path,
+                agent_id=agent_id,
+            )
             if missing_embeddings:
                 backfill_embeddings = embedder([fact_text for _, fact_text in missing_embeddings])
                 backfill_missing_candidate_embeddings(
@@ -149,7 +152,10 @@ async def run_light_phase(
         candidates = result.output
         validate_candidate_source_ids(candidates, evidence_ids)
 
-        missing_embeddings = load_candidates_missing_embeddings(db_path)
+        missing_embeddings = load_candidates_missing_embeddings(
+            db_path,
+            agent_id=agent_id,
+        )
         if missing_embeddings:
             backfill_embeddings = embedder([fact_text for _, fact_text in missing_embeddings])
             backfill_missing_candidate_embeddings(

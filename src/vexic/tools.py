@@ -84,7 +84,12 @@ def _truncate_expand_history(text: str) -> str:
 
 def search_memory(ctx_or_deps: Any, query: str) -> str:
     deps = _deps(ctx_or_deps)
-    results = search_messages(deps.db_path, query, session_id=deps.session_id)
+    results = search_messages(
+        deps.db_path,
+        query,
+        session_id=deps.session_id,
+        agent_id=getattr(deps, "agent_id", None),
+    )
 
     if not results:
         return "No relevant memories found."
@@ -118,6 +123,7 @@ def expand_history(
             first_message_id,
             last_message_id,
             session_id=deps.session_id,
+            agent_id=getattr(deps, "agent_id", None),
             max_rows=EXPAND_HISTORY_MAX_RANGE_WIDTH,
         )
     except TranscriptRangeTooLarge as exc:
