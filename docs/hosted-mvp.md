@@ -78,7 +78,7 @@ For one internal hosted environment:
 External customer-memory readiness is blocked by the hosted readiness gate
 ([COA-177](https://linear.app/ryan-boissonnault/issue/COA-177/define-hosted-security-privacy-backup-and-abuse-readiness-gate))
 in Linear. This hosted shell remains internal-only until that gate is satisfied
-or an explicit Ryan-approved risk acceptance is recorded.
+or an explicit security/engineering owner risk acceptance is recorded.
 
 Internal-only today:
 
