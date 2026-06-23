@@ -142,6 +142,8 @@ Each doc owns one thing. Avoid duplicate status and copied platform history.
 
 - `README.md` - short project overview and test commands.
 - `AGENTS.md` - agent rules, settled boundaries, and working conventions.
+- `docs/adr/README.md` - index of every ADR with title and one-line status.
+- `docs/adr/*` - dated architecture decision records.
 - `docs/provenance.md` - extraction provenance from the private source host.
 - `docs/memory-service-contract.md` - human-readable contract reference.
 - `docs/architecture.md` - Vexic memory architecture and local-core design.
@@ -149,6 +151,41 @@ Each doc owns one thing. Avoid duplicate status and copied platform history.
 
 If a doc describes contract fields or operation semantics, verify it against
 `src/vexic/contract` and the relevant tests.
+
+### Docs Are Downstream Of Code
+
+In-repo `AGENTS.md` and `docs/adr/*` are authoritative for architecture
+decisions, settled boundaries, and the service operation surface. Code under
+`src/vexic` and `tests/` is authoritative for behavior. Any project-tracking
+view of this repository - including the Linear roadmap, todo, and planning
+docs - is downstream. When a tracking doc disagrees with `AGENTS.md`,
+`docs/adr/*`, or the code, the tracking doc is wrong and must be reconciled
+against the repo, not the other way around.
+
+Do not let downstream tracking drift silently. The following are reconciliation
+triggers. When one fires in your change, reconcile the downstream Linear
+roadmap/todo against the in-repo source of truth in the same work session (or,
+if Linear tooling is unavailable, record the required reconciliation per the
+Linear Tracking rules):
+
+- A new or changed ADR under `docs/adr/`. Update the Linear roadmap/todo to
+  match the ADR set and statuses, and confirm `docs/adr/README.md` lists every
+  ADR file. The in-repo ADR index, not Linear, is the canonical ADR list.
+- A change to the `LocalMemoryService` operation surface in
+  `src/vexic/service.py` (an operation added, removed, renamed, or moved
+  between implemented and host-port/deferred). Update any Linear roadmap/todo
+  that enumerates implemented vs deferred operations to match the
+  `MemoryService` contract and `LocalMemoryService`, as recorded in the
+  "v0.1 Local Service Surface" section above.
+- A test-count change (new or removed tests under `tests/`). Re-run
+  `uv run pytest` and update any tracking doc that cites a test count to the
+  fresh number. Do not carry a hand-typed count forward; verify it.
+
+`.claude/hooks/check_doc_drift.py` enforces the in-repo half of this loop at
+session start: it checks that `docs/adr/README.md` lists every ADR file and
+that the documented service surface matches `src/vexic`. A hook cannot read
+Linear, so closing the loop against the tracking docs remains a manual step
+under the triggers above.
 
 ---
 
@@ -219,7 +256,10 @@ changes. Do not stash, reset, or commit user work unless Ryan asks.
 ### Linear Tracking
 
 Linear is project tracking only. Do not add Linear SDKs, secrets, imports, or
-runtime dependencies to `src/vexic`.
+runtime dependencies to `src/vexic`. Linear is downstream of the repo: see
+"Docs Are Downstream Of Code". The Linear roadmap, todo, and planning docs
+never override `AGENTS.md`, `docs/adr/*`, or the code; they are reconciled
+against them.
 
 At the start of each work session, review relevant Linear project issues through
 the configured Linear connector or MCP tools when tooling and auth are
@@ -227,10 +267,16 @@ available. Map the requested work to an existing issue, or create one for
 non-trivial plans and changes.
 
 During work, keep the issue status and comments current when scope changes,
-blockers, decisions, or follow-up work appear. At finish, update the issue with
-the branch, commit, verification result, and any generated follow-up issues.
+blockers, decisions, or follow-up work appear. When a reconciliation trigger
+from "Docs Are Downstream Of Code" fires (a new or changed ADR, a change to the
+`LocalMemoryService` operation surface, or a test-count change), reconcile the
+affected Linear roadmap/todo against the in-repo source of truth before
+finishing. At finish, update the issue with the branch, commit, verification
+result, and any generated follow-up issues.
 
 If Linear tooling is unavailable, say so plainly and do not invent issue IDs.
+Record the reconciliation that the triggers above require - for example, in the
+commit message or the session report - so it is not lost.
 
 In this section, fresh verification means the relevant checks from the
 Verification section have been run after the final edit.

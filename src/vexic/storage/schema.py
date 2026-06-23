@@ -311,7 +311,7 @@ def _ensure_long_term_memory_embeddings(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_retrieval_events(conn: sqlite3.Connection) -> None:
-    # One row per fact surfaced by one Tier 3 retrieval (ADR-0008). The durable
+    # One row per fact surfaced by one Tier 3 retrieval (upstream ADR-0008). The durable
     # source that makes retrieved_count/used_count derivable and rebuild-safe.
     # `used` is tri-state: NULL = use judge never ran, 0 = judged not used,
     # 1 = judged used — the only mutation a row ever receives is that judgment.
@@ -363,7 +363,7 @@ def _ensure_retrieval_events(conn: sqlite3.Connection) -> None:
 
 def _ensure_memory_candidates_fts(conn: sqlite3.Connection) -> None:
     # External-content FTS5 shadow over candidate fact_text for the Tier 2
-    # candidate-fallback keyword retriever (ADR-0010), mirroring
+    # candidate-fallback keyword retriever (upstream ADR-0010), mirroring
     # long_term_memory_fts. Light-phase merge updates hit_count/source ids/
     # embedding but not fact_text, so the update trigger rarely fires; it is
     # kept for correctness regardless.
@@ -419,7 +419,7 @@ def _ensure_memory_candidates_fts(conn: sqlite3.Connection) -> None:
 
 def _ensure_candidate_retrieval_events(conn: sqlite3.Connection) -> None:
     # One row per Tier 2 candidate surfaced by one candidate-fallback retrieval
-    # (ADR-0010). Parallel to retrieval_events, never an extension of it: the
+    # (upstream ADR-0010). Parallel to retrieval_events, never an extension of it: the
     # referent is a mutable candidate, not a durable fact, so the shipped Tier 3
     # events path stays untouched. `used` is tri-state like retrieval_events
     # (NULL = no candidate use judge ran yet — deferred), reserved for a future
