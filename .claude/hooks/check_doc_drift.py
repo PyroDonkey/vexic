@@ -85,6 +85,28 @@ def _check_adr_index(warnings: list[str]) -> None:
         )
 
 
+def _service_surface_section(agents_text: str) -> str:
+    """Return the body of the 'v0.1 Local Service Surface' section of AGENTS.md.
+
+    Slices from the section header to the next markdown heading or horizontal
+    rule. Raises if the header is absent so the caller records a "could not
+    run" note rather than silently passing.
+    """
+    header = "### v0.1 Local Service Surface"
+    start = agents_text.find(header)
+    if start == -1:
+        raise ValueError(
+            "'### v0.1 Local Service Surface' section not found in AGENTS.md"
+        )
+    rest = agents_text[start + len(header):]
+    end = len(rest)
+    for marker in ("\n## ", "\n### ", "\n---"):
+        idx = rest.find(marker)
+        if idx != -1:
+            end = min(end, idx)
+    return rest[:end]
+
+
 def _check_service_surface(warnings: list[str]) -> None:
     contract_ops = _async_methods(CONTRACT, "MemoryService")
     service_ops = _async_methods(SERVICE, "LocalMemoryService")
@@ -101,19 +123,24 @@ def _check_service_surface(warnings: list[str]) -> None:
             "MemoryService contract: " + ", ".join(only_service) + "."
         )
 
-    # Match each operation as a backticked token (`op`) rather than a bare
-    # substring, so e.g. the `rebuild` op is not considered documented just
-    # because the prose word "Rebuildable" contains it. AGENTS.md backticks
-    # every operation name, including run_dream_phase (documented as a
-    # host-port op outside the bullet list), so this stays a true check.
-    agents_text = AGENTS.read_text(encoding="utf-8")
-    undocumented = sorted(op for op in service_ops if f"`{op}`" not in agents_text)
+    # Scope the documentation check to the authoritative
+    # "v0.1 Local Service Surface" section, and match each operation as a
+    # backticked token (`op`) rather than a bare substring. Section scoping
+    # means an op dropped from that section is flagged even if it survives in
+    # unrelated prose; backtick matching means `rebuild` is not counted as
+    # documented just because the word "Rebuildable" contains it. The section
+    # holds all 12 ops, including run_dream_phase, which is documented there as
+    # a host-port op (in prose, not the bullet list), so this stays a true
+    # check with no false positive on it.
+    surface = _service_surface_section(AGENTS.read_text(encoding="utf-8"))
+    undocumented = sorted(op for op in service_ops if f"`{op}`" not in surface)
     if undocumented:
         warnings.append(
-            "AGENTS.md does not mention service operation(s) present in code: "
+            "The 'v0.1 Local Service Surface' section of AGENTS.md does not "
+            "list service operation(s) present in code: "
             + ", ".join(undocumented)
-            + ". Update the 'v0.1 Local Service Surface' section and reconcile "
-            "the downstream tracking roadmap/todo (see AGENTS.md)."
+            + ". Update that section and reconcile the downstream tracking "
+            "roadmap/todo (see AGENTS.md)."
         )
 
 
