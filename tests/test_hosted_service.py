@@ -2,15 +2,18 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 import json
 import os
+import re
 import sqlite3
 import stat
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
+from vexic.embeddings import EMBEDDING_DIM
 from vexic.contract import (
     AppendTranscriptRequest,
     DreamPhase,
@@ -20,6 +23,7 @@ from vexic.contract import (
     PrincipalType,
     RedactionContext,
     RunDreamPhaseRequest,
+    SearchLongTermRequest,
     SearchTranscriptRequest,
     TrustBoundary,
 )
@@ -33,9 +37,14 @@ from vexic.hosted import (
     HostedRateLimitExceeded,
     HostedUsageEvent,
 )
+from vexic.models import ContradictionJudgment, FactCandidate, RemBoost, RemBoostPlan
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
-from vexic.ports import HostPortNotConfigured
+from vexic.ports import DreamPhasePorts, HostPortNotConfigured
 from vexic.storage import single_message_adapter
+
+
+def _unit_vector(first: float = 1.0) -> list[float]:
+    return [first] + [0.0] * (EMBEDDING_DIM - 1)
 
 
 def _scope(
@@ -81,6 +90,22 @@ class _FailingJobTelemetry:
 
     def record_job_event(self, event: HostedJobEvent) -> None:
         raise RuntimeError("job telemetry unavailable")
+
+
+class _FailingJobUsageTelemetry:
+    def __init__(self, catalog: HostedTenantCatalog) -> None:
+        self.catalog = catalog
+
+    def record_audit_event(self, event: HostedAuditEvent) -> None:
+        self.catalog.record_audit_event(event)
+
+    def record_usage_event(self, event: HostedUsageEvent) -> None:
+        if event.kind == "job":
+            raise RuntimeError("job usage telemetry unavailable")
+        self.catalog.record_usage_event(event)
+
+    def record_job_event(self, event: HostedJobEvent) -> None:
+        self.catalog.record_job_event(event)
 
 
 class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -1144,6 +1169,247 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             [created_paths[0].name],
         )
 
+    async def test_hosted_dream_worker_runs_light_rem_deep_with_fake_ports(
+        self,
+    ) -> None:
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        self.catalog.provision_tenant("tenant-b", project_ids={"project-b"})
+        key_a = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={
+                MemoryCapability.ADMIN_REBUILD,
+                MemoryCapability.SEARCH,
+                MemoryCapability.WRITE,
+            },
+            project_ids={"project-a"},
+        )
+        key_b = self.keys.create_key(
+            tenant_id="tenant-b",
+            principal_id="agent-b",
+            capabilities={MemoryCapability.SEARCH},
+            project_ids={"project-b"},
+        )
+
+        class ExtractionAgent:
+            async def run(self, transcript: str) -> object:
+                message_id = int(re.search(r"message_id=(\d+)", transcript).group(1))
+                return SimpleNamespace(
+                    output=[
+                        FactCandidate(
+                            fact_text="Ryan prefers compact hosted reports.",
+                            subject="Ryan",
+                            category="preference",
+                            importance=7,
+                            confidence=0.9,
+                            source_message_ids=[message_id],
+                        )
+                    ],
+                    usage=lambda: SimpleNamespace(
+                        requests=1,
+                        input_tokens=11,
+                        output_tokens=7,
+                        total_tokens=18,
+                    ),
+                )
+
+        class RemAgent:
+            async def run(self, prompt: str) -> object:
+                candidate_ids = [
+                    int(candidate_id)
+                    for candidate_id in re.findall(r"candidate_id=(\d+)", prompt)
+                ]
+                return SimpleNamespace(
+                    output=RemBoostPlan(
+                        boosts=[
+                            RemBoost(candidate_id=candidate_id, boost=0.5)
+                            for candidate_id in candidate_ids
+                        ]
+                    ),
+                    usage=lambda: SimpleNamespace(
+                        requests=1,
+                        input_tokens=3,
+                        output_tokens=2,
+                        total_tokens=5,
+                    ),
+                )
+
+        class ContradictionAgent:
+            async def run(self, prompt: str) -> object:
+                return SimpleNamespace(
+                    output=ContradictionJudgment(
+                        contradicts=False,
+                        confidence=0.9,
+                    ),
+                    usage=lambda: SimpleNamespace(
+                        requests=1,
+                        input_tokens=4,
+                        output_tokens=1,
+                        total_tokens=5,
+                    ),
+                )
+
+        service = HostedMemoryService(
+            self.catalog,
+            self.keys,
+            telemetry=self.catalog,
+            dream_phase_ports=DreamPhasePorts(
+                model_group="fake",
+                embed=lambda texts: [_unit_vector() for _ in texts],
+                extraction_agent_factory=lambda *_args, **_kwargs: ExtractionAgent(),
+                rem_agent_factory=lambda *_args, **_kwargs: RemAgent(),
+                contradiction_agent_factory=lambda *_args, **_kwargs: ContradictionAgent(),
+            ),
+        )
+        jobs = HostedBackgroundJobRunner(service)
+        message_json = single_message_adapter.dump_json(
+            ModelRequest(parts=[UserPromptPart(content="compact hosted reports")])
+        )
+
+        await service.append_transcript(
+            key_a.raw_key,
+            AppendTranscriptRequest(
+                scope=_scope(capabilities={MemoryCapability.WRITE}),
+                messages_json=[message_json],
+                redaction=RedactionContext(forbidden_values=()),
+            ),
+        )
+        for phase in (DreamPhase.LIGHT, DreamPhase.REM, DreamPhase.DEEP):
+            result = await jobs.run_dream_phase(
+                key_a.raw_key,
+                RunDreamPhaseRequest(
+                    scope=_scope(capabilities={MemoryCapability.ADMIN_REBUILD}),
+                    phase=phase,
+                    redaction=RedactionContext(forbidden_values=()),
+                ),
+            )
+            self.assertEqual(result.status, "ok")
+
+        result_a = await service.search_long_term(
+            key_a.raw_key,
+            SearchLongTermRequest(
+                scope=_scope(capabilities={MemoryCapability.SEARCH}),
+                query="compact reports",
+            ),
+        )
+        result_b = await service.search_long_term(
+            key_b.raw_key,
+            SearchLongTermRequest(
+                scope=_scope(
+                    tenant_id="tenant-b",
+                    project_id="project-b",
+                    capabilities={MemoryCapability.SEARCH},
+                ),
+                query="compact reports",
+            ),
+        )
+
+        self.assertEqual(
+            [fact.fact_text for fact in result_a.facts],
+            ["Ryan prefers compact hosted reports."],
+        )
+        self.assertEqual(result_b.facts, [])
+        self.assertEqual([event.status for event in jobs.job_events], ["running", "ok"] * 3)
+        job_usage = [
+            event
+            for event in self.catalog.usage_events("tenant-a")
+            if event.kind == "job"
+        ]
+        self.assertEqual([event.status for event in job_usage], ["ok", "ok", "ok"])
+        self.assertEqual(job_usage[0].model_requests, 1)
+        self.assertEqual(job_usage[0].input_tokens, 11)
+        self.assertEqual(job_usage[0].output_tokens, 7)
+        self.assertEqual(job_usage[0].total_tokens, 18)
+        self.assertEqual(job_usage[1].model_requests, 1)
+        self.assertEqual(job_usage[1].input_tokens, 3)
+        self.assertEqual(job_usage[1].output_tokens, 2)
+        self.assertEqual(job_usage[1].total_tokens, 5)
+
+    async def test_hosted_dream_worker_redaction_failure_does_not_call_model(
+        self,
+    ) -> None:
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.ADMIN_REBUILD, MemoryCapability.WRITE},
+            project_ids={"project-a"},
+        )
+        agent_calls = 0
+
+        class ExtractionAgent:
+            async def run(self, transcript: str) -> object:
+                nonlocal agent_calls
+                agent_calls += 1
+                return SimpleNamespace(
+                    output=[
+                        FactCandidate(
+                            fact_text="Ryan prefers redacted reports.",
+                            subject="Ryan",
+                            category="preference",
+                            importance=7,
+                            confidence=0.9,
+                            source_message_ids=[1],
+                        )
+                    ],
+                    usage=lambda: SimpleNamespace(
+                        requests=1,
+                        input_tokens=1,
+                        output_tokens=1,
+                        total_tokens=2,
+                    ),
+                )
+
+        service = HostedMemoryService(
+            self.catalog,
+            self.keys,
+            telemetry=self.catalog,
+            dream_phase_ports=DreamPhasePorts(
+                model_group="fake",
+                embed=lambda texts: [_unit_vector() for _ in texts],
+                extraction_agent_factory=lambda *_args, **_kwargs: ExtractionAgent(),
+            ),
+        )
+        jobs = HostedBackgroundJobRunner(service)
+
+        await service.append_transcript(
+            api_key.raw_key,
+            AppendTranscriptRequest(
+                scope=_scope(capabilities={MemoryCapability.WRITE}),
+                messages_json=[
+                    single_message_adapter.dump_json(
+                        ModelRequest(parts=[UserPromptPart(content="cedar-secret")])
+                    )
+                ],
+                redaction=RedactionContext(forbidden_values=()),
+            ),
+        )
+
+        with self.assertRaises(ValueError):
+            await jobs.run_dream_phase(
+                api_key.raw_key,
+                RunDreamPhaseRequest(
+                    scope=_scope(capabilities={MemoryCapability.ADMIN_REBUILD}),
+                    phase=DreamPhase.LIGHT,
+                    redaction=RedactionContext(forbidden_values=("cedar-secret",)),
+                ),
+            )
+
+        with closing(sqlite3.connect(tenant.db_path)) as conn:
+            candidate_count = conn.execute(
+                "SELECT COUNT(*) FROM memory_candidates"
+            ).fetchone()[0]
+
+        self.assertEqual(agent_calls, 0)
+        self.assertEqual(candidate_count, 0)
+        self.assertEqual([event.status for event in jobs.job_events], ["running", "error"])
+        ledger_text = (
+            repr(jobs.job_events)
+            + repr(self.catalog.audit_events("tenant-a"))
+            + repr(self.catalog.usage_events("tenant-a"))
+        )
+        self.assertNotIn("cedar-secret", ledger_text)
+
     async def test_dream_job_fails_closed_without_host_port(self) -> None:
         self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
         api_key = self.keys.create_key(
@@ -1206,6 +1472,34 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn(api_key.raw_key, ledger_text)
         self.assertNotIn("Dream phase host port is not configured", ledger_text)
+
+    async def test_job_usage_telemetry_failure_does_not_mask_dream_job_error(self) -> None:
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.ADMIN_REBUILD},
+            project_ids={"project-a"},
+        )
+        service = HostedMemoryService(
+            self.catalog,
+            self.keys,
+            telemetry=_FailingJobUsageTelemetry(self.catalog),
+        )
+        runner = HostedBackgroundJobRunner(service)
+
+        with self.assertRaises(HostPortNotConfigured):
+            await runner.run_dream_phase(
+                api_key.raw_key,
+                RunDreamPhaseRequest(
+                    scope=_scope(capabilities={MemoryCapability.ADMIN_REBUILD}),
+                    phase=DreamPhase.LIGHT,
+                    redaction=RedactionContext(forbidden_values=()),
+                ),
+            )
+
+        self.assertEqual([event.status for event in runner.job_events], ["running", "error"])
+        self.assertEqual(runner.job_events[-1].error_type, "HostPortNotConfigured")
 
     async def test_dream_job_failure_lifecycle_persists_across_catalog_reload(
         self,

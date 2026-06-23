@@ -35,10 +35,12 @@ def build_rem_agent(
     raise missing_host_port("REM boost")
 
 
-def _forbidden_secret_values(secrets: Mapping[str, str] | None) -> list[str]:
-    if secrets is None:
-        return []
-    return list(secrets.values())
+def _forbidden_secret_values(
+    secrets: Mapping[str, str] | None,
+    extra_values: tuple[str, ...] = (),
+) -> list[str]:
+    values = [] if secrets is None else list(secrets.values())
+    return [*values, *extra_values]
 
 
 def _rem_prompt(candidate_lines: list[str]) -> str:
@@ -102,9 +104,10 @@ async def run_rem_phase(
     max_candidates_per_batch: int = REM_MAX_CANDIDATES_PER_BATCH,
     max_prompt_tokens_per_batch: int = REM_MAX_PROMPT_TOKENS_PER_BATCH,
     rem_agent_factory: AgentFactory | None = None,
-) -> None:
+    forbidden_secret_values: tuple[str, ...] = (),
+) -> UsageSummary:
     started_at = utc_now_iso()
-    forbidden = _forbidden_secret_values(secrets)
+    forbidden = _forbidden_secret_values(secrets, forbidden_secret_values)
     agent_factory = rem_agent_factory or build_rem_agent
     try:
         if max_candidates_per_batch <= 0:
@@ -124,7 +127,7 @@ async def run_rem_phase(
                 forbidden_secret_values=forbidden,
             )
             print("REM phase: no eligible candidates. No-op.")
-            return
+            return UsageSummary()
 
         batches = _candidate_batches(
             candidates,
@@ -168,6 +171,7 @@ async def run_rem_phase(
             forbidden_secret_values=forbidden,
         )
         print(f"REM phase: {stats.boosted} candidates boosted.")
+        return usage
     except Exception as exc:
         try:
             commit_rem_cycle(

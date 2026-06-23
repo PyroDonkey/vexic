@@ -15,7 +15,7 @@ from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 from vexic.embeddings import EMBEDDING_DIM
 from vexic.deep import run_deep_phase
-from vexic.models import FactCandidate, RemBoost, RemBoostPlan
+from vexic.models import ContradictionJudgment, FactCandidate, RemBoost, RemBoostPlan
 from vexic.pipeline import _main, run_light_phase
 from vexic.ports import HostPortNotConfigured
 from vexic.rem import run_rem_phase
@@ -141,6 +141,47 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             self.assertFalse(agent_factory_called)
+
+    async def test_light_phase_redaction_failure_does_not_call_embedder(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            save_messages(
+                db_path,
+                [ModelRequest(parts=[UserPromptPart(content="I prefer compact reports.")])],
+            )
+            embed_calls = 0
+
+            class ExtractionAgent:
+                async def run(self, transcript: str) -> object:
+                    return SimpleNamespace(
+                        output=[
+                            FactCandidate(
+                                fact_text="Ryan stores cedar-secret outside embeddings.",
+                                subject="Ryan",
+                                category="constraint",
+                                importance=8,
+                                confidence=0.9,
+                                source_message_ids=[1],
+                            )
+                        ]
+                    )
+
+            def embed(texts: list[str]) -> list[list[float]]:
+                nonlocal embed_calls
+                embed_calls += 1
+                return [_unit_vector(1.0) for _ in texts]
+
+            with self.assertRaises(ValueError):
+                await run_light_phase(
+                    db_path,
+                    "glm",
+                    extraction_agent_factory=lambda *_args, **_kwargs: ExtractionAgent(),
+                    embed=embed,
+                    forbidden_secret_values=("cedar-secret",),
+                )
+
+        self.assertEqual(embed_calls, 0)
 
     async def test_light_phase_repairs_only_requested_agent_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -326,6 +367,47 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
+    async def test_rem_phase_redaction_failure_does_not_call_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            commit_dream_cycle(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="Ryan keeps cedar-secret out of model prompts.",
+                        subject="Ryan",
+                        category="constraint",
+                        importance=8,
+                        confidence=0.9,
+                        source_message_ids=[1],
+                    )
+                ],
+                candidate_embeddings=[_unit_vector(1.0)],
+                agent_id=None,
+                status="ok",
+                started_at="2026-01-01T00:00:00Z",
+                finished_at="2026-01-01T00:00:01Z",
+                messages_processed=1,
+                last_processed_message_id=1,
+            )
+            factory_calls = 0
+
+            def rem_agent_factory(*_args: object, **_kwargs: object) -> object:
+                nonlocal factory_calls
+                factory_calls += 1
+                return SimpleNamespace()
+
+            with self.assertRaises(ValueError):
+                await run_rem_phase(
+                    db_path,
+                    "glm",
+                    rem_agent_factory=rem_agent_factory,
+                    forbidden_secret_values=("cedar-secret",),
+                )
+
+        self.assertEqual(factory_calls, 0)
+
     async def test_deep_phase_promotes_only_requested_agent_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = str(Path(temp_dir) / "memory.db")
@@ -376,6 +458,71 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(facts, [("agent-a", "Ryan agent a cedar fact.")])
         self.assertEqual(candidates, [("agent-a", 1), ("agent-b", 0)])
         self.assertEqual(deep_runs, [("agent-a", 1)])
+
+    async def test_deep_phase_redaction_failure_does_not_call_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            second_vector = [0.0, 1.0] + [0.0] * (EMBEDDING_DIM - 2)
+            for fact_text, embedding, message_id in (
+                ("Ryan stores cedar-secret outside model prompts.", _unit_vector(1.0), 1),
+                ("Ryan prefers compact reports.", second_vector, 2),
+            ):
+                commit_dream_cycle(
+                    db_path,
+                    [
+                        FactCandidate(
+                            fact_text=fact_text,
+                            subject="Ryan",
+                            category="constraint",
+                            importance=8,
+                            confidence=0.9,
+                            source_message_ids=[message_id],
+                        )
+                    ],
+                    candidate_embeddings=[embedding],
+                    agent_id=None,
+                    status="ok",
+                    started_at="2026-01-01T00:00:00Z",
+                    finished_at="2026-01-01T00:00:01Z",
+                    messages_processed=1,
+                    last_processed_message_id=message_id,
+                )
+            commit_deep_cycle(
+                db_path,
+                [PromotionDecision(candidate_id=1, embedding=_unit_vector(1.0))],
+                status="ok",
+                started_at="2026-01-01T00:01:00Z",
+                finished_at="2026-01-01T00:01:01Z",
+            )
+            agent_calls = 0
+
+            class ContradictionAgent:
+                async def run(self, prompt: str) -> object:
+                    nonlocal agent_calls
+                    agent_calls += 1
+                    return SimpleNamespace(
+                        output=ContradictionJudgment(
+                            contradicts=False,
+                            confidence=0.9,
+                        )
+                    )
+
+            with self.assertRaises(ValueError):
+                await run_deep_phase(
+                    db_path,
+                    "glm",
+                    contradiction_agent_factory=lambda *_args, **_kwargs: ContradictionAgent(),
+                    forbidden_secret_values=("cedar-secret",),
+                )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                promoted = conn.execute(
+                    "SELECT promoted FROM memory_candidates WHERE id = 2"
+                ).fetchone()[0]
+
+        self.assertEqual(agent_calls, 0)
+        self.assertEqual(promoted, 0)
 
     def test_deep_commit_rejects_decisions_outside_requested_agent_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
