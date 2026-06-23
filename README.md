@@ -5,9 +5,9 @@ provenance-first, replayable memory core for long-running agents.
 
 This first package slice is a local Python core with a SQLite adapter, public
 contract models, and conformance tests. Managed billing, dashboards, public
-HTTP, remote MCP, and production hosted operations are intentionally out of
-scope for v0.1. The read-only local stdio MCP MVP below is the narrow in-scope
-adapter slice.
+HTTP, mature remote MCP, and production hosted operations are intentionally out
+of scope for v0.1. The read-only local stdio MCP MVP and the hosted
+internal-alpha read-only HTTP MCP adapter are the narrow in-scope MCP slices.
 
 ## Running the Project
 
@@ -154,3 +154,22 @@ customer-memory readiness is blocked by the
 hosted readiness gate
 ([COA-177](https://linear.app/ryan-boissonnault/issue/COA-177/define-hosted-security-privacy-backup-and-abuse-readiness-gate))
 in Linear.
+
+## Native HTTP MCP
+
+The hosted FastAPI app also exposes `POST /mcp` as a stateless, read-only,
+JSON-only Streamable HTTP MCP slice. It requires `Authorization: Bearer
+<vexic-api-key>`, binds project/session/agent scope from `X-Vexic-*` headers,
+and exposes only `search_transcript` and `search_long_term`.
+
+Minimum smoke request:
+
+```powershell
+curl.exe -s https://api.vexic.dev/mcp `
+  -H "Authorization: Bearer <raw-key>" `
+  -H "Accept: application/json, text/event-stream" `
+  -H "X-Vexic-Project-Id: project-a" `
+  -H "X-Vexic-Session-Id: session-a" `
+  -H "Content-Type: application/json" `
+  -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}"
+```

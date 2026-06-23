@@ -12,17 +12,18 @@ remain owned by the hosted service layer around the Vexic core.
 
 MCP adapters must stay thin: they delegate to the public memory contract and
 inherit the same scope, capability, redaction, audit, and rate-limit rules as
-the hosted API. Local stdio MCP should come first for coding agents; remote HTTP
-MCP should come after hosted auth is stable. The default local MCP slice is
-read-only search: transcript append, export, delete, rebuild, and admin tools
-wait until their ingress, egress, and lifecycle guards are explicit.
+the hosted API. Local stdio MCP came first for coding agents; ADR 0010 adds a
+thin native read-only HTTP MCP slice after hosted API-key auth became available.
+Mature remote MCP remains deferred. The default MCP slice is read-only search:
+transcript append, export, delete, rebuild, and admin tools wait until their
+ingress, egress, and lifecycle guards are explicit.
 
-COA-174 decision: remote MCP remains deferred, while local stdio MCP may expose
-verbatim history expansion before remote MCP only as a disabled-by-default
-privileged egress slice. Operators must opt in at process launch, the adapter
-must require `MemoryCapability.EXPAND_HISTORY`, and callers may only expand
-bounded ranges in the configured session scope. Forbidden values must fail
-closed before egress, and the adapter must cap both requested range and returned
-text. Vexic v0.1 has no dedicated local MCP audit hook for this path; until that
-host port exists, the missing audit dependency is documented here and the tool
-must not become a default MCP capability.
+The local stdio MCP may expose verbatim history expansion only as a
+disabled-by-default privileged egress slice. Operators must opt in at process
+launch, the adapter must require `MemoryCapability.EXPAND_HISTORY`, and callers
+may only expand bounded ranges in the configured session scope. Forbidden
+values must fail closed before egress, and the adapter must cap both requested
+range and returned text. Vexic v0.1 has no dedicated local MCP audit hook for
+this path; until that host port exists, the missing audit dependency is
+documented here and the tool must not become a default MCP capability. Native
+HTTP MCP does not expose `expand_history` in its initial slice.
