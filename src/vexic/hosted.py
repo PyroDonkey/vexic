@@ -286,13 +286,18 @@ class HostedMemoryService:
         self,
         api_key: str,
         request: ExpandHistoryRequest,
+        *,
+        max_rows: int | None = None,
     ) -> ExpandHistoryResult:
         return await self._call(
             "expand_history",
             api_key,
             request,
             request.required_capability,
-            lambda bound, tenant: self._local_service(tenant).expand_history(bound),
+            lambda bound, tenant: self._local_service(tenant).expand_history(
+                bound,
+                max_rows=max_rows,
+            ),
         )
 
     async def search_long_term(

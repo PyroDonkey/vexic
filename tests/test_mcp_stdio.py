@@ -1,11 +1,16 @@
 import asyncio
 import json
+import os
 import tempfile
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from threading import Thread
+from typing import ClassVar
 
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
+from vexic.contract import SearchTranscriptResult, TranscriptHit
 from vexic.mcp_stdio import (
     MAX_EXPAND_HISTORY_CHARS,
     MAX_EXPAND_HISTORY_MESSAGES,
@@ -14,6 +19,30 @@ from vexic.mcp_stdio import (
     handle_jsonrpc_message,
 )
 from vexic.storage import save_messages
+from vexic.hosted_mcp import create_hosted_http_memory_service
+
+
+class _HostedApiHandler(BaseHTTPRequestHandler):
+    captured: ClassVar[dict[str, object]] = {}
+    response_payload: ClassVar[dict[str, object]] = {}
+
+    def do_POST(self) -> None:
+        length = int(self.headers["Content-Length"])
+        body = self.rfile.read(length)
+        type(self).captured = {
+            "path": self.path,
+            "authorization": self.headers.get("Authorization"),
+            "body": json.loads(body),
+        }
+        payload = json.dumps(type(self).response_payload).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
 
 
 class McpStdioTests(unittest.IsolatedAsyncioTestCase):
@@ -123,6 +152,71 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(config.agent_id, "agent-a")
+
+    def test_cli_flag_configures_hosted_api_transport(self) -> None:
+        config = _parse_args(
+            [
+                "--api-base-url",
+                "https://vexic.example",
+                "--api-key-env",
+                "CUSTOM_VEXIC_KEY",
+                "--tenant-id",
+                "tenant-a",
+            ]
+        )
+
+        self.assertEqual(config.api_base_url, "https://vexic.example")
+        self.assertEqual(config.api_key_env, "CUSTOM_VEXIC_KEY")
+
+    async def test_hosted_api_backed_search_uses_bearer_api_key(self) -> None:
+        _HostedApiHandler.response_payload = SearchTranscriptResult(
+            hits=[
+                TranscriptHit(
+                    message_id=7,
+                    session_id="session-a",
+                    body="User: remote cedar",
+                )
+            ]
+        ).model_dump(mode="json")
+        server = HTTPServer(("127.0.0.1", 0), _HostedApiHandler)
+        thread = Thread(target=server.handle_request)
+        thread.start()
+        old_key = os.environ.get("VEXIC_API_KEY")
+        os.environ["VEXIC_API_KEY"] = "vx_test_key"
+        try:
+            response = await handle_jsonrpc_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "search_transcript",
+                        "arguments": {"query": "cedar"},
+                    },
+                },
+                McpServerConfig(
+                    api_base_url=f"http://127.0.0.1:{server.server_port}",
+                    tenant_id="tenant-a",
+                    session_id="session-a",
+                    project_id="project-a",
+                    service_factory=create_hosted_http_memory_service,
+                ),
+            )
+        finally:
+            if old_key is None:
+                os.environ.pop("VEXIC_API_KEY", None)
+            else:
+                os.environ["VEXIC_API_KEY"] = old_key
+            server.server_close()
+            thread.join(timeout=1)
+
+        text = response["result"]["content"][0]["text"]
+        captured = _HostedApiHandler.captured
+        self.assertIn("remote cedar", text)
+        self.assertEqual(captured["path"], "/v1/search_transcript")
+        self.assertEqual(captured["authorization"], "Bearer vx_test_key")
+        self.assertEqual(captured["body"]["scope"]["tenant_id"], "tenant-a")
+        self.assertEqual(captured["body"]["scope"]["trust_boundary"], "networked")
 
     async def test_search_transcript_uses_configured_session_scope(self) -> None:
         save_messages(

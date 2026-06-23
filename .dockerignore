@@ -1,0 +1,9 @@
+.git
+.pytest_cache
+.venv
+.hosted-memory
+build
+dist
+*.db
+*.pyc
+__pycache__

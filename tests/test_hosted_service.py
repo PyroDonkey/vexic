@@ -33,7 +33,7 @@ from vexic.hosted import (
     HostedRateLimitExceeded,
     HostedUsageEvent,
 )
-from vexic_hosted_local import HostedApiKeyStore, HostedTenantCatalog
+from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 from vexic.ports import HostPortNotConfigured
 from vexic.storage import single_message_adapter
 
@@ -1130,7 +1130,7 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             db_path.touch()
             raise RuntimeError("customer db init failed")
 
-        with patch("vexic_hosted_local.LocalMemoryService.init_schema", fail_once):
+        with patch("vexic.hosted_local.LocalMemoryService.init_schema", fail_once):
             with self.assertRaisesRegex(RuntimeError, "customer db init failed"):
                 self.catalog.provision_tenant("tenant-a")
 

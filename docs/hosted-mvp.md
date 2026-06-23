@@ -4,21 +4,21 @@ Role: deployment and readiness notes for the first hosted boundary around the
 Vexic memory core.
 
 The hosted MVP shell is an in-process Python boundary in `vexic.hosted`.
-Concrete tenant catalog and API-key provisioning live in adapters outside
-`src/vexic`; the repository-local `vexic_hosted_local` module is for local
-staging and tests. This is not a public HTTP server, dashboard, billing system,
-or production customer-data service. A future web/API process can wrap this
-boundary without changing the memory contract.
+Concrete tenant catalog, API-key provisioning, and internal-alpha transports
+live in adapter modules under `vexic`. The `vexic.hosted_local` module is for
+local staging and tests. This is not a public HTTP server, dashboard, billing
+system, or production customer-data service. A future web/API process can wrap
+this boundary without changing the memory contract.
 
 ## What Exists
 
 - `HostedMemoryService` exposes the public memory contract operation names,
   binds tenant/principal/capability scope from an adapter-supplied auth context,
   and delegates to `LocalMemoryService`.
-- `vexic_hosted_local.HostedTenantCatalog` persists local staging tenant routing
+- `vexic.hosted_local.HostedTenantCatalog` persists local staging tenant routing
   in a SQLite control-plane database and provisions one isolated
   SQLite-compatible Customer Memory Database per tenant.
-- `vexic_hosted_local.HostedApiKeyStore` creates high-entropy scoped API keys,
+- `vexic.hosted_local.HostedApiKeyStore` creates high-entropy scoped API keys,
   persists only SHA-256 hashes, scope, and revocation metadata in the local
   SQLite control-plane database, authenticates by non-secret key id with
   constant-time hash comparison, and can revoke keys for local staging.
@@ -32,6 +32,13 @@ boundary without changing the memory contract.
   or request payload text.
 - `HostedMemoryService` applies single-process in-memory operation quotas for
   authenticated local staging traffic before delegating to the memory core.
+- `vexic.hosted_http` exposes an internal-alpha FastAPI transport over
+  `HostedMemoryService` for `append_transcript`, `search_transcript`,
+  `search_long_term`, and `expand_history`, with API-key auth, request caps,
+  error mapping, and `/health`.
+- `vexic.mcp_stdio` stays the local Claude Code stdio MCP process; the
+  `vexic.hosted_mcp` adapter lets the supported launcher point
+  that MCP process at the hosted HTTP API.
 
 ## Local Staging
 
@@ -42,7 +49,7 @@ from pathlib import Path
 
 from vexic.contract import MemoryCapability
 from vexic.hosted import HostedMemoryService
-from vexic_hosted_local import HostedApiKeyStore, HostedTenantCatalog
+from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 
 catalog = HostedTenantCatalog(Path(".hosted-memory"))
 catalog.provision_tenant("tenant-a", project_ids={"project-a"})
@@ -87,6 +94,71 @@ For one internal hosted environment:
 - keep audit and usage ledgers durable outside the tenant memory database;
 - supply model-backed host ports before enabling real Light, REM, or Deep jobs.
 
+## Internal Alpha HTTP API
+
+Run the hosted HTTP adapter locally:
+
+```powershell
+uv run --with-editable . --extra hosted python -m uvicorn vexic.hosted_http:create_app --factory --host 127.0.0.1 --port 8000
+```
+
+Issue a tester key against the same hosted root:
+
+```powershell
+uv run --with-editable . --extra hosted python -m vexic.hosted_http issue-key --root .hosted-memory --tenant-id tenant-a --project-id project-a --principal-id claude-code
+```
+
+The raw key is printed once. Store it in the caller secret store or Claude Code
+MCP environment, not in repository files.
+
+The HTTP API accepts `Authorization: Bearer <raw-key>` or `X-Vexic-Api-Key` and
+serves:
+
+- `GET /health`
+- `POST /v1/append_transcript`
+- `POST /v1/search_transcript`
+- `POST /v1/search_long_term`
+- `POST /v1/expand_history`
+
+For Claude Code alpha testing, run the stdio MCP shim against the hosted API:
+
+```powershell
+$env:VEXIC_API_KEY = "<raw-key>"
+uv run python scripts/vexic-mcp-stdio.py --api-base-url http://127.0.0.1:8000 --tenant-id tenant-a --project-id project-a --session-id session-a
+```
+
+`append_transcript` is verified through the hosted HTTP API. Claude Code then
+searches the hosted memory through the stdio MCP tools.
+
+## Railway Alpha Deploy
+
+Use the committed `Dockerfile`; do not rely on Railway Nixpacks for this slice.
+The image installs Python 3.13 dependencies with `uv` and includes
+`sqlite-vec`.
+
+Alpha storage choice: mount a Railway persistent volume at `/data/vexic` and
+keep `VEXIC_HOSTED_ROOT=/data/vexic`. This preserves the current
+SQLite-compatible Customer Memory Database boundary from ADR 0005. Turso/libSQL
+remains the next hosted-storage option when the alpha needs managed database
+operations instead of a single Railway volume.
+
+Required Railway config:
+
+- `PORT`: provided by Railway.
+- `VEXIC_HOSTED_ROOT=/data/vexic`
+- Persistent volume mounted at `/data/vexic`
+- Health check path: `/health`
+
+One-off key issuance can run against the same volume:
+
+```powershell
+uv run --no-sync python -m vexic.hosted_http issue-key --root /data/vexic --tenant-id tenant-a --project-id project-a --principal-id claude-code
+```
+
+This is internal-alpha infrastructure for throwaway data. It is not a
+production customer-data launch, public MCP endpoint, billing portal, dashboard,
+or enterprise auth surface.
+
 ## Readiness
 
 External customer-memory readiness is blocked by the hosted readiness gate.
@@ -95,7 +167,7 @@ explicit security/engineering owner risk acceptance is recorded.
 
 Internal-only today:
 
-- in-process Python API boundary;
+- in-process Python API boundary and internal-alpha HTTP adapter;
 - local SQLite-compatible tenant databases;
 - repo-local SQLite control-plane tenant catalog and API-key/revocation adapter;
 - sanitized local SQLite control-plane audit, usage, and job lifecycle ledgers;
@@ -105,7 +177,6 @@ Internal-only today:
 
 Not production/customer-data ready yet:
 
-- no public HTTP adapter in this package;
 - no production control-plane catalog, audit store, usage store, or job ledger;
 - no restore drill, network hardening, distributed rate limiting, support-access
   policy, or incident runbook;

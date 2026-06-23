@@ -22,6 +22,9 @@ def test_vexic_runtime_does_not_import_coalescent_engine() -> None:
 
 def test_hosted_core_does_not_own_infrastructure_provisioning() -> None:
     text = (ROOT / "src" / "vexic" / "hosted.py").read_text(encoding="utf-8")
+    mcp_stdio_text = (ROOT / "src" / "vexic" / "mcp_stdio.py").read_text(
+        encoding="utf-8"
+    )
 
     for forbidden in (
         "class HostedTenantCatalog",
@@ -34,3 +37,10 @@ def test_hosted_core_does_not_own_infrastructure_provisioning() -> None:
         "self.usage_events",
     ):
         assert forbidden not in text
+
+    for forbidden in (
+        "import urllib",
+        "urlopen(",
+        "HostedHttpMemoryServiceClient",
+    ):
+        assert forbidden not in mcp_stdio_text

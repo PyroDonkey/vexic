@@ -4,18 +4,22 @@ import argparse
 import asyncio
 import json
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, TextIO
+from typing import Any, Protocol, TextIO
 
 from vexic import CONTRACT_VERSION
 from vexic.contract import (
+    ExpandHistoryResult,
     ExpandHistoryRequest,
     MemoryCapability,
     MemoryScope,
     Principal,
     PrincipalType,
     RedactionContext,
+    SearchLongTermResult,
     SearchLongTermRequest,
+    SearchTranscriptResult,
     SearchTranscriptRequest,
     TrustBoundary,
 )
@@ -29,10 +33,29 @@ MAX_EXPAND_HISTORY_MESSAGES = 100
 MAX_EXPAND_HISTORY_CHARS = 20_000
 
 
+class McpMemoryService(Protocol):
+    async def search_transcript(
+        self,
+        request: SearchTranscriptRequest,
+    ) -> SearchTranscriptResult: ...
+
+    async def expand_history(
+        self,
+        request: ExpandHistoryRequest,
+        *,
+        max_rows: int | None = None,
+    ) -> ExpandHistoryResult: ...
+
+    async def search_long_term(
+        self,
+        request: SearchLongTermRequest,
+    ) -> SearchLongTermResult: ...
+
+
 @dataclass(frozen=True)
 class McpServerConfig:
-    db_path: str
     tenant_id: str
+    db_path: str | None = None
     session_id: str = "default"
     project_id: str | None = None
     user_id: str | None = None
@@ -40,8 +63,17 @@ class McpServerConfig:
     principal_id: str = "vexic-local-mcp"
     forbidden_secret_values: tuple[str, ...] = ()
     enable_expand_history: bool = False
+    api_base_url: str | None = None
+    api_key_env: str = "VEXIC_API_KEY"
+    service_factory: Callable[["McpServerConfig"], McpMemoryService] | None = None
 
-    def service(self) -> LocalMemoryService:
+    def service(self) -> McpMemoryService:
+        if self.api_base_url is not None:
+            if self.service_factory is None:
+                raise ValueError("hosted API service factory is required.")
+            return self.service_factory(self)
+        if self.db_path is None:
+            raise ValueError("db_path is required for local MCP.")
         return LocalMemoryService(
             db_path=self.db_path,
             tenant_id=self.tenant_id,
@@ -62,7 +94,11 @@ class McpServerConfig:
                 principal_id=self.principal_id,
                 principal_type=PrincipalType.AGENT,
             ),
-            trust_boundary=TrustBoundary.LOCAL_TRUSTED,
+            trust_boundary=(
+                TrustBoundary.NETWORKED
+                if self.api_base_url is not None
+                else TrustBoundary.LOCAL_TRUSTED
+            ),
             capabilities=capabilities,
         )
 
@@ -374,7 +410,10 @@ async def run_stdio(
     stdout: TextIO = sys.stdout,
     stderr: TextIO = sys.stderr,
 ) -> None:
-    config.service().init_schema()
+    service = config.service()
+    init_schema = getattr(service, "init_schema", None)
+    if callable(init_schema):
+        init_schema()
     for line in stdin:
         if not line.strip():
             continue
@@ -390,9 +429,16 @@ async def run_stdio(
         stderr.flush()
 
 
-def _parse_args(argv: list[str] | None) -> McpServerConfig:
+def _parse_args(
+    argv: list[str] | None,
+    *,
+    service_factory: Callable[[McpServerConfig], McpMemoryService] | None = None,
+) -> McpServerConfig:
     parser = argparse.ArgumentParser(description="Run the Vexic local stdio MCP server.")
-    parser.add_argument("--db-path", required=True)
+    transport = parser.add_mutually_exclusive_group(required=True)
+    transport.add_argument("--db-path")
+    transport.add_argument("--api-base-url")
+    parser.add_argument("--api-key-env", default="VEXIC_API_KEY")
     parser.add_argument("--tenant-id", required=True)
     parser.add_argument("--session-id", default="default")
     parser.add_argument("--project-id")
@@ -412,11 +458,18 @@ def _parse_args(argv: list[str] | None) -> McpServerConfig:
         principal_id=args.principal_id,
         forbidden_secret_values=tuple(args.forbidden_value),
         enable_expand_history=args.enable_expand_history,
+        api_base_url=args.api_base_url,
+        api_key_env=args.api_key_env,
+        service_factory=service_factory,
     )
 
 
-def main(argv: list[str] | None = None) -> int:
-    asyncio.run(run_stdio(_parse_args(argv)))
+def main(
+    argv: list[str] | None = None,
+    *,
+    service_factory: Callable[[McpServerConfig], McpMemoryService] | None = None,
+) -> int:
+    asyncio.run(run_stdio(_parse_args(argv, service_factory=service_factory)))
     return 0
 
 
