@@ -27,8 +27,9 @@ boundary without changing the memory contract.
   absent.
 - `HostedMemoryService` can send sanitized request audit and usage metadata to
   a telemetry sink without storing tenant metadata in shared service lists.
-- The local staging adapter stores request audit and usage rows in each tenant
-  SQLite database without raw API keys or request payload text.
+- The local staging adapter stores sanitized request audit, usage, and
+  background job lifecycle metadata in `control-plane.db` without raw API keys
+  or request payload text.
 - `HostedMemoryService` applies single-process in-memory operation quotas for
   authenticated local staging traffic before delegating to the memory core.
 
@@ -97,9 +98,8 @@ Internal-only today:
 - in-process Python API boundary;
 - local SQLite-compatible tenant databases;
 - repo-local SQLite control-plane tenant catalog and API-key/revocation adapter;
+- sanitized local SQLite control-plane audit, usage, and job lifecycle ledgers;
 - single-process in-memory authenticated request limiter;
-- tenant-local SQLite audit and usage telemetry in the local adapter;
-- in-memory job lifecycle events;
 - one `LocalMemoryService` instance is created per hosted request;
 - fail-closed dream jobs without host model ports.
 

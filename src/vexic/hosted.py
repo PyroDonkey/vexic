@@ -227,6 +227,8 @@ class HostedTelemetrySink(Protocol):
 
     def record_usage_event(self, event: HostedUsageEvent) -> None: ...
 
+    def record_job_event(self, event: HostedJobEvent) -> None: ...
+
 
 class HostedMemoryService:
     def __init__(
@@ -547,7 +549,11 @@ class HostedMemoryService:
 
 class HostedBackgroundJobRunner:
     def __init__(self, service: HostedMemoryService) -> None:
+        telemetry = service.telemetry
+        if telemetry is None:
+            raise ValueError("HostedBackgroundJobRunner requires durable telemetry.")
         self.service = service
+        self.telemetry = telemetry
         self.job_events: list[HostedJobEvent] = []
 
     async def run_dream_phase(
@@ -599,18 +605,18 @@ class HostedBackgroundJobRunner:
         status: str,
         error_type: str | None = None,
     ) -> None:
-        self.job_events.append(
-            HostedJobEvent(
-                job_id=job_id,
-                operation="run_dream_phase",
-                tenant_id=auth.tenant_id,
-                principal_id=auth.principal.principal_id,
-                status=status,
-                phase=request.phase.value,
-                recorded_at=_now(),
-                error_type=error_type,
-            )
+        event = HostedJobEvent(
+            job_id=job_id,
+            operation="run_dream_phase",
+            tenant_id=auth.tenant_id,
+            principal_id=auth.principal.principal_id,
+            status=status,
+            phase=request.phase.value,
+            recorded_at=_now(),
+            error_type=error_type,
         )
+        self.telemetry.record_job_event(event)
+        self.job_events.append(event)
 
 
 def _now() -> str:

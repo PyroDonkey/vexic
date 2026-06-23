@@ -29,6 +29,7 @@ from vexic.hosted import (
     HostedMemoryService,
     HostedRateLimitRule,
     HostedRateLimitExceeded,
+    HostedUsageEvent,
 )
 from vexic_hosted_local import HostedApiKeyStore, HostedTenantCatalog
 from vexic.ports import HostPortNotConfigured
@@ -77,6 +78,12 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
+
+    def test_background_job_runner_requires_durable_telemetry(self) -> None:
+        service = HostedMemoryService(self.catalog, self.keys)
+
+        with self.assertRaisesRegex(ValueError, "requires durable telemetry"):
+            HostedBackgroundJobRunner(service)
 
     def test_hosted_api_exposes_contract_operation_names(self) -> None:
         for method_name in (
@@ -485,7 +492,130 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(api_key.raw_key, ledger_text)
         self.assertNotIn("cedar", ledger_text)
 
-    async def test_telemetry_is_stored_per_tenant_database(self) -> None:
+    async def test_reloaded_catalog_reads_sanitized_request_ledgers_from_control_plane(
+        self,
+    ) -> None:
+        root = Path(self.temp_dir.name)
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH},
+            project_ids={"project-a"},
+        )
+        message_json = single_message_adapter.dump_json(
+            ModelRequest(parts=[UserPromptPart(content="persisted transcript pine")])
+        )
+
+        await self.service.append_transcript(
+            api_key.raw_key,
+            AppendTranscriptRequest(
+                scope=_scope(capabilities={MemoryCapability.WRITE}),
+                messages_json=[message_json],
+                redaction=RedactionContext(forbidden_values=()),
+            ),
+        )
+        await self.service.search_transcript(
+            api_key.raw_key,
+            SearchTranscriptRequest(
+                scope=_scope(capabilities={MemoryCapability.SEARCH}),
+                query="pine query text",
+            ),
+        )
+
+        reloaded_catalog = HostedTenantCatalog(root)
+        audit_events = reloaded_catalog.audit_events("tenant-a")
+        usage_events = reloaded_catalog.usage_events("tenant-a")
+
+        self.assertEqual(
+            [event.operation for event in audit_events],
+            ["append_transcript", "search_transcript"],
+        )
+        self.assertEqual([event.status for event in audit_events], ["ok", "ok"])
+        self.assertEqual(
+            [event.operation for event in usage_events],
+            ["append_transcript", "search_transcript"],
+        )
+        self.assertEqual([event.status for event in usage_events], ["ok", "ok"])
+
+        control_plane_bytes = (root / "control-plane.db").read_bytes()
+        self.assertIn(b"search_transcript", control_plane_bytes)
+        ledger_text = repr(audit_events) + repr(usage_events)
+        for forbidden in (
+            api_key.raw_key,
+            "pine query text",
+            "persisted transcript pine",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, ledger_text)
+                self.assertNotIn(forbidden.encode("utf-8"), control_plane_bytes)
+
+    async def test_invalid_api_key_records_sanitized_null_tenant_ledgers_on_reload(
+        self,
+    ) -> None:
+        root = Path(self.temp_dir.name)
+        bad_key = "vx_badkey_bad-secret-value"
+
+        with self.assertRaises(PermissionError):
+            await self.service.search_transcript(
+                bad_key,
+                SearchTranscriptRequest(
+                    scope=_scope(capabilities={MemoryCapability.SEARCH}),
+                    query="raw invalid-key query text",
+                ),
+            )
+
+        reloaded_catalog = HostedTenantCatalog(root)
+        audit_events = reloaded_catalog.audit_events(None)
+        usage_events = reloaded_catalog.usage_events(None)
+
+        self.assertEqual(len(audit_events), 1)
+        self.assertEqual(audit_events[0].operation, "search_transcript")
+        self.assertIsNone(audit_events[0].tenant_id)
+        self.assertIsNone(audit_events[0].principal_id)
+        self.assertEqual(audit_events[0].status, "error")
+        self.assertEqual(audit_events[0].error_type, "PermissionError")
+        self.assertEqual(len(usage_events), 1)
+        self.assertEqual(usage_events[0].kind, "request")
+        self.assertEqual(usage_events[0].status, "error")
+        self.assertEqual(usage_events[0].error_type, "PermissionError")
+        self.assertEqual(reloaded_catalog.job_events(None), [])
+
+        control_plane_bytes = (root / "control-plane.db").read_bytes()
+        ledger_text = repr(audit_events) + repr(usage_events)
+        for forbidden in (bad_key, "raw invalid-key query text"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, ledger_text)
+                self.assertNotIn(forbidden.encode("utf-8"), control_plane_bytes)
+
+    def test_usage_counter_fields_survive_catalog_reload(self) -> None:
+        root = Path(self.temp_dir.name)
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        self.catalog.record_usage_event(
+            HostedUsageEvent(
+                kind="request",
+                operation="run_dream_phase",
+                tenant_id="tenant-a",
+                principal_id="agent-a",
+                status="ok",
+                recorded_at="2026-06-23T00:00:00Z",
+                model_requests=2,
+                input_tokens=300,
+                output_tokens=125,
+                total_tokens=425,
+                estimated_cost_micros=9876,
+            )
+        )
+
+        [usage_event] = HostedTenantCatalog(root).usage_events("tenant-a")
+
+        self.assertEqual(usage_event.model_requests, 2)
+        self.assertEqual(usage_event.input_tokens, 300)
+        self.assertEqual(usage_event.output_tokens, 125)
+        self.assertEqual(usage_event.total_tokens, 425)
+        self.assertEqual(usage_event.estimated_cost_micros, 9876)
+
+    async def test_telemetry_is_filtered_per_tenant_in_control_plane(self) -> None:
         self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
         self.catalog.provision_tenant("tenant-b", project_ids={"project-b"})
         key_a = self.keys.create_key(
@@ -1026,3 +1156,50 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(usage_events[-2].error_type, "HostPortNotConfigured")
         self.assertEqual(usage_events[-1].kind, "job")
         self.assertEqual(usage_events[-1].error_type, "HostPortNotConfigured")
+
+    async def test_dream_job_failure_lifecycle_persists_across_catalog_reload(
+        self,
+    ) -> None:
+        root = Path(self.temp_dir.name)
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.ADMIN_REBUILD},
+            project_ids={"project-a"},
+        )
+
+        with self.assertRaises(HostPortNotConfigured):
+            await self.jobs.run_dream_phase(
+                api_key.raw_key,
+                RunDreamPhaseRequest(
+                    scope=_scope(capabilities={MemoryCapability.ADMIN_REBUILD}),
+                    phase=DreamPhase.LIGHT,
+                    redaction=RedactionContext(forbidden_values=()),
+                ),
+            )
+
+        reloaded_catalog = HostedTenantCatalog(root)
+        job_events = reloaded_catalog.job_events("tenant-a")
+        usage_events = reloaded_catalog.usage_events("tenant-a")
+
+        self.assertEqual([event.status for event in job_events], ["running", "error"])
+        self.assertEqual({event.job_id for event in job_events}, {job_events[0].job_id})
+        for event in job_events:
+            with self.subTest(status=event.status):
+                self.assertEqual(event.operation, "run_dream_phase")
+                self.assertEqual(event.tenant_id, "tenant-a")
+                self.assertEqual(event.principal_id, "agent-a")
+                self.assertEqual(event.phase, DreamPhase.LIGHT.value)
+                self.assertTrue(event.recorded_at.endswith("Z"))
+        self.assertIsNone(job_events[0].error_type)
+        self.assertEqual(job_events[1].error_type, "HostPortNotConfigured")
+        self.assertEqual(usage_events[-1].kind, "job")
+        self.assertEqual(usage_events[-1].status, "error")
+        self.assertEqual(usage_events[-1].error_type, "HostPortNotConfigured")
+
+        ledger_bytes = (root / "control-plane.db").read_bytes()
+        ledger_text = repr(job_events) + repr(usage_events)
+        self.assertNotIn(api_key.raw_key, ledger_text)
+        self.assertNotIn(api_key.raw_key.encode("utf-8"), ledger_bytes)
+        self.assertNotIn(b"Dream phase host port is not configured", ledger_bytes)

@@ -12,7 +12,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from vexic.contract import MemoryCapability, Principal, PrincipalType
-from vexic.hosted import HostedAuditEvent, HostedAuthContext, HostedTenant, HostedUsageEvent
+from vexic.hosted import (
+    HostedAuditEvent,
+    HostedAuthContext,
+    HostedJobEvent,
+    HostedTenant,
+    HostedUsageEvent,
+)
 from vexic.service import LocalMemoryService
 
 
@@ -85,7 +91,6 @@ class HostedTenantCatalog:
             if needs_customer_init:
                 tenant_db_path = self.root_path / db_filename
                 LocalMemoryService(db_path=str(tenant_db_path), tenant_id=tenant_id).init_schema()
-                self._init_telemetry_schema(tenant_db_path)
             conn.execute(
                 """
                 UPDATE tenants
@@ -131,10 +136,7 @@ class HostedTenantCatalog:
             return self._tenant_from_filename(conn, tenant_id, row[0])
 
     def record_audit_event(self, event: HostedAuditEvent) -> None:
-        if event.tenant_id is None:
-            return
-        tenant = self.get_tenant(event.tenant_id)
-        with closing(sqlite3.connect(tenant.db_path)) as conn:
+        with closing(self._connect_control()) as conn:
             conn.execute(
                 """
                 INSERT INTO hosted_audit_events (
@@ -154,10 +156,7 @@ class HostedTenantCatalog:
             conn.commit()
 
     def record_usage_event(self, event: HostedUsageEvent) -> None:
-        if event.tenant_id is None:
-            return
-        tenant = self.get_tenant(event.tenant_id)
-        with closing(sqlite3.connect(tenant.db_path)) as conn:
+        with closing(self._connect_control()) as conn:
             conn.execute(
                 """
                 INSERT INTO hosted_usage_events (
@@ -184,31 +183,117 @@ class HostedTenantCatalog:
             )
             conn.commit()
 
-    def audit_events(self, tenant_id: str) -> list[HostedAuditEvent]:
-        tenant = self.get_tenant(tenant_id)
-        with closing(sqlite3.connect(tenant.db_path)) as conn:
-            rows = conn.execute(
+    def record_job_event(self, event: HostedJobEvent) -> None:
+        with closing(self._connect_control()) as conn:
+            conn.execute(
                 """
-                SELECT operation, tenant_id, principal_id, status, recorded_at, error_type
-                FROM hosted_audit_events
-                ORDER BY id
-                """
-            ).fetchall()
+                INSERT INTO hosted_job_events (
+                    job_id, operation, tenant_id, principal_id, status, recorded_at,
+                    phase, error_type
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.job_id,
+                    event.operation,
+                    event.tenant_id,
+                    event.principal_id,
+                    event.status,
+                    event.recorded_at,
+                    event.phase,
+                    event.error_type,
+                ),
+            )
+            conn.commit()
+
+    def audit_events(self, tenant_id: str | None) -> list[HostedAuditEvent]:
+        with closing(self._connect_control()) as conn:
+            if tenant_id is None:
+                rows = conn.execute(
+                    """
+                    SELECT operation, tenant_id, principal_id, status, recorded_at, error_type
+                    FROM hosted_audit_events
+                    WHERE tenant_id IS NULL
+                    ORDER BY id
+                    """
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT operation, tenant_id, principal_id, status, recorded_at, error_type
+                    FROM hosted_audit_events
+                    WHERE tenant_id = ?
+                    ORDER BY id
+                    """,
+                    (tenant_id,),
+                ).fetchall()
         return [HostedAuditEvent(*row) for row in rows]
 
-    def usage_events(self, tenant_id: str) -> list[HostedUsageEvent]:
-        tenant = self.get_tenant(tenant_id)
-        with closing(sqlite3.connect(tenant.db_path)) as conn:
-            rows = conn.execute(
-                """
-                SELECT kind, operation, tenant_id, principal_id, status, recorded_at,
-                       model_requests, input_tokens, output_tokens, total_tokens,
-                       estimated_cost_micros, error_type
-                FROM hosted_usage_events
-                ORDER BY id
-                """
-            ).fetchall()
+    def usage_events(self, tenant_id: str | None) -> list[HostedUsageEvent]:
+        with closing(self._connect_control()) as conn:
+            if tenant_id is None:
+                rows = conn.execute(
+                    """
+                    SELECT kind, operation, tenant_id, principal_id, status, recorded_at,
+                           model_requests, input_tokens, output_tokens, total_tokens,
+                           estimated_cost_micros, error_type
+                    FROM hosted_usage_events
+                    WHERE tenant_id IS NULL
+                    ORDER BY id
+                    """
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT kind, operation, tenant_id, principal_id, status, recorded_at,
+                           model_requests, input_tokens, output_tokens, total_tokens,
+                           estimated_cost_micros, error_type
+                    FROM hosted_usage_events
+                    WHERE tenant_id = ?
+                    ORDER BY id
+                    """,
+                    (tenant_id,),
+                ).fetchall()
         return [HostedUsageEvent(*row) for row in rows]
+
+    def job_events(self, tenant_id: str | None) -> list[HostedJobEvent]:
+        with closing(self._connect_control()) as conn:
+            if tenant_id is None:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        job_id, operation, tenant_id, principal_id, status,
+                        recorded_at, phase, error_type
+                    FROM hosted_job_events
+                    WHERE tenant_id IS NULL
+                    ORDER BY id
+                    """
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        job_id, operation, tenant_id, principal_id, status,
+                        recorded_at, phase, error_type
+                    FROM hosted_job_events
+                    WHERE tenant_id = ?
+                    ORDER BY id
+                    """,
+                    (tenant_id,),
+                ).fetchall()
+        return [
+            HostedJobEvent(
+                job_id=row[0],
+                operation=row[1],
+                tenant_id=row[2],
+                principal_id=row[3],
+                status=row[4],
+                recorded_at=row[5],
+                phase=row[6],
+                error_type=row[7],
+            )
+            for row in rows
+        ]
 
     def _connect_control(self) -> sqlite3.Connection:
         return _connect_control_db(self._control_db_path)
@@ -230,6 +315,51 @@ class HostedTenantCatalog:
                     PRIMARY KEY (tenant_id, project_id),
                     FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS hosted_audit_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    operation TEXT NOT NULL,
+                    tenant_id TEXT,
+                    principal_id TEXT,
+                    status TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL,
+                    error_type TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS hosted_usage_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    tenant_id TEXT,
+                    principal_id TEXT,
+                    status TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL,
+                    model_requests INTEGER NOT NULL DEFAULT 0,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    estimated_cost_micros INTEGER NOT NULL DEFAULT 0,
+                    error_type TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS hosted_job_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    principal_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL,
+                    phase TEXT,
+                    error_type TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_hosted_audit_events_tenant_id
+                    ON hosted_audit_events(tenant_id);
+                CREATE INDEX IF NOT EXISTS idx_hosted_usage_events_tenant_id
+                    ON hosted_usage_events(tenant_id);
+                CREATE INDEX IF NOT EXISTS idx_hosted_job_events_tenant_id
+                    ON hosted_job_events(tenant_id);
                 """
             )
             conn.commit()
@@ -288,41 +418,6 @@ class HostedTenantCatalog:
             db_path=self.root_path / db_filename,
             project_ids=frozenset(row[0] for row in project_rows),
         )
-
-    @staticmethod
-    def _init_telemetry_schema(db_path: Path) -> None:
-        with closing(sqlite3.connect(db_path)) as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS hosted_audit_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    operation TEXT NOT NULL,
-                    tenant_id TEXT NOT NULL,
-                    principal_id TEXT,
-                    status TEXT NOT NULL,
-                    recorded_at TEXT NOT NULL,
-                    error_type TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS hosted_usage_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    kind TEXT NOT NULL,
-                    operation TEXT NOT NULL,
-                    tenant_id TEXT NOT NULL,
-                    principal_id TEXT,
-                    status TEXT NOT NULL,
-                    recorded_at TEXT NOT NULL,
-                    model_requests INTEGER NOT NULL DEFAULT 0,
-                    input_tokens INTEGER NOT NULL DEFAULT 0,
-                    output_tokens INTEGER NOT NULL DEFAULT 0,
-                    total_tokens INTEGER NOT NULL DEFAULT 0,
-                    estimated_cost_micros INTEGER NOT NULL DEFAULT 0,
-                    error_type TEXT
-                );
-                """
-            )
-            conn.commit()
-
 
 class HostedApiKeyStore:
     def __init__(self, root_path: str | Path | None = None) -> None:
