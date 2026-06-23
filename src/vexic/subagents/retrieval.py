@@ -182,7 +182,7 @@ async def retrieve_candidate_fallback(
     return_k: int = RETURN_K,
     embed: EmbedTexts | None = None,
 ) -> list[CandidateNote]:
-    """Tier 2 candidate-fallback retrieval (ADR-0010, COA-95).
+    """Tier 2 candidate-fallback retrieval (upstream ADR-0010, COA-95).
 
     The zero-Tier-3-hit rescue: hybrid FTS + sqlite-vec KNN over active
     unpromoted candidates, fused via RRF (same shape as Tier 3, no query

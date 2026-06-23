@@ -30,6 +30,6 @@ Notes:
 - 0007 corresponds to the multi-agent scoping work. The repo, not a tracking
   view, defines the accepted scope semantics.
 - These numbers are the Vexic `docs/adr/` series. Some source comments under
-  `src/vexic` cite an `ADR-00NN` label from the upstream extraction source
-  (for example `ADR-0010` for candidate-fallback retrieval); those labels are
-  not this series and do not map one-to-one to the files here.
+  `src/vexic` cite an `upstream ADR-00NN` label from the extraction source
+  (for example `upstream ADR-0010` for candidate-fallback retrieval); those
+  labels are deliberately namespaced and do not map to the files here.

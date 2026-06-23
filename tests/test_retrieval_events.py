@@ -386,7 +386,7 @@ class RetrievalEventTests(unittest.TestCase):
         self.assertEqual(judged_at, "2000-01-01 00:00:00")
 
     def test_counters_are_derivable_from_events(self) -> None:
-        # The losslessness claim (ADR-0008): aggregate columns can always be
+        # The losslessness claim (upstream ADR-0008): aggregate columns can always be
         # recomputed from retrieval_events after a rebuild.
         fact_id = self._insert_fact("Ryan likes Python.", 1)
         for _ in range(3):
