@@ -15,11 +15,11 @@ COPY src ./src
 RUN uv sync --frozen --no-dev --extra hosted
 RUN mkdir -p /data/vexic
 
-ENV PYTHONPATH="/app/src:${PYTHONPATH}"
-RUN uv run --no-sync python -c "from uvicorn.importer import import_from_string; import_from_string('vexic.hosted_http:create_app')"
+ENV PYTHONPATH=/app/src
+RUN PYTHONPATH="/app/src${PYTHONPATH:+:$PYTHONPATH}" uv run --no-sync python -c "from uvicorn.importer import import_from_string; import_from_string('vexic.hosted_http:create_app')"
 
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD python -c "import os, urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.environ.get(\"PORT\", \"8000\")}/health', timeout=3).read()"
 
-CMD uv run --no-sync python -m uvicorn vexic.hosted_http:create_app --factory --host 0.0.0.0 --port ${PORT}
+CMD PYTHONPATH="/app/src${PYTHONPATH:+:$PYTHONPATH}" uv run --no-sync python -m uvicorn vexic.hosted_http:create_app --factory --host 0.0.0.0 --port ${PORT}
