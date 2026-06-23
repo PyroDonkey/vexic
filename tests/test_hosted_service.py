@@ -1,6 +1,9 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+import json
+import os
 import sqlite3
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -221,6 +224,234 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                     query="cedar",
                 ),
             )
+
+    async def test_durable_api_key_store_reloads_scope_and_revocation_without_raw_key(self) -> None:
+        root = Path(self.temp_dir.name)
+        self.catalog.provision_tenant(
+            "tenant-a",
+            project_ids={"project-a", "project-b"},
+        )
+        self.catalog.provision_tenant("tenant-b", project_ids={"project-b"})
+        keys = HostedApiKeyStore(root)
+        api_key = keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH},
+            project_ids={"project-a"},
+            agent_ids={"memory-agent-a"},
+        )
+        raw_key_prefix = f"vx_{api_key.key_id}_"
+        self.assertTrue(api_key.raw_key.startswith(raw_key_prefix))
+        raw_key_secret = api_key.raw_key[len(raw_key_prefix) :]
+
+        reloaded_keys = HostedApiKeyStore(root)
+        auth = reloaded_keys.authenticate(api_key.raw_key)
+        self.assertEqual(auth.key_id, api_key.key_id)
+        self.assertEqual(auth.tenant_id, "tenant-a")
+        self.assertEqual(auth.principal.principal_id, "agent-a")
+        self.assertEqual(
+            auth.capabilities,
+            frozenset({MemoryCapability.WRITE, MemoryCapability.SEARCH}),
+        )
+        self.assertEqual(auth.project_ids, frozenset({"project-a"}))
+        self.assertEqual(auth.agent_ids, frozenset({"memory-agent-a"}))
+
+        service = HostedMemoryService(self.catalog, reloaded_keys, telemetry=self.catalog)
+        message_json = single_message_adapter.dump_json(
+            ModelRequest(parts=[UserPromptPart(content="durable hosted cedar")])
+        )
+        await service.append_transcript(
+            api_key.raw_key,
+            AppendTranscriptRequest(
+                scope=_scope(
+                    capabilities={MemoryCapability.WRITE},
+                    agent_id="memory-agent-a",
+                ),
+                messages_json=[message_json],
+                redaction=RedactionContext(forbidden_values=()),
+            ),
+        )
+        result = await service.search_transcript(
+            api_key.raw_key,
+            SearchTranscriptRequest(
+                scope=_scope(
+                    capabilities={MemoryCapability.SEARCH},
+                    agent_id="memory-agent-a",
+                ),
+                query="cedar",
+            ),
+        )
+        self.assertEqual([hit.body for hit in result.hits], ["User: durable hosted cedar"])
+
+        with self.assertRaises(PermissionError):
+            await service.search_transcript(
+                api_key.raw_key,
+                SearchTranscriptRequest(
+                    scope=_scope(
+                        tenant_id="tenant-b",
+                        project_id="project-b",
+                        capabilities={MemoryCapability.SEARCH},
+                        agent_id="memory-agent-a",
+                    ),
+                    query="cedar",
+                ),
+            )
+        with self.assertRaises(PermissionError):
+            await service.search_transcript(
+                api_key.raw_key,
+                SearchTranscriptRequest(
+                    scope=_scope(
+                        project_id="project-b",
+                        capabilities={MemoryCapability.SEARCH},
+                        agent_id="memory-agent-a",
+                    ),
+                    query="cedar",
+                ),
+            )
+        with self.assertRaises(PermissionError):
+            await service.search_transcript(
+                api_key.raw_key,
+                SearchTranscriptRequest(
+                    scope=_scope(
+                        capabilities={MemoryCapability.SEARCH},
+                        agent_id="memory-agent-b",
+                    ),
+                    query="cedar",
+                ),
+            )
+        with self.assertRaises(PermissionError):
+            await service.run_dream_phase(
+                api_key.raw_key,
+                RunDreamPhaseRequest(
+                    scope=_scope(
+                        capabilities={MemoryCapability.ADMIN_REBUILD},
+                        agent_id="memory-agent-a",
+                    ),
+                    phase=DreamPhase.LIGHT,
+                    redaction=RedactionContext(forbidden_values=()),
+                ),
+            )
+
+        control_db = root / "control-plane.db"
+        control_db_bytes = control_db.read_bytes()
+        self.assertNotIn(api_key.raw_key.encode("utf-8"), control_db_bytes)
+        self.assertNotIn(raw_key_secret.encode("utf-8"), control_db_bytes)
+        with closing(sqlite3.connect(control_db)) as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    key_id, key_hash, tenant_id, principal_id, capabilities,
+                    project_ids, agent_ids, revoked_at, revoked_by
+                FROM hosted_api_keys
+                WHERE key_id = ?
+                """,
+                (api_key.key_id,),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], api_key.key_id)
+        self.assertEqual(len(row[1]), 64)
+        self.assertNotEqual(row[1], api_key.raw_key)
+        self.assertEqual(row[2], "tenant-a")
+        self.assertEqual(row[3], "agent-a")
+        self.assertEqual(
+            json.loads(row[4]),
+            sorted([MemoryCapability.WRITE.value, MemoryCapability.SEARCH.value]),
+        )
+        self.assertEqual(json.loads(row[5]), ["project-a"])
+        self.assertEqual(json.loads(row[6]), ["memory-agent-a"])
+        self.assertIsNone(row[7])
+        self.assertIsNone(row[8])
+
+        ledger_text = repr(self.catalog.audit_events("tenant-a")) + repr(
+            self.catalog.usage_events("tenant-a")
+        )
+        self.assertNotIn(api_key.raw_key, ledger_text)
+        self.assertNotIn(raw_key_secret, ledger_text)
+
+        reloaded_keys.revoke_key(api_key.key_id, revoked_by="operator-a")
+        revoked_keys = HostedApiKeyStore(root)
+        revoked_service = HostedMemoryService(self.catalog, revoked_keys)
+        with self.assertRaises(PermissionError):
+            revoked_keys.authenticate(api_key.raw_key)
+        with self.assertRaises(PermissionError):
+            await revoked_service.search_transcript(
+                api_key.raw_key,
+                SearchTranscriptRequest(
+                    scope=_scope(
+                        capabilities={MemoryCapability.SEARCH},
+                        agent_id="memory-agent-a",
+                    ),
+                    query="cedar",
+                ),
+            )
+
+        control_db_bytes = control_db.read_bytes()
+        self.assertNotIn(api_key.raw_key.encode("utf-8"), control_db_bytes)
+        self.assertNotIn(raw_key_secret.encode("utf-8"), control_db_bytes)
+        with closing(sqlite3.connect(control_db)) as conn:
+            row = conn.execute(
+                """
+                SELECT key_id, tenant_id, principal_id, revoked_at, revoked_by
+                FROM hosted_api_keys
+                WHERE key_id = ?
+                """,
+                (api_key.key_id,),
+            ).fetchone()
+        self.assertEqual(row[0], api_key.key_id)
+        self.assertEqual(row[1], "tenant-a")
+        self.assertEqual(row[2], "agent-a")
+        self.assertIsNotNone(row[3])
+        self.assertEqual(row[4], "operator-a")
+        self.assertNotIn(api_key.raw_key, repr(row))
+        self.assertNotIn(raw_key_secret, repr(row))
+
+    def test_durable_api_key_store_rejects_corrupt_key_rows(self) -> None:
+        root = Path(self.temp_dir.name)
+        corruptions = (
+            ("capabilities", json.dumps(["not-a-capability"])),
+            ("project_ids", "not-json"),
+        )
+        for column_name, corrupt_value in corruptions:
+            with self.subTest(column_name=column_name):
+                keys = HostedApiKeyStore(root)
+                api_key = keys.create_key(
+                    tenant_id="tenant-a",
+                    principal_id="agent-a",
+                    capabilities={MemoryCapability.SEARCH},
+                )
+                with closing(sqlite3.connect(root / "control-plane.db")) as conn:
+                    conn.execute(
+                        f"""
+                        UPDATE hosted_api_keys
+                        SET {column_name} = ?
+                        WHERE key_id = ?
+                        """,
+                        (corrupt_value, api_key.key_id),
+                    )
+                    conn.commit()
+
+                with self.assertRaisesRegex(
+                    PermissionError,
+                    "Invalid hosted API key.",
+                ):
+                    HostedApiKeyStore(root).authenticate(api_key.raw_key)
+
+    def test_durable_control_plane_database_is_owner_read_write_only(self) -> None:
+        root = Path(self.temp_dir.name) / "durable-control"
+        control_db = root / "control-plane.db"
+
+        with patch("os.chmod", wraps=os.chmod) as chmod:
+            HostedTenantCatalog(root)
+            HostedApiKeyStore(root)
+
+        chmod_control_calls = [
+            call_args
+            for call_args in chmod.call_args_list
+            if call_args.args == (control_db, 0o600)
+        ]
+        self.assertGreaterEqual(len(chmod_control_calls), 2)
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(control_db.stat().st_mode), 0o600)
 
     async def test_successful_request_records_sanitized_audit_and_usage(self) -> None:
         self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})

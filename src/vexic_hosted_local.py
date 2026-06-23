@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
+import os
 import secrets
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 from vexic.contract import MemoryCapability, Principal, PrincipalType
 from vexic.hosted import HostedAuditEvent, HostedAuthContext, HostedTenant, HostedUsageEvent
 from vexic.service import LocalMemoryService
+
+
+_CONTROL_DB_MODE = 0o600
 
 
 @dataclass(frozen=True)
@@ -28,6 +34,9 @@ class _HostedApiKey:
     capabilities: frozenset[MemoryCapability]
     project_ids: frozenset[str]
     agent_ids: frozenset[str | None]
+    created_at: str | None = None
+    revoked_at: str | None = None
+    revoked_by: str | None = None
     active: bool = True
 
 
@@ -202,9 +211,7 @@ class HostedTenantCatalog:
         return [HostedUsageEvent(*row) for row in rows]
 
     def _connect_control(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._control_db_path, timeout=30)
-        conn.execute("PRAGMA foreign_keys = ON")
-        return conn
+        return _connect_control_db(self._control_db_path)
 
     def _init_control_plane_schema(self) -> None:
         with closing(self._connect_control()) as conn:
@@ -318,8 +325,14 @@ class HostedTenantCatalog:
 
 
 class HostedApiKeyStore:
-    def __init__(self) -> None:
+    def __init__(self, root_path: str | Path | None = None) -> None:
         self._keys: dict[str, _HostedApiKey] = {}
+        self.root_path = Path(root_path) if root_path is not None else None
+        self._control_db_path: Path | None = None
+        if self.root_path is not None:
+            self.root_path.mkdir(parents=True, exist_ok=True)
+            self._control_db_path = self.root_path / "control-plane.db"
+            self._init_control_plane_schema()
 
     def create_key(
         self,
@@ -330,9 +343,9 @@ class HostedApiKeyStore:
         project_ids: set[str] | frozenset[str] = frozenset(),
         agent_ids: set[str | None] | frozenset[str | None] = frozenset(),
     ) -> ProvisionedApiKey:
-        raw_key = f"vx_{secrets.token_urlsafe(32)}"
         key_id = secrets.token_hex(8)
-        self._keys[key_id] = _HostedApiKey(
+        raw_key = f"vx_{key_id}_{secrets.token_urlsafe(32)}"
+        stored = _HostedApiKey(
             key_id=key_id,
             key_hash=self._hash(raw_key),
             tenant_id=tenant_id,
@@ -340,34 +353,203 @@ class HostedApiKeyStore:
             capabilities=frozenset(capabilities),
             project_ids=frozenset(project_ids),
             agent_ids=frozenset(agent_ids),
+            created_at=_now(),
         )
+        if self._control_db_path is None:
+            self._keys[key_id] = stored
+        else:
+            with closing(self._connect_control()) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO hosted_api_keys (
+                        key_id, key_hash, tenant_id, principal_id, capabilities,
+                        project_ids, agent_ids, created_at, revoked_at, revoked_by
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+                    """,
+                    (
+                        stored.key_id,
+                        stored.key_hash,
+                        stored.tenant_id,
+                        stored.principal_id,
+                        _capabilities_json(stored.capabilities),
+                        _strings_json(stored.project_ids),
+                        _nullable_strings_json(stored.agent_ids),
+                        stored.created_at,
+                    ),
+                )
+                conn.commit()
         return ProvisionedApiKey(key_id=key_id, raw_key=raw_key)
 
     def authenticate(self, raw_key: str) -> HostedAuthContext:
+        key_id = self._parse_key_id(raw_key)
         key_hash = self._hash(raw_key)
-        # ponytail: linear scan is fine for MVP; index by hash when key counts matter.
-        for stored in self._keys.values():
-            if stored.active and hmac.compare_digest(stored.key_hash, key_hash):
-                return HostedAuthContext(
-                    key_id=stored.key_id,
-                    tenant_id=stored.tenant_id,
-                    principal=Principal(
-                        principal_id=stored.principal_id,
-                        principal_type=PrincipalType.AGENT,
-                    ),
-                    capabilities=stored.capabilities,
-                    project_ids=stored.project_ids,
-                    agent_ids=stored.agent_ids,
-                )
+        stored = self._load_key(key_id)
+        if hmac.compare_digest(stored.key_hash, key_hash) and stored.active:
+            return HostedAuthContext(
+                key_id=stored.key_id,
+                tenant_id=stored.tenant_id,
+                principal=Principal(
+                    principal_id=stored.principal_id,
+                    principal_type=PrincipalType.AGENT,
+                ),
+                capabilities=stored.capabilities,
+                project_ids=stored.project_ids,
+                agent_ids=stored.agent_ids,
+            )
         raise PermissionError("Invalid hosted API key.")
 
-    def revoke_key(self, key_id: str) -> None:
-        try:
-            stored = self._keys[key_id]
-        except KeyError as exc:
-            raise PermissionError("Unknown hosted API key.") from exc
-        self._keys[key_id] = replace(stored, active=False)
+    def revoke_key(self, key_id: str, *, revoked_by: str | None = None) -> None:
+        if self._control_db_path is None:
+            try:
+                stored = self._keys[key_id]
+            except KeyError as exc:
+                raise PermissionError("Unknown hosted API key.") from exc
+            self._keys[key_id] = replace(
+                stored,
+                active=False,
+                revoked_at=stored.revoked_at or _now(),
+                revoked_by=stored.revoked_by or revoked_by,
+            )
+            return
+        with closing(self._connect_control()) as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM hosted_api_keys
+                WHERE key_id = ?
+                """,
+                (key_id,),
+            ).fetchone()
+            if row is None:
+                raise PermissionError("Unknown hosted API key.")
+            conn.execute(
+                """
+                UPDATE hosted_api_keys
+                SET
+                    revoked_at = COALESCE(revoked_at, ?),
+                    revoked_by = COALESCE(revoked_by, ?)
+                WHERE key_id = ?
+                """,
+                (_now(), revoked_by, key_id),
+            )
+            conn.commit()
 
     @staticmethod
     def _hash(raw_key: str) -> str:
         return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _parse_key_id(raw_key: str) -> str:
+        parts = raw_key.split("_", 2)
+        if len(parts) != 3 or parts[0] != "vx" or not parts[1] or not parts[2]:
+            raise PermissionError("Invalid hosted API key.")
+        return parts[1]
+
+    def _connect_control(self) -> sqlite3.Connection:
+        if self._control_db_path is None:
+            raise RuntimeError("Hosted API key store is not durable.")
+        return _connect_control_db(self._control_db_path)
+
+    def _init_control_plane_schema(self) -> None:
+        with closing(self._connect_control()) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS hosted_api_keys (
+                    key_id TEXT PRIMARY KEY,
+                    key_hash TEXT NOT NULL UNIQUE,
+                    tenant_id TEXT NOT NULL,
+                    principal_id TEXT NOT NULL,
+                    capabilities TEXT NOT NULL,
+                    project_ids TEXT NOT NULL,
+                    agent_ids TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    revoked_at TEXT,
+                    revoked_by TEXT
+                )
+                """
+            )
+            conn.commit()
+
+    def _load_key(self, key_id: str) -> _HostedApiKey:
+        if self._control_db_path is None:
+            try:
+                return self._keys[key_id]
+            except KeyError as exc:
+                raise PermissionError("Invalid hosted API key.") from exc
+        with closing(self._connect_control()) as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    key_id, key_hash, tenant_id, principal_id, capabilities,
+                    project_ids, agent_ids, created_at, revoked_at, revoked_by
+                FROM hosted_api_keys
+                WHERE key_id = ?
+                """,
+                (key_id,),
+            ).fetchone()
+        if row is None:
+            raise PermissionError("Invalid hosted API key.")
+        revoked_at = row[8]
+        try:
+            return _HostedApiKey(
+                key_id=row[0],
+                key_hash=row[1],
+                tenant_id=row[2],
+                principal_id=row[3],
+                capabilities=frozenset(
+                    MemoryCapability(value) for value in _load_json_list(row[4])
+                ),
+                project_ids=frozenset(_load_json_list(row[5])),
+                agent_ids=frozenset(_load_json_list(row[6], allow_none=True)),
+                created_at=row[7],
+                revoked_at=revoked_at,
+                revoked_by=row[9],
+                active=revoked_at is None,
+            )
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise PermissionError("Invalid hosted API key.") from exc
+
+
+def _capabilities_json(capabilities: frozenset[MemoryCapability]) -> str:
+    return json.dumps(sorted(capability.value for capability in capabilities))
+
+
+def _strings_json(values: frozenset[str]) -> str:
+    return json.dumps(sorted(values))
+
+
+def _nullable_strings_json(values: frozenset[str | None]) -> str:
+    return json.dumps(
+        sorted(values, key=lambda value: (0, "") if value is None else (1, value))
+    )
+
+
+def _connect_control_db(db_path: Path) -> sqlite3.Connection:
+    _ensure_control_db_permissions(db_path)
+    conn = sqlite3.connect(db_path, timeout=30)
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def _ensure_control_db_permissions(db_path: Path) -> None:
+    try:
+        fd = os.open(db_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, _CONTROL_DB_MODE)
+    except FileExistsError:
+        pass
+    else:
+        os.close(fd)
+    os.chmod(db_path, _CONTROL_DB_MODE)
+
+
+def _load_json_list(raw: str, *, allow_none: bool = False) -> list[str | None]:
+    values = json.loads(raw)
+    if not isinstance(values, list):
+        raise TypeError("Expected JSON list.")
+    if not all(isinstance(value, str) or (allow_none and value is None) for value in values):
+        raise TypeError("Expected JSON string list.")
+    return values
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
