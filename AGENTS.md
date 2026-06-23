@@ -90,8 +90,9 @@ It also exposes `init_schema()` as a local adapter helper. `init_schema()` is
 not part of the public `MemoryService` Protocol.
 
 `run_dream_phase` is deliberately settled as a host-port operation in v0.1:
-`LocalMemoryService` authorizes and checks lifecycle state, then fails closed
-with `HostPortNotConfigured` through `missing_host_port` when no host adapter is
+`LocalMemoryService` authorizes and checks lifecycle state, executes only when
+explicit dream-phase host ports are supplied, and fails closed with
+`HostPortNotConfigured` through `missing_host_port` when no host adapter is
 provided.
 
 Do not "fix" model-backed dream execution by importing private host runtime code.

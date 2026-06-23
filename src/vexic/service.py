@@ -15,6 +15,7 @@ from vexic.contract import (
     CandidateNote as ContractCandidateNote,
     DeleteScopeRequest,
     DeleteScopeResult,
+    DreamPhase,
     ExpandHistoryRequest,
     ExpandHistoryResult,
     ExportScopeRequest,
@@ -46,7 +47,7 @@ from vexic.contract import (
     TombstoneRecord,
     require_capability,
 )
-from vexic.ports import EmbedTexts, missing_host_port
+from vexic.ports import DreamPhasePorts, EmbedTexts, missing_host_port
 from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage import (
     TranscriptRangeTooLarge,
@@ -62,6 +63,7 @@ from vexic.storage import (
 from vexic.storage.longterm import record_fact_use_verdict, record_long_term_retrieval
 from vexic.storage.operators import repair_memory_projections
 from vexic.subagents.retrieval import retrieve_candidate_fallback, retrieve_long_term_facts
+from vexic.usage import UsageSummary
 
 def _iter_payload_strings(value: object) -> Iterator[str]:
     """Yield every raw string (mapping keys and values) in a JSON-able payload.
@@ -99,11 +101,13 @@ class LocalMemoryService(MemoryService):
         tenant_id: str,
         forbidden_secret_values: tuple[str, ...] = (),
         embed: EmbedTexts | None = None,
+        dream_phase_ports: DreamPhasePorts | None = None,
     ) -> None:
         self.db_path = db_path
         self.tenant_id = tenant_id
         self.forbidden_secret_values = forbidden_secret_values
         self.embed = embed
+        self.dream_phase_ports = dream_phase_ports
 
     def init_schema(self) -> None:
         init_db(self.db_path)
@@ -539,13 +543,8 @@ class LocalMemoryService(MemoryService):
         self,
         request: RunDreamPhaseRequest,
     ) -> RunDreamPhaseResult:
-        init_db(self.db_path)
-        self._authorize(request.scope, request.required_capability)
-        self._assert_not_tombstoned(
-            self._with_default_session(request.scope),
-            "rebuild",
-        )
-        raise missing_host_port("Dream phase")
+        result, _usage = await _run_dream_phase_with_usage(self, request)
+        return result
 
     async def export_scope(
         self,
@@ -663,3 +662,55 @@ class LocalMemoryService(MemoryService):
                 physical_purge_deferred=True,
             )
         )
+
+
+async def _run_dream_phase_with_usage(
+    service: LocalMemoryService,
+    request: RunDreamPhaseRequest,
+) -> tuple[RunDreamPhaseResult, UsageSummary]:
+    init_db(service.db_path)
+    service._authorize(request.scope, request.required_capability)
+    service._assert_not_tombstoned(
+        service._with_default_session(request.scope),
+        "rebuild",
+    )
+    ports = service.dream_phase_ports
+    if ports is None:
+        raise missing_host_port("Dream phase")
+
+    if request.phase is DreamPhase.LIGHT:
+        from vexic.pipeline import run_light_phase
+
+        usage = await run_light_phase(
+            service.db_path,
+            ports.model_group,
+            agent_id=request.scope.agent_id,
+            secrets=ports.secrets,
+            extraction_agent_factory=ports.extraction_agent_factory,
+            embed=ports.embed,
+            forbidden_secret_values=service._redaction_values(request.redaction),
+        )
+    elif request.phase is DreamPhase.REM:
+        from vexic.rem import run_rem_phase
+
+        usage = await run_rem_phase(
+            service.db_path,
+            ports.model_group,
+            agent_id=request.scope.agent_id,
+            secrets=ports.secrets,
+            rem_agent_factory=ports.rem_agent_factory,
+            forbidden_secret_values=service._redaction_values(request.redaction),
+        )
+    else:
+        from vexic.deep import run_deep_phase
+
+        usage = await run_deep_phase(
+            service.db_path,
+            ports.model_group,
+            agent_id=request.scope.agent_id,
+            secrets=ports.secrets,
+            contradiction_agent_factory=ports.contradiction_agent_factory,
+            forbidden_secret_values=service._redaction_values(request.redaction),
+        )
+
+    return RunDreamPhaseResult(phase=request.phase, status="ok"), usage

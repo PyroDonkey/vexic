@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 
@@ -21,6 +22,16 @@ class AgentFactory(Protocol):
 
 
 type EmbedTexts = Callable[[list[str]], list[list[float]]]
+
+
+@dataclass(frozen=True)
+class DreamPhasePorts:
+    model_group: str
+    embed: EmbedTexts | None = None
+    extraction_agent_factory: AgentFactory | None = None
+    rem_agent_factory: AgentFactory | None = None
+    contradiction_agent_factory: AgentFactory | None = None
+    secrets: Mapping[str, str] | None = None
 
 
 def missing_host_port(name: str) -> HostPortNotConfigured:

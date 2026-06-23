@@ -13,6 +13,7 @@ from pydantic_ai.messages import (
 
 from vexic.models import FactCandidate
 from vexic.ports import AgentFactory, EmbedTexts, HostPortNotConfigured, missing_host_port
+from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage import (
     backfill_missing_candidate_embeddings,
     commit_dream_cycle,
@@ -22,7 +23,7 @@ from vexic.storage import (
     load_messages_since,
 )
 from vexic.timeutil import utc_now_iso
-from vexic.usage import summarize_agent_usage
+from vexic.usage import UsageSummary, summarize_agent_usage
 
 LIGHT_PHASE_BATCH_SIZE = 50
 
@@ -82,10 +83,12 @@ def validate_candidate_source_ids(
         candidate.source_message_ids = sorted(candidate_ids)
 
 
-def _forbidden_secret_values(secrets: Mapping[str, str] | None) -> list[str]:
-    if secrets is None:
-        return []
-    return list(secrets.values())
+def _forbidden_secret_values(
+    secrets: Mapping[str, str] | None,
+    extra_values: tuple[str, ...] = (),
+) -> list[str]:
+    values = [] if secrets is None else list(secrets.values())
+    return [*values, *extra_values]
 
 
 async def run_light_phase(
@@ -96,10 +99,11 @@ async def run_light_phase(
     secrets: Mapping[str, str] | None = None,
     extraction_agent_factory: AgentFactory | None = None,
     embed: EmbedTexts | None = None,
-) -> None:
+    forbidden_secret_values: tuple[str, ...] = (),
+) -> UsageSummary:
     started_at = utc_now_iso()
     watermark = 0
-    forbidden = _forbidden_secret_values(secrets)
+    forbidden = _forbidden_secret_values(secrets, forbidden_secret_values)
     agent_factory = extraction_agent_factory or build_extraction_agent
     if embed is None:
         raise missing_host_port("Embeddings")
@@ -122,6 +126,10 @@ async def run_light_phase(
                 agent_id=agent_id,
             )
             if missing_embeddings:
+                assert_no_forbidden_secret_values(
+                    forbidden,
+                    *(fact_text for _, fact_text in missing_embeddings),
+                )
                 backfill_embeddings = embedder([fact_text for _, fact_text in missing_embeddings])
                 backfill_missing_candidate_embeddings(
                     db_path,
@@ -140,11 +148,12 @@ async def run_light_phase(
                 forbidden_secret_values=forbidden,
             )
             print("Light phase: no new messages. No-op.")
-            return
+            return UsageSummary()
 
         window_ids = [msg_id for msg_id, _ in rows]
         transcript = render_transcript(rows)
         evidence_ids = rendered_message_ids(rows)
+        assert_no_forbidden_secret_values(forbidden, transcript)
 
         agent = agent_factory(model_group, secrets=secrets)
         result = await agent.run(transcript)
@@ -157,6 +166,10 @@ async def run_light_phase(
             agent_id=agent_id,
         )
         if missing_embeddings:
+            assert_no_forbidden_secret_values(
+                forbidden,
+                *(fact_text for _, fact_text in missing_embeddings),
+            )
             backfill_embeddings = embedder([fact_text for _, fact_text in missing_embeddings])
             backfill_missing_candidate_embeddings(
                 db_path,
@@ -164,6 +177,10 @@ async def run_light_phase(
                 forbidden_secret_values=forbidden,
             )
 
+        assert_no_forbidden_secret_values(
+            forbidden,
+            *(candidate.fact_text for candidate in candidates),
+        )
         candidate_embeddings = embedder([candidate.fact_text for candidate in candidates])
         commit_dream_cycle(
             db_path,
@@ -183,6 +200,7 @@ async def run_light_phase(
             forbidden_secret_values=forbidden,
         )
         print(f"Light phase: {len(rows)} messages -> {len(candidates)} extracted candidates.")
+        return usage
 
     except Exception as exc:
         commit_dream_cycle(

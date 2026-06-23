@@ -200,9 +200,10 @@ rather than source of truth.
 source-ledger transcript ingest, long-term search, retrieval telemetry, fact
 retirement, export, replay, rebuild, and scope tombstones. Dream phase
 orchestration is deliberately host-port backed: the local adapter authorizes and
-checks lifecycle state, then fails closed with `HostPortNotConfigured` when no
-host execution adapter is supplied. This is not an invitation to import
-private host runtime code.
+checks lifecycle state, executes Light, REM, or Deep only when explicit dream
+phase ports are supplied, and fails closed with `HostPortNotConfigured` when no
+host execution adapter is supplied. This is not an invitation to import private
+host runtime code.
 
 ## Data Flow
 

@@ -97,16 +97,17 @@ behavioral contract and the current `LocalMemoryService` v0.1 surface.
 | Search long-term | `SearchLongTermRequest` | `memory:search` | Implemented |
 | Record retrieval event | `RecordRetrievalEventRequest` | `memory:write` | Implemented |
 | Retire fact | `RetireFactRequest` | `memory:write` | Implemented |
-| Run dream phase | `RunDreamPhaseRequest` | `memory:admin:rebuild` | Host-port deferred |
+| Run dream phase | `RunDreamPhaseRequest` | `memory:admin:rebuild` | Host-port backed |
 | Export scope | `ExportScopeRequest` | `memory:export` | Implemented |
 | Replay scope | `ReplayScopeRequest` | `memory:replay` | Implemented |
 | Rebuild | `RebuildRequest` | `memory:admin:rebuild` | Implemented |
 | Delete scope | `DeleteScopeRequest` | `memory:admin:lifecycle` | Implemented |
 
-Host-port deferred means `LocalMemoryService` authorizes and checks lifecycle
-state, then fails closed with `HostPortNotConfigured` through
-`missing_host_port` unless a host supplies the model-backed execution adapter.
-Do not wire this by importing private host runtime code.
+Host-port backed means `LocalMemoryService` authorizes and checks lifecycle
+state, then executes Light, REM, or Deep only when a host supplies explicit
+model-backed dream-phase ports. Without those ports it fails closed with
+`HostPortNotConfigured` through `missing_host_port`. Do not wire this by
+importing private host runtime code.
 
 ## Redaction
 

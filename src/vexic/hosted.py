@@ -38,8 +38,12 @@ from vexic.contract import (
     SearchTranscriptResult,
     TrustBoundary,
 )
-from vexic.ports import missing_host_port
-from vexic.service import LocalMemoryService
+from vexic.ports import DreamPhasePorts, missing_host_port
+from vexic.service import (
+    LocalMemoryService,
+    _run_dream_phase_with_usage as _run_local_dream_phase_with_usage,
+)
+from vexic.usage import UsageSummary
 
 
 _RequestT = TypeVar("_RequestT", bound=MemoryRequest)
@@ -237,11 +241,13 @@ class HostedMemoryService:
         api_keys: HostedApiKeyAuthenticator,
         telemetry: HostedTelemetrySink | None = None,
         rate_limiter: HostedInMemoryRateLimiter | None = None,
+        dream_phase_ports: DreamPhasePorts | None = None,
     ) -> None:
         self.catalog = catalog
         self.api_keys = api_keys
         self.telemetry = telemetry
         self.rate_limiter = rate_limiter or HostedInMemoryRateLimiter()
+        self.dream_phase_ports = dream_phase_ports
 
     async def append_transcript(
         self,
@@ -350,6 +356,19 @@ class HostedMemoryService:
             request,
             request.required_capability,
             lambda bound, tenant: self._run_dream_phase(bound, tenant),
+        )
+
+    async def _run_dream_phase_job(
+        self,
+        api_key: str,
+        request: RunDreamPhaseRequest,
+    ) -> tuple[RunDreamPhaseResult, UsageSummary]:
+        return await self._call(
+            "run_dream_phase",
+            api_key,
+            request,
+            request.required_capability,
+            lambda bound, tenant: self._run_dream_phase_with_usage(bound, tenant),
         )
 
     async def export_scope(
@@ -473,15 +492,31 @@ class HostedMemoryService:
         return request.model_copy(update={"scope": scope}), tenant
 
     def _local_service(self, tenant: HostedTenant) -> LocalMemoryService:
-        return LocalMemoryService(db_path=str(tenant.db_path), tenant_id=tenant.tenant_id)
+        return LocalMemoryService(
+            db_path=str(tenant.db_path),
+            tenant_id=tenant.tenant_id,
+            embed=self.dream_phase_ports.embed if self.dream_phase_ports else None,
+            dream_phase_ports=self.dream_phase_ports,
+        )
 
     async def _run_dream_phase(
         self,
         request: RunDreamPhaseRequest,
         tenant: HostedTenant,
     ) -> RunDreamPhaseResult:
+        result, _usage = await self._run_dream_phase_with_usage(request, tenant)
+        return result
+
+    async def _run_dream_phase_with_usage(
+        self,
+        request: RunDreamPhaseRequest,
+        tenant: HostedTenant,
+    ) -> tuple[RunDreamPhaseResult, UsageSummary]:
         try:
-            return await self._local_service(tenant).run_dream_phase(request)
+            return await _run_local_dream_phase_with_usage(
+                self._local_service(tenant),
+                request,
+            )
         except NotImplementedError as exc:
             raise missing_host_port("Dream phase") from exc
 
@@ -535,10 +570,12 @@ class HostedMemoryService:
         tenant_id: str,
         principal_id: str,
         status: str,
+        usage: UsageSummary | None = None,
         error_type: str | None = None,
     ) -> None:
         if self.telemetry is None:
             return
+        counters = usage or UsageSummary()
         self.telemetry.record_usage_event(
             HostedUsageEvent(
                 kind="job",
@@ -547,6 +584,11 @@ class HostedMemoryService:
                 principal_id=principal_id,
                 status=status,
                 recorded_at=_now(),
+                model_requests=counters.model_requests,
+                input_tokens=counters.input_tokens,
+                output_tokens=counters.output_tokens,
+                total_tokens=counters.total_tokens,
+                estimated_cost_micros=counters.estimated_cost_micros,
                 error_type=error_type,
             )
         )
@@ -575,7 +617,7 @@ class HostedBackgroundJobRunner:
             status="running",
         )
         try:
-            result = await self.service.run_dream_phase(api_key, request)
+            result, usage = await self.service._run_dream_phase_job(api_key, request)
         except Exception as exc:
             self._record_job(
                 job_id,
@@ -598,6 +640,7 @@ class HostedBackgroundJobRunner:
             tenant_id=auth.tenant_id,
             principal_id=auth.principal.principal_id,
             status="ok",
+            usage=usage,
         )
         return result
 

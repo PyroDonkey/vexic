@@ -15,6 +15,7 @@ from math import log
 from typing import Any
 
 from vexic.ports import AgentFactory, missing_host_port
+from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage import (
     CandidateRetirementDecision,
     LongTermNeighbor,
@@ -80,10 +81,12 @@ def _candidate_judge_prompt(
     )
 
 
-def _forbidden_secret_values(secrets: Mapping[str, str] | None) -> list[str]:
-    if secrets is None:
-        return []
-    return list(secrets.values())
+def _forbidden_secret_values(
+    secrets: Mapping[str, str] | None,
+    extra_values: tuple[str, ...] = (),
+) -> list[str]:
+    values = [] if secrets is None else list(secrets.values())
+    return [*values, *extra_values]
 
 
 def compute_score(
@@ -168,7 +171,8 @@ async def run_deep_phase(
     neighbor_k: int = DEFAULT_NEIGHBOR_K,
     now: datetime | None = None,
     contradiction_agent_factory: AgentFactory | None = None,
-) -> None:
+    forbidden_secret_values: tuple[str, ...] = (),
+) -> UsageSummary:
     """Score eligible Tier 2 candidates, promote the top-N to Tier 3, and
     retire any pre-existing Tier 3 fact a promotion contradicts.
 
@@ -179,7 +183,7 @@ async def run_deep_phase(
     failure records an error dream_run and re-raises, leaving Tier 3 untouched.
     """
     started_at = utc_now_iso()
-    forbidden = _forbidden_secret_values(secrets)
+    forbidden = _forbidden_secret_values(secrets, forbidden_secret_values)
     agent_factory = contradiction_agent_factory or build_contradiction_agent
     try:
         init_vector_memory(db_path)
@@ -198,7 +202,7 @@ async def run_deep_phase(
                 forbidden_secret_values=forbidden,
             )
             print("Deep phase: no eligible candidates. No-op.")
-            return
+            return UsageSummary()
 
         agent = agent_factory(model_group, secrets=secrets)
         decisions: list[PromotionDecision | CandidateRetirementDecision] = []
@@ -214,9 +218,11 @@ async def run_deep_phase(
             contradicted_neighbors: list[LongTermNeighbor] = []
             candidate_retired = False
             for neighbor in neighbors:
+                prompt = _judge_prompt(candidate, neighbor)
+                assert_no_forbidden_secret_values(forbidden, prompt)
                 contradicts, judge_usage = await _high_confidence_contradiction(
                     agent,
-                    _judge_prompt(candidate, neighbor),
+                    prompt,
                 )
                 usage = usage.plus(judge_usage)
                 if contradicts:
@@ -247,9 +253,11 @@ async def run_deep_phase(
             retired_candidate_ids: list[int] = []
             surviving_pending: list[_PendingPromotion] = []
             for index, pending in enumerate(pending_promotions):
+                prompt = _candidate_judge_prompt(candidate, pending.candidate)
+                assert_no_forbidden_secret_values(forbidden, prompt)
                 contradicts, judge_usage = await _high_confidence_contradiction(
                     agent,
-                    _candidate_judge_prompt(candidate, pending.candidate),
+                    prompt,
                 )
                 usage = usage.plus(judge_usage)
                 if not contradicts:
@@ -312,6 +320,7 @@ async def run_deep_phase(
         print(
             f"Deep phase: {stats.promotions} promotions, {stats.retirements} retirements."
         )
+        return usage
 
     except Exception as exc:
         # Best-effort audit. A failure writing the error row must not mask the

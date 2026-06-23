@@ -22,9 +22,9 @@ this boundary without changing the memory contract.
   persists only SHA-256 hashes, scope, and revocation metadata in the local
   SQLite control-plane database, authenticates by non-secret key id with
   constant-time hash comparison, and can revoke keys for local staging.
-- `HostedBackgroundJobRunner` records dream-phase job lifecycle events and
-  fails closed with `HostPortNotConfigured` while model-backed host ports are
-  absent.
+- `HostedBackgroundJobRunner` runs Light/REM/Deep dream phases when explicit
+  host model ports are supplied, records job lifecycle and usage events, and
+  fails closed with `HostPortNotConfigured` while ports are absent.
 - `HostedMemoryService` can send sanitized request audit and usage metadata to
   a telemetry sink without storing tenant metadata in shared service lists.
 - The local staging adapter stores sanitized request audit, usage, and
@@ -165,8 +165,10 @@ Current internal-alpha state as of 2026-06-23:
 - API-key auth rejects missing and invalid keys. A throwaway tester key proved
   hosted HTTP append/search, then hosted-API-backed stdio MCP search. An
   agent-B scoped MCP search did not see the agent-A marker.
-- Hosted Light/REM/Deep promotion into long-term memory is not verified here;
-  hosted workers remain tracked by COA-201.
+- This deployment smoke did not verify hosted Light/REM/Deep promotion into
+  long-term memory. The injected-port worker slice now has local fake-port
+  coverage, but needs a fresh hosted alpha promotion/search smoke after it is
+  deployed.
 - Tester keys are alpha-only and should be revoked after each check.
 
 One-off key issuance can run against the same volume:
@@ -199,7 +201,8 @@ Internal-only today:
 - sanitized local SQLite control-plane audit, usage, and job lifecycle ledgers;
 - single-process in-memory authenticated request limiter;
 - one `LocalMemoryService` instance is created per hosted request;
-- fail-closed dream jobs without host model ports.
+- hosted Light/REM/Deep jobs run only with injected host model ports and fail
+  closed without them.
 
 Not production/customer-data ready yet:
 
