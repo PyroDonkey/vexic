@@ -1,5 +1,7 @@
 # Agent scope is exact and shared rows are explicit
 
+Status: accepted
+
 Vexic separates agent-private memory with an optional `agent_id` refinement on
 `MemoryScope` and `MemoryScopeSelector`. A missing `agent_id` means shared
 memory inside the same tenant, project, user, and session parent scope; it is
