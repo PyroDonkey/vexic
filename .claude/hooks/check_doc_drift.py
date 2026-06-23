@@ -2,8 +2,8 @@
 """SessionStart hook: warn when in-repo docs drift from in-repo code.
 
 Read-only. It checks two in-repo invariants and reports drift; it never edits
-files. A hook cannot read Linear, so this only enforces the in-repo half of the
-"Docs Are Downstream Of Code" loop in AGENTS.md:
+files. A hook cannot read an external tracking system, so this only enforces the
+in-repo half of the "Docs Are Downstream Of Code" loop in AGENTS.md:
 
 1. docs/adr/README.md lists every ADR file under docs/adr/ (and no phantom
    entries), so "the index lists 0001-0004 but nine ADRs exist" cannot recur.
@@ -11,8 +11,8 @@ files. A hook cannot read Linear, so this only enforces the in-repo half of the
    operation surface, and AGENTS.md mentions each operation, so an operation
    added in code without a doc update is surfaced.
 
-Closing the loop against the downstream Linear roadmap/todo stays a manual step
-under the reconciliation triggers in AGENTS.md.
+Closing the loop against the downstream tracking roadmap/todo (named in
+AGENTS.md) stays a manual step under the reconciliation triggers there.
 """
 
 from __future__ import annotations
@@ -101,14 +101,19 @@ def _check_service_surface(warnings: list[str]) -> None:
             "MemoryService contract: " + ", ".join(only_service) + "."
         )
 
+    # Match each operation as a backticked token (`op`) rather than a bare
+    # substring, so e.g. the `rebuild` op is not considered documented just
+    # because the prose word "Rebuildable" contains it. AGENTS.md backticks
+    # every operation name, including run_dream_phase (documented as a
+    # host-port op outside the bullet list), so this stays a true check.
     agents_text = AGENTS.read_text(encoding="utf-8")
-    undocumented = sorted(op for op in service_ops if op not in agents_text)
+    undocumented = sorted(op for op in service_ops if f"`{op}`" not in agents_text)
     if undocumented:
         warnings.append(
             "AGENTS.md does not mention service operation(s) present in code: "
             + ", ".join(undocumented)
             + ". Update the 'v0.1 Local Service Surface' section and reconcile "
-            "the downstream Linear roadmap/todo."
+            "the downstream tracking roadmap/todo (see AGENTS.md)."
         )
 
 
@@ -137,7 +142,12 @@ def main() -> int:
         return 0
 
     body = "Doc drift check (read-only):\n\n" + "\n\n".join(notes + warnings)
-    _emit(body, "In-repo doc drift detected; reconcile per AGENTS.md.")
+    if warnings:
+        system_message = "In-repo doc drift detected; reconcile per AGENTS.md."
+    else:
+        # Only "could not run" notes (e.g. partial checkout): do not imply drift.
+        system_message = "Doc drift check could not fully run; see context."
+    _emit(body, system_message)
     return 0
 
 

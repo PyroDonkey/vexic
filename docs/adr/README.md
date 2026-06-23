@@ -1,10 +1,11 @@
 # Architecture Decision Records
 
 This index is the canonical in-repo list of Vexic ADRs. It is authoritative
-over any downstream tracking view (Linear roadmap/todo). When an ADR is added,
-changed, or its status moves, update this index in the same change and
-reconcile the Linear roadmap/todo against it. See "Docs Are Downstream Of Code"
-in `AGENTS.md`.
+over any downstream tracking view (the project roadmap/todo). When an ADR is
+added, changed, or its status moves, update this index in the same change and
+reconcile the downstream tracking roadmap/todo against it. See "Docs Are
+Downstream Of Code" in `AGENTS.md`, which names the tracking system and the
+reconciliation triggers.
 
 Every ADR file in this directory must appear in the table below. The
 `.claude/hooks/check_doc_drift.py` SessionStart hook flags any ADR file that is
