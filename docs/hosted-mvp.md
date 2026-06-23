@@ -127,6 +127,9 @@ $env:VEXIC_API_KEY = "<raw-key>"
 uv run python scripts/vexic-mcp-stdio.py --api-base-url http://127.0.0.1:8000 --tenant-id tenant-a --project-id project-a --session-id session-a
 ```
 
+For the internal Railway alpha, use `https://api.vexic.dev` as the
+`--api-base-url` with a throwaway scoped API key.
+
 `append_transcript` is verified through the hosted HTTP API. Claude Code then
 searches the hosted memory through the stdio MCP tools.
 
@@ -149,10 +152,33 @@ Required Railway config:
 - Persistent volume mounted at `/data/vexic`
 - Health check path: `/health`
 
+Current internal-alpha state as of 2026-06-23:
+
+- Railway project `Vexic` runs service `vexic` in the `production`
+  environment at `https://api.vexic.dev`.
+- The verified deployment is
+  `f8ce2754-6aac-4462-9d3d-edd275db674f` at commit
+  `0d67181f1dee146742e97d09ae7ea1d044ef7832`.
+- `/health` returns `200` with contract version `0.1.0`.
+- `vexic-volume` is mounted at `/data/vexic`; append/search persistence
+  survived a redeploy.
+- API-key auth rejects missing and invalid keys. A throwaway tester key proved
+  hosted HTTP append/search, then hosted-API-backed stdio MCP search. An
+  agent-B scoped MCP search did not see the agent-A marker.
+- Hosted Light/REM/Deep promotion into long-term memory is not verified here;
+  hosted workers remain tracked by COA-201.
+- Tester keys are alpha-only and should be revoked after each check.
+
 One-off key issuance can run against the same volume:
 
 ```powershell
 uv run --no-sync python -m vexic.hosted_http issue-key --root /data/vexic --tenant-id tenant-a --project-id project-a --principal-id claude-code
+```
+
+Revoke a throwaway key by key id, not by raw key:
+
+```powershell
+uv run --no-sync python -m vexic.hosted_http revoke-key --root /data/vexic --key-id <key-id> --revoked-by ryan
 ```
 
 This is internal-alpha infrastructure for throwaway data. It is not a

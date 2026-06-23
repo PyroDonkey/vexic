@@ -146,10 +146,11 @@ answer synthesis is recorded separately as `not_run` with the reserved
 
 The dependency-free hosted shell in `vexic.hosted` binds authenticated tenant
 scope before delegation and can route sanitized request/job usage events to an
-adapter-owned telemetry sink. Concrete tenant provisioning and API-key storage
-live in adapters outside `src/vexic`.
-It is an internal in-process boundary, not a public HTTP service. See
-`docs/hosted-mvp.md`. External customer-memory readiness is blocked by the
+adapter-owned telemetry sink. Concrete tenant provisioning, API-key storage,
+and the internal-alpha HTTP transport live in adapters outside the memory core.
+The Railway alpha at `https://api.vexic.dev` is for throwaway internal testing,
+not a public product service. See `docs/hosted-mvp.md`. External
+customer-memory readiness is blocked by the
 hosted readiness gate
 ([COA-177](https://linear.app/ryan-boissonnault/issue/COA-177/define-hosted-security-privacy-backup-and-abuse-readiness-gate))
 in Linear.
