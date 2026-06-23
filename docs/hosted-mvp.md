@@ -4,21 +4,21 @@ Role: deployment and readiness notes for the first hosted boundary around the
 Vexic memory core.
 
 The hosted MVP shell is an in-process Python boundary in `vexic.hosted`.
-Concrete tenant catalog and API-key provisioning live in adapters outside
-`src/vexic`; the repository-local `vexic_hosted_local` module is for local
-staging and tests. This is not a public HTTP server, dashboard, billing system,
-or production customer-data service. A future web/API process can wrap this
-boundary without changing the memory contract.
+Concrete tenant catalog, API-key provisioning, and internal-alpha transports
+live in adapter modules under `vexic`. The `vexic.hosted_local` module is for
+local staging and tests. This is not a public HTTP server, dashboard, billing
+system, or production customer-data service. A future web/API process can wrap
+this boundary without changing the memory contract.
 
 ## What Exists
 
 - `HostedMemoryService` exposes the public memory contract operation names,
   binds tenant/principal/capability scope from an adapter-supplied auth context,
   and delegates to `LocalMemoryService`.
-- `vexic_hosted_local.HostedTenantCatalog` persists local staging tenant routing
+- `vexic.hosted_local.HostedTenantCatalog` persists local staging tenant routing
   in a SQLite control-plane database and provisions one isolated
   SQLite-compatible Customer Memory Database per tenant.
-- `vexic_hosted_local.HostedApiKeyStore` creates high-entropy scoped API keys,
+- `vexic.hosted_local.HostedApiKeyStore` creates high-entropy scoped API keys,
   persists only SHA-256 hashes, scope, and revocation metadata in the local
   SQLite control-plane database, authenticates by non-secret key id with
   constant-time hash comparison, and can revoke keys for local staging.
@@ -32,12 +32,12 @@ boundary without changing the memory contract.
   or request payload text.
 - `HostedMemoryService` applies single-process in-memory operation quotas for
   authenticated local staging traffic before delegating to the memory core.
-- `vexic_hosted_http` exposes an internal-alpha FastAPI transport over
+- `vexic.hosted_http` exposes an internal-alpha FastAPI transport over
   `HostedMemoryService` for `append_transcript`, `search_transcript`,
   `search_long_term`, and `expand_history`, with API-key auth, request caps,
   error mapping, and `/health`.
 - `vexic.mcp_stdio` stays the local Claude Code stdio MCP process; the
-  repository-local `vexic_hosted_mcp` adapter lets the supported launcher point
+  `vexic.hosted_mcp` adapter lets the supported launcher point
   that MCP process at the hosted HTTP API.
 
 ## Local Staging
@@ -49,7 +49,7 @@ from pathlib import Path
 
 from vexic.contract import MemoryCapability
 from vexic.hosted import HostedMemoryService
-from vexic_hosted_local import HostedApiKeyStore, HostedTenantCatalog
+from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 
 catalog = HostedTenantCatalog(Path(".hosted-memory"))
 catalog.provision_tenant("tenant-a", project_ids={"project-a"})
@@ -99,13 +99,13 @@ For one internal hosted environment:
 Run the hosted HTTP adapter locally:
 
 ```powershell
-uv run --extra hosted uvicorn vexic_hosted_http:create_app --factory --host 127.0.0.1 --port 8000
+uv run --with-editable . --extra hosted python -m uvicorn vexic.hosted_http:create_app --factory --host 127.0.0.1 --port 8000
 ```
 
 Issue a tester key against the same hosted root:
 
 ```powershell
-uv run --extra hosted python -m vexic_hosted_http issue-key --root .hosted-memory --tenant-id tenant-a --project-id project-a --principal-id claude-code
+uv run --with-editable . --extra hosted python -m vexic.hosted_http issue-key --root .hosted-memory --tenant-id tenant-a --project-id project-a --principal-id claude-code
 ```
 
 The raw key is printed once. Store it in the caller secret store or Claude Code
@@ -152,7 +152,7 @@ Required Railway config:
 One-off key issuance can run against the same volume:
 
 ```powershell
-uv run --no-sync python -m vexic_hosted_http issue-key --root /data/vexic --tenant-id tenant-a --project-id project-a --principal-id claude-code
+uv run --no-sync python -m vexic.hosted_http issue-key --root /data/vexic --tenant-id tenant-a --project-id project-a --principal-id claude-code
 ```
 
 This is internal-alpha infrastructure for throwaway data. It is not a

@@ -19,7 +19,7 @@ from vexic.mcp_stdio import (
     handle_jsonrpc_message,
 )
 from vexic.storage import save_messages
-from vexic_hosted_mcp import create_hosted_http_memory_service
+from vexic.hosted_mcp import create_hosted_http_memory_service
 
 
 class _HostedApiHandler(BaseHTTPRequestHandler):

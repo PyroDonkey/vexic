@@ -28,7 +28,7 @@ from vexic.hosted import (
     HostedRateLimitExceeded,
 )
 from vexic.ports import HostPortNotConfigured
-from vexic_hosted_local import HostedApiKeyStore, HostedTenantCatalog
+from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 
 
 MAX_BODY_BYTES = 1_000_000

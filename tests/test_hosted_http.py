@@ -18,8 +18,8 @@ from vexic.contract import (
 )
 from vexic.hosted import HostedInMemoryRateLimiter, HostedMemoryService, HostedRateLimitRule
 from vexic.storage import single_message_adapter
-from vexic_hosted_http import create_app
-from vexic_hosted_local import HostedApiKeyStore, HostedTenantCatalog
+from vexic.hosted_http import create_app
+from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 
 
 def _scope(

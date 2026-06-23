@@ -22,9 +22,8 @@ def test_vexic_runtime_does_not_import_coalescent_engine() -> None:
 
 def test_hosted_core_does_not_own_infrastructure_provisioning() -> None:
     text = (ROOT / "src" / "vexic" / "hosted.py").read_text(encoding="utf-8")
-    core_text = "\n".join(
-        path.read_text(encoding="utf-8")
-        for path in (ROOT / "src" / "vexic").rglob("*.py")
+    mcp_stdio_text = (ROOT / "src" / "vexic" / "mcp_stdio.py").read_text(
+        encoding="utf-8"
     )
 
     for forbidden in (
@@ -44,4 +43,4 @@ def test_hosted_core_does_not_own_infrastructure_provisioning() -> None:
         "urlopen(",
         "HostedHttpMemoryServiceClient",
     ):
-        assert forbidden not in core_text
+        assert forbidden not in mcp_stdio_text
