@@ -19,6 +19,7 @@ from vexic.mcp_stdio import (
     handle_jsonrpc_message,
 )
 from vexic.storage import save_messages
+from vexic_hosted_mcp import create_hosted_http_memory_service
 
 
 class _HostedApiHandler(BaseHTTPRequestHandler):
@@ -198,6 +199,7 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
                     tenant_id="tenant-a",
                     session_id="session-a",
                     project_id="project-a",
+                    service_factory=create_hosted_http_memory_service,
                 ),
             )
         finally:

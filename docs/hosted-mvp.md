@@ -36,8 +36,9 @@ boundary without changing the memory contract.
   `HostedMemoryService` for `append_transcript`, `search_transcript`,
   `search_long_term`, and `expand_history`, with API-key auth, request caps,
   error mapping, and `/health`.
-- `vexic.mcp_stdio` can run as the local Claude Code stdio MCP process against
-  either a local SQLite database or the hosted HTTP API.
+- `vexic.mcp_stdio` stays the local Claude Code stdio MCP process; the
+  repository-local `vexic_hosted_mcp` adapter lets the supported launcher point
+  that MCP process at the hosted HTTP API.
 
 ## Local Staging
 

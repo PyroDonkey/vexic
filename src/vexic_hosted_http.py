@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 from vexic import CONTRACT_VERSION
 from vexic.contract import (
     AppendTranscriptRequest,
+    ExpandHistoryResult,
     ExpandHistoryRequest,
     MemoryCapability,
     MemoryRequest,
@@ -79,7 +80,15 @@ def create_app(service: HostedMemoryService | None = None) -> FastAPI:
 
     @app.post("/v1/expand_history")
     async def expand_history(request: Request, payload: ExpandHistoryRequest) -> JSONResponse:
-        return await _handle(request, payload, service.expand_history)
+        return await _handle(
+            request,
+            payload,
+            lambda api_key, body: service.expand_history(
+                api_key,
+                body,
+                max_rows=MAX_EXPAND_HISTORY_MESSAGES,
+            ),
+        )
 
     return app
 
@@ -109,6 +118,8 @@ async def _handle(
         return cap_error
     try:
         result = await call(api_key, payload)
+        if isinstance(result, ExpandHistoryResult) and result.truncated and not result.text:
+            return _too_large("expand_history range is capped.")
         result = _cap_result(result)
     except HostedRateLimitExceeded as exc:
         return _error_response(
@@ -160,9 +171,6 @@ def _cap_error(payload: MemoryRequest) -> JSONResponse | None:
                 "invalid_request",
                 "first_message_id must be less than or equal to last_message_id.",
             )
-        # ponytail: ID span cap is the cheap alpha guard; adapter-level max_rows is the upgrade.
-        if payload.last_message_id - payload.first_message_id + 1 > MAX_EXPAND_HISTORY_MESSAGES:
-            return _too_large("expand_history range is capped.")
     return None
 
 

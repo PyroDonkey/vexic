@@ -178,16 +178,91 @@ class HostedHttpTests(unittest.TestCase):
         self.assertIn("Retry-After", response.headers)
         self.assertNotIn("cedar-secret", response.text)
 
-    def test_expand_history_range_cap_is_enforced(self) -> None:
-        api_key = self._api_key(capabilities={MemoryCapability.EXPAND_HISTORY})
+    def test_expand_history_caps_scoped_rows_not_global_id_span(self) -> None:
+        api_key = self._api_key(
+            capabilities={MemoryCapability.WRITE, MemoryCapability.EXPAND_HISTORY}
+        )
+        first_response = self.client.post(
+            "/v1/append_transcript",
+            headers=self._auth(api_key),
+            json=AppendTranscriptRequest(
+                scope=_scope(capabilities={MemoryCapability.WRITE}),
+                messages_json=[
+                    single_message_adapter.dump_json(
+                        ModelRequest(parts=[UserPromptPart(content="session alpha first")])
+                    )
+                ],
+                redaction=RedactionContext(forbidden_values=()),
+            ).model_dump(mode="json"),
+        )
+        beta_scope = _scope(capabilities={MemoryCapability.WRITE}).model_copy(
+            update={"session_id": "session-b"}
+        )
+        self.client.post(
+            "/v1/append_transcript",
+            headers=self._auth(api_key),
+            json=AppendTranscriptRequest(
+                scope=beta_scope,
+                messages_json=[
+                    single_message_adapter.dump_json(
+                        ModelRequest(parts=[UserPromptPart(content=f"session beta {index}")])
+                    )
+                    for index in range(100)
+                ],
+                redaction=RedactionContext(forbidden_values=()),
+            ).model_dump(mode="json"),
+        )
+        last_response = self.client.post(
+            "/v1/append_transcript",
+            headers=self._auth(api_key),
+            json=AppendTranscriptRequest(
+                scope=_scope(capabilities={MemoryCapability.WRITE}),
+                messages_json=[
+                    single_message_adapter.dump_json(
+                        ModelRequest(parts=[UserPromptPart(content="session alpha last")])
+                    )
+                ],
+                redaction=RedactionContext(forbidden_values=()),
+            ).model_dump(mode="json"),
+        )
 
         response = self.client.post(
             "/v1/expand_history",
             headers=self._auth(api_key),
             json=ExpandHistoryRequest(
                 scope=_scope(capabilities={MemoryCapability.EXPAND_HISTORY}),
-                first_message_id=1,
-                last_message_id=102,
+                first_message_id=first_response.json()["message_ids"][0],
+                last_message_id=last_response.json()["message_ids"][0],
+                redaction=RedactionContext(forbidden_values=()),
+            ).model_dump(mode="json"),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("session alpha first", response.json()["text"])
+        self.assertIn("session alpha last", response.json()["text"])
+        self.assertNotIn("session beta", response.text)
+
+        message_ids = self.client.post(
+            "/v1/append_transcript",
+            headers=self._auth(api_key),
+            json=AppendTranscriptRequest(
+                scope=_scope(capabilities={MemoryCapability.WRITE}),
+                messages_json=[
+                    single_message_adapter.dump_json(
+                        ModelRequest(parts=[UserPromptPart(content=f"session alpha {index}")])
+                    )
+                    for index in range(99)
+                ],
+                redaction=RedactionContext(forbidden_values=()),
+            ).model_dump(mode="json"),
+        ).json()["message_ids"]
+        response = self.client.post(
+            "/v1/expand_history",
+            headers=self._auth(api_key),
+            json=ExpandHistoryRequest(
+                scope=_scope(capabilities={MemoryCapability.EXPAND_HISTORY}),
+                first_message_id=first_response.json()["message_ids"][0],
+                last_message_id=message_ids[-1],
                 redaction=RedactionContext(forbidden_values=()),
             ).model_dump(mode="json"),
         )

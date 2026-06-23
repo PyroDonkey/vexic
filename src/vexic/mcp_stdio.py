@@ -3,12 +3,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 import sys
-import urllib.error
-import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Protocol, TextIO, TypeVar
+from typing import Any, Protocol, TextIO
 
 from vexic import CONTRACT_VERSION
 from vexic.contract import (
@@ -33,8 +31,6 @@ MAX_QUERY_CHARS = 1_000
 MAX_LIMIT = 20
 MAX_EXPAND_HISTORY_MESSAGES = 100
 MAX_EXPAND_HISTORY_CHARS = 20_000
-
-_ResultT = TypeVar("_ResultT")
 
 
 class McpMemoryService(Protocol):
@@ -69,13 +65,13 @@ class McpServerConfig:
     enable_expand_history: bool = False
     api_base_url: str | None = None
     api_key_env: str = "VEXIC_API_KEY"
+    service_factory: Callable[["McpServerConfig"], McpMemoryService] | None = None
 
     def service(self) -> McpMemoryService:
         if self.api_base_url is not None:
-            api_key = os.environ.get(self.api_key_env)
-            if not api_key:
-                raise ValueError(f"{self.api_key_env} environment variable is required.")
-            return HostedHttpMemoryServiceClient(self.api_base_url, api_key)
+            if self.service_factory is None:
+                raise ValueError("hosted API service factory is required.")
+            return self.service_factory(self)
         if self.db_path is None:
             raise ValueError("db_path is required for local MCP.")
         return LocalMemoryService(
@@ -167,73 +163,6 @@ def _tools(config: McpServerConfig) -> tuple[dict[str, Any], ...]:
     if config.enable_expand_history:
         return (*BASE_TOOLS, EXPAND_HISTORY_TOOL)
     return BASE_TOOLS
-
-
-class HostedHttpMemoryServiceClient:
-    def __init__(self, base_url: str, api_key: str) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.api_key = api_key
-
-    async def search_transcript(
-        self,
-        request: SearchTranscriptRequest,
-    ) -> SearchTranscriptResult:
-        return await self._post("search_transcript", request, SearchTranscriptResult)
-
-    async def expand_history(
-        self,
-        request: ExpandHistoryRequest,
-        *,
-        max_rows: int | None = None,
-    ) -> ExpandHistoryResult:
-        return await self._post("expand_history", request, ExpandHistoryResult)
-
-    async def search_long_term(
-        self,
-        request: SearchLongTermRequest,
-    ) -> SearchLongTermResult:
-        return await self._post("search_long_term", request, SearchLongTermResult)
-
-    async def _post(self, operation: str, payload: object, result_type: type[_ResultT]) -> _ResultT:
-        body = json.dumps(payload.model_dump(mode="json")).encode("utf-8")
-        request = urllib.request.Request(
-            f"{self.base_url}/v1/{operation}",
-            data=body,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-
-        def send() -> bytes:
-            try:
-                with urllib.request.urlopen(request, timeout=30) as response:
-                    return response.read()
-            except urllib.error.HTTPError as exc:
-                raise RuntimeError(_hosted_http_error(exc)) from exc
-            except urllib.error.URLError as exc:
-                raise RuntimeError(f"Hosted Vexic API request failed: {exc.reason}") from exc
-
-        raw = await asyncio.to_thread(send)
-        return result_type.model_validate_json(raw)
-
-
-def _hosted_http_error(exc: urllib.error.HTTPError) -> str:
-    raw = exc.read().decode("utf-8", errors="replace")
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        return f"Hosted Vexic API returned HTTP {exc.code}."
-    error = payload.get("error")
-    if isinstance(error, dict) and isinstance(error.get("message"), str):
-        return error["message"]
-    detail = payload.get("detail")
-    if isinstance(detail, dict):
-        error = detail.get("error")
-        if isinstance(error, dict) and isinstance(error.get("message"), str):
-            return error["message"]
-    return f"Hosted Vexic API returned HTTP {exc.code}."
 
 
 def _response(message_id: Any, result: dict[str, Any]) -> dict[str, Any]:
@@ -500,7 +429,11 @@ async def run_stdio(
         stderr.flush()
 
 
-def _parse_args(argv: list[str] | None) -> McpServerConfig:
+def _parse_args(
+    argv: list[str] | None,
+    *,
+    service_factory: Callable[[McpServerConfig], McpMemoryService] | None = None,
+) -> McpServerConfig:
     parser = argparse.ArgumentParser(description="Run the Vexic local stdio MCP server.")
     transport = parser.add_mutually_exclusive_group(required=True)
     transport.add_argument("--db-path")
@@ -527,11 +460,16 @@ def _parse_args(argv: list[str] | None) -> McpServerConfig:
         enable_expand_history=args.enable_expand_history,
         api_base_url=args.api_base_url,
         api_key_env=args.api_key_env,
+        service_factory=service_factory,
     )
 
 
-def main(argv: list[str] | None = None) -> int:
-    asyncio.run(run_stdio(_parse_args(argv)))
+def main(
+    argv: list[str] | None = None,
+    *,
+    service_factory: Callable[[McpServerConfig], McpMemoryService] | None = None,
+) -> int:
+    asyncio.run(run_stdio(_parse_args(argv, service_factory=service_factory)))
     return 0
 
 
