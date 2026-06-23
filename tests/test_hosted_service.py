@@ -92,6 +92,22 @@ class _FailingJobTelemetry:
         raise RuntimeError("job telemetry unavailable")
 
 
+class _FailingJobUsageTelemetry:
+    def __init__(self, catalog: HostedTenantCatalog) -> None:
+        self.catalog = catalog
+
+    def record_audit_event(self, event: HostedAuditEvent) -> None:
+        self.catalog.record_audit_event(event)
+
+    def record_usage_event(self, event: HostedUsageEvent) -> None:
+        if event.kind == "job":
+            raise RuntimeError("job usage telemetry unavailable")
+        self.catalog.record_usage_event(event)
+
+    def record_job_event(self, event: HostedJobEvent) -> None:
+        self.catalog.record_job_event(event)
+
+
 class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -1456,6 +1472,34 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn(api_key.raw_key, ledger_text)
         self.assertNotIn("Dream phase host port is not configured", ledger_text)
+
+    async def test_job_usage_telemetry_failure_does_not_mask_dream_job_error(self) -> None:
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.ADMIN_REBUILD},
+            project_ids={"project-a"},
+        )
+        service = HostedMemoryService(
+            self.catalog,
+            self.keys,
+            telemetry=_FailingJobUsageTelemetry(self.catalog),
+        )
+        runner = HostedBackgroundJobRunner(service)
+
+        with self.assertRaises(HostPortNotConfigured):
+            await runner.run_dream_phase(
+                api_key.raw_key,
+                RunDreamPhaseRequest(
+                    scope=_scope(capabilities={MemoryCapability.ADMIN_REBUILD}),
+                    phase=DreamPhase.LIGHT,
+                    redaction=RedactionContext(forbidden_values=()),
+                ),
+            )
+
+        self.assertEqual([event.status for event in runner.job_events], ["running", "error"])
+        self.assertEqual(runner.job_events[-1].error_type, "HostPortNotConfigured")
 
     async def test_dream_job_failure_lifecycle_persists_across_catalog_reload(
         self,

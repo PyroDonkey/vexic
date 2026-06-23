@@ -576,22 +576,25 @@ class HostedMemoryService:
         if self.telemetry is None:
             return
         counters = usage or UsageSummary()
-        self.telemetry.record_usage_event(
-            HostedUsageEvent(
-                kind="job",
-                operation=operation,
-                tenant_id=tenant_id,
-                principal_id=principal_id,
-                status=status,
-                recorded_at=_now(),
-                model_requests=counters.model_requests,
-                input_tokens=counters.input_tokens,
-                output_tokens=counters.output_tokens,
-                total_tokens=counters.total_tokens,
-                estimated_cost_micros=counters.estimated_cost_micros,
-                error_type=error_type,
+        try:
+            self.telemetry.record_usage_event(
+                HostedUsageEvent(
+                    kind="job",
+                    operation=operation,
+                    tenant_id=tenant_id,
+                    principal_id=principal_id,
+                    status=status,
+                    recorded_at=_now(),
+                    model_requests=counters.model_requests,
+                    input_tokens=counters.input_tokens,
+                    output_tokens=counters.output_tokens,
+                    total_tokens=counters.total_tokens,
+                    estimated_cost_micros=counters.estimated_cost_micros,
+                    error_type=error_type,
+                )
             )
-        )
+        except Exception:
+            pass
 
 
 class HostedBackgroundJobRunner:
