@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import sqlite3
 from contextlib import closing
@@ -13,6 +14,9 @@ from pathlib import Path
 from vexic.contract import MemoryCapability, Principal, PrincipalType
 from vexic.hosted import HostedAuditEvent, HostedAuthContext, HostedTenant, HostedUsageEvent
 from vexic.service import LocalMemoryService
+
+
+_CONTROL_DB_MODE = 0o600
 
 
 @dataclass(frozen=True)
@@ -207,9 +211,7 @@ class HostedTenantCatalog:
         return [HostedUsageEvent(*row) for row in rows]
 
     def _connect_control(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._control_db_path, timeout=30)
-        conn.execute("PRAGMA foreign_keys = ON")
-        return conn
+        return _connect_control_db(self._control_db_path)
 
     def _init_control_plane_schema(self) -> None:
         with closing(self._connect_control()) as conn:
@@ -447,9 +449,7 @@ class HostedApiKeyStore:
     def _connect_control(self) -> sqlite3.Connection:
         if self._control_db_path is None:
             raise RuntimeError("Hosted API key store is not durable.")
-        conn = sqlite3.connect(self._control_db_path, timeout=30)
-        conn.execute("PRAGMA foreign_keys = ON")
-        return conn
+        return _connect_control_db(self._control_db_path)
 
     def _init_control_plane_schema(self) -> None:
         with closing(self._connect_control()) as conn:
@@ -491,19 +491,24 @@ class HostedApiKeyStore:
         if row is None:
             raise PermissionError("Invalid hosted API key.")
         revoked_at = row[8]
-        return _HostedApiKey(
-            key_id=row[0],
-            key_hash=row[1],
-            tenant_id=row[2],
-            principal_id=row[3],
-            capabilities=frozenset(MemoryCapability(value) for value in json.loads(row[4])),
-            project_ids=frozenset(json.loads(row[5])),
-            agent_ids=frozenset(json.loads(row[6])),
-            created_at=row[7],
-            revoked_at=revoked_at,
-            revoked_by=row[9],
-            active=revoked_at is None,
-        )
+        try:
+            return _HostedApiKey(
+                key_id=row[0],
+                key_hash=row[1],
+                tenant_id=row[2],
+                principal_id=row[3],
+                capabilities=frozenset(
+                    MemoryCapability(value) for value in _load_json_list(row[4])
+                ),
+                project_ids=frozenset(_load_json_list(row[5])),
+                agent_ids=frozenset(_load_json_list(row[6], allow_none=True)),
+                created_at=row[7],
+                revoked_at=revoked_at,
+                revoked_by=row[9],
+                active=revoked_at is None,
+            )
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise PermissionError("Invalid hosted API key.") from exc
 
 
 def _capabilities_json(capabilities: frozenset[MemoryCapability]) -> str:
@@ -518,6 +523,32 @@ def _nullable_strings_json(values: frozenset[str | None]) -> str:
     return json.dumps(
         sorted(values, key=lambda value: (0, "") if value is None else (1, value))
     )
+
+
+def _connect_control_db(db_path: Path) -> sqlite3.Connection:
+    _ensure_control_db_permissions(db_path)
+    conn = sqlite3.connect(db_path, timeout=30)
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def _ensure_control_db_permissions(db_path: Path) -> None:
+    try:
+        fd = os.open(db_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, _CONTROL_DB_MODE)
+    except FileExistsError:
+        pass
+    else:
+        os.close(fd)
+    os.chmod(db_path, _CONTROL_DB_MODE)
+
+
+def _load_json_list(raw: str, *, allow_none: bool = False) -> list[str | None]:
+    values = json.loads(raw)
+    if not isinstance(values, list):
+        raise TypeError("Expected JSON list.")
+    if not all(isinstance(value, str) or (allow_none and value is None) for value in values):
+        raise TypeError("Expected JSON string list.")
+    return values
 
 
 def _now() -> str:

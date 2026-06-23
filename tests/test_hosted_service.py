@@ -1,7 +1,9 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 import json
+import os
 import sqlite3
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -402,6 +404,54 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row[4], "operator-a")
         self.assertNotIn(api_key.raw_key, repr(row))
         self.assertNotIn(raw_key_secret, repr(row))
+
+    def test_durable_api_key_store_rejects_corrupt_key_rows(self) -> None:
+        root = Path(self.temp_dir.name)
+        corruptions = (
+            ("capabilities", json.dumps(["not-a-capability"])),
+            ("project_ids", "not-json"),
+        )
+        for column_name, corrupt_value in corruptions:
+            with self.subTest(column_name=column_name):
+                keys = HostedApiKeyStore(root)
+                api_key = keys.create_key(
+                    tenant_id="tenant-a",
+                    principal_id="agent-a",
+                    capabilities={MemoryCapability.SEARCH},
+                )
+                with closing(sqlite3.connect(root / "control-plane.db")) as conn:
+                    conn.execute(
+                        f"""
+                        UPDATE hosted_api_keys
+                        SET {column_name} = ?
+                        WHERE key_id = ?
+                        """,
+                        (corrupt_value, api_key.key_id),
+                    )
+                    conn.commit()
+
+                with self.assertRaisesRegex(
+                    PermissionError,
+                    "Invalid hosted API key.",
+                ):
+                    HostedApiKeyStore(root).authenticate(api_key.raw_key)
+
+    def test_durable_control_plane_database_is_owner_read_write_only(self) -> None:
+        root = Path(self.temp_dir.name) / "durable-control"
+        control_db = root / "control-plane.db"
+
+        with patch("os.chmod", wraps=os.chmod) as chmod:
+            HostedTenantCatalog(root)
+            HostedApiKeyStore(root)
+
+        chmod_control_calls = [
+            call_args
+            for call_args in chmod.call_args_list
+            if call_args.args == (control_db, 0o600)
+        ]
+        self.assertGreaterEqual(len(chmod_control_calls), 2)
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(control_db.stat().st_mode), 0o600)
 
     async def test_successful_request_records_sanitized_audit_and_usage(self) -> None:
         self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
