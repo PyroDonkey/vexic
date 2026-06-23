@@ -51,8 +51,15 @@ def create_app(service: HostedMemoryService | None = None) -> FastAPI:
     async def cap_body(request: Request, call_next: Callable[[Request], Awaitable[object]]):
         if request.method in {"POST", "PUT", "PATCH"}:
             content_length = request.headers.get("content-length")
-            if content_length is not None and int(content_length) > MAX_BODY_BYTES:
-                return _error_response(413, "request_too_large", "Request body is too large.")
+            if content_length is not None:
+                try:
+                    body_size = int(content_length)
+                except ValueError:
+                    return _error_response(400, "invalid_request", "Invalid Content-Length header.")
+                if body_size < 0:
+                    return _error_response(400, "invalid_request", "Invalid Content-Length header.")
+                if body_size > MAX_BODY_BYTES:
+                    return _error_response(413, "request_too_large", "Request body is too large.")
             body = await request.body()
             if len(body) > MAX_BODY_BYTES:
                 return _error_response(413, "request_too_large", "Request body is too large.")

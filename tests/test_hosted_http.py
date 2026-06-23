@@ -139,6 +139,11 @@ class HostedHttpTests(unittest.TestCase):
     def test_search_request_caps_are_enforced_before_delegation(self) -> None:
         api_key = self._api_key(capabilities={MemoryCapability.SEARCH})
 
+        malformed_length = self.client.post(
+            "/v1/search_transcript",
+            headers={"Content-Length": "nope"},
+            content=b"{}",
+        )
         response = self.client.post(
             "/v1/search_transcript",
             headers=self._auth(api_key),
@@ -148,6 +153,8 @@ class HostedHttpTests(unittest.TestCase):
             ).model_dump(mode="json"),
         )
 
+        self.assertEqual(malformed_length.status_code, 400)
+        self.assertEqual(malformed_length.json()["error"]["code"], "invalid_request")
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"]["code"], "request_too_large")
 
