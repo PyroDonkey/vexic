@@ -14,9 +14,18 @@ dependencies = [
 Repository = "https://github.com/PyroDonkey/vexic"
 Issues = "https://github.com/PyroDonkey/vexic/issues"
 
+[project.optional-dependencies]
+hosted = [
+    "fastapi>=0.138.0",
+    "uvicorn[standard]>=0.49.0",
+]
+
 [dependency-groups]
 dev = [
+    "fastapi>=0.138.0",
+    "httpx>=0.28.1",
     "pytest>=9.0.3",
+    "uvicorn[standard]>=0.49.0",
 ]
 
 [tool.pytest.ini_options]

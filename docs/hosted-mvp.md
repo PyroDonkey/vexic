@@ -32,6 +32,12 @@ boundary without changing the memory contract.
   or request payload text.
 - `HostedMemoryService` applies single-process in-memory operation quotas for
   authenticated local staging traffic before delegating to the memory core.
+- `vexic_hosted_http` exposes an internal-alpha FastAPI transport over
+  `HostedMemoryService` for `append_transcript`, `search_transcript`,
+  `search_long_term`, and `expand_history`, with API-key auth, request caps,
+  error mapping, and `/health`.
+- `vexic.mcp_stdio` can run as the local Claude Code stdio MCP process against
+  either a local SQLite database or the hosted HTTP API.
 
 ## Local Staging
 
@@ -87,6 +93,71 @@ For one internal hosted environment:
 - keep audit and usage ledgers durable outside the tenant memory database;
 - supply model-backed host ports before enabling real Light, REM, or Deep jobs.
 
+## Internal Alpha HTTP API
+
+Run the hosted HTTP adapter locally:
+
+```powershell
+uv run --extra hosted uvicorn vexic_hosted_http:create_app --factory --host 127.0.0.1 --port 8000
+```
+
+Issue a tester key against the same hosted root:
+
+```powershell
+uv run --extra hosted python -m vexic_hosted_http issue-key --root .hosted-memory --tenant-id tenant-a --project-id project-a --principal-id claude-code
+```
+
+The raw key is printed once. Store it in the caller secret store or Claude Code
+MCP environment, not in repository files.
+
+The HTTP API accepts `Authorization: Bearer <raw-key>` or `X-Vexic-Api-Key` and
+serves:
+
+- `GET /health`
+- `POST /v1/append_transcript`
+- `POST /v1/search_transcript`
+- `POST /v1/search_long_term`
+- `POST /v1/expand_history`
+
+For Claude Code alpha testing, run the stdio MCP shim against the hosted API:
+
+```powershell
+$env:VEXIC_API_KEY = "<raw-key>"
+uv run python scripts/vexic-mcp-stdio.py --api-base-url http://127.0.0.1:8000 --tenant-id tenant-a --project-id project-a --session-id session-a
+```
+
+`append_transcript` is verified through the hosted HTTP API. Claude Code then
+searches the hosted memory through the stdio MCP tools.
+
+## Railway Alpha Deploy
+
+Use the committed `Dockerfile`; do not rely on Railway Nixpacks for this slice.
+The image installs Python 3.13 dependencies with `uv` and includes
+`sqlite-vec`.
+
+Alpha storage choice: mount a Railway persistent volume at `/data/vexic` and
+keep `VEXIC_HOSTED_ROOT=/data/vexic`. This preserves the current
+SQLite-compatible Customer Memory Database boundary from ADR 0005. Turso/libSQL
+remains the next hosted-storage option when the alpha needs managed database
+operations instead of a single Railway volume.
+
+Required Railway config:
+
+- `PORT`: provided by Railway.
+- `VEXIC_HOSTED_ROOT=/data/vexic`
+- Persistent volume mounted at `/data/vexic`
+- Health check path: `/health`
+
+One-off key issuance can run against the same volume:
+
+```powershell
+uv run --no-sync python -m vexic_hosted_http issue-key --root /data/vexic --tenant-id tenant-a --project-id project-a --principal-id claude-code
+```
+
+This is internal-alpha infrastructure for throwaway data. It is not a
+production customer-data launch, public MCP endpoint, billing portal, dashboard,
+or enterprise auth surface.
+
 ## Readiness
 
 External customer-memory readiness is blocked by the hosted readiness gate.
@@ -95,7 +166,7 @@ explicit security/engineering owner risk acceptance is recorded.
 
 Internal-only today:
 
-- in-process Python API boundary;
+- in-process Python API boundary and internal-alpha HTTP adapter;
 - local SQLite-compatible tenant databases;
 - repo-local SQLite control-plane tenant catalog and API-key/revocation adapter;
 - sanitized local SQLite control-plane audit, usage, and job lifecycle ledgers;
@@ -105,7 +176,6 @@ Internal-only today:
 
 Not production/customer-data ready yet:
 
-- no public HTTP adapter in this package;
 - no production control-plane catalog, audit store, usage store, or job ledger;
 - no restore drill, network hardening, distributed rate limiting, support-access
   policy, or incident runbook;
