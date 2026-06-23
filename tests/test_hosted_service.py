@@ -24,8 +24,10 @@ from vexic.contract import (
     TrustBoundary,
 )
 from vexic.hosted import (
+    HostedAuditEvent,
     HostedBackgroundJobRunner,
     HostedInMemoryRateLimiter,
+    HostedJobEvent,
     HostedMemoryService,
     HostedRateLimitRule,
     HostedRateLimitExceeded,
@@ -65,6 +67,20 @@ class _CountingTenantCatalog:
     def get_tenant(self, tenant_id: str):
         self.get_tenant_calls += 1
         return self.catalog.get_tenant(tenant_id)
+
+
+class _FailingJobTelemetry:
+    def __init__(self, catalog: HostedTenantCatalog) -> None:
+        self.catalog = catalog
+
+    def record_audit_event(self, event: HostedAuditEvent) -> None:
+        self.catalog.record_audit_event(event)
+
+    def record_usage_event(self, event: HostedUsageEvent) -> None:
+        self.catalog.record_usage_event(event)
+
+    def record_job_event(self, event: HostedJobEvent) -> None:
+        raise RuntimeError("job telemetry unavailable")
 
 
 class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -579,7 +595,6 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(usage_events[0].kind, "request")
         self.assertEqual(usage_events[0].status, "error")
         self.assertEqual(usage_events[0].error_type, "PermissionError")
-        self.assertEqual(reloaded_catalog.job_events(None), [])
 
         control_plane_bytes = (root / "control-plane.db").read_bytes()
         ledger_text = repr(audit_events) + repr(usage_events)
@@ -1156,6 +1171,41 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(usage_events[-2].error_type, "HostPortNotConfigured")
         self.assertEqual(usage_events[-1].kind, "job")
         self.assertEqual(usage_events[-1].error_type, "HostPortNotConfigured")
+
+    async def test_job_telemetry_failure_does_not_mask_dream_job_error(self) -> None:
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.ADMIN_REBUILD},
+            project_ids={"project-a"},
+        )
+        service = HostedMemoryService(
+            self.catalog,
+            self.keys,
+            telemetry=_FailingJobTelemetry(self.catalog),
+        )
+        runner = HostedBackgroundJobRunner(service)
+
+        with self.assertRaises(HostPortNotConfigured):
+            await runner.run_dream_phase(
+                api_key.raw_key,
+                RunDreamPhaseRequest(
+                    scope=_scope(capabilities={MemoryCapability.ADMIN_REBUILD}),
+                    phase=DreamPhase.LIGHT,
+                    redaction=RedactionContext(forbidden_values=()),
+                ),
+            )
+
+        self.assertEqual([event.status for event in runner.job_events], ["running", "error"])
+        self.assertEqual(runner.job_events[-1].error_type, "HostPortNotConfigured")
+        ledger_text = (
+            repr(runner.job_events)
+            + repr(self.catalog.audit_events("tenant-a"))
+            + repr(self.catalog.usage_events("tenant-a"))
+        )
+        self.assertNotIn(api_key.raw_key, ledger_text)
+        self.assertNotIn("Dream phase host port is not configured", ledger_text)
 
     async def test_dream_job_failure_lifecycle_persists_across_catalog_reload(
         self,

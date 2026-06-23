@@ -615,8 +615,11 @@ class HostedBackgroundJobRunner:
             recorded_at=_now(),
             error_type=error_type,
         )
-        self.telemetry.record_job_event(event)
         self.job_events.append(event)
+        try:
+            self.telemetry.record_job_event(event)
+        except Exception:
+            pass
 
 
 def _now() -> str:

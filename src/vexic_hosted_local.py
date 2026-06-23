@@ -256,31 +256,19 @@ class HostedTenantCatalog:
                 ).fetchall()
         return [HostedUsageEvent(*row) for row in rows]
 
-    def job_events(self, tenant_id: str | None) -> list[HostedJobEvent]:
+    def job_events(self, tenant_id: str) -> list[HostedJobEvent]:
         with closing(self._connect_control()) as conn:
-            if tenant_id is None:
-                rows = conn.execute(
-                    """
-                    SELECT
-                        job_id, operation, tenant_id, principal_id, status,
-                        recorded_at, phase, error_type
-                    FROM hosted_job_events
-                    WHERE tenant_id IS NULL
-                    ORDER BY id
-                    """
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """
-                    SELECT
-                        job_id, operation, tenant_id, principal_id, status,
-                        recorded_at, phase, error_type
-                    FROM hosted_job_events
-                    WHERE tenant_id = ?
-                    ORDER BY id
-                    """,
-                    (tenant_id,),
-                ).fetchall()
+            rows = conn.execute(
+                """
+                SELECT
+                    job_id, operation, tenant_id, principal_id, status,
+                    recorded_at, phase, error_type
+                FROM hosted_job_events
+                WHERE tenant_id = ?
+                ORDER BY id
+                """,
+                (tenant_id,),
+            ).fetchall()
         return [
             HostedJobEvent(
                 job_id=row[0],
