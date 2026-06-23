@@ -36,6 +36,16 @@ Account, billing, admin, auth, metering, and operational management around the
 hosted memory API.
 _Avoid_: Memory core
 
+**Operational Telemetry**:
+Sanitized control-plane records used to run, audit, meter, and debug the hosted
+memory API without storing customer memory payloads.
+_Avoid_: Product analytics, memory telemetry
+
+**Product-Improvement Data Collection**:
+Customer-data-derived collection used to improve Vexic's product behavior beyond
+operating a tenant's own memory service.
+_Avoid_: Operational telemetry, audit log
+
 **Memory Scope**:
 The customer-visible boundary that limits which tenant, project, user, or
 session memory a caller may access. Agent identity can further refine this
