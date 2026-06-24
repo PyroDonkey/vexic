@@ -371,7 +371,7 @@ class HostedHttpTests(unittest.TestCase):
         asyncio.run(append())
         stdout = io.StringIO()
 
-        with patch.dict(os.environ, {"VEXIC_TEST_API_KEY": api_key.raw_key}):
+        with patch.dict(os.environ, {"VEXIC_TEST_API_KEY": f"{api_key.raw_key}\n"}):
             with contextlib.redirect_stdout(stdout):
                 exit_code = _main_result(
                     [
@@ -400,7 +400,14 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         payload = json.loads(stdout.getvalue())
         self.assertEqual(payload["result"]["status"], "ok")
-        self.assertEqual(payload["job_events"][-1]["status"], "ok")
+        self.assertEqual(
+            [event["status"] for event in payload["job_events"]],
+            ["running", "ok"],
+        )
+        self.assertEqual(
+            [event["operation"] for event in payload["usage_events"]],
+            ["run_dream_phase", "run_dream_phase"],
+        )
         job_usage = [
             event
             for event in self.catalog.usage_events("tenant-a")
@@ -408,6 +415,32 @@ class HostedHttpTests(unittest.TestCase):
         ]
         self.assertEqual(job_usage[-1].model_requests, 1)
         self.assertEqual(job_usage[-1].total_tokens, 5)
+
+    def test_run_dream_phase_cli_missing_adapter_fails_as_missing_host_port(self) -> None:
+        stderr = io.StringIO()
+
+        with patch.dict(os.environ, {"VEXIC_TEST_API_KEY": "vx_fake_secret"}):
+            with contextlib.redirect_stderr(stderr):
+                exit_code = _main_result(
+                    [
+                        "run-dream-phase",
+                        "--root",
+                        self.temp_dir.name,
+                        "--api-key-env",
+                        "VEXIC_TEST_API_KEY",
+                        "--adapter",
+                        str(Path(self.temp_dir.name) / "missing.py"),
+                        "--model-group",
+                        "fake",
+                        "--tenant-id",
+                        "tenant-a",
+                        "--phase",
+                        "light",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("requires a host-supplied model port", stderr.getvalue())
 
 
 def _main_result(argv: list[str]) -> int:
