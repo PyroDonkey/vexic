@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import contextlib
+import importlib.util
 import json
 import os
+import sys
+import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from types import ModuleType
 from typing import TypeVar
 
 from fastapi import FastAPI, Request
@@ -14,21 +20,29 @@ from fastapi.responses import JSONResponse
 from vexic import CONTRACT_VERSION
 from vexic.contract import (
     AppendTranscriptRequest,
+    DreamPhase,
     ExpandHistoryResult,
     ExpandHistoryRequest,
     MemoryCapability,
     MemoryRequest,
     MemoryResult,
+    MemoryScope,
+    Principal,
+    PrincipalType,
+    RedactionContext,
+    RunDreamPhaseRequest,
     SearchLongTermRequest,
     SearchTranscriptRequest,
+    TrustBoundary,
 )
 from vexic.hosted import (
+    HostedBackgroundJobRunner,
     HostedInMemoryRateLimiter,
     HostedMemoryService,
     HostedRateLimitExceeded,
 )
 from vexic.mcp_http import register_mcp_routes
-from vexic.ports import HostPortNotConfigured
+from vexic.ports import DreamPhasePorts, HostPortNotConfigured
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 
 
@@ -227,6 +241,115 @@ def _capabilities(values: list[str]) -> set[MemoryCapability]:
     return {MemoryCapability(value) for value in values}
 
 
+def _api_key_from_env(name: str) -> str:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        raise ValueError(f"{name} is required in the environment.")
+    return value
+
+
+def _secret_env_values(names: list[str]) -> dict[str, str] | None:
+    secrets: dict[str, str] = {}
+    for name in names:
+        value = os.environ.get(name)
+        if value is None:
+            raise ValueError(f"{name} is required in the environment.")
+        secrets[name] = value
+    return secrets or None
+
+
+def _load_dream_phase_adapter(path: Path) -> ModuleType:
+    if not path.exists():
+        raise ValueError(f"dream phase adapter not found: {path}")
+    module_name = f"vexic_hosted_adapter_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"could not load dream phase adapter: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    for name in (
+        "embed_texts",
+        "build_extraction_agent",
+        "build_rem_agent",
+        "build_contradiction_agent",
+    ):
+        if not callable(getattr(module, name, None)):
+            raise ValueError(f"dream phase adapter must define callable {name}.")
+    return module
+
+
+def _dream_phase_ports(args: argparse.Namespace) -> DreamPhasePorts:
+    adapter = _load_dream_phase_adapter(Path(args.adapter))
+    return DreamPhasePorts(
+        model_group=args.model_group,
+        embed=adapter.embed_texts,
+        extraction_agent_factory=adapter.build_extraction_agent,
+        rem_agent_factory=adapter.build_rem_agent,
+        contradiction_agent_factory=adapter.build_contradiction_agent,
+        secrets=_secret_env_values(args.secret_env),
+    )
+
+
+def _dream_phase_scope(args: argparse.Namespace) -> MemoryScope:
+    return MemoryScope(
+        tenant_id=args.tenant_id,
+        project_id=args.project_id,
+        session_id=args.session_id,
+        agent_id=args.agent_id,
+        principal=Principal(
+            principal_id="hosted-worker-cli",
+            principal_type=PrincipalType.OPERATOR,
+        ),
+        trust_boundary=TrustBoundary.LOCAL_TRUSTED,
+        capabilities={MemoryCapability.ADMIN_REBUILD},
+    )
+
+
+def _event_dict(event: object) -> dict[str, object]:
+    return dict(event.__dict__)
+
+
+def _run_dream_phase_command(args: argparse.Namespace) -> int:
+    root = _root_arg(args.root)
+    catalog = HostedTenantCatalog(root)
+    service = HostedMemoryService(
+        catalog,
+        HostedApiKeyStore(root),
+        telemetry=catalog,
+        rate_limiter=HostedInMemoryRateLimiter(),
+        dream_phase_ports=_dream_phase_ports(args),
+    )
+    with contextlib.redirect_stdout(sys.stderr):
+        result = asyncio.run(
+            HostedBackgroundJobRunner(service).run_dream_phase(
+                _api_key_from_env(args.api_key_env),
+                RunDreamPhaseRequest(
+                    scope=_dream_phase_scope(args),
+                    phase=DreamPhase(args.phase),
+                    redaction=RedactionContext(
+                        forbidden_values=tuple(args.forbidden_value),
+                    ),
+                ),
+            )
+        )
+    print(
+        json.dumps(
+            {
+                "result": result.model_dump(mode="json"),
+                "job_events": [
+                    _event_dict(event) for event in catalog.job_events(args.tenant_id)
+                ],
+                "usage_events": [
+                    _event_dict(event) for event in catalog.usage_events(args.tenant_id)
+                ],
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Manage the Vexic hosted alpha adapter.")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -244,36 +367,62 @@ def main(argv: list[str] | None = None) -> int:
     revoke.add_argument("--key-id", required=True)
     revoke.add_argument("--revoked-by")
 
+    run_phase = subcommands.add_parser("run-dream-phase")
+    run_phase.add_argument("--root")
+    run_phase.add_argument("--api-key-env", default="VEXIC_API_KEY")
+    run_phase.add_argument("--adapter", required=True)
+    run_phase.add_argument("--model-group", required=True)
+    run_phase.add_argument("--tenant-id", required=True)
+    run_phase.add_argument("--project-id")
+    run_phase.add_argument("--session-id")
+    run_phase.add_argument("--agent-id")
+    run_phase.add_argument(
+        "--phase",
+        choices=[phase.value for phase in DreamPhase],
+        required=True,
+    )
+    run_phase.add_argument("--forbidden-value", action="append", default=[])
+    run_phase.add_argument("--secret-env", action="append", default=[])
+
     args = parser.parse_args(argv)
-    root = _root_arg(args.root)
-    keys = HostedApiKeyStore(root)
 
-    if args.command == "issue-key":
-        catalog = HostedTenantCatalog(root)
-        catalog.provision_tenant(args.tenant_id, project_ids=set(args.project_id))
-        api_key = keys.create_key(
-            tenant_id=args.tenant_id,
-            principal_id=args.principal_id,
-            capabilities=_capabilities(args.capability),
-            project_ids=set(args.project_id),
-            agent_ids=set(args.agent_id),
-        )
-        print(
-            json.dumps(
-                {
-                    "key_id": api_key.key_id,
-                    "raw_key": api_key.raw_key,
-                    "tenant_id": args.tenant_id,
-                    "project_ids": args.project_id,
-                },
-                sort_keys=True,
+    try:
+        if args.command == "run-dream-phase":
+            return _run_dream_phase_command(args)
+
+        root = _root_arg(args.root)
+        keys = HostedApiKeyStore(root)
+
+        if args.command == "issue-key":
+            catalog = HostedTenantCatalog(root)
+            catalog.provision_tenant(args.tenant_id, project_ids=set(args.project_id))
+            api_key = keys.create_key(
+                tenant_id=args.tenant_id,
+                principal_id=args.principal_id,
+                capabilities=_capabilities(args.capability),
+                project_ids=set(args.project_id),
+                agent_ids=set(args.agent_id),
             )
-        )
-        return 0
+            print(
+                json.dumps(
+                    {
+                        "key_id": api_key.key_id,
+                        "raw_key": api_key.raw_key,
+                        "tenant_id": args.tenant_id,
+                        "project_ids": args.project_id,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0
 
-    keys.revoke_key(args.key_id, revoked_by=args.revoked_by)
-    print(json.dumps({"key_id": args.key_id, "revoked": True}, sort_keys=True))
-    return 0
+        keys.revoke_key(args.key_id, revoked_by=args.revoked_by)
+        print(json.dumps({"key_id": args.key_id, "revoked": True}, sort_keys=True))
+        return 0
+    except (HostPortNotConfigured, PermissionError, ValueError) as exc:
+        parser.exit(2, f"{exc}\n")
+    except Exception as exc:
+        parser.exit(1, f"hosted command failed: {type(exc).__name__}: {exc}\n")
 
 
 if __name__ == "__main__":

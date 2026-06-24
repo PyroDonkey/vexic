@@ -217,8 +217,20 @@ Current internal-alpha state as of 2026-06-23:
 One-off key issuance can run against the same volume:
 
 ```powershell
-uv run --no-sync python -m vexic.hosted_http issue-key --root /data/vexic --tenant-id tenant-a --project-id project-a --principal-id claude-code
+uv run --no-sync python -m vexic.hosted_http issue-key --root /data/vexic --tenant-id tenant-a --project-id project-a --principal-id claude-code --capability memory:write --capability memory:search --capability memory:admin:rebuild
 ```
+
+Run one hosted dream phase through a private host-owned adapter:
+
+```powershell
+$env:VEXIC_API_KEY = "<raw-key>"
+uv run --no-sync python -m vexic.hosted_http run-dream-phase --root /data/vexic --api-key-env VEXIC_API_KEY --adapter /data/vexic/dream_phase_adapter.py --model-group hosted-alpha --tenant-id tenant-a --project-id project-a --session-id session-a --agent-id agent-a --phase light
+```
+
+The adapter file must define `embed_texts`, `build_extraction_agent`,
+`build_rem_agent`, and `build_contradiction_agent`. Provider secrets stay in
+the host environment; pass secret variable names with `--secret-env NAME` when
+Vexic should include those values in redaction checks.
 
 Revoke a throwaway key by key id, not by raw key:
 

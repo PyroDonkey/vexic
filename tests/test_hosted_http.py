@@ -1,10 +1,17 @@
+import contextlib
+import io
+import json
+import os
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
+from vexic import hosted_http
 from vexic.contract import (
     AppendTranscriptRequest,
     ExpandHistoryRequest,
@@ -276,6 +283,138 @@ class HostedHttpTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"]["code"], "request_too_large")
+
+    def test_run_dream_phase_cli_uses_host_supplied_adapter(self) -> None:
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.ADMIN_REBUILD, MemoryCapability.WRITE},
+            project_ids={"project-a"},
+            agent_ids={"agent-a"},
+        )
+        service = HostedMemoryService(self.catalog, self.keys, telemetry=self.catalog)
+        scoped = _scope(capabilities={MemoryCapability.WRITE}).model_copy(
+            update={"agent_id": "agent-a"}
+        )
+        message_json = single_message_adapter.dump_json(
+            ModelRequest(parts=[UserPromptPart(content="hosted worker ultraviolet")])
+        )
+        adapter = Path(self.temp_dir.name) / "adapter.py"
+        adapter.write_text(
+            textwrap.dedent(
+                """
+                import re
+
+                from vexic.embeddings import EMBEDDING_DIM
+                from vexic.models import FactCandidate
+
+                class _Result:
+                    def __init__(self, output):
+                        self.output = output
+
+                    def usage(self):
+                        return type(
+                            "Usage",
+                            (),
+                            {
+                                "requests": 1,
+                                "input_tokens": 3,
+                                "output_tokens": 2,
+                                "total_tokens": 5,
+                            },
+                        )()
+
+                class _ExtractionAgent:
+                    async def run(self, transcript):
+                        message_id = int(re.search(r"message_id=(\\d+)", transcript).group(1))
+                        return _Result(
+                            [
+                                FactCandidate(
+                                    fact_text="Ryan's favorite color is ultraviolet.",
+                                    subject="Ryan",
+                                    category="preference",
+                                    importance=7,
+                                    confidence=0.9,
+                                    source_message_ids=[message_id],
+                                )
+                            ]
+                        )
+
+                def build_extraction_agent(model_group, secrets=None):
+                    return _ExtractionAgent()
+
+                def build_rem_agent(model_group, secrets=None):
+                    raise AssertionError("REM should not run in this test")
+
+                def build_contradiction_agent(model_group, secrets=None):
+                    raise AssertionError("Deep should not run in this test")
+
+                def embed_texts(texts):
+                    return [[1.0] + [0.0] * (EMBEDDING_DIM - 1) for _ in texts]
+                """
+            )
+        )
+
+        async def append() -> None:
+            await service.append_transcript(
+                api_key.raw_key,
+                AppendTranscriptRequest(
+                    scope=scoped,
+                    messages_json=[message_json],
+                    redaction=RedactionContext(forbidden_values=()),
+                ),
+            )
+
+        import asyncio
+
+        asyncio.run(append())
+        stdout = io.StringIO()
+
+        with patch.dict(os.environ, {"VEXIC_TEST_API_KEY": api_key.raw_key}):
+            with contextlib.redirect_stdout(stdout):
+                exit_code = _main_result(
+                    [
+                        "run-dream-phase",
+                        "--root",
+                        self.temp_dir.name,
+                        "--api-key-env",
+                        "VEXIC_TEST_API_KEY",
+                        "--adapter",
+                        str(adapter),
+                        "--model-group",
+                        "fake",
+                        "--tenant-id",
+                        "tenant-a",
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "session-a",
+                        "--agent-id",
+                        "agent-a",
+                        "--phase",
+                        "light",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["result"]["status"], "ok")
+        self.assertEqual(payload["job_events"][-1]["status"], "ok")
+        job_usage = [
+            event
+            for event in self.catalog.usage_events("tenant-a")
+            if event.kind == "job"
+        ]
+        self.assertEqual(job_usage[-1].model_requests, 1)
+        self.assertEqual(job_usage[-1].total_tokens, 5)
+
+
+def _main_result(argv: list[str]) -> int:
+    try:
+        return hosted_http.main(argv)
+    except SystemExit as exc:
+        return int(exc.code)
 
 
 if __name__ == "__main__":
