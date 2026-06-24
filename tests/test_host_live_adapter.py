@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 from pathlib import Path
 
@@ -62,3 +63,31 @@ def test_live_adapter_rejects_openai_provider_model_prefix(
         match="VEXIC_LIVE_MODEL must use an OpenRouter model id like",
     ):
         adapter.build_extraction_agent("retrieval-smoke")
+
+
+def test_live_adapter_embedding_can_run_inside_active_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _load_adapter()
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
+
+    class _Result:
+        embeddings = [[1.0] + [0.0] * 383]
+
+    class _Embedder:
+        def __init__(self, model: object) -> None:
+            self.model = model
+
+        def embed_documents_sync(self, texts: list[str], *, settings: object) -> _Result:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return _Result()
+            raise RuntimeError("called inside active event loop")
+
+    monkeypatch.setattr(adapter, "Embedder", _Embedder)
+
+    async def run() -> list[list[float]]:
+        return adapter.embed_texts(["hello"])
+
+    assert asyncio.run(run()) == [[1.0] + [0.0] * 383]

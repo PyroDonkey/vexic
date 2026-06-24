@@ -4,6 +4,7 @@ import math
 import os
 import re
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from pydantic_ai import Agent
@@ -160,10 +161,15 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
     model = _embedding_model_name()
-    result = Embedder(OpenAIEmbeddingModel(model, provider=_provider())).embed_documents_sync(
-        texts,
-        settings={"dimensions": EMBEDDING_DIM},
-    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = executor.submit(
+            lambda: Embedder(
+                OpenAIEmbeddingModel(model, provider=_provider())
+            ).embed_documents_sync(
+                texts,
+                settings={"dimensions": EMBEDDING_DIM},
+            )
+        ).result()
     embeddings = [list(embedding) for embedding in result.embeddings]
     bad_dimensions = [
         len(embedding)
