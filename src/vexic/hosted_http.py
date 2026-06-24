@@ -27,6 +27,7 @@ from vexic.hosted import (
     HostedMemoryService,
     HostedRateLimitExceeded,
 )
+from vexic.mcp_http import register_mcp_routes
 from vexic.ports import HostPortNotConfigured
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 
@@ -43,9 +44,18 @@ _RequestT = TypeVar("_RequestT", bound=MemoryRequest)
 _ResultT = TypeVar("_ResultT", bound=MemoryResult)
 
 
-def create_app(service: HostedMemoryService | None = None) -> FastAPI:
+def create_app(
+    service: HostedMemoryService | None = None,
+    *,
+    mcp_forbidden_secret_values: tuple[str, ...] = (),
+) -> FastAPI:
     service = service or create_service_from_env()
     app = FastAPI(title="Vexic Hosted Memory", version=CONTRACT_VERSION)
+    register_mcp_routes(
+        app,
+        service,
+        forbidden_secret_values=mcp_forbidden_secret_values,
+    )
 
     @app.middleware("http")
     async def cap_body(request: Request, call_next: Callable[[Request], Awaitable[object]]):

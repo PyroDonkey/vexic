@@ -23,6 +23,7 @@ Key modules:
 - `vexic.deep` - Deep promotion/supersession phase
 - `vexic.subagents.retrieval` - hybrid Tier 3 retrieval and candidate fallback
 - `vexic.mcp_stdio` - read-only local stdio MCP MVP
+- `vexic.mcp_http` - read-only native HTTP MCP adapter over hosted auth
 - `vexic.ports` - host-supplied model-agent ports
 - `vexic.redaction` - persistence and egress secret guard
 
@@ -48,7 +49,9 @@ is a consumer, not a dependency.
 - Private host runtime wiring.
 - Host-specific application features and integrations layered on the private
   source host (messaging, content generation, scheduling, or model routing).
-- Hosted auth, billing, dashboards, public HTTP, or remote MCP in the v0.1 core.
+- Hosted auth, billing, dashboards, public HTTP, or mature remote MCP in the
+  v0.1 core. The native HTTP MCP slice is a thin hosted adapter, not core
+  memory behavior.
 - External vector databases for the local core.
 - Destructive chat-window compression.
 - Physical purge semantics before a backend/SLA decision exists.

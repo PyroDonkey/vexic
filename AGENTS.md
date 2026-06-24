@@ -17,13 +17,15 @@ The current v0.1 package is a local Python core with:
 - memory storage, retrieval, and Light/REM/Deep primitives under `src/vexic`
 - conformance and reliability tests under `tests`
 
-Managed hosted auth stacks, billing, dashboards, public HTTP, remote MCP, and
-managed operations are out of scope for v0.1. The read-only local stdio MCP MVP
-is the narrow local adapter slice. The in-process hosted MVP shell in
-`src/vexic/hosted.py` may bind Vexic-scoped API keys to tenant/project/capability
-scope for internal staging, but it is not a public HTTP service or production
-control plane. The private source host remains the first-party consumer; see
-`docs/provenance.md` for extraction provenance.
+Managed hosted auth stacks, billing, dashboards, public marketplace MCP, mature
+remote MCP, and managed operations are out of scope for v0.1. The read-only
+local stdio MCP MVP is the local adapter slice. The in-process hosted MVP shell
+in `src/vexic/hosted.py` may bind Vexic-scoped API keys to
+tenant/project/capability scope for internal staging, and the hosted FastAPI
+adapter may expose the narrow read-only native HTTP MCP `/mcp` slice described
+in ADR 0010. This is not a public HTTP service or production control plane. The
+private source host remains the first-party consumer; see `docs/provenance.md`
+for extraction provenance.
 
 ---
 
@@ -197,9 +199,10 @@ under the triggers above.
 - Type annotate new public functions and models.
 - Prefer Pydantic models and structured APIs over string parsing.
 - Keep code in focused modules that match the existing package boundaries.
-- Do not add provider secrets, hosted auth, billing, public HTTP, remote MCP,
-  or dashboard concerns to the core package unless Ryan explicitly starts that
-  workstream.
+- Do not add provider secrets, hosted auth, billing, public HTTP, mature remote
+  MCP, or dashboard concerns to the core package unless Ryan explicitly starts
+  that workstream. The ADR 0010 native HTTP MCP slice is limited to read-only
+  hosted adapter code.
 - Before relying on pydantic-ai import paths or behavior, verify the current
   upstream docs. The package changes quickly.
 - Keep generated docs ASCII unless an existing file has a clear reason to use

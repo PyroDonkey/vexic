@@ -39,6 +39,9 @@ this boundary without changing the memory contract.
 - `vexic.mcp_stdio` stays the local Claude Code stdio MCP process; the
   `vexic.hosted_mcp` adapter lets the supported launcher point
   that MCP process at the hosted HTTP API.
+- `vexic.mcp_http` exposes a native read-only Streamable HTTP MCP `/mcp`
+  route on the hosted FastAPI app. It is stateless, JSON-only, Bearer-auth
+  only, and exposes `search_transcript` and `search_long_term`.
 
 ## Local Staging
 
@@ -119,6 +122,46 @@ serves:
 - `POST /v1/search_transcript`
 - `POST /v1/search_long_term`
 - `POST /v1/expand_history`
+- `POST /mcp`
+
+`POST /mcp` is the native read-only Streamable HTTP MCP route. It differs from
+the `/v1/*` routes deliberately:
+
+- it requires `Authorization: Bearer <raw-key>`;
+- it rejects query strings and does not accept `X-Vexic-Api-Key`;
+- it returns `application/json` only and no SSE;
+- it is stateless and does not issue `MCP-Session-Id`;
+- it accepts missing `Origin` for CLI agents, but rejects present origins that
+  are not listed in `VEXIC_MCP_ALLOWED_ORIGINS`;
+- it binds `project_id`, `session_id`, and optional `agent_id` from
+  `X-Vexic-Project-Id`, `X-Vexic-Session-Id`, and `X-Vexic-Agent-Id`;
+- it exposes only `search_transcript` and `search_long_term`.
+
+Native HTTP MCP explicitly defers OAuth discovery/PKCE/audience handling,
+redirect/SSRF hardening, SSE/resumability, stateful sessions, write/admin
+tools, public marketplace distribution, and production customer-data readiness.
+
+Minimal client config shape for Claude Code, Codex, OpenClaw, and Hermes Agent:
+
+```text
+transport: streamable-http
+url: https://api.vexic.dev/mcp
+headers:
+  Authorization: Bearer <raw-key>
+  X-Vexic-Project-Id: project-a
+  X-Vexic-Session-Id: session-a
+  X-Vexic-Agent-Id: agent-a  # optional
+```
+
+Smoke each configured client with the same sequence:
+
+1. `initialize` succeeds and returns protocol version `2025-11-25`.
+2. `tools/list` returns exactly `search_transcript` and `search_long_term`.
+3. `tools/call search_transcript` returns scoped transcript hits.
+4. `tools/call search_long_term` returns facts or a configuration tool error
+   if no embedding port is configured.
+5. Missing or invalid Bearer key returns `401`.
+6. `expand_history`, write, and admin tools are absent and unreachable.
 
 For Claude Code alpha testing, run the stdio MCP shim against the hosted API:
 

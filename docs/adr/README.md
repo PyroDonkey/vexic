@@ -22,6 +22,7 @@ missing from this index (and the reverse).
 | 0007 | Agent scope is exact and shared rows are explicit               | accepted |
 | 0008 | Hosted data protection uses provider encryption, PITR, exports  | accepted |
 | 0009 | Production telemetry boundary is settled before product analytics | accepted |
+| 0010 | Native read-only HTTP MCP is a stateless hosted adapter slice   | accepted |
 
 Notes:
 
