@@ -53,7 +53,7 @@ def _require_openai_model(model: str, env_name: str) -> str:
 def _reject_passed_secrets(secrets: Mapping[str, str] | None) -> None:
     if secrets:
         raise RuntimeError(
-            "host_live_adapter.py reads provider secrets from environment variables only."
+            "openai_live_adapter.py reads provider secrets from environment variables only."
         )
 
 

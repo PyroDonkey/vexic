@@ -11,8 +11,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _load_adapter() -> object:
     spec = importlib.util.spec_from_file_location(
-        "host_live_adapter_under_test",
-        ROOT / "host_live_adapter.py",
+        "openai_live_adapter_under_test",
+        ROOT / "adapters" / "openai_live_adapter.py",
     )
     assert spec is not None
     assert spec.loader is not None
