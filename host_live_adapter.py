@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import re
 from collections.abc import Mapping
@@ -38,7 +39,8 @@ def _env_key(value: str) -> str:
 
 
 def _require_openai_key() -> None:
-    if not os.environ.get("OPENAI_API_KEY"):
+    key = os.environ.get("OPENAI_API_KEY")
+    if key is None or not key.strip():
         raise RuntimeError("OPENAI_API_KEY is required for the live retrieval adapter.")
 
 
@@ -73,11 +75,11 @@ def _float_env(name: str, default: float) -> float:
     if value is None or not value.strip():
         return default
     try:
-        parsed = float(value)
+        parsed = float(value.strip())
     except ValueError as exc:
         raise RuntimeError(f"{name} must be a number.") from exc
-    if parsed <= 0:
-        raise RuntimeError(f"{name} must be greater than 0.")
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise RuntimeError(f"{name} must be a finite number greater than 0.")
     return parsed
 
 
