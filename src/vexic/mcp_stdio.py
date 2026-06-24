@@ -23,7 +23,10 @@ from vexic.contract import (
     SearchTranscriptRequest,
     TrustBoundary,
 )
-from vexic.redaction import assert_no_forbidden_secret_values
+from vexic.redaction import (
+    assert_no_forbidden_secret_values,
+    assert_no_forbidden_secret_values_in_payload,
+)
 from vexic.service import LocalMemoryService
 
 MCP_PROTOCOL_VERSION = "2025-11-25"
@@ -270,8 +273,9 @@ async def _search_transcript(
             limit=_limit(arguments),
         )
     )
-    _check_egress(config, [hit.body for hit in result.hits])
-    return _tool_text({"hits": [hit.model_dump(mode="json") for hit in result.hits]})
+    payload = {"hits": [hit.model_dump(mode="json") for hit in result.hits]}
+    assert_no_forbidden_secret_values_in_payload(config.forbidden_secret_values, payload)
+    return _tool_text(payload)
 
 
 async def _expand_history(
@@ -319,19 +323,14 @@ async def _search_long_term(
             limit=_limit(arguments),
         )
     )
-    _check_egress(
-        config,
-        [fact.fact_text for fact in result.facts]
-        + [note.fact_text for note in result.candidate_notes],
-    )
-    return _tool_text(
-        {
-            "facts": [fact.model_dump(mode="json") for fact in result.facts],
-            "candidate_notes": [
-                note.model_dump(mode="json") for note in result.candidate_notes
-            ],
-        }
-    )
+    payload = {
+        "facts": [fact.model_dump(mode="json") for fact in result.facts],
+        "candidate_notes": [
+            note.model_dump(mode="json") for note in result.candidate_notes
+        ],
+    }
+    assert_no_forbidden_secret_values_in_payload(config.forbidden_secret_values, payload)
+    return _tool_text(payload)
 
 
 async def _call_tool(

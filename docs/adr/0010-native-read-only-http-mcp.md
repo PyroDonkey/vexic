@@ -37,6 +37,9 @@ string tokens and `X-Vexic-Api-Key` are rejected on `/mcp`; the older
 routes. Tenant, principal, and capability scope come from hosted API-key auth.
 Project, session, and agent memory scope come from configured request headers
 and are validated again by `HostedMemoryService` before delegation.
+`X-Vexic-Session-Id` is required for every `tools/call`; the adapter fails closed
+with a tool error rather than letting the service fall back to a shared `default`
+session.
 
 The adapter supports JSON-RPC `initialize`, `ping`, `tools/list`, and
 `tools/call`. It returns `application/json` for request responses, `202

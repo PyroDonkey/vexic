@@ -468,6 +468,58 @@ class McpHttpTests(unittest.TestCase):
         self.assertIn("Retry-After", response.headers)
         self.assertNotIn("cedar-secret", response.text)
 
+    def test_search_requires_session_header_and_fails_closed(self) -> None:
+        api_key = self._api_key()
+
+        for tool in ("search_transcript", "search_long_term"):
+            with self.subTest(tool=tool):
+                response = self.client.post(
+                    "/mcp",
+                    headers=self._mcp_headers(api_key),
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 18,
+                        "method": "tools/call",
+                        "params": {"name": tool, "arguments": {"query": "cedar"}},
+                    },
+                )
+
+                self.assertEqual(response.status_code, 200)
+                result = response.json()["result"]
+                self.assertTrue(result["isError"])
+                self.assertIn("X-Vexic-Session-Id", result["content"][0]["text"])
+                self.assertNotIn("default", result["content"][0]["text"])
+
+    def test_unexpected_auth_failure_returns_json_error(self) -> None:
+        api_key = self._api_key()
+
+        def _boom(_: str) -> object:
+            raise RuntimeError("key store unavailable")
+
+        self.service.api_keys.authenticate = _boom  # type: ignore[method-assign]
+
+        response = self.client.post(
+            "/mcp",
+            headers=self._mcp_headers(api_key),
+            json={"jsonrpc": "2.0", "id": 19, "method": "ping"},
+        )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.headers["content-type"], "application/json")
+        self.assertEqual(response.json()["error"]["code"], "internal_error")
+        self.assertNotIn("key store unavailable", response.text)
+
+    def test_payload_egress_guard_covers_non_text_fields(self) -> None:
+        from vexic.redaction import assert_no_forbidden_secret_values_in_payload
+
+        payload = {
+            "facts": [
+                {"fact_text": "harmless", "subject": "cedar-secret in subject"}
+            ]
+        }
+        with self.assertRaises(ValueError):
+            assert_no_forbidden_secret_values_in_payload(("cedar-secret",), payload)
+
     def test_jsonrpc_parse_and_unknown_method_errors(self) -> None:
         api_key = self._api_key()
 

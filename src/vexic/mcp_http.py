@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from vexic import CONTRACT_VERSION
 from vexic.contract import (
@@ -24,7 +25,32 @@ from vexic.mcp_stdio import (
     _tool_error,
     _tool_text,
 )
-from vexic.redaction import assert_no_forbidden_secret_values
+from vexic.redaction import assert_no_forbidden_secret_values_in_payload
+
+
+class JsonRpcRequest(BaseModel):
+    """Structural validation of an inbound JSON-RPC message envelope.
+
+    Extra keys (``result``/``error`` on client response messages) are retained
+    so the handler can distinguish requests, notifications, and responses
+    without re-inspecting the raw dict.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    jsonrpc: Literal["2.0"]
+    method: str | None = None
+    params: Any = None
+    id: Any = None
+
+    @property
+    def is_notification(self) -> bool:
+        return "id" not in self.model_fields_set
+
+    @property
+    def is_response_message(self) -> bool:
+        extra = self.model_extra or {}
+        return self.method is None and ("result" in extra or "error" in extra)
 
 
 def register_mcp_routes(
@@ -50,25 +76,27 @@ def register_mcp_routes(
             auth = service.api_keys.authenticate(api_key)
         except PermissionError:
             return _http_error(401, "unauthorized", "Invalid hosted API key.")
+        except Exception:
+            return _http_error(500, "internal_error", "Hosted memory request failed.")
 
         try:
-            message = await request.json()
+            body = await request.json()
         except Exception:
             return JSONResponse(_jsonrpc_error(None, -32700, "parse error"))
-        if not isinstance(message, dict):
-            return JSONResponse(_jsonrpc_error(None, -32600, "invalid request"))
-        if message.get("jsonrpc") != "2.0":
-            return JSONResponse(_jsonrpc_error(message.get("id"), -32600, "invalid request"))
-        method = message.get("method")
-        if method is None and ("result" in message or "error" in message):
+        try:
+            rpc = JsonRpcRequest.model_validate(body)
+        except ValidationError:
+            message_id = body.get("id") if isinstance(body, dict) else None
+            return JSONResponse(_jsonrpc_error(message_id, -32600, "invalid request"))
+        if rpc.is_response_message:
             return Response(status_code=202)
-        if not isinstance(method, str):
-            return JSONResponse(_jsonrpc_error(message.get("id"), -32600, "invalid request"))
-        if "id" not in message:
+        if rpc.method is None:
+            return JSONResponse(_jsonrpc_error(rpc.id, -32600, "invalid request"))
+        if rpc.is_notification:
             return Response(status_code=202)
         try:
             response = await _handle_message(
-                message,
+                rpc,
                 request,
                 service,
                 api_key,
@@ -83,7 +111,7 @@ def register_mcp_routes(
                 headers={"Retry-After": str(exc.retry_after_seconds)},
             )
         if response is None:
-            return JSONResponse(_jsonrpc_error(message.get("id"), -32601, "method not found"))
+            return JSONResponse(_jsonrpc_error(rpc.id, -32601, "method not found"))
         return JSONResponse(response)
 
 
@@ -123,23 +151,23 @@ def _protocol_error(request: Request) -> JSONResponse | None:
 
 
 async def _handle_message(
-    message: dict[str, Any],
+    rpc: JsonRpcRequest,
     request: Request,
     service: HostedMemoryService,
     api_key: str,
     auth: HostedAuthContext,
     forbidden_secret_values: tuple[str, ...],
 ) -> dict[str, Any] | None:
-    if message.get("method") == "tools/list":
-        return _response(message.get("id"), {"tools": list(BASE_TOOLS)})
-    if message.get("method") == "ping":
-        return _response(message.get("id"), {})
-    if message.get("method") == "tools/call":
-        params = message.get("params") or {}
+    if rpc.method == "tools/list":
+        return _response(rpc.id, {"tools": list(BASE_TOOLS)})
+    if rpc.method == "ping":
+        return _response(rpc.id, {})
+    if rpc.method == "tools/call":
+        params = rpc.params or {}
         if not isinstance(params, dict):
-            return _response(message.get("id"), _tool_error("params must be an object."))
+            return _response(rpc.id, _tool_error("params must be an object."))
         return _response(
-            message.get("id"),
+            rpc.id,
             await _call_tool(
                 params,
                 request,
@@ -149,12 +177,12 @@ async def _handle_message(
                 forbidden_secret_values,
             ),
         )
-    if message.get("method") != "initialize":
+    if rpc.method != "initialize":
         return None
-    params = message.get("params") or {}
+    params = rpc.params or {}
     requested_version = params.get("protocolVersion") if isinstance(params, dict) else None
     return _response(
-        message.get("id"),
+        rpc.id,
         {
             "protocolVersion": (
                 requested_version if requested_version == MCP_PROTOCOL_VERSION else MCP_PROTOCOL_VERSION
@@ -202,11 +230,9 @@ async def _call_tool(
                     limit=_limit(arguments),
                 ),
             )
-            assert_no_forbidden_secret_values(
-                forbidden_secret_values,
-                *(hit.body for hit in result.hits),
-            )
-            return _tool_text({"hits": [hit.model_dump(mode="json") for hit in result.hits]})
+            payload = {"hits": [hit.model_dump(mode="json") for hit in result.hits]}
+            assert_no_forbidden_secret_values_in_payload(forbidden_secret_values, payload)
+            return _tool_text(payload)
         if name == "search_long_term":
             _reject_extra(arguments, {"query", "limit"})
             result = await service.search_long_term(
@@ -217,19 +243,14 @@ async def _call_tool(
                     limit=_limit(arguments),
                 ),
             )
-            assert_no_forbidden_secret_values(
-                forbidden_secret_values,
-                *(fact.fact_text for fact in result.facts),
-                *(note.fact_text for note in result.candidate_notes),
-            )
-            return _tool_text(
-                {
-                    "facts": [fact.model_dump(mode="json") for fact in result.facts],
-                    "candidate_notes": [
-                        note.model_dump(mode="json") for note in result.candidate_notes
-                    ],
-                }
-            )
+            payload = {
+                "facts": [fact.model_dump(mode="json") for fact in result.facts],
+                "candidate_notes": [
+                    note.model_dump(mode="json") for note in result.candidate_notes
+                ],
+            }
+            assert_no_forbidden_secret_values_in_payload(forbidden_secret_values, payload)
+            return _tool_text(payload)
         return _tool_error(f"unknown tool: {name}")
     except HostedRateLimitExceeded:
         raise
@@ -238,10 +259,13 @@ async def _call_tool(
 
 
 def _scope_from_headers(request: Request, auth: HostedAuthContext) -> MemoryScope:
+    session_id = request.headers.get("x-vexic-session-id")
+    if session_id is None or not session_id.strip():
+        raise ValueError("X-Vexic-Session-Id header is required.")
     return MemoryScope(
         tenant_id=auth.tenant_id,
         project_id=request.headers.get("x-vexic-project-id"),
-        session_id=request.headers.get("x-vexic-session-id"),
+        session_id=session_id,
         agent_id=request.headers.get("x-vexic-agent-id"),
         principal=auth.principal,
         trust_boundary=TrustBoundary.NETWORKED,
