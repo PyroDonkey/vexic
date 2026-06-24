@@ -26,6 +26,8 @@ from vexic.hosted import (
     HostedInMemoryRateLimiter,
     HostedMemoryService,
     HostedRateLimitExceeded,
+    add_run_dream_phase_subcommand,
+    run_dream_phase_command,
 )
 from vexic.mcp_http import register_mcp_routes
 from vexic.ports import HostPortNotConfigured
@@ -244,36 +246,47 @@ def main(argv: list[str] | None = None) -> int:
     revoke.add_argument("--key-id", required=True)
     revoke.add_argument("--revoked-by")
 
+    add_run_dream_phase_subcommand(subcommands)
+
     args = parser.parse_args(argv)
-    root = _root_arg(args.root)
-    keys = HostedApiKeyStore(root)
 
-    if args.command == "issue-key":
-        catalog = HostedTenantCatalog(root)
-        catalog.provision_tenant(args.tenant_id, project_ids=set(args.project_id))
-        api_key = keys.create_key(
-            tenant_id=args.tenant_id,
-            principal_id=args.principal_id,
-            capabilities=_capabilities(args.capability),
-            project_ids=set(args.project_id),
-            agent_ids=set(args.agent_id),
-        )
-        print(
-            json.dumps(
-                {
-                    "key_id": api_key.key_id,
-                    "raw_key": api_key.raw_key,
-                    "tenant_id": args.tenant_id,
-                    "project_ids": args.project_id,
-                },
-                sort_keys=True,
+    try:
+        if args.command == "run-dream-phase":
+            return run_dream_phase_command(args)
+
+        root = _root_arg(args.root)
+        keys = HostedApiKeyStore(root)
+
+        if args.command == "issue-key":
+            catalog = HostedTenantCatalog(root)
+            catalog.provision_tenant(args.tenant_id, project_ids=set(args.project_id))
+            api_key = keys.create_key(
+                tenant_id=args.tenant_id,
+                principal_id=args.principal_id,
+                capabilities=_capabilities(args.capability),
+                project_ids=set(args.project_id),
+                agent_ids=set(args.agent_id),
             )
-        )
-        return 0
+            print(
+                json.dumps(
+                    {
+                        "key_id": api_key.key_id,
+                        "raw_key": api_key.raw_key,
+                        "tenant_id": args.tenant_id,
+                        "project_ids": args.project_id,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0
 
-    keys.revoke_key(args.key_id, revoked_by=args.revoked_by)
-    print(json.dumps({"key_id": args.key_id, "revoked": True}, sort_keys=True))
-    return 0
+        keys.revoke_key(args.key_id, revoked_by=args.revoked_by)
+        print(json.dumps({"key_id": args.key_id, "revoked": True}, sort_keys=True))
+        return 0
+    except (HostPortNotConfigured, PermissionError, ValueError) as exc:
+        parser.exit(2, f"{exc}\n")
+    except Exception as exc:
+        parser.exit(1, f"hosted command failed: {type(exc).__name__}: {exc}\n")
 
 
 if __name__ == "__main__":

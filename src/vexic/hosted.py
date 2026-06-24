@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import argparse
+import asyncio
+import contextlib
+import importlib.util
+import json
+import os
 import secrets
+import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import ModuleType
 from typing import Awaitable, Callable, Protocol, TypeVar
 
 from vexic.contract import (
@@ -13,6 +22,7 @@ from vexic.contract import (
     AppendTranscriptResult,
     DeleteScopeRequest,
     DeleteScopeResult,
+    DreamPhase,
     ExpandHistoryRequest,
     ExpandHistoryResult,
     ExportScopeRequest,
@@ -23,11 +33,14 @@ from vexic.contract import (
     RunDreamPhaseResult,
     MemoryCapability,
     MemoryRequest,
+    MemoryScope,
     Principal,
+    PrincipalType,
     RecordRetrievalEventRequest,
     RecordRetrievalEventResult,
     RebuildRequest,
     RebuildResult,
+    RedactionContext,
     ReplayScopeRequest,
     ReplayScopeResult,
     RetireFactRequest,
@@ -671,6 +684,148 @@ class HostedBackgroundJobRunner:
             self.telemetry.record_job_event(event)
         except Exception:
             pass
+
+
+def add_run_dream_phase_subcommand(
+    subcommands: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    run_phase = subcommands.add_parser("run-dream-phase")
+    run_phase.add_argument("--root")
+    run_phase.add_argument("--api-key-env", default="VEXIC_API_KEY")
+    run_phase.add_argument("--adapter", required=True)
+    run_phase.add_argument("--model-group", required=True)
+    run_phase.add_argument("--tenant-id", required=True)
+    run_phase.add_argument("--project-id")
+    run_phase.add_argument("--session-id")
+    run_phase.add_argument("--agent-id")
+    run_phase.add_argument(
+        "--phase",
+        choices=[phase.value for phase in DreamPhase],
+        required=True,
+    )
+    run_phase.add_argument("--forbidden-value", action="append", default=[])
+    run_phase.add_argument("--secret-env", action="append", default=[])
+
+
+def run_dream_phase_command(args: argparse.Namespace) -> int:
+    from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
+
+    root = _hosted_root_arg(args.root)
+    catalog = HostedTenantCatalog(root)
+    service = HostedMemoryService(
+        catalog,
+        HostedApiKeyStore(root),
+        telemetry=catalog,
+        rate_limiter=HostedInMemoryRateLimiter(),
+        dream_phase_ports=_dream_phase_ports(args),
+    )
+    # ponytail: staging CLI assumes no concurrent tenant writers; add event ids if shared.
+    usage_event_offset = len(catalog.usage_events(args.tenant_id))
+    runner = HostedBackgroundJobRunner(service)
+    with contextlib.redirect_stdout(sys.stderr):
+        result = asyncio.run(
+            runner.run_dream_phase(
+                _api_key_from_env(args.api_key_env),
+                RunDreamPhaseRequest(
+                    scope=_dream_phase_scope(args),
+                    phase=DreamPhase(args.phase),
+                    redaction=RedactionContext(
+                        forbidden_values=tuple(args.forbidden_value),
+                    ),
+                ),
+            )
+        )
+    print(
+        json.dumps(
+            {
+                "result": result.model_dump(mode="json"),
+                "job_events": [_event_dict(event) for event in runner.job_events],
+                "usage_events": [
+                    _event_dict(event)
+                    for event in catalog.usage_events(args.tenant_id)[usage_event_offset:]
+                ],
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _hosted_root_arg(value: str | None) -> Path:
+    return Path(value or os.environ.get("VEXIC_HOSTED_ROOT", ".hosted-memory"))
+
+
+def _api_key_from_env(name: str) -> str:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        raise ValueError(f"{name} is required in the environment.")
+    return value.strip()
+
+
+def _secret_env_values(names: list[str]) -> dict[str, str] | None:
+    secrets_by_name: dict[str, str] = {}
+    for name in names:
+        value = os.environ.get(name)
+        if value is None:
+            raise ValueError(f"{name} is required in the environment.")
+        secrets_by_name[name] = value
+    return secrets_by_name or None
+
+
+def _load_dream_phase_adapter(path: Path) -> ModuleType:
+    if not path.exists():
+        raise missing_host_port("Dream phase adapter")
+    module_name = f"vexic_hosted_adapter_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise missing_host_port("Dream phase adapter")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        sys.modules.pop(module_name, None)
+        raise missing_host_port("Dream phase adapter") from exc
+    for name in (
+        "embed_texts",
+        "build_extraction_agent",
+        "build_rem_agent",
+        "build_contradiction_agent",
+    ):
+        if not callable(getattr(module, name, None)):
+            raise missing_host_port("Dream phase adapter")
+    return module
+
+
+def _dream_phase_ports(args: argparse.Namespace) -> DreamPhasePorts:
+    adapter = _load_dream_phase_adapter(Path(args.adapter))
+    return DreamPhasePorts(
+        model_group=args.model_group,
+        embed=adapter.embed_texts,
+        extraction_agent_factory=adapter.build_extraction_agent,
+        rem_agent_factory=adapter.build_rem_agent,
+        contradiction_agent_factory=adapter.build_contradiction_agent,
+        secrets=_secret_env_values(args.secret_env),
+    )
+
+
+def _dream_phase_scope(args: argparse.Namespace) -> MemoryScope:
+    return MemoryScope(
+        tenant_id=args.tenant_id,
+        project_id=args.project_id,
+        session_id=args.session_id,
+        agent_id=args.agent_id,
+        principal=Principal(
+            principal_id="hosted-worker-cli",
+            principal_type=PrincipalType.OPERATOR,
+        ),
+        trust_boundary=TrustBoundary.LOCAL_TRUSTED,
+        capabilities={MemoryCapability.ADMIN_REBUILD},
+    )
+
+
+def _event_dict(event: object) -> dict[str, object]:
+    return dict(event.__dict__)
 
 
 def _now() -> str:
