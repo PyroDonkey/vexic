@@ -14,6 +14,8 @@ from vexic.embeddings import EMBEDDING_DIM
 from vexic.models import ContradictionJudgment, FactCandidate, RemBoostPlan
 
 
+PROVIDER = "openai"
+
 EXTRACTION_INSTRUCTIONS = """\
 Extract only durable user facts stated in the transcript.
 Use the closed category vocabulary exactly: preference, fact, goal, event,
