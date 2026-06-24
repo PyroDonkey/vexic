@@ -20,6 +20,8 @@ from vexic.models import ContradictionJudgment, FactCandidate, RemBoostPlan
 
 PROVIDER = "openrouter"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+# ponytail: single embedding worker; add a pool only if live runs need parallel embeddings.
+_EMBED_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 
 EXTRACTION_INSTRUCTIONS = """\
 Extract only durable user facts stated in the transcript.
@@ -53,6 +55,7 @@ def _require_openrouter_key() -> str:
 
 
 def _require_openrouter_model(model: str, env_name: str) -> str:
+    model = model.strip()
     if ":" in model or "/" not in model:
         raise RuntimeError(
             f"{env_name} must use an OpenRouter model id like openai/gpt-4o-mini."
@@ -161,15 +164,14 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
     model = _embedding_model_name()
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        result = executor.submit(
-            lambda: Embedder(
-                OpenAIEmbeddingModel(model, provider=_provider())
-            ).embed_documents_sync(
-                texts,
-                settings={"dimensions": EMBEDDING_DIM},
-            )
-        ).result()
+    result = _EMBED_EXECUTOR.submit(
+        lambda: Embedder(
+            OpenAIEmbeddingModel(model, provider=_provider())
+        ).embed_documents_sync(
+            texts,
+            settings={"dimensions": EMBEDDING_DIM},
+        )
+    ).result()
     embeddings = [list(embedding) for embedding in result.embeddings]
     bad_dimensions = [
         len(embedding)

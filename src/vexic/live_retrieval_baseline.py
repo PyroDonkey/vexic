@@ -284,6 +284,8 @@ def _validate_adapter_provider(provider: str, adapter: ModuleType) -> None:
         return
     if not isinstance(adapter_provider, str) or not adapter_provider.strip():
         raise BaselineConfigError("adapter PROVIDER must be a non-empty string.")
+    adapter_provider = adapter_provider.strip()
+    provider = provider.strip()
     if adapter_provider.lower() != provider.lower():
         raise BaselineConfigError(
             f"adapter provider {adapter_provider} does not match --provider {provider}."

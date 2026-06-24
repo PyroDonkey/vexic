@@ -10,6 +10,7 @@ from pathlib import Path
 import sys
 import tempfile
 import textwrap
+from types import ModuleType
 import unittest
 from unittest import mock
 
@@ -337,6 +338,12 @@ class LiveRetrievalBaselineTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 2)
         self.assertIn("adapter provider openrouter does not match --provider openai", stderr.getvalue())
+
+    def test_adapter_provider_validation_strips_whitespace(self) -> None:
+        adapter = ModuleType("fake_adapter")
+        adapter.PROVIDER = " openrouter "
+
+        self.baseline._validate_adapter_provider("openrouter\n", adapter)
 
     def test_failed_agent_attempt_is_counted_in_metrics(self) -> None:
         adapter = self.root / "adapter.py"
