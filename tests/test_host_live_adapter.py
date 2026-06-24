@@ -11,8 +11,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _load_adapter() -> object:
     spec = importlib.util.spec_from_file_location(
-        "openai_live_adapter_under_test",
-        ROOT / "adapters" / "openai_live_adapter.py",
+        "openrouter_live_adapter_under_test",
+        ROOT / "adapters" / "openrouter_live_adapter.py",
     )
     assert spec is not None
     assert spec.loader is not None
@@ -21,13 +21,13 @@ def _load_adapter() -> object:
     return module
 
 
-def test_live_adapter_rejects_blank_openai_key(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_live_adapter_rejects_blank_openrouter_key(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter = _load_adapter()
-    monkeypatch.setenv("OPENAI_API_KEY", "  \t")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "  \t")
 
     with pytest.raises(
         RuntimeError,
-        match="OPENAI_API_KEY is required for the live retrieval adapter.",
+        match="OPENROUTER_API_KEY is required for the live retrieval adapter.",
     ):
         adapter.build_extraction_agent("retrieval-smoke")
 
@@ -38,7 +38,7 @@ def test_live_adapter_rejects_non_finite_timeout(
     timeout: str,
 ) -> None:
     adapter = _load_adapter()
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
     monkeypatch.setenv("VEXIC_LIVE_REQUEST_TIMEOUT_SECONDS", timeout)
     monkeypatch.delenv("VEXIC_LIVE_MODEL", raising=False)
     monkeypatch.delenv("VEXIC_LIVE_RETRIEVAL_SMOKE_MODEL", raising=False)
@@ -46,5 +46,19 @@ def test_live_adapter_rejects_non_finite_timeout(
     with pytest.raises(
         RuntimeError,
         match="VEXIC_LIVE_REQUEST_TIMEOUT_SECONDS must be a finite number greater than 0.",
+    ):
+        adapter.build_extraction_agent("retrieval-smoke")
+
+
+def test_live_adapter_rejects_openai_provider_model_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _load_adapter()
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
+    monkeypatch.setenv("VEXIC_LIVE_MODEL", "openai:gpt-4o-mini")
+
+    with pytest.raises(
+        RuntimeError,
+        match="VEXIC_LIVE_MODEL must use an OpenRouter model id like",
     ):
         adapter.build_extraction_agent("retrieval-smoke")

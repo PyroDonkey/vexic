@@ -317,7 +317,7 @@ class LiveRetrievalBaselineTests(unittest.TestCase):
     def test_adapter_provider_mismatch_is_config_error_before_live_run(self) -> None:
         stderr = io.StringIO()
 
-        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": ""}, clear=False):
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": ""}, clear=False):
             with contextlib.redirect_stderr(stderr):
                 exit_code = self.baseline.main(
                     [
@@ -325,9 +325,9 @@ class LiveRetrievalBaselineTests(unittest.TestCase):
                         "--fixture",
                         str(self._one_row_fixture()),
                         "--adapter",
-                        str(REPO_ROOT / "adapters" / "openai_live_adapter.py"),
+                        str(REPO_ROOT / "adapters" / "openrouter_live_adapter.py"),
                         "--provider",
-                        "openrouter",
+                        "openai",
                         "--model-group",
                         "retrieval-smoke",
                         "--output-dir",
@@ -336,7 +336,7 @@ class LiveRetrievalBaselineTests(unittest.TestCase):
                 )
 
         self.assertEqual(exit_code, 2)
-        self.assertIn("adapter provider openai does not match --provider openrouter", stderr.getvalue())
+        self.assertIn("adapter provider openrouter does not match --provider openai", stderr.getvalue())
 
     def test_failed_agent_attempt_is_counted_in_metrics(self) -> None:
         adapter = self.root / "adapter.py"
@@ -515,6 +515,8 @@ class LiveRetrievalBaselineDocumentationTests(unittest.TestCase):
 
         self.assertIn("uv run --with-editable . python -m vexic.live_retrieval_baseline", readme)
         self.assertNotIn("scripts\\live_retrieval_baseline.py", readme)
+        self.assertIn("adapters\\openrouter_live_adapter.py", readme)
+        self.assertIn("--provider openrouter", readme)
         self.assertIn("--allow-live", readme)
         self.assertIn("--provider", readme)
         self.assertIn("--model-group", readme)
