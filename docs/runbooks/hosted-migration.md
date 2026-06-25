@@ -16,6 +16,8 @@ endpoint, or customer self-serve import API.
   and support-only markers are available for redaction checks.
 - Any host-owned extension table has an explicit host migration plan. Without
   that plan, canonical export must fail closed.
+- The replacement database is new or contains only Vexic-owned schema tables.
+  Host-owned extension tables in the replacement database must fail closed.
 - The old active Customer Memory Database remains available for rollback until
   the migration evidence is accepted.
 
@@ -51,9 +53,12 @@ endpoint, or customer self-serve import API.
    - Search long-term memory for the promoted fact fixture.
    - Re-ingest the same source transcript key and confirm it is skipped.
    - Confirm tenant/project spoofed artifacts are rejected.
+   - Confirm the local catalog rejects replacement databases imported for a
+     different tenant/project.
    - Confirm schema/version mismatches are rejected.
    - Confirm redaction failures leave no artifact or replacement database.
-   - Confirm host-owned extension tables fail without an explicit plan.
+   - Confirm source or replacement host-owned extension tables fail without an
+     explicit plan.
 
 5. Repoint the local hosted catalog.
 
@@ -83,7 +88,8 @@ endpoint, or customer self-serve import API.
   database handle while both files are retained.
 - Re-running the same import against the same replacement database imports zero
   new rows and leaves existing canonical rows unchanged.
-- If a row id exists with different content, import fails closed. Investigate the
+- If a row id exists with different content, or if the replacement database has
+  canonical rows outside the artifact, import fails closed. Investigate the
   replacement database rather than overwriting in place.
 
 ## What This Does Not Do

@@ -24,6 +24,7 @@ from vexic.storage import (
     commit_dream_cycle,
     ingest_source_messages,
     init_db,
+    save_messages,
     single_message_adapter,
 )
 from vexic.storage.promotion import PromotionDecision
@@ -152,6 +153,21 @@ class OperatorMigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([fact.fact_text for fact in long_term.facts], ["cedar migration durable fact"])
         self.assertEqual(duplicate_ingest[0].status, "skipped")
 
+    def test_canonical_migration_export_does_not_create_vector_projection_tables(self) -> None:
+        from vexic.migration import export_canonical_migration
+
+        init_db(str(self.source_db))
+        before = self._table_names(self.source_db)
+
+        export_canonical_migration(
+            str(self.source_db),
+            self.artifact,
+            tenant_id="tenant-a",
+            project_id="project-a",
+        )
+
+        self.assertEqual(self._table_names(self.source_db), before)
+
     def test_canonical_migration_export_fails_closed_on_forbidden_values(self) -> None:
         from vexic.migration import export_canonical_migration
 
@@ -164,6 +180,29 @@ class OperatorMigrationTests(unittest.IsolatedAsyncioTestCase):
                 tenant_id="tenant-a",
                 project_id="project-a",
                 forbidden_secret_values=("cedar migration",),
+            )
+
+        self.assertFalse(self.artifact.exists())
+
+    def test_canonical_migration_overwrite_removes_stale_artifact_on_redaction_failure(self) -> None:
+        from vexic.migration import export_canonical_migration
+
+        self._seed_source()
+        export_canonical_migration(
+            str(self.source_db),
+            self.artifact,
+            tenant_id="tenant-a",
+            project_id="project-a",
+        )
+
+        with self.assertRaisesRegex(ValueError, "forbidden"):
+            export_canonical_migration(
+                str(self.source_db),
+                self.artifact,
+                tenant_id="tenant-a",
+                project_id="project-a",
+                forbidden_secret_values=("cedar migration",),
+                overwrite=True,
             )
 
         self.assertFalse(self.artifact.exists())
@@ -198,6 +237,40 @@ class OperatorMigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(first.rows_imported, 0)
         self.assertEqual(second.rows_imported, 0)
 
+    def test_canonical_migration_import_rejects_extra_target_canonical_rows(self) -> None:
+        from vexic.migration import (
+            export_canonical_migration,
+            import_canonical_migration,
+        )
+
+        self._seed_source()
+        export_canonical_migration(
+            str(self.source_db),
+            self.artifact,
+            tenant_id="tenant-a",
+            project_id="project-a",
+        )
+        import_canonical_migration(
+            self.artifact,
+            str(self.target_db),
+            tenant_id="tenant-a",
+            project_id="project-a",
+        )
+        save_messages(
+            str(self.target_db),
+            [ModelRequest(parts=[UserPromptPart(content="cedar target contaminant")])],
+            session_id="session-a",
+            agent_id="agent-a",
+        )
+
+        with self.assertRaisesRegex(ValueError, "outside the artifact"):
+            import_canonical_migration(
+                self.artifact,
+                str(self.target_db),
+                tenant_id="tenant-a",
+                project_id="project-a",
+            )
+
     def test_canonical_migration_export_fails_closed_on_host_owned_extension_tables(self) -> None:
         from vexic.migration import export_canonical_migration
 
@@ -215,6 +288,31 @@ class OperatorMigrationTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertFalse(self.artifact.exists())
+
+    def test_canonical_migration_import_fails_closed_on_target_host_owned_tables(self) -> None:
+        from vexic.migration import (
+            export_canonical_migration,
+            import_canonical_migration,
+        )
+
+        self._seed_source()
+        export_canonical_migration(
+            str(self.source_db),
+            self.artifact,
+            tenant_id="tenant-a",
+            project_id="project-a",
+        )
+        with closing(sqlite3.connect(self.target_db)) as conn:
+            conn.execute("CREATE TABLE background_tool_audit (id INTEGER PRIMARY KEY)")
+            conn.commit()
+
+        with self.assertRaisesRegex(ValueError, "host-owned extension table"):
+            import_canonical_migration(
+                self.artifact,
+                str(self.target_db),
+                tenant_id="tenant-a",
+                project_id="project-a",
+            )
 
     def test_hosted_catalog_repoints_to_imported_replacement_database(self) -> None:
         from vexic.hosted_local import HostedTenantCatalog
@@ -252,6 +350,35 @@ class OperatorMigrationTests(unittest.IsolatedAsyncioTestCase):
                 ("tenant-a",),
             ).fetchall()
         self.assertEqual(rows, [(replacement_db.name, 1)])
+
+    def test_hosted_catalog_rejects_replacement_imported_for_another_tenant(self) -> None:
+        from vexic.hosted_local import HostedTenantCatalog
+        from vexic.migration import (
+            export_canonical_migration,
+            import_canonical_migration,
+        )
+
+        self._seed_source()
+        catalog = HostedTenantCatalog(self.root)
+        old_tenant = catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        replacement_db = self.root / "replacement.db"
+        export_canonical_migration(
+            str(self.source_db),
+            self.artifact,
+            tenant_id="tenant-b",
+            project_id="project-b",
+        )
+        import_canonical_migration(
+            self.artifact,
+            str(replacement_db),
+            tenant_id="tenant-b",
+            project_id="project-b",
+        )
+
+        with self.assertRaisesRegex(PermissionError, "tenant"):
+            catalog.activate_replacement_database("tenant-a", replacement_db)
+
+        self.assertEqual(catalog.get_tenant("tenant-a").db_path, old_tenant.db_path)
 
     def test_canonical_migration_import_rejects_artifact_scope_spoofing(self) -> None:
         from vexic.migration import (
@@ -335,3 +462,17 @@ class OperatorMigrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(catalog.get_tenant("tenant-a").db_path, old_tenant.db_path)
         self.assertFalse(self.target_db.exists())
+
+    def _table_names(self, db_path: Path) -> set[str]:
+        with closing(sqlite3.connect(db_path)) as conn:
+            return {
+                str(row[0])
+                for row in conn.execute(
+                    """
+                    SELECT name
+                    FROM sqlite_master
+                    WHERE type = 'table'
+                        AND name NOT LIKE 'sqlite_%'
+                    """
+                )
+            }

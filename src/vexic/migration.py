@@ -8,10 +8,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from vexic.redaction import assert_no_forbidden_secret_values
-from vexic.storage import init_vector_memory
+from vexic.storage import init_db, init_vector_memory
 from vexic.storage.operators import MemoryProjectionRepairReport, repair_memory_projections
 
 ARTIFACT_VERSION = "vexic.canonical-migration.v1"
+MIGRATION_METADATA_TABLE = "canonical_migration_imports"
 
 CANONICAL_TABLES = (
     "messages",
@@ -58,6 +59,7 @@ VEXIC_PROJECTION_TABLES = frozenset(
         "long_term_memory_embeddings_vector_chunks00",
     }
 )
+VEXIC_OPERATOR_TABLES = frozenset({MIGRATION_METADATA_TABLE})
 
 
 @dataclass(frozen=True)
@@ -88,14 +90,33 @@ def _iter_payload_strings(value: object) -> Iterator[str]:
 
 def _rows(conn: sqlite3.Connection, table_name: str) -> list[dict[str, object]]:
     conn.row_factory = sqlite3.Row
+    if not _table_exists(conn, table_name):
+        return []
     return [
         dict(row)
         for row in conn.execute(f'SELECT * FROM "{table_name}" ORDER BY id ASC')
     ]
 
 
+def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = 'table'
+            AND name = ?
+        """,
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
 def _assert_no_host_owned_tables(conn: sqlite3.Connection) -> None:
-    known_tables = frozenset(CANONICAL_TABLES) | VEXIC_PROJECTION_TABLES
+    known_tables = (
+        frozenset(CANONICAL_TABLES)
+        | VEXIC_PROJECTION_TABLES
+        | VEXIC_OPERATOR_TABLES
+    )
     rows = conn.execute(
         """
         SELECT name
@@ -122,7 +143,7 @@ def export_canonical_migration(
     forbidden_secret_values: Iterable[str] = (),
     overwrite: bool = False,
 ) -> CanonicalMigrationExportReport:
-    init_vector_memory(db_path)
+    init_db(db_path)
     target = Path(artifact_path)
     if target.exists() and not overwrite:
         raise FileExistsError(f"Refusing to overwrite migration artifact: {target}")
@@ -135,10 +156,15 @@ def export_canonical_migration(
             "tables": {table_name: _rows(conn, table_name) for table_name in CANONICAL_TABLES},
         }
 
-    assert_no_forbidden_secret_values(
-        tuple(forbidden_secret_values),
-        *_iter_payload_strings(payload),
-    )
+    try:
+        assert_no_forbidden_secret_values(
+            tuple(forbidden_secret_values),
+            *_iter_payload_strings(payload),
+        )
+    except Exception:
+        if overwrite:
+            target.unlink(missing_ok=True)
+        raise
     encoded = json.dumps(payload, indent=2, sort_keys=True).encode()
     temp_path = target.with_name(f".{target.name}.tmp")
     try:
@@ -160,12 +186,14 @@ def _insert_rows(
     rows: list[dict[str, object]],
 ) -> int:
     if not rows:
+        _assert_no_extra_rows(conn, table_name, set())
         return 0
     columns = list(rows[0])
     column_sql = ", ".join(f'"{column}"' for column in columns)
     placeholders = ", ".join("?" for _ in columns)
     imported = 0
     conn.row_factory = sqlite3.Row
+    _assert_no_extra_rows(conn, table_name, {int(row["id"]) for row in rows})
     for row in rows:
         existing = conn.execute(
             f'SELECT {column_sql} FROM "{table_name}" WHERE id = ?',
@@ -181,6 +209,59 @@ def _insert_rows(
         )
         imported += 1
     return imported
+
+
+def _assert_no_extra_rows(
+    conn: sqlite3.Connection,
+    table_name: str,
+    artifact_ids: set[int],
+) -> None:
+    if not _table_exists(conn, table_name):
+        return
+    target_ids = {
+        int(row[0])
+        for row in conn.execute(f'SELECT id FROM "{table_name}"')
+    }
+    extra_ids = sorted(target_ids - artifact_ids)
+    if extra_ids:
+        raise ValueError(
+            f"Target table {table_name} contains canonical rows outside the artifact: "
+            + ", ".join(str(row_id) for row_id in extra_ids)
+        )
+
+
+def _record_import_metadata(
+    target_db_path: str,
+    *,
+    tenant_id: str,
+    project_id: str | None,
+) -> None:
+    with closing(sqlite3.connect(target_db_path)) as conn:
+        with conn:
+            conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {MIGRATION_METADATA_TABLE} (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    artifact_version TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    project_id TEXT,
+                    imported_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                f"""
+                INSERT INTO {MIGRATION_METADATA_TABLE}
+                    (id, artifact_version, tenant_id, project_id)
+                VALUES (1, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    artifact_version = excluded.artifact_version,
+                    tenant_id = excluded.tenant_id,
+                    project_id = excluded.project_id,
+                    imported_at = CURRENT_TIMESTAMP
+                """,
+                (ARTIFACT_VERSION, tenant_id, project_id),
+            )
 
 
 def import_canonical_migration(
@@ -201,6 +282,10 @@ def import_canonical_migration(
         *_iter_payload_strings(payload),
     )
 
+    target = Path(target_db_path)
+    if target.exists():
+        with closing(sqlite3.connect(target)) as conn:
+            _assert_no_host_owned_tables(conn)
     init_vector_memory(target_db_path)
     rows_imported = 0
     with closing(sqlite3.connect(target_db_path)) as conn:
@@ -212,6 +297,11 @@ def import_canonical_migration(
     repair_report = repair_memory_projections(
         target_db_path,
         forbidden_secret_values=forbidden_secret_values,
+    )
+    _record_import_metadata(
+        target_db_path,
+        tenant_id=tenant_id,
+        project_id=project_id,
     )
     return CanonicalMigrationImportReport(
         rows_imported=rows_imported,
