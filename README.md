@@ -129,7 +129,8 @@ Without `--allow-live`, the command exits 0 before importing the adapter or
 calling providers. The host-owned OpenRouter adapter reads `OPENROUTER_API_KEY`
 from the process environment and supplies `build_extraction_agent`,
 `build_rem_agent`, `build_contradiction_agent`, and `embed_texts`; Vexic core
-does not read provider secrets.
+does not read provider secrets. The adapter lives under repo-local `adapters/`
+by design because it is host-owned provider wiring, not package core.
 
 Fixture rows are JSONL objects with `id`, `transcript`, `question`, and
 `expected_fact`. `transcript` may be a list of strings or `{ "role": "user" |
