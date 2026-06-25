@@ -68,3 +68,8 @@ data behind the hosted memory API. Project, user, and session boundaries remain
 `MemoryScope` refinements inside it; control-plane catalog, auth, billing, and
 routing metadata live outside it.
 _Avoid_: Shared tenant rows, control-plane database
+
+**Canonical Row Migration**:
+A migration that preserves source memory records and provenance through Vexic
+export/import, while rebuilding derived projections after import.
+_Avoid_: Semantic replay, re-dream migration
