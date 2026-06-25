@@ -7,6 +7,8 @@ from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
+
 from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage import init_db, init_vector_memory
 from vexic.storage.operators import MemoryProjectionRepairReport, repair_memory_projections
@@ -73,6 +75,40 @@ class CanonicalMigrationExportReport:
 class CanonicalMigrationImportReport:
     rows_imported: int
     repair_report: MemoryProjectionRepairReport
+
+
+class _CanonicalMigrationScope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: str
+    project_id: str | None
+
+
+class _CanonicalMigrationArtifact(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_version: str
+    scope: _CanonicalMigrationScope
+    tables: dict[str, list[dict[str, object]]]
+
+    @field_validator("tables")
+    @classmethod
+    def _validate_tables(
+        cls,
+        tables: dict[str, list[dict[str, object]]],
+    ) -> dict[str, list[dict[str, object]]]:
+        expected = set(CANONICAL_TABLES)
+        actual = set(tables)
+        if actual != expected:
+            raise ValueError("canonical migration artifact tables are invalid.")
+        for table_name, rows in tables.items():
+            for row in rows:
+                row_id = row.get("id")
+                if not isinstance(row_id, int) or isinstance(row_id, bool):
+                    raise ValueError(
+                        f"canonical migration artifact row in {table_name} must have integer id."
+                    )
+        return tables
 
 
 def _iter_payload_strings(value: object) -> Iterator[str]:
@@ -264,6 +300,13 @@ def _record_import_metadata(
             )
 
 
+def _load_artifact(artifact_path: str | Path) -> _CanonicalMigrationArtifact:
+    try:
+        return _CanonicalMigrationArtifact.model_validate_json(Path(artifact_path).read_text())
+    except ValidationError as exc:
+        raise ValueError("Invalid canonical migration artifact.") from exc
+
+
 def import_canonical_migration(
     artifact_path: str | Path,
     target_db_path: str,
@@ -272,14 +315,14 @@ def import_canonical_migration(
     project_id: str | None,
     forbidden_secret_values: Iterable[str] = (),
 ) -> CanonicalMigrationImportReport:
-    payload = json.loads(Path(artifact_path).read_text())
-    if payload.get("artifact_version") != ARTIFACT_VERSION:
+    artifact = _load_artifact(artifact_path)
+    if artifact.artifact_version != ARTIFACT_VERSION:
         raise ValueError("Unsupported canonical migration artifact version.")
-    if payload.get("scope") != {"tenant_id": tenant_id, "project_id": project_id}:
+    if artifact.scope.tenant_id != tenant_id or artifact.scope.project_id != project_id:
         raise PermissionError("Migration artifact scope does not match hosted operator scope.")
     assert_no_forbidden_secret_values(
         tuple(forbidden_secret_values),
-        *_iter_payload_strings(payload),
+        *_iter_payload_strings(artifact.model_dump(mode="json")),
     )
 
     target = Path(target_db_path)
@@ -290,9 +333,8 @@ def import_canonical_migration(
     rows_imported = 0
     with closing(sqlite3.connect(target_db_path)) as conn:
         with conn:
-            tables = payload["tables"]
             for table_name in CANONICAL_TABLES:
-                rows_imported += _insert_rows(conn, table_name, tables[table_name])
+                rows_imported += _insert_rows(conn, table_name, artifact.tables[table_name])
 
     repair_report = repair_memory_projections(
         target_db_path,

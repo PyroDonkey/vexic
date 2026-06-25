@@ -434,6 +434,33 @@ class OperatorMigrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(self.target_db.exists())
 
+    def test_canonical_migration_import_rejects_malformed_artifact_before_db_creation(self) -> None:
+        from vexic.migration import (
+            export_canonical_migration,
+            import_canonical_migration,
+        )
+
+        self._seed_source()
+        export_canonical_migration(
+            str(self.source_db),
+            self.artifact,
+            tenant_id="tenant-a",
+            project_id="project-a",
+        )
+        payload = json.loads(self.artifact.read_text())
+        payload["tables"].pop("messages")
+        self.artifact.write_text(json.dumps(payload))
+
+        with self.assertRaisesRegex(ValueError, "artifact"):
+            import_canonical_migration(
+                self.artifact,
+                str(self.target_db),
+                tenant_id="tenant-a",
+                project_id="project-a",
+            )
+
+        self.assertFalse(self.target_db.exists())
+
     def test_failed_import_leaves_catalog_on_existing_database(self) -> None:
         from vexic.hosted_local import HostedTenantCatalog
         from vexic.migration import (
