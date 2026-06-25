@@ -195,23 +195,26 @@ Required Railway config:
 - Persistent volume mounted at `/data/vexic`
 - Health check path: `/health`
 
-Current internal-alpha state as of 2026-06-23:
+Current internal-alpha state as of 2026-06-25:
 
 - Railway project `Vexic` runs service `vexic` in the `production`
   environment at `https://api.vexic.dev`.
 - The verified deployment is
-  `f8ce2754-6aac-4462-9d3d-edd275db674f` at commit
-  `0d67181f1dee146742e97d09ae7ea1d044ef7832`.
+  `1dd924f7-8c82-4bf6-a828-3928b06a73e9` at commit
+  `ed67ea9b8d03ecc606971c3355de2b740c058873`.
 - `/health` returns `200` with contract version `0.1.0`.
 - `vexic-volume` is mounted at `/data/vexic`; append/search persistence
   survived a redeploy.
 - API-key auth rejects missing and invalid keys. A throwaway tester key proved
   hosted HTTP append/search, then hosted-API-backed stdio MCP search. An
   agent-B scoped MCP search did not see the agent-A marker.
-- This deployment smoke did not verify hosted Light/REM/Deep promotion into
-  long-term memory. The injected-port worker slice now has local fake-port
-  coverage, but needs a fresh hosted alpha promotion/search smoke after it is
-  deployed.
+- COA-227 verified hosted Light/REM/Deep promotion/search against the alpha
+  deployment with a host-owned OpenRouter adapter and temporary provider key:
+  Light extracted one candidate, REM boosted it, Deep promoted it, tenant A
+  `search_long_term` returned the promoted marker fact, tenant B search did
+  not expose it, and hosted job usage counters were recorded for all three
+  phases. The throwaway Vexic API keys and temporary provider key were revoked
+  after the smoke.
 - Tester keys are alpha-only and should be revoked after each check.
 
 One-off key issuance can run against the same volume:
