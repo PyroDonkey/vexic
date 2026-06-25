@@ -409,6 +409,19 @@ class OperatorMigrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(catalog.get_tenant("tenant-a").db_path, old_tenant.db_path)
 
+    def test_hosted_catalog_rejects_invalid_replacement_database(self) -> None:
+        from vexic.hosted_local import HostedTenantCatalog
+
+        catalog = HostedTenantCatalog(self.root)
+        old_tenant = catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        replacement_db = self.root / "replacement.db"
+        replacement_db.write_bytes(b"not sqlite")
+
+        with self.assertRaisesRegex(PermissionError, "migration metadata"):
+            catalog.activate_replacement_database("tenant-a", replacement_db)
+
+        self.assertEqual(catalog.get_tenant("tenant-a").db_path, old_tenant.db_path)
+
     def test_canonical_migration_import_rejects_artifact_scope_spoofing(self) -> None:
         from vexic.migration import (
             export_canonical_migration,

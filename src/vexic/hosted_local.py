@@ -143,7 +143,6 @@ class HostedTenantCatalog:
             raise FileNotFoundError(f"Replacement database does not exist: {replacement}")
 
         db_filename = relative.name
-        LocalMemoryService(db_path=str(replacement), tenant_id=tenant_id).init_schema()
         with closing(self._connect_control()) as conn:
             row = conn.execute(
                 """
@@ -173,6 +172,7 @@ class HostedTenantCatalog:
                 raise PermissionError("Replacement database tenant does not match catalog tenant.")
             if imported_project_id not in project_ids:
                 raise PermissionError("Replacement database project is outside catalog tenant projects.")
+            LocalMemoryService(db_path=str(replacement), tenant_id=tenant_id).init_schema()
             conn.execute(
                 """
                 UPDATE tenants
@@ -185,8 +185,8 @@ class HostedTenantCatalog:
             return self._tenant_from_filename(conn, tenant_id, db_filename)
 
     def _replacement_migration_scope(self, db_path: Path) -> tuple[str, str | None] | None:
-        with closing(sqlite3.connect(db_path)) as conn:
-            try:
+        try:
+            with closing(sqlite3.connect(db_path)) as conn:
                 row = conn.execute(
                     """
                     SELECT tenant_id, project_id
@@ -194,8 +194,8 @@ class HostedTenantCatalog:
                     WHERE id = 1
                     """
                 ).fetchone()
-            except sqlite3.OperationalError:
-                return None
+        except sqlite3.DatabaseError:
+            return None
         if row is None:
             return None
         return str(row[0]), None if row[1] is None else str(row[1])
