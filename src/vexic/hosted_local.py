@@ -121,6 +121,85 @@ class HostedTenantCatalog:
             conn.commit()
             return self._tenant_from_filename(conn, tenant_id, row[0])
 
+    def activate_replacement_database(
+        self,
+        tenant_id: str,
+        replacement_db_path: str | Path,
+    ) -> HostedTenant:
+        if not tenant_id.strip():
+            raise ValueError("tenant_id must not be blank.")
+        candidate = Path(replacement_db_path)
+        if not candidate.is_absolute():
+            candidate = self.root_path / candidate
+        root = self.root_path.resolve()
+        replacement = candidate.resolve()
+        try:
+            relative = replacement.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("replacement database must be under hosted root.") from exc
+        if len(relative.parts) != 1 or relative.name == "control-plane.db":
+            raise ValueError("replacement database must be a customer database file.")
+        if not replacement.is_file():
+            raise FileNotFoundError(f"Replacement database does not exist: {replacement}")
+
+        db_filename = relative.name
+        with closing(self._connect_control()) as conn:
+            row = conn.execute(
+                """
+                SELECT db_filename
+                FROM tenants
+                WHERE tenant_id = ? AND active = 1
+                """,
+                (tenant_id,),
+            ).fetchone()
+            if row is None:
+                raise PermissionError("Unknown hosted tenant.")
+            project_rows = conn.execute(
+                """
+                SELECT project_id
+                FROM tenant_projects
+                WHERE tenant_id = ?
+                ORDER BY project_id
+                """,
+                (tenant_id,),
+            ).fetchall()
+            project_ids = frozenset(str(project_row[0]) for project_row in project_rows)
+            migration_scope = self._replacement_migration_scope(replacement)
+            if migration_scope is None:
+                raise PermissionError("Replacement database has no migration metadata.")
+            imported_tenant_id, imported_project_id = migration_scope
+            if imported_tenant_id != tenant_id:
+                raise PermissionError("Replacement database tenant does not match catalog tenant.")
+            if imported_project_id not in project_ids:
+                raise PermissionError("Replacement database project is outside catalog tenant projects.")
+            LocalMemoryService(db_path=str(replacement), tenant_id=tenant_id).init_schema()
+            conn.execute(
+                """
+                UPDATE tenants
+                SET db_filename = ?, active = 1
+                WHERE tenant_id = ?
+                """,
+                (db_filename, tenant_id),
+            )
+            conn.commit()
+            return self._tenant_from_filename(conn, tenant_id, db_filename)
+
+    def _replacement_migration_scope(self, db_path: Path) -> tuple[str, str | None] | None:
+        try:
+            with closing(sqlite3.connect(db_path)) as conn:
+                row = conn.execute(
+                    """
+                    SELECT tenant_id, project_id
+                    FROM canonical_migration_imports
+                    WHERE id = 1
+                    """
+                ).fetchone()
+        except sqlite3.DatabaseError:
+            return None
+        if row is None:
+            return None
+        return str(row[0]), None if row[1] is None else str(row[1])
+
     def get_tenant(self, tenant_id: str) -> HostedTenant:
         with closing(self._connect_control()) as conn:
             row = conn.execute(
