@@ -279,13 +279,64 @@ Internal-only today:
 - hosted Light/REM/Deep jobs run only with injected host model ports and fail
   closed without them.
 
+### Production Telemetry Policy
+
+The v1 telemetry vocabulary is intentionally narrow:
+
+- `HostedAuditEvent`;
+- `HostedUsageEvent`;
+- `HostedJobEvent`;
+- `retrieval_events`; and
+- `candidate_retrieval_events`.
+
+`HostedAuditEvent`, `HostedUsageEvent`, `HostedJobEvent`, and non-content
+operational aggregates are control-plane operational telemetry. They are used
+to run, audit, meter, debug, and plan capacity for the hosted memory API. They
+must not store raw memory payloads, prompt payloads, hidden instructions,
+thinking traces, tool bodies, retrieval query text, raw API keys, provider
+secrets, database tokens, or configured forbidden values.
+
+V1 retains control-plane operational telemetry and non-content operational
+aggregates for 400 days, then deletes them. These records are not part of a
+tenant memory export. After a customer or scope deletion, Vexic may retain only
+the minimized operational records needed for deletion evidence, security,
+abuse, metering support, incident response, or audit, under the same 400-day
+retention window and the same no-content rule.
+
+`retrieval_events` and `candidate_retrieval_events` are tenant-scoped memory
+telemetry inside the Customer Memory Database. They are part of replayable
+memory behavior, not cross-tenant product analytics. They may contain
+query-bearing telemetry, so they are retained with the Customer Memory Database,
+included in scoped export artifacts, excluded from transcript-only replay
+responses, and removed from active access through the same scope tombstone
+behavior as memory rows. Physical purge remains
+backend/SLA-specific and must not be promised before provider backup or Object
+Lock retention expires.
+
+The Support View may expose account, project, key, usage, audit, job, and
+incident metadata needed to operate hosted Vexic. It must not expose raw memory,
+transcript text, fact text, retrieval query text, prompt or tool bodies, hidden
+instructions, thinking traces, raw keys, provider secrets, database tokens, or
+configured forbidden values. Privileged inspection of tenant-scoped memory
+telemetry requires a purpose-bound operator procedure with approval, audit
+logging, time-boxing, and post-incident review.
+
+Product-improvement use of customer-data-derived content is default off.
+Content-bearing or query-bearing memory telemetry, including `retrieval_events`
+and `candidate_retrieval_events`, must not be used for cross-tenant product
+improvement unless a separate consent, retention, deletion, security, and legal
+gate is accepted. Non-content operational aggregates may be used for capacity,
+reliability, and product planning within the 400-day retention window.
+
+### Current Production Gaps
+
 Not production/customer-data ready yet:
 
 - no production control-plane catalog, audit store, usage store, or job ledger;
-- no restore drill, network hardening, distributed rate limiting, support-access
-  policy, or incident runbook;
+- no restore drill, network hardening, distributed rate limiting, implemented
+  support-access workflow, or incident runbook;
 - no Cloudflare/WAF configuration, origin lock-down, auth-failure throttling,
   alerting, or abuse override workflow;
 - no billing, dashboard, portal, enterprise SSO, or compliance claims;
-- export/delete/retention depend on the underlying `MemoryService` methods and
-  remain limited by the current local service implementation.
+- physical purge remains backend/SLA-specific and limited by the current local
+  service implementation.

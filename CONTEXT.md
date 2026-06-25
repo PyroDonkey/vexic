@@ -66,6 +66,13 @@ Sanitized control-plane records used to run, audit, meter, and debug the hosted
 memory API without storing customer memory payloads.
 _Avoid_: Product analytics, memory telemetry
 
+**Non-Content Operational Aggregate**:
+A derived operational metric that contains counts, rates, durations, token or
+cost totals, or status totals without customer memory content, prompt content,
+query text, transcript text, facts, tool bodies, secrets, or identifiers beyond
+the approved operational dimensions.
+_Avoid_: Product analytics dataset, retrieval query aggregate
+
 **Product-Improvement Data Collection**:
 Customer-data-derived collection used to improve Vexic's product behavior beyond
 operating a tenant's own memory service.
