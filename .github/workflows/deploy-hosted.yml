@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: hosted-railway-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     if: github.ref == 'refs/heads/main'
@@ -40,6 +44,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Railway CLI
-        run: npm install -g @railway/cli
+        run: npm install -g @railway/cli@5.23.1
       - name: Deploy to Railway
         run: railway up --ci --project ${{ vars.RAILWAY_PROJECT_ID }} --environment production --service vexic
+      - name: Verify hosted health
+        run: curl --fail --retry 12 --retry-all-errors --retry-delay 10 https://api.vexic.dev/health

@@ -199,8 +199,9 @@ GitHub Actions deploy trigger:
 
 - `.github/workflows/deploy-hosted.yml` runs on pushes to `main` and manual
   `workflow_dispatch` runs against `main`.
-- The workflow runs `uv run pytest`, then builds the hosted Docker image, then
-  deploys with `railway up --ci`.
+- The workflow serializes hosted deploy runs, runs `uv run pytest`, builds the
+  hosted Docker image, deploys with Railway CLI `5.23.1`, then checks
+  `https://api.vexic.dev/health`.
 - Required GitHub secret: `RAILWAY_TOKEN`, a Railway project token scoped to
   the `production` environment.
 - Required GitHub variable: `RAILWAY_PROJECT_ID=1dcc4bac-613a-4291-af84-56bf7dec2b79`.
