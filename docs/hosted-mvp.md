@@ -307,8 +307,9 @@ retention window and the same no-content rule.
 telemetry inside the Customer Memory Database. They are part of replayable
 memory behavior, not cross-tenant product analytics. They may contain
 query-bearing telemetry, so they are retained with the Customer Memory Database,
-included in scoped export/replay, and removed from active access through the
-same scope tombstone behavior as memory rows. Physical purge remains
+included in scoped export artifacts, excluded from transcript-only replay
+responses, and removed from active access through the same scope tombstone
+behavior as memory rows. Physical purge remains
 backend/SLA-specific and must not be promised before provider backup or Object
 Lock retention expires.
 
