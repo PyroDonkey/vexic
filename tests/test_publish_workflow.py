@@ -11,6 +11,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 CHECK_SCRIPT = ROOT / "scripts" / "check_release_tag.py"
 PUBLISH_WORKFLOW = ROOT / ".github" / "workflows" / "publish-pypi.yml"
+HOSTED_DEPLOY_WORKFLOW = ROOT / ".github" / "workflows" / "deploy-hosted.yml"
 
 
 def _load_checker() -> ModuleType:
@@ -95,3 +96,20 @@ def test_pypi_placeholder_does_not_package_real_source() -> None:
     assert data["project"]["name"] == "vexic"
     assert data["project"]["version"] == "0.0.0"
     assert data["tool"]["setuptools"]["packages"] == []
+
+
+def test_hosted_deploy_workflow_tests_builds_and_deploys_railway() -> None:
+    workflow = HOSTED_DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+    required = [
+        "branches: [main]",
+        "workflow_dispatch:",
+        "run: uv run pytest",
+        "needs: test",
+        "docker build --tag vexic-hosted:${{ github.sha }} .",
+        "needs: docker-build",
+        "RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}",
+        "npm install -g @railway/cli",
+        "railway up --ci --project ${{ vars.RAILWAY_PROJECT_ID }} --environment production --service vexic",
+    ]
+
+    assert [item for item in required if item not in workflow] == []

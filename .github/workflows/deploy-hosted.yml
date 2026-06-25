@@ -1,0 +1,45 @@
+name: Deploy Hosted
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Set up Python
+        run: uv python install 3.13
+      - name: Run tests
+        run: uv run pytest
+
+  docker-build:
+    if: github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build hosted image
+        run: docker build --tag vexic-hosted:${{ github.sha }} .
+
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    needs: docker-build
+    runs-on: ubuntu-latest
+    environment: railway-alpha
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+      - name: Deploy to Railway
+        run: railway up --ci --project ${{ vars.RAILWAY_PROJECT_ID }} --environment production --service vexic

@@ -195,13 +195,28 @@ Required Railway config:
 - Persistent volume mounted at `/data/vexic`
 - Health check path: `/health`
 
+GitHub Actions deploy trigger:
+
+- `.github/workflows/deploy-hosted.yml` runs on pushes to `main` and manual
+  `workflow_dispatch` runs against `main`.
+- The workflow runs `uv run pytest`, then builds the hosted Docker image, then
+  deploys with `railway up --ci`.
+- Required GitHub secret: `RAILWAY_TOKEN`, a Railway project token scoped to
+  the `production` environment.
+- Required GitHub variable: `RAILWAY_PROJECT_ID=1dcc4bac-613a-4291-af84-56bf7dec2b79`.
+- Railway GitHub autodeploys for the service should stay disabled so GitHub
+  Actions is the test gate before deploy.
+- Roll back from the Railway service deployments tab by selecting a previous
+  successful deployment and using Railway's rollback action. Railway restores
+  that deployment's Docker image and custom variables, subject to retention.
+
 Current internal-alpha state as of 2026-06-25:
 
 - Railway project `Vexic` runs service `vexic` in the `production`
   environment at `https://api.vexic.dev`.
 - The verified deployment is
-  `1dd924f7-8c82-4bf6-a828-3928b06a73e9` at commit
-  `ed67ea9b8d03ecc606971c3355de2b740c058873`.
+  `83a04e5a-199c-4671-bd15-7d01e3a3181b` at commit
+  `f8b22637ab6ad31ac055b469b568243869627b90`.
 - `/health` returns `200` with contract version `0.1.0`.
 - `vexic-volume` is mounted at `/data/vexic`; append/search persistence
   survived a redeploy.
