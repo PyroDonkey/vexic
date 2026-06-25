@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: hosted-railway-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   test:
@@ -48,4 +48,4 @@ jobs:
       - name: Deploy to Railway
         run: railway up --ci --project ${{ vars.RAILWAY_PROJECT_ID }} --environment production --service vexic
       - name: Verify hosted health
-        run: curl --fail --retry 12 --retry-all-errors --retry-delay 10 https://api.vexic.dev/health
+        run: curl --fail --retry 12 --retry-all-errors --retry-delay 10 --connect-timeout 5 --max-time 15 --retry-connrefused https://api.vexic.dev/health

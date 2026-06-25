@@ -105,7 +105,7 @@ def test_hosted_deploy_workflow_tests_builds_and_deploys_railway() -> None:
         "branches: [main]",
         "workflow_dispatch:",
         "concurrency:",
-        "cancel-in-progress: true",
+        "cancel-in-progress: false",
         "run: uv run pytest",
         "needs: test",
         "docker build --tag vexic-hosted:${{ github.sha }} .",
@@ -113,7 +113,7 @@ def test_hosted_deploy_workflow_tests_builds_and_deploys_railway() -> None:
         "RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}",
         "npm install -g @railway/cli@5.23.1",
         "railway up --ci --project ${{ vars.RAILWAY_PROJECT_ID }} --environment production --service vexic",
-        "curl --fail --retry 12 --retry-all-errors --retry-delay 10 https://api.vexic.dev/health",
+        "curl --fail --retry 12 --retry-all-errors --retry-delay 10 --connect-timeout 5 --max-time 15 --retry-connrefused https://api.vexic.dev/health",
     ]
 
     assert [item for item in required if item not in workflow] == []
@@ -123,6 +123,6 @@ def test_hosted_deploy_workflow_tests_builds_and_deploys_railway() -> None:
         r"  deploy:\n.*?needs: docker-build\n.*?RAILWAY_TOKEN: \$\{\{ secrets.RAILWAY_TOKEN \}\}"
         r".*?npm install -g @railway/cli@5\.23\.1\n"
         r".*?railway up --ci --project \$\{\{ vars.RAILWAY_PROJECT_ID \}\} --environment production --service vexic\n"
-        r".*?curl --fail --retry 12 --retry-all-errors --retry-delay 10 https://api\.vexic\.dev/health",
+        r".*?curl --fail --retry 12 --retry-all-errors --retry-delay 10 --connect-timeout 5 --max-time 15 --retry-connrefused https://api\.vexic\.dev/health",
         workflow,
     )
