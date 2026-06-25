@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import tomllib
 from pathlib import Path
 from types import ModuleType
@@ -11,6 +12,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 CHECK_SCRIPT = ROOT / "scripts" / "check_release_tag.py"
 PUBLISH_WORKFLOW = ROOT / ".github" / "workflows" / "publish-pypi.yml"
+HOSTED_DEPLOY_WORKFLOW = ROOT / ".github" / "workflows" / "deploy-hosted.yml"
 
 
 def _load_checker() -> ModuleType:
@@ -95,3 +97,32 @@ def test_pypi_placeholder_does_not_package_real_source() -> None:
     assert data["project"]["name"] == "vexic"
     assert data["project"]["version"] == "0.0.0"
     assert data["tool"]["setuptools"]["packages"] == []
+
+
+def test_hosted_deploy_workflow_tests_builds_and_deploys_railway() -> None:
+    workflow = HOSTED_DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+    required = [
+        "branches: [main]",
+        "workflow_dispatch:",
+        "concurrency:",
+        "cancel-in-progress: false",
+        "run: uv run pytest",
+        "needs: test",
+        "docker build --tag vexic-hosted:${{ github.sha }} .",
+        "needs: docker-build",
+        "RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}",
+        "npm install -g @railway/cli@5.23.1",
+        "railway up --ci --project ${{ vars.RAILWAY_PROJECT_ID }} --environment production --service vexic",
+        "curl --fail --retry 12 --retry-all-errors --retry-delay 10 --connect-timeout 5 --max-time 15 --retry-connrefused https://api.vexic.dev/health",
+    ]
+
+    assert [item for item in required if item not in workflow] == []
+    assert re.search(
+        r"(?ms)^  test:\n.*?run: uv run pytest\n\n  docker-build:\n.*?needs: test\n"
+        r".*?docker build --tag vexic-hosted:\$\{\{ github.sha \}\} \.\n\n"
+        r"  deploy:\n.*?needs: docker-build\n.*?RAILWAY_TOKEN: \$\{\{ secrets.RAILWAY_TOKEN \}\}"
+        r".*?npm install -g @railway/cli@5\.23\.1\n"
+        r".*?railway up --ci --project \$\{\{ vars.RAILWAY_PROJECT_ID \}\} --environment production --service vexic\n"
+        r".*?curl --fail --retry 12 --retry-all-errors --retry-delay 10 --connect-timeout 5 --max-time 15 --retry-connrefused https://api\.vexic\.dev/health",
+        workflow,
+    )
