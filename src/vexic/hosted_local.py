@@ -121,6 +121,51 @@ class HostedTenantCatalog:
             conn.commit()
             return self._tenant_from_filename(conn, tenant_id, row[0])
 
+    def activate_replacement_database(
+        self,
+        tenant_id: str,
+        replacement_db_path: str | Path,
+    ) -> HostedTenant:
+        if not tenant_id.strip():
+            raise ValueError("tenant_id must not be blank.")
+        candidate = Path(replacement_db_path)
+        if not candidate.is_absolute():
+            candidate = self.root_path / candidate
+        root = self.root_path.resolve()
+        replacement = candidate.resolve()
+        try:
+            relative = replacement.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("replacement database must be under hosted root.") from exc
+        if len(relative.parts) != 1 or relative.name == "control-plane.db":
+            raise ValueError("replacement database must be a customer database file.")
+        if not replacement.is_file():
+            raise FileNotFoundError(f"Replacement database does not exist: {replacement}")
+
+        db_filename = relative.name
+        LocalMemoryService(db_path=str(replacement), tenant_id=tenant_id).init_schema()
+        with closing(self._connect_control()) as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM tenants
+                WHERE tenant_id = ? AND active = 1
+                """,
+                (tenant_id,),
+            ).fetchone()
+            if row is None:
+                raise PermissionError("Unknown hosted tenant.")
+            conn.execute(
+                """
+                UPDATE tenants
+                SET db_filename = ?, active = 1
+                WHERE tenant_id = ?
+                """,
+                (db_filename, tenant_id),
+            )
+            conn.commit()
+            return self._tenant_from_filename(conn, tenant_id, db_filename)
+
     def get_tenant(self, tenant_id: str) -> HostedTenant:
         with closing(self._connect_control()) as conn:
             row = conn.execute(
