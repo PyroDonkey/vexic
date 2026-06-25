@@ -36,6 +36,31 @@ Account, billing, admin, auth, metering, and operational management around the
 hosted memory API.
 _Avoid_: Memory core
 
+**Vexic Console**:
+The human-facing product surface for hosted Vexic account, organization,
+project, API-key, usage, and support workflows.
+_Avoid_: Memory browser, memory core
+
+**Customer Account**:
+The human account/team boundary represented by a Clerk Organization in the
+Vexic Console.
+_Avoid_: Memory scope, customer memory database
+
+**Project**:
+A Vexic-owned control-plane record under a Customer Account that maps human
+configuration to hosted API project scope.
+_Avoid_: Clerk organization, memory database
+
+**Agent API Key**:
+A Vexic-owned machine credential minted by the hosted API for agent access to
+project-scoped memory capabilities.
+_Avoid_: Clerk API key, human session
+
+**Support View**:
+The Vexic Console surface for account, project, key, usage, audit, job, and
+incident metadata needed to operate hosted Vexic without browsing raw memory.
+_Avoid_: Memory browser, transcript viewer, fact browser
+
 **Operational Telemetry**:
 Sanitized control-plane records used to run, audit, meter, and debug the hosted
 memory API without storing customer memory payloads.
