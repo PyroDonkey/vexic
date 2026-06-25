@@ -23,6 +23,7 @@ missing from this index (and the reverse).
 | 0008 | Hosted data protection uses provider encryption, PITR, exports  | accepted |
 | 0009 | Production telemetry boundary is settled before product analytics | accepted |
 | 0010 | Native read-only HTTP MCP is a stateless hosted adapter slice   | accepted |
+| 0011 | Hosted migration is operator-run canonical row migration        | accepted |
 
 Notes:
 
@@ -31,6 +32,9 @@ Notes:
   downstream "SaaS Stack Plan" or similar planning doc must not contradict them.
 - 0007 corresponds to the multi-agent scoping work. The repo, not a tracking
   view, defines the accepted scope semantics.
+- 0011 corresponds to the local/self-host to hosted migration-path decision for
+  COA-202. The operator runbook and drill, not a public import API, are the
+  readiness owner for that path.
 - These numbers are the Vexic `docs/adr/` series. Some source comments under
   `src/vexic` cite an `upstream ADR-00NN` label from the extraction source
   (for example `upstream ADR-0010` for candidate-fallback retrieval); those
