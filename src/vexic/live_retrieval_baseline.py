@@ -104,18 +104,19 @@ class CountingAgent:
 
     async def run(self, *args: Any, **kwargs: Any) -> Any:
         self.budget.ensure_available("agent.run")
+        request_limit = self.budget.remaining()
         if _accepts_kwarg(self.agent.run, "usage_limits"):
             kwargs.setdefault(
                 "usage_limits",
-                UsageLimits(request_limit=self.budget.remaining()),
+                UsageLimits(request_limit=request_limit),
             )
+        self.budget.spend("agent.run attempt")
         result = self.agent.run(*args, **kwargs)
         if hasattr(result, "__await__"):
             result = await result
-        self.budget.spend(
-            "agent.run",
-            max(summarize_agent_usage(result).model_requests, 1),
-        )
+        additional_requests = max(summarize_agent_usage(result).model_requests, 1) - 1
+        if additional_requests:
+            self.budget.spend("agent.run", additional_requests)
         return result
 
 
@@ -277,6 +278,20 @@ def _load_adapter(path: Path) -> ModuleType:
     return module
 
 
+def _validate_adapter_provider(provider: str, adapter: ModuleType) -> None:
+    adapter_provider = getattr(adapter, "PROVIDER", None)
+    if adapter_provider is None:
+        return
+    if not isinstance(adapter_provider, str) or not adapter_provider.strip():
+        raise BaselineConfigError("adapter PROVIDER must be a non-empty string.")
+    adapter_provider = adapter_provider.strip()
+    provider = provider.strip()
+    if adapter_provider.lower() != provider.lower():
+        raise BaselineConfigError(
+            f"adapter provider {adapter_provider} does not match --provider {provider}."
+        )
+
+
 def _wrap_factory(factory: Any, budget: ProviderBudget) -> Any:
     def counted_factory(model_group: str, secrets: dict[str, str] | None = None) -> CountingAgent:
         return CountingAgent(factory(model_group, secrets=secrets), budget)
@@ -286,10 +301,11 @@ def _wrap_factory(factory: Any, budget: ProviderBudget) -> Any:
 
 def _wrap_embed(embed_texts: Any, budget: ProviderBudget) -> Any:
     def counted_embed(texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return embed_texts(texts)
         budget.ensure_available("embed_texts")
-        result = embed_texts(texts)
         budget.spend("embed_texts")
-        return result
+        return embed_texts(texts)
 
     return counted_embed
 
@@ -543,13 +559,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         fixture = Path(_require(args.fixture, "--fixture"))
         adapter_path = Path(_require(args.adapter, "--adapter"))
-        _require(args.provider, "--provider")
+        provider = _require(args.provider, "--provider")
         _require(args.model_group, "--model-group")
         output_dir = Path(_require(args.output_dir, "--output-dir"))
         _validate_numeric_caps(args)
         rows = _load_fixture(fixture, max_rows=args.max_rows)
         _validate_caps(args, rows)
         adapter = _load_adapter(adapter_path)
+        _validate_adapter_provider(provider, adapter)
         retrieval = asyncio.run(_run_live(rows, args, adapter))
         _write_artifacts(output_dir, retrieval)
     except BaselineConfigError as exc:

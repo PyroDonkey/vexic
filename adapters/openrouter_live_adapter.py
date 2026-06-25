@@ -4,15 +4,24 @@ import math
 import os
 import re
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from pydantic_ai import Agent
 from pydantic_ai.embeddings import Embedder
+from pydantic_ai.embeddings.openai import OpenAIEmbeddingModel
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
 
 from vexic.embeddings import EMBEDDING_DIM
 from vexic.models import ContradictionJudgment, FactCandidate, RemBoostPlan
 
+
+PROVIDER = "openrouter"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+# ponytail: single embedding worker; add a pool only if live runs need parallel embeddings.
+_EMBED_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 
 EXTRACTION_INSTRUCTIONS = """\
 Extract only durable user facts stated in the transcript.
@@ -38,22 +47,26 @@ def _env_key(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_").upper()
 
 
-def _require_openai_key() -> None:
-    key = os.environ.get("OPENAI_API_KEY")
+def _require_openrouter_key() -> str:
+    key = os.environ.get("OPENROUTER_API_KEY")
     if key is None or not key.strip():
-        raise RuntimeError("OPENAI_API_KEY is required for the live retrieval adapter.")
+        raise RuntimeError("OPENROUTER_API_KEY is required for the live retrieval adapter.")
+    return key.strip()
 
 
-def _require_openai_model(model: str, env_name: str) -> str:
-    if not model.startswith("openai:"):
-        raise RuntimeError(f"{env_name} must use an openai: model for this adapter.")
+def _require_openrouter_model(model: str, env_name: str) -> str:
+    model = model.strip()
+    if ":" in model or "/" not in model:
+        raise RuntimeError(
+            f"{env_name} must use an OpenRouter model id like openai/gpt-4o-mini."
+        )
     return model
 
 
 def _reject_passed_secrets(secrets: Mapping[str, str] | None) -> None:
     if secrets:
         raise RuntimeError(
-            "openai_live_adapter.py reads provider secrets from environment variables only."
+            "openrouter_live_adapter.py reads provider secrets from environment variables only."
         )
 
 
@@ -87,17 +100,17 @@ def _model_name(model_group: str) -> str:
     group_key = _env_key(model_group)
     group_env = f"VEXIC_LIVE_{group_key}_MODEL"
     if group_model := os.environ.get(group_env):
-        return _require_openai_model(group_model, group_env)
+        return _require_openrouter_model(group_model, group_env)
     if default_model := os.environ.get("VEXIC_LIVE_MODEL"):
-        return _require_openai_model(default_model, "VEXIC_LIVE_MODEL")
-    return "openai:gpt-4o-mini"
+        return _require_openrouter_model(default_model, "VEXIC_LIVE_MODEL")
+    return "openai/gpt-4o-mini"
 
 
 def _embedding_model_name() -> str:
     model = os.environ.get("VEXIC_LIVE_EMBEDDING_MODEL")
     if model:
-        return _require_openai_model(model, "VEXIC_LIVE_EMBEDDING_MODEL")
-    return "openai:text-embedding-3-small"
+        return _require_openrouter_model(model, "VEXIC_LIVE_EMBEDDING_MODEL")
+    return "openai/text-embedding-3-small"
 
 
 def _model_settings() -> ModelSettings:
@@ -107,10 +120,16 @@ def _model_settings() -> ModelSettings:
     }
 
 
+def _provider() -> OpenAIProvider:
+    return OpenAIProvider(
+        base_url=OPENROUTER_BASE_URL,
+        api_key=_require_openrouter_key(),
+    )
+
+
 def _agent(model_group: str, output_type: Any, instructions: str) -> Agent[None, Any]:
-    _require_openai_key()
     return Agent(
-        _model_name(model_group),
+        OpenAIChatModel(_model_name(model_group), provider=_provider()),
         output_type=output_type,
         instructions=instructions,
         model_settings=_model_settings(),
@@ -144,12 +163,15 @@ def build_contradiction_agent(
 def embed_texts(texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
-    _require_openai_key()
     model = _embedding_model_name()
-    result = Embedder(model).embed_documents_sync(
-        texts,
-        settings={"dimensions": EMBEDDING_DIM},
-    )
+    result = _EMBED_EXECUTOR.submit(
+        lambda: Embedder(
+            OpenAIEmbeddingModel(model, provider=_provider())
+        ).embed_documents_sync(
+            texts,
+            settings={"dimensions": EMBEDDING_DIM},
+        )
+    ).result()
     embeddings = [list(embedding) for embedding in result.embeddings]
     bad_dimensions = [
         len(embedding)

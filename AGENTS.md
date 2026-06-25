@@ -37,6 +37,9 @@ into Vexic.
 ### Package Boundary
 
 - Vexic code lives under `src/vexic`.
+- Repo-local host adapter files under `adapters/` may import public `vexic.*`
+  APIs as consumers. They are not Vexic package runtime, and provider-secret or
+  live-model wiring belongs there rather than in `src/vexic`.
 - Runtime code must not import legacy `engine.*` modules.
 - Private source-host paths may appear in provenance or compatibility docs, not as
   operational dependencies.

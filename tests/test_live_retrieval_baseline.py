@@ -5,11 +5,14 @@ import contextlib
 import importlib
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
 import textwrap
+from types import ModuleType
 import unittest
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -312,6 +315,145 @@ class LiveRetrievalBaselineTests(unittest.TestCase):
         self.assertFalse(retrieval["rows"][0]["diagnostics"]["candidate_fallback_used"])
         self.assertEqual(synthesis["status"], "not_run")
 
+    def test_adapter_provider_mismatch_is_config_error_before_live_run(self) -> None:
+        stderr = io.StringIO()
+
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": ""}, clear=False):
+            with contextlib.redirect_stderr(stderr):
+                exit_code = self.baseline.main(
+                    [
+                        "--allow-live",
+                        "--fixture",
+                        str(self._one_row_fixture()),
+                        "--adapter",
+                        str(REPO_ROOT / "adapters" / "openrouter_live_adapter.py"),
+                        "--provider",
+                        "openai",
+                        "--model-group",
+                        "retrieval-smoke",
+                        "--output-dir",
+                        str(self.root / "out"),
+                    ]
+                )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("adapter provider openrouter does not match --provider openai", stderr.getvalue())
+
+    def test_adapter_provider_validation_strips_whitespace(self) -> None:
+        adapter = ModuleType("fake_adapter")
+        adapter.PROVIDER = " openrouter "
+
+        self.baseline._validate_adapter_provider("openrouter\n", adapter)
+
+    def test_failed_agent_attempt_is_counted_in_metrics(self) -> None:
+        adapter = self.root / "adapter.py"
+        adapter.write_text(
+            textwrap.dedent(
+                """
+                class _ExtractionAgent:
+                    async def run(self, transcript):
+                        raise RuntimeError("provider blew up")
+
+                def build_extraction_agent(model_group, secrets=None):
+                    return _ExtractionAgent()
+
+                def build_rem_agent(model_group, secrets=None):
+                    raise AssertionError("REM should not run")
+
+                def build_contradiction_agent(model_group, secrets=None):
+                    raise AssertionError("Deep should not run")
+
+                def embed_texts(texts):
+                    raise AssertionError("Embeddings should not run")
+                """
+            )
+        )
+        output_dir = self.root / "out"
+
+        exit_code = self.baseline.main(
+            [
+                "--allow-live",
+                "--fixture",
+                str(self._one_row_fixture()),
+                "--adapter",
+                str(adapter),
+                "--provider",
+                "fake",
+                "--model-group",
+                "fake-model",
+                "--output-dir",
+                str(output_dir),
+            ]
+        )
+
+        retrieval = json.loads((output_dir / "retrieval_metrics.json").read_text())
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(retrieval["provider_calls_used"], 1)
+        self.assertEqual(retrieval["rows"][0]["failure_type"], "provider_runtime_failure")
+
+    def test_failed_embedding_attempt_is_counted_in_metrics(self) -> None:
+        adapter = self.root / "adapter.py"
+        adapter.write_text(
+            textwrap.dedent(
+                """
+                from vexic.models import FactCandidate
+
+                class _Result:
+                    output = [
+                        FactCandidate(
+                            fact_text="Ryan prefers compact reliability reports with provenance.",
+                            subject="Ryan",
+                            category="preference",
+                            importance=6,
+                            confidence=0.9,
+                            source_message_ids=[1],
+                        )
+                    ]
+
+                    def usage(self):
+                        return type("Usage", (), {"requests": 1})()
+
+                class _ExtractionAgent:
+                    async def run(self, transcript):
+                        return _Result()
+
+                def build_extraction_agent(model_group, secrets=None):
+                    return _ExtractionAgent()
+
+                def build_rem_agent(model_group, secrets=None):
+                    raise AssertionError("REM should not run")
+
+                def build_contradiction_agent(model_group, secrets=None):
+                    raise AssertionError("Deep should not run")
+
+                def embed_texts(texts):
+                    raise RuntimeError("embedding provider blew up")
+                """
+            )
+        )
+        output_dir = self.root / "out"
+
+        exit_code = self.baseline.main(
+            [
+                "--allow-live",
+                "--fixture",
+                str(self._one_row_fixture()),
+                "--adapter",
+                str(adapter),
+                "--provider",
+                "fake",
+                "--model-group",
+                "fake-model",
+                "--output-dir",
+                str(output_dir),
+            ]
+        )
+
+        retrieval = json.loads((output_dir / "retrieval_metrics.json").read_text())
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(retrieval["provider_calls_used"], 2)
+        self.assertEqual(retrieval["rows"][0]["failure_type"], "provider_runtime_failure")
+
     def test_classify_failure_taxonomy(self) -> None:
         classify = self.baseline.classify_failure
 
@@ -380,6 +522,8 @@ class LiveRetrievalBaselineDocumentationTests(unittest.TestCase):
 
         self.assertIn("uv run --with-editable . python -m vexic.live_retrieval_baseline", readme)
         self.assertNotIn("scripts\\live_retrieval_baseline.py", readme)
+        self.assertIn("adapters\\openrouter_live_adapter.py", readme)
+        self.assertIn("--provider openrouter", readme)
         self.assertIn("--allow-live", readme)
         self.assertIn("--provider", readme)
         self.assertIn("--model-group", readme)

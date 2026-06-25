@@ -116,8 +116,8 @@ The opt-in live provider retrieval smoke is:
 uv run --with-editable . python -m vexic.live_retrieval_baseline `
   --allow-live `
   --fixture .\longmemeval_s_smoke.jsonl `
-  --adapter .\adapters\openai_live_adapter.py `
-  --provider openai `
+  --adapter .\adapters\openrouter_live_adapter.py `
+  --provider openrouter `
   --model-group retrieval-smoke `
   --output-dir .\artifacts\live-retrieval `
   --max-rows 1 `
@@ -126,9 +126,11 @@ uv run --with-editable . python -m vexic.live_retrieval_baseline `
 ```
 
 Without `--allow-live`, the command exits 0 before importing the adapter or
-calling providers. The host-owned adapter file supplies `build_extraction_agent`,
+calling providers. The host-owned OpenRouter adapter reads `OPENROUTER_API_KEY`
+from the process environment and supplies `build_extraction_agent`,
 `build_rem_agent`, `build_contradiction_agent`, and `embed_texts`; Vexic core
-does not load provider SDKs or read provider secrets.
+does not read provider secrets. The adapter lives under repo-local `adapters/`
+by design because it is host-owned provider wiring, not package core.
 
 Fixture rows are JSONL objects with `id`, `transcript`, `question`, and
 `expected_fact`. `transcript` may be a list of strings or `{ "role": "user" |
