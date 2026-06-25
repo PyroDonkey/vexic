@@ -171,7 +171,7 @@ class HostedTenantCatalog:
             imported_tenant_id, imported_project_id = migration_scope
             if imported_tenant_id != tenant_id:
                 raise PermissionError("Replacement database tenant does not match catalog tenant.")
-            if project_ids and imported_project_id not in project_ids:
+            if imported_project_id not in project_ids:
                 raise PermissionError("Replacement database project is outside catalog tenant projects.")
             conn.execute(
                 """
