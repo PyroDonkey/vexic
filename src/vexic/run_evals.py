@@ -27,10 +27,8 @@ Exit code is always 0 (this is an eval, not a gate). The final stdout line is a
 machine-readable JSON summary.
 
 Usage (needs the editable install on path, since this imports ``vexic``):
-    uv run --with-editable . python scripts/run_evals.py --dataset longmemeval_s_smoke.jsonl
-    uv run --with-editable . python scripts/run_evals.py --dataset longmemeval_s_subset_10.jsonl --limit 3
-
-A bare ``uv run python scripts/run_evals.py`` fails with ModuleNotFoundError.
+    uv run --with-editable . python -m vexic.run_evals --dataset longmemeval_s_smoke.jsonl
+    uv run --with-editable . python -m vexic.run_evals --dataset longmemeval_s_subset_10.jsonl --limit 3
 """
 
 from __future__ import annotations

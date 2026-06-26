@@ -349,10 +349,8 @@ Alongside the two SessionStart hooks (`.claude/hooks/check_doc_drift.py` and
 PreToolUse guard fails closed against Tier-1 `messages` mutation and against
 changes to the host-extension `background_tool_audit` table.
 
-Use `scripts/run_evals.py` as the eval runner for the LongMemEval datasets. It
-imports `vexic`, so run it with the editable install on path:
-`uv run --with-editable . python scripts/run_evals.py --dataset longmemeval_s_smoke.jsonl`.
-A bare `uv run python scripts/run_evals.py` fails with `ModuleNotFoundError`.
+Use `vexic.run_evals` as the eval runner for the LongMemEval datasets:
+`uv run --with-editable . python -m vexic.run_evals --dataset longmemeval_s_smoke.jsonl`.
 See `docs/examples.md` for worked examples.
 
 Private source-host references are allowed in `docs/provenance.md` and compatibility
