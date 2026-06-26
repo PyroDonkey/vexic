@@ -6,8 +6,8 @@ notice package, and not external readiness by itself.
 
 Completing this runbook or a tabletop does not close COA-177 and does not make
 hosted Vexic external/customer-data ready. Any `blocked`, `fail`, or unaccepted
-`pass-with-caveats` row keeps the hosted readiness gate blocked unless Ryan
-risk-accepts it in Linear or an ADR.
+`pass-with-caveats` row keeps the hosted readiness gate blocked unless the
+designated security/engineering risk owner accepts the risk in Linear or an ADR.
 
 ## Evidence Tiers
 
@@ -16,7 +16,8 @@ risk-accepts it in Linear or an ADR.
 - `tabletop-synthetic`: dry-run evidence using fake tenants, fake keys, fake
   events, and metadata-only artifacts.
 - `requires-prod-control`: runtime, infrastructure, or operational-control
-  evidence. No pass without concrete artifact or Ryan risk acceptance.
+  evidence. No pass without concrete artifact or acceptance by the designated
+  risk owner.
 
 Owner issue `Done` never means gate pass. Gate pass requires row evidence that
 matches the tier and gate rule.
@@ -33,7 +34,9 @@ matches the tier and gate rule.
 - Classify up when unsure. Highest applicable severity wins.
 - Every real incident and tabletop has one named Incident Commander and one
   deputy or explicit deputy gap.
-- Default IC is Ryan or a named delegate.
+- Default IC is the on-call Incident Commander or designated incident owner.
+- Risk acceptance must be recorded by the designated security/engineering risk
+  owner in Linear or an ADR.
 - IC owns severity, containment authorization, customer notification timing and
   content, metadata-only evidence discipline, and follow-up todos.
 - If the IC caused or is implicated in the incident, record the conflict and
@@ -304,7 +307,8 @@ a follow-up todo and leaves the gate blocked.
 - IC: [name]
 - Deputy: [name or blocked]
 - IC conflict/deputy check: [tested | not-tested | blocked]
-- Ryan implicated in config/routing change: [yes | no | synthetic]
+- IC/designated incident owner implicated in config/routing change:
+  [yes | no | synthetic]
 - Affected tenant/project labels: [fake labels]
 - Evidence tier: tabletop-synthetic
 - Metadata-only evidence pointers: [audit ids, counts, checksums, fake notices]
@@ -322,11 +326,13 @@ Status vocabulary:
 
 - `pass`: evidence satisfies the row with no known readiness caveat.
 - `pass-with-caveats`: not gate-green unless the caveat is explicitly
-  non-gating or has Ryan-approved risk acceptance.
+  non-gating or has acceptance by the designated risk owner.
 - `fail`: tested/evaluated and did not satisfy the row; blocks external beta
-  unless Ryan risk-accepts it in Linear or an ADR.
+  unless the designated security/engineering risk owner accepts the risk in
+  Linear or an ADR.
 - `blocked`: prerequisite work/tooling/drill is missing; blocks external beta
-  unless Ryan risk-accepts it in Linear or an ADR.
+  unless the designated security/engineering risk owner accepts the risk in
+  Linear or an ADR.
 
 Each review row must record status, evidence pointer, owner issue,
 notes/caveat, follow-up todo when not a clean pass, and risk-acceptance pointer
@@ -334,12 +340,12 @@ when proceeding despite a gap.
 
 | Row | Evidence tier | Current default status | Owner/evidence | Gate rule |
 | --- | --- | --- | --- | --- |
-| 1. Auth, Clerk/session abuse, and Agent API Key scope/revocation | requires-prod-control | blocked | COA-200, COA-199; need revocation/session-abuse artifacts | Blocks unless concrete auth/key evidence or Ryan risk acceptance exists. |
-| 2. Tenant isolation and routing integrity | requires-prod-control | blocked | COA-199, COA-200; need production-control catalog/routing checks | Blocks unless content-blind isolation evidence or Ryan risk acceptance exists. |
-| 3. No Operator Raw Memory Access and support metadata boundaries | requires-prod-control | blocked | COA-179, COA-203; unresolved support workflow/audit | Blocks unless support metadata controls exist or Ryan risk acceptance exists. |
+| 1. Auth, Clerk/session abuse, and Agent API Key scope/revocation | requires-prod-control | blocked | COA-200, COA-199; need revocation/session-abuse artifacts | Blocks unless concrete auth/key evidence or acceptance by the designated risk owner exists. |
+| 2. Tenant isolation and routing integrity | requires-prod-control | blocked | COA-199, COA-200; need production-control catalog/routing checks | Blocks unless content-blind isolation evidence or acceptance by the designated risk owner exists. |
+| 3. No Operator Raw Memory Access and support metadata boundaries | requires-prod-control | blocked | COA-179, COA-203; unresolved support workflow/audit | Blocks unless support metadata controls exist or acceptance by the designated risk owner exists. |
 | 4. Redaction fail-closed paths | requires-prod-control | blocked | COA-200 plus contract/tests; need request/persistence/log/export evidence | Blocks unless fail-closed evidence covers egress and persistence. |
-| 5. Encryption, TLS, secrets, and key rotation | requires-prod-control | blocked | COA-189; need deployed TLS/encryption/rotation evidence | Blocks unless deployed control evidence or Ryan risk acceptance exists. |
-| 6. Backup, PITR, immutable/export backup, and restore drills | requires-prod-control | blocked | COA-189; restore drills unresolved | Blocks unless restore drill artifacts pass or Ryan risk acceptance exists. |
+| 5. Encryption, TLS, secrets, and key rotation | requires-prod-control | blocked | COA-189; need deployed TLS/encryption/rotation evidence | Blocks unless deployed control evidence or acceptance by the designated risk owner exists. |
+| 6. Backup, PITR, immutable/export backup, and restore drills | requires-prod-control | blocked | COA-189; restore drills unresolved | Blocks unless restore drill artifacts pass or acceptance by the designated risk owner exists. |
 | 7. Audit, usage, job, incident ledgers, and detection signals | requires-prod-control | blocked | COA-199; durable-ledger/production-control unresolved | Blocks unless durable ledger and detection artifacts exist. |
 | 8. Rate limits, payload caps, abuse controls, origin protection, and alerting | requires-prod-control | blocked | COA-191; abuse enforcement/origin protection unresolved | Blocks unless enforcement and alert evidence exists. |
 | 9. Worker/model processor consent, spend caps, and job cancellation | requires-prod-control | blocked | COA-201; processor spend/job-cancel controls unresolved | Blocks unless consent, cap, pause/cancel evidence exists. |
