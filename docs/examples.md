@@ -81,17 +81,18 @@ Notes:
 ## Example 3: A Model-Backed Op Fails Closed With HostPortNotConfigured
 
 `AGENTS.md` settles `run_dream_phase` as a host-port operation in v0.1.
-`LocalMemoryService` authorizes the request and checks lifecycle state, executes
-only when explicit dream-phase host ports are supplied, and fails closed with
-`HostPortNotConfigured` through `missing_host_port` when no host adapter is
-provided. The correct behavior is to surface that error, not to import private
-host runtime code or wire a provider SDK to "fix" it.
+`LocalMemoryService` applies the local authorization and tombstone checks, then
+executes only when explicit dream-phase host ports are supplied. When those local
+checks pass and no host adapter is provided, it fails closed with
+`HostPortNotConfigured` through `missing_host_port`. The correct behavior is to
+surface that error, not to import private host runtime code or wire a provider
+SDK to "fix" it.
 
-Expected behavior when calling a dream phase without dream-phase ports
-configured:
+Expected behavior when calling a dream phase with a valid, non-tombstoned scope
+and no dream-phase ports configured:
 
 ```python
-service = LocalMemoryService(db_path)  # no dream_phase_ports supplied
+service = LocalMemoryService(db_path=str(db_path), tenant_id="tenant-a")
 await service.run_dream_phase(request)  # raises HostPortNotConfigured
 ```
 
