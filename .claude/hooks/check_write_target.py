@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import sys
 
 # Tier 1 append-only table (Invariant #1).
@@ -48,10 +49,6 @@ _TABLE = (
 def _table_ref(name: str) -> str:
     return _TABLE.format(name=re.escape(name))
 
-
-# The hook only classifies commands that actually invoke the sqlite3 CLI, so a
-# command that merely mentions SQL text (rg/grep/echo/heredoc) is not blocked.
-_SQLITE_INVOCATION = re.compile(r"\bsqlite3\b", re.IGNORECASE)
 
 # UPDATE <messages> SET ...  (mutating Tier 1 rows)
 _UPDATE_MESSAGES = re.compile(
@@ -172,6 +169,33 @@ def _violation_reason(command: str) -> str | None:
     return None
 
 
+def _is_sqlite3_executable(token: str) -> bool:
+    name = token.rstrip("/\\").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return name in {"sqlite3", "sqlite3.exe"}
+
+
+def _invokes_sqlite3(command: str) -> bool:
+    try:
+        if "|" in command:
+            lexer = shlex.shlex(command, posix=True, punctuation_chars="|")
+            lexer.whitespace_split = True
+            tokens = list(lexer)
+        else:
+            tokens = shlex.split(command)
+    except ValueError:
+        return False
+
+    segment_start = True
+    for token in tokens:
+        if token == "|":
+            segment_start = True
+            continue
+        if segment_start and _is_sqlite3_executable(token):
+            return True
+        segment_start = False
+    return False
+
+
 def main() -> int:
     raw = sys.stdin.read()
     if not raw.strip():
@@ -192,7 +216,7 @@ def main() -> int:
 
     # Only classify commands that actually invoke sqlite3; a command that merely
     # mentions SQL text (rg/grep/echo/heredoc) is not a database write.
-    if not _SQLITE_INVOCATION.search(command):
+    if not _invokes_sqlite3(command):
         return 0
 
     reason = _violation_reason(command)

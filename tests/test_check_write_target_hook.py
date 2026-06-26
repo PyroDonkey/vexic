@@ -56,6 +56,7 @@ def _decision(payload: dict[str, object]) -> str | None:
 
 DENY_COMMANDS = [
     "sqlite3 memory.db 'DELETE FROM messages WHERE id=1'",
+    "/usr/bin/sqlite3 memory.db 'DELETE FROM messages WHERE id=1'",
     "sqlite3 memory.db \"UPDATE   messages SET body='x'\"",
     "sqlite3 memory.db 'delete from MESSAGES'",
     "sqlite3 memory.db 'DROP TABLE background_tool_audit'",
@@ -72,6 +73,8 @@ DENY_COMMANDS = [
     "sqlite3 memory.db 'CREATE VIRTUAL TABLE background_tool_audit USING fts5(x)'",
     "sqlite3 memory.db 'CREATE TEMP TABLE background_tool_audit (id)'",
     "sqlite3 memory.db 'CREATE TEMPORARY TABLE background_tool_audit (id)'",
+    "cat setup.sql | sqlite3 memory.db 'DELETE FROM messages WHERE id=1'",
+    "cat setup.sql|sqlite3 memory.db 'DELETE FROM messages WHERE id=1'",
 ]
 
 ALLOW_COMMANDS = [
@@ -85,6 +88,7 @@ ALLOW_COMMANDS = [
     'grep "UPDATE messages SET" notes.txt',
     "python -c \"print('DELETE FROM messages')\"",
     "echo 'DROP TABLE background_tool_audit'",
+    "echo \"sqlite3 memory.db 'DELETE FROM messages'\"",
 ]
 
 
