@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -136,3 +137,17 @@ def test_empty_or_malformed_input_allows(
         _run(monkeypatch, capsys, {"tool_name": "Bash", "tool_input": {"command": ""}})
         == {}
     )
+
+
+def test_hook_error_path_emits_no_permission_decision() -> None:
+    completed = subprocess.run(
+        [sys.executable, str(ROOT / ".claude" / "hooks" / "check_write_target.py")],
+        input="{",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == ""
+    assert "Write-target guardrail hook errored" in completed.stderr

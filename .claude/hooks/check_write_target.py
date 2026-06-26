@@ -141,27 +141,6 @@ def _emit_deny(reason: str) -> None:
     )
 
 
-def _emit_allow(note: str | None = None) -> None:
-    """Allow by emitting nothing (normal permission flow).
-
-    A PreToolUse hook that wants to defer to normal flow emits no decision. We
-    keep an optional note path only for the fail-safe error case, where we want
-    a trace without blocking; the note is surfaced as additionalContext.
-    """
-    if note is None:
-        return
-    json.dump(
-        {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "allow",
-                "permissionDecisionReason": note,
-            }
-        },
-        sys.stdout,
-    )
-
-
 def _violation_reason(command: str) -> str | None:
     for pattern, reason in _RULES:
         if pattern.search(command):
@@ -233,5 +212,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as exc:  # fail safe: allow, never block the agent
-        _emit_allow(f"Write-target guardrail hook errored, allowing: {exc!r}")
+        print(f"Write-target guardrail hook errored, allowing: {exc!r}", file=sys.stderr)
         sys.exit(0)
