@@ -328,13 +328,23 @@ improvement unless a separate consent, retention, deletion, security, and legal
 gate is accepted. Non-content operational aggregates may be used for capacity,
 reliability, and product planning within the 400-day retention window.
 
+### Incident Response And Security Review
+
+The COA-203 hosted incident response and pre-beta security review runbook lives
+at `docs/runbooks/hosted-incident-response.md`. The first synthetic tabletop
+artifact lives at
+`docs/runbooks/incident-tabletops/2026-06-26-coa-203-scoped-key-routing.md`.
+These artifacts satisfy COA-203 documentation/tabletop evidence only; they do
+not close the hosted readiness gate or make hosted Vexic external/customer-data
+ready.
+
 ### Current Production Gaps
 
 Not production/customer-data ready yet:
 
 - no production control-plane catalog, audit store, usage store, or job ledger;
-- no restore drill, network hardening, distributed rate limiting, implemented
-  support-access workflow, or incident runbook;
+- no accepted restore drill, incident tabletop/security-review signoff, network
+  hardening, distributed rate limiting, or implemented support-access workflow;
 - no Cloudflare/WAF configuration, origin lock-down, auth-failure throttling,
   alerting, or abuse override workflow;
 - no billing, dashboard, portal, enterprise SSO, or compliance claims;

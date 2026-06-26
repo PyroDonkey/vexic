@@ -61,6 +61,21 @@ The Vexic Console surface for account, project, key, usage, audit, job, and
 incident metadata needed to operate hosted Vexic without browsing raw memory.
 _Avoid_: Memory browser, transcript viewer, fact browser
 
+**No Operator Raw Memory Access**:
+The hosted Vexic rule that developers, admins, support operators, incident
+responders, and other customers must never view a customer's raw agent memory
+content or memory files. Customer memory-content questions must be resolved
+through customer-visible access, customer-supplied evidence, sanitized
+operational metadata, row counts, checksums, and scoped operation traces.
+_Avoid_: Break-glass memory browser, admin transcript viewer
+
+**Customer-Enabled Memory Processor**:
+A hosted model or processor path that handles customer memory content only after
+the customer explicitly enables that processing path. Unauthorized model
+processing of customer memory is a data-exposure incident even when no human
+views the memory.
+_Avoid_: Ambient hosted model access, implicit memory processing
+
 **Operational Telemetry**:
 Sanitized control-plane records used to run, audit, meter, and debug the hosted
 memory API without storing customer memory payloads.
