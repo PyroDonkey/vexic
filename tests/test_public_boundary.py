@@ -44,3 +44,18 @@ def test_hosted_core_does_not_own_infrastructure_provisioning() -> None:
         "HostedHttpMemoryServiceClient",
     ):
         assert forbidden not in mcp_stdio_text
+
+
+def test_console_boundary_is_documented_as_outside_vexic_package() -> None:
+    root_readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    console_readme = (ROOT / "console" / "README.md").read_text(encoding="utf-8")
+    console_layout = (
+        ROOT / "console" / "app" / "console" / "layout.tsx"
+    ).read_text(encoding="utf-8")
+
+    for text in (" ".join(root_readme.split()), " ".join(console_readme.split())):
+        assert "repo-local Next.js control-plane app" in text
+        assert "not Vexic package runtime" in text
+        assert "`vexic.*` entrypoint" in text
+
+    assert "not memory-core runtime under src/vexic" in console_layout
