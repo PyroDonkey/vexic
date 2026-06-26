@@ -17,14 +17,10 @@ Install and test with `uv`:
 uv run pytest
 ```
 
-The COA-230 console app lives in `console/`:
-
-```powershell
-cd console
-npm install
-npm test
-npm run build
-```
+The COA-230 console source lives in `console/`. This repository remains
+`uv`-managed only; do not add a separate JavaScript package manager or
+install/test/build commands here until the console packaging path is changed
+deliberately.
 
 ## Agent Workflow
 
