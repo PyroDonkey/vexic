@@ -4,6 +4,7 @@ import { OrganizationSwitcher, UserButton } from "@clerk/nextjs";
 import { readAuthContext } from "@/lib/auth";
 import { isClerkConfigured } from "@/lib/clerk-config";
 
+// Vexic Console is repo-local control-plane UI, not memory-core runtime under src/vexic.
 export const dynamic = "force-dynamic";
 
 export default async function ConsoleLayout({ children }: { children: React.ReactNode }) {

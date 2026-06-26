@@ -17,10 +17,12 @@ Install and test with `uv`:
 uv run pytest
 ```
 
-The COA-230 console source lives in `console/`. This repository remains
-`uv`-managed only; do not add a separate JavaScript package manager or
-install/test/build commands here until the console packaging path is changed
-deliberately.
+The COA-230 console source lives in `console/` as a repo-local Next.js
+control-plane app. It is not Vexic package runtime, not a `vexic.*` entrypoint,
+and must not move under `src/vexic`; ADR 0012 keeps dashboard concerns outside
+the memory core. This repository remains `uv`-managed only; do not add a
+separate JavaScript package manager or install/test/build commands here until
+the console packaging path is changed deliberately.
 
 ## Agent Workflow
 
