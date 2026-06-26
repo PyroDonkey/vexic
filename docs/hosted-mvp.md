@@ -356,8 +356,13 @@ ready.
 Not production/customer-data ready yet:
 
 - no production control-plane catalog, audit store, usage store, or job ledger;
-- no accepted restore drill, incident tabletop/security-review signoff, network
-  hardening, distributed rate limiting, or implemented support-access workflow;
+- no customer-readiness restore drill, incident tabletop/security-review
+  signoff, network hardening, distributed rate limiting, or implemented
+  support-access workflow; the Railway-volume alpha restore drill passed with
+  caveats in
+  `docs/runbooks/restore-drills/2026-06-26-coa-232-railway-alpha-volume.md`,
+  but Turso PITR, Neon control-plane recovery, and S3 Object Lock export
+  restore remain blocked;
 - no Cloudflare/WAF configuration, origin lock-down, auth-failure throttling,
   alerting, or abuse override workflow;
 - no billing, dashboard, portal, enterprise SSO, or compliance claims;

@@ -345,7 +345,7 @@ when proceeding despite a gap.
 | 3. No Operator Raw Memory Access and support metadata boundaries | requires-prod-control | blocked | COA-179, COA-203; unresolved support workflow/audit | Blocks unless support metadata controls exist or acceptance by the designated risk owner exists. |
 | 4. Redaction fail-closed paths | requires-prod-control | blocked | COA-200 plus contract/tests; need request/persistence/log/export evidence | Blocks unless fail-closed evidence covers egress and persistence. |
 | 5. Encryption, TLS, secrets, and key rotation | requires-prod-control | blocked | COA-189; need deployed TLS/encryption/rotation evidence | Blocks unless deployed control evidence or acceptance by the designated risk owner exists. |
-| 6. Backup, PITR, immutable/export backup, and restore drills | requires-prod-control | blocked | COA-189; restore drills unresolved | Blocks unless restore drill artifacts pass or acceptance by the designated risk owner exists. |
+| 6. Backup, PITR, immutable/export backup, and restore drills | requires-prod-control | blocked | COA-189, COA-232; Railway-volume alpha drill passed with caveats in `docs/runbooks/restore-drills/2026-06-26-coa-232-railway-alpha-volume.md`; production Turso/Neon/S3 drills blocked | Blocks unless customer-readiness restore drill artifacts pass or acceptance by the designated risk owner exists. |
 | 7. Audit, usage, job, incident ledgers, and detection signals | requires-prod-control | blocked | COA-199; durable-ledger/production-control unresolved | Blocks unless durable ledger and detection artifacts exist. |
 | 8. Rate limits, payload caps, abuse controls, origin protection, and alerting | requires-prod-control | blocked | COA-191; abuse enforcement/origin protection unresolved | Blocks unless enforcement and alert evidence exists. |
 | 9. Worker/model processor consent, spend caps, and job cancellation | requires-prod-control | blocked | COA-201; processor spend/job-cancel controls unresolved | Blocks unless consent, cap, pause/cancel evidence exists. |
@@ -364,7 +364,8 @@ when proceeding despite a gap.
 - job cancellation and queue drain;
 - processor consent/re-enable controls;
 - alerting and detection signals;
-- restore drills;
+- production Turso PITR, Neon control-plane recovery, and S3 Object Lock
+  restore drills;
 - legal-reviewed exposure/regulatory notices;
 - legal-hold policy and retention override decision;
 - customer contact-of-record and status-page process;
