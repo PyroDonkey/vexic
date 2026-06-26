@@ -21,20 +21,8 @@ The Vexic Console source lives in `console/` as a repo-local Next.js
 control-plane app. It is not Vexic package runtime, not a `vexic.*` entrypoint,
 and must not move under `src/vexic`; ADR 0012 keeps dashboard concerns outside
 the memory core. The Python core remains `uv`-managed at the repository root.
-The console is the only npm-managed slice, with its own `package.json` and
-`package-lock.json` under `console/`.
-
-For local console checks:
-
-```powershell
-cd console
-npm ci
-npm run build
-npm test
-```
-
-For Vercel, set the project root directory to `console/`, use Node `24.x` from
-`console/package.json`, and use `npm run build` as the build command.
+Do not add package-manager manifests, lockfiles, or alternate install/test
+flows under `console/` without an explicit repository policy change.
 
 ## Agent Workflow
 

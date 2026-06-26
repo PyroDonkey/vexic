@@ -7,25 +7,20 @@ package runtime and not a `vexic.*` entrypoint. Keep memory-core runtime under
 `src/vexic`; Console talks to hosted control-plane surfaces as a client.
 
 The control-plane API routes are stubs until hosted endpoints are live. The
-console is npm-managed here, while the repository root and Python core remain
-`uv`-managed.
+repository root and Python core remain `uv`-managed.
 
-## Local Build
+## Local Checks
 
 ```powershell
-npm ci
-npm run build
-npm test
+uv run pytest
 ```
 
-Run these commands from `console/`.
+Run repository checks from the repository root. This source slice does not carry
+its own package-manager manifest, lockfile, or alternate install/test flow.
 
 ## Vercel
 
 - Root directory: `console/`
-- Node version: `24.x`, from `package.json`
-- Install command: `npm ci`
-- Build command: `npm run build`
 
 ## Environment
 

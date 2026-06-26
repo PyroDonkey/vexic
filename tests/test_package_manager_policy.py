@@ -1,4 +1,3 @@
-import json
 from pathlib import Path
 
 
@@ -11,39 +10,38 @@ def test_root_remains_uv_managed() -> None:
     assert not (ROOT / "package-lock.json").exists()
 
 
-def test_console_is_standalone_npm_package() -> None:
-    manifest_path = CONSOLE / "package.json"
-    lockfile_path = CONSOLE / "package-lock.json"
+def test_console_does_not_define_package_manager_surface() -> None:
+    for filename in (
+        "package.json",
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "bun.lock",
+        "bun.lockb",
+    ):
+        assert not (CONSOLE / filename).exists()
 
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    lockfile = json.loads(lockfile_path.read_text(encoding="utf-8"))
 
-    assert manifest["private"] is True
-    assert manifest["scripts"]["build"] == "next build"
-    assert manifest["scripts"]["test"] == "node --test"
-    assert manifest["engines"]["node"] == "24.x"
+def test_readmes_do_not_document_console_npm_flows() -> None:
+    readmes = [
+        ROOT / "README.md",
+        CONSOLE / "README.md",
+    ]
+    forbidden_fragments = (
+        "console/package.json",
+        "package-lock.json",
+        "npm ci",
+        "npm install",
+        "npm run",
+        "npm test",
+        "npm-managed",
+    )
 
-    expected_dependencies = {
-        "@clerk/nextjs": "6.39.5",
-        "next": "16.2.9",
-        "react": "18.3.1",
-        "react-dom": "18.3.1",
-    }
-    expected_dev_dependencies = {
-        "@types/node": "20.17.58",
-        "@types/react": "18.3.25",
-        "@types/react-dom": "18.3.7",
-        "typescript": "5.9.3",
-    }
-
-    assert manifest["dependencies"] == expected_dependencies
-    assert manifest["devDependencies"] == expected_dev_dependencies
-    assert manifest["overrides"]["postcss"] == "8.5.15"
-
-    root_package = lockfile["packages"][""]
-    assert lockfile["lockfileVersion"] == 3
-    assert root_package["dependencies"] == expected_dependencies
-    assert root_package["devDependencies"] == expected_dev_dependencies
+    for readme in readmes:
+        text = readme.read_text(encoding="utf-8")
+        for fragment in forbidden_fragments:
+            assert fragment not in text
 
 
 def test_console_env_contract_is_documented() -> None:
