@@ -211,6 +211,39 @@ under the triggers above.
 - Keep generated docs ASCII unless an existing file has a clear reason to use
   non-ASCII.
 
+## Loop Bounds and Escalation
+
+- Stop after 3 failed verification cycles on the same target. Report the failure
+  to Ryan instead of retrying blindly.
+- No destructive retry loops. Do not reset, delete, or rewrite work to force a
+  passing run.
+- Escalate to Ryan on non-convergence. This is the same gate as the existing
+  "stop and report" rules in Branch Sync and the "wait for a decision" rule in
+  Working Rules; do not invent a new escalation path.
+- See `docs/agent-runbook.md` for the per-session run-audit practice and for
+  replay and debug detail.
+
+## Economics
+
+Token and cost discipline. There is no hard token budget enforced yet; this is
+guidance, not a gate.
+
+- Route by task class. Routine doc, lint, and test reads can use a cheaper
+  model. Architecture, contract, and memory-invariant changes use a frontier
+  model.
+- Prune stale tool output and large file dumps from context between
+  verification cycles. Do not carry an obsolete dump forward.
+
+## Execution Modes
+
+- Conductor mode is real-time interactive work with Ryan in the loop.
+- Orchestrator mode is async or delegated multi-agent work.
+- When decomposing, delegate independent work to subagents on disjoint files so
+  edits do not collide. Keep one writer per file.
+- The human-judgment boundary is unchanged: the "Ryan directs and reviews
+  architecture" rule in Working Rules is the defer-to-human gate. Delegated
+  agents do not settle architecture, contract, or boundary questions.
+
 ## Repository Workflow
 
 ### Branch Sync
@@ -311,6 +344,17 @@ rg -n "C[o]alescent|A[g]entOS|Telegram|Blog Writer|teammate|COA-" AGENTS.md docs
 rg -n "Linear" src/vexic tests
 ```
 
+Alongside the two SessionStart hooks (`.claude/hooks/check_doc_drift.py` and
+`.claude/hooks/check_branch_sync.py`), the `.claude/hooks/check_write_target.py`
+PreToolUse guard fails closed against Tier-1 `messages` mutation and against
+changes to the host-extension `background_tool_audit` table.
+
+Use `scripts/run_evals.py` as the eval runner for the LongMemEval datasets. It
+imports `vexic`, so run it with the editable install on path:
+`uv run --with-editable . python scripts/run_evals.py --dataset longmemeval_s_smoke.jsonl`.
+A bare `uv run python scripts/run_evals.py` fails with `ModuleNotFoundError`.
+See `docs/examples.md` for worked examples.
+
 Private source-host references are allowed in `docs/provenance.md` and compatibility
 sections. They should not become Vexic runtime instructions.
 Linear references are allowed as project-tracking workflow in `AGENTS.md`,
@@ -328,3 +372,5 @@ code.
 - If Ryan asks you to build something within the settled boundaries, build it.
 - Review generated code and docs honestly. Flag drift, missing tests, and
   boundary leaks plainly.
+- A recurring agent failure should drive a harness or rule fix, not just a
+  retry. See `docs/agent-runbook.md`.
