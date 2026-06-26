@@ -87,6 +87,48 @@ The stdio tool schemas cap `query` at 1000 characters, `limit` at 1-20 results,
 and privileged `expand_history` responses at 100 returned messages and 20000
 characters.
 
+### Native Agent Memory
+
+[ADR 0004](docs/adr/0004-native-agent-memory-is-host-integration-policy.md)
+treats runtime-native memory suppression as host integration policy. When Claude
+Code, Codex, or another local agent is connected to Vexic, disable that
+runtime's own durable memory where the runtime exposes a supported switch. Vexic
+core cannot prevent local runtime memory writes and must not grow Claude-,
+Codex-, or provider-specific suppression code.
+
+For Claude Code, disable auto memory in the settings layer used to launch the
+Vexic-connected agent:
+
+```json
+{
+  "autoMemoryEnabled": false
+}
+```
+
+Alternatively, launch Claude Code with `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`.
+`CLAUDE.md` files remain useful project instructions, but they are prompt
+context rather than storage enforcement.
+
+For Codex/local agents, keep Codex memories disabled for the Vexic profile. If a
+profile would otherwise enable memories, pin the Vexic profile off:
+
+```toml
+[features]
+memories = false
+
+[memories]
+generate_memories = false
+use_memories = false
+disable_on_external_context = true
+```
+
+If a runtime cannot disable native memory, Vexic is authoritative only for
+memory ingested through its own MCP, recorder, or importer path. Runtime-local
+memory remains outside Vexic replay, export, redaction, and deletion semantics.
+For the host transcript recorder flow, see
+[Claude Code Transcript Import](#claude-code-transcript-import) and
+[ADR 0002](docs/adr/0002-host-recorders-ingest-complete-cleaned-transcripts.md).
+
 ## Claude Code Transcript Import
 
 Import cleaned Claude Code JSONL transcript rows into a local Vexic database:
