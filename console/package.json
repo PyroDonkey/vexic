@@ -1,0 +1,25 @@
+{
+  "name": "vexic-console",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@clerk/nextjs": "6.39.5",
+    "next": "16.2.9",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "20.17.58",
+    "@types/react": "18.3.25",
+    "@types/react-dom": "18.3.7",
+    "typescript": "5.9.3"
+  },
+  "overrides": {
+    "postcss": "8.5.15"
+  }
+}

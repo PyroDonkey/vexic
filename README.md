@@ -17,6 +17,15 @@ Install and test with `uv`:
 uv run pytest
 ```
 
+The COA-230 console app lives in `console/`:
+
+```powershell
+cd console
+npm install
+npm test
+npm run build
+```
+
 ## Agent Workflow
 
 Agents should follow `AGENTS.md`: sync `main` and `dev` before edits, do all
