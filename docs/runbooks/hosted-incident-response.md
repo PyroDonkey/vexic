@@ -33,6 +33,9 @@ matches the tier and gate rule.
 - Classify up when unsure. Highest applicable severity wins.
 - Every real incident and tabletop has one named Incident Commander and one
   deputy or explicit deputy gap.
+- Default IC is Ryan or a named delegate.
+- IC owns severity, containment authorization, customer notification timing and
+  content, metadata-only evidence discipline, and follow-up todos.
 - If the IC caused or is implicated in the incident, record the conflict and
   require a delegate or secondary review.
 - When the IC is conflicted, delegate or secondary review must approve
@@ -40,6 +43,8 @@ matches the tier and gate rule.
   guidance, and final status acceptance.
 - IC authority does not permit raw memory access, customer processor re-enable,
   or bypass of containment rules.
+- Optional helper roles are evidence recorder, customer comms, and technical
+  lead.
 
 Evidence is metadata-only. Do not collect raw memory, transcript text, fact
 text, candidate text, prompt/tool bodies, retrieval query text, request bodies,
@@ -95,12 +100,16 @@ purge promises, and compliance claims.
    - Assign IC, deputy, severity, and metadata-only evidence recorder.
    - Start a timeline with fake-safe or redacted identifiers.
 2. Contain first.
+   - Use tenant as the default containment unit. Projects are scope filters
+     inside the Customer Memory Database.
    - Block affected tenant route when routing integrity is suspect.
    - Revoke scoped keys for credential compromise or unclear key exposure.
    - Pause/cancel processors or workers for unauthorized access or runaway
      spend.
    - Stop export/delete/admin egress for affected routes when exposure is in
      scope.
+   - Use bland maintenance/status responses for blocked customer routes. Do not
+     disclose routing or catalog internals.
 3. Preserve metadata-only evidence.
    - Collect allowed evidence, checksums, counts, audit ids, and control states.
    - Run forbidden-data checks on artifacts before sharing or storing.
@@ -112,7 +121,10 @@ purge promises, and compliance claims.
      processor access, failed/degraded restore, customer-visible processor
      pause, or customer-visible route maintenance.
 6. Recover.
-   - Unblock only after content-blind evidence passes.
+   - Unblock only after content-blind evidence passes: catalog handle, no
+     stale/orphan routable handles, database identity/schema/checkpoint, counts
+     and checksums, cross-tenant negative checks, scoped API smoke tests,
+     processor authorization state, and redacted audit trace.
    - Customer or authorized project admin re-enables processors.
 7. Close.
    - Record final status, evidence pointers, customer notices, follow-up todos,
@@ -134,6 +146,9 @@ purge promises, and compliance claims.
 | Tenant routing suspicion | SEV-2, SEV-1 if exposure likely | Block tenant route by default, stop reads/writes/egress, verify content-blind. |
 
 ## Scenario Playbooks
+
+Data exposure is not a standalone playbook. It is a shared
+escalation/notification path invoked by any playbook when criteria are met.
 
 ### Compromised Or Abused Agent API Key
 
@@ -160,7 +175,9 @@ purge promises, and compliance claims.
 1. Put affected tenant route in maintenance by default.
 2. Stop reads/search, writes, export/replay/rebuild/delete/admin egress.
 3. Verify catalog handle, database identity, schema/checkpoint, row counts,
-   checksums, and cross-tenant negative tests.
+   checksums, no stale/orphan routable handles, cross-tenant negative tests,
+   scoped API smoke tests, processor authorization state, and redacted audit
+   trace.
 4. Revoke keys only if credential exposure, abuse, or unclear key integrity is
    in scope.
 5. Unblock only after content-blind evidence passes and IC records approval.
@@ -300,6 +317,20 @@ a follow-up todo and leaves the gate blocked.
 ```
 
 ## Pre-Beta Security Review Checklist
+
+Status vocabulary:
+
+- `pass`: evidence satisfies the row with no known readiness caveat.
+- `pass-with-caveats`: not gate-green unless the caveat is explicitly
+  non-gating or has Ryan-approved risk acceptance.
+- `fail`: tested/evaluated and did not satisfy the row; blocks external beta
+  unless Ryan risk-accepts it in Linear or an ADR.
+- `blocked`: prerequisite work/tooling/drill is missing; blocks external beta
+  unless Ryan risk-accepts it in Linear or an ADR.
+
+Each review row must record status, evidence pointer, owner issue,
+notes/caveat, follow-up todo when not a clean pass, and risk-acceptance pointer
+when proceeding despite a gap.
 
 | Row | Evidence tier | Current default status | Owner/evidence | Gate rule |
 | --- | --- | --- | --- | --- |
