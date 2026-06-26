@@ -24,7 +24,11 @@ def _load_hook() -> ModuleType:
     return module
 
 
-def _run(monkeypatch, capsys, event: dict[str, object]) -> dict[str, object]:
+def _run(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    event: dict[str, object],
+) -> dict[str, object]:
     hook = _load_hook()
     monkeypatch.setattr("sys.stdin", _Stdin(json.dumps(event)))
     assert hook.main() == 0
@@ -85,7 +89,11 @@ ALLOW_COMMANDS = [
 
 
 @pytest.mark.parametrize("command", DENY_COMMANDS)
-def test_denies_invariant_violations(monkeypatch, capsys, command: str) -> None:
+def test_denies_invariant_violations(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+) -> None:
     payload = _run(monkeypatch, capsys, _bash(command))
     assert _decision(payload) == "deny"
     reason = payload["hookSpecificOutput"]["permissionDecisionReason"]  # type: ignore[index]
@@ -93,12 +101,19 @@ def test_denies_invariant_violations(monkeypatch, capsys, command: str) -> None:
 
 
 @pytest.mark.parametrize("command", ALLOW_COMMANDS)
-def test_allows_safe_commands(monkeypatch, capsys, command: str) -> None:
+def test_allows_safe_commands(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+) -> None:
     payload = _run(monkeypatch, capsys, _bash(command))
     assert _decision(payload) is None
 
 
-def test_ignores_non_bash_tools(monkeypatch, capsys) -> None:
+def test_ignores_non_bash_tools(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     event = {
         "tool_name": "Edit",
         "tool_input": {"file_path": "f", "old_string": "DELETE FROM messages"},
@@ -107,7 +122,10 @@ def test_ignores_non_bash_tools(monkeypatch, capsys) -> None:
     assert _decision(payload) is None
 
 
-def test_empty_or_malformed_input_allows(monkeypatch, capsys) -> None:
+def test_empty_or_malformed_input_allows(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     assert _run(monkeypatch, capsys, {}) == {}
     assert _run(monkeypatch, capsys, {"tool_name": "Bash"}) == {}
     assert (
