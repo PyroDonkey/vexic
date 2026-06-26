@@ -123,8 +123,8 @@ disable_on_external_context = true
 ```
 
 If a runtime cannot disable native memory, Vexic is authoritative only for
-memory ingested through its own MCP, recorder, or importer path. Runtime-local
-memory remains outside Vexic replay, export, redaction, and deletion semantics.
+memory ingested through its recorder or importer path. Runtime-local memory
+remains outside Vexic replay, export, redaction, and deletion semantics.
 For the host transcript recorder flow, see
 [Claude Code Transcript Import](#claude-code-transcript-import) and
 [ADR 0002](docs/adr/0002-host-recorders-ingest-complete-cleaned-transcripts.md).

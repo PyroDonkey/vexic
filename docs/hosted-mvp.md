@@ -160,9 +160,9 @@ this as host integration policy, not Vexic core behavior: Vexic cannot stop
 Claude Code, Codex, or another runtime from writing its own local memory. Use
 the local setup guidance in
 [README.md](../README.md#native-agent-memory); if suppression is unavailable,
-treat Vexic as authoritative only for memory that reaches the Vexic MCP,
-recorder, or importer path. The Claude Code host transcript recorder flow is
-documented in
+treat Vexic as authoritative only for memory that reaches Vexic through the
+hosted HTTP append route, recorder, or importer path. The Claude Code host
+transcript recorder flow is documented in
 [README.md](../README.md#claude-code-transcript-import) and
 [ADR 0002](adr/0002-host-recorders-ingest-complete-cleaned-transcripts.md).
 
