@@ -1,10 +1,18 @@
+import json
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CONSOLE = ROOT / "console"
 
 
-def test_next_env_does_not_import_ignored_next_output() -> None:
-    text = (ROOT / "console" / "next-env.d.ts").read_text(encoding="utf-8")
+def test_next_env_uses_committed_next_type_references() -> None:
+    text = (CONSOLE / "next-env.d.ts").read_text(encoding="utf-8")
+    tsconfig = json.loads((CONSOLE / "tsconfig.json").read_text(encoding="utf-8"))
 
-    assert "./.next/" not in text
+    assert '/// <reference types="next" />' in text
+    assert '/// <reference types="next/image-types/global" />' in text
+    assert ".next/" not in text
+    assert "import " not in text
+    assert ".next/types/**/*.ts" in tsconfig["include"]
+    assert ".next/dev/types/**/*.ts" in tsconfig["include"]
