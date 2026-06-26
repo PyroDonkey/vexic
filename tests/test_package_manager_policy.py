@@ -51,12 +51,17 @@ def test_console_env_contract_is_documented() -> None:
     for name in (
         "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY",
         "CLERK_SECRET_KEY",
-        "VEXIC_HOSTED_API_BASE_URL",
         "NEXT_PUBLIC_CLERK_SIGN_IN_URL",
         "NEXT_PUBLIC_CLERK_SIGN_UP_URL",
         "NEXT_PUBLIC_CLERK_AFTER_SIGN_IN_URL",
         "NEXT_PUBLIC_CLERK_AFTER_SIGN_UP_URL",
         "VEXIC_INTERNAL_ORG_ID",
+        "VEXIC_HOSTED_API_BASE_URL",
     ):
         assert name in env_example
         assert name in console_readme
+
+    required_section = console_readme.split("Route defaults:", 1)[0]
+    assert "VEXIC_HOSTED_API_BASE_URL" not in required_section
+    assert "Reserved until hosted endpoints are wired:" in console_readme
+    assert "Reserved until hosted control-plane endpoints are wired." in env_example

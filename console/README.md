@@ -28,7 +28,6 @@ Required:
 
 - `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`
 - `CLERK_SECRET_KEY`
-- `VEXIC_HOSTED_API_BASE_URL`
 
 Route defaults:
 
@@ -40,3 +39,7 @@ Route defaults:
 Internal support:
 
 - `VEXIC_INTERNAL_ORG_ID`
+
+Reserved until hosted endpoints are wired:
+
+- `VEXIC_HOSTED_API_BASE_URL`
