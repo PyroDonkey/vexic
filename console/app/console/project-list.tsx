@@ -41,6 +41,7 @@ export default function ProjectList() {
     }
 
     const data = (await response.json()) as { project: Project };
+    setStatus("");
     setName("");
     setProjects((current) => [data.project, ...current.filter((project) => project.id !== data.project.id)]);
     router.push(`/console/projects/${data.project.id}`);
