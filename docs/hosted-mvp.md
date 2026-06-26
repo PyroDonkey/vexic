@@ -153,6 +153,19 @@ headers:
   X-Vexic-Agent-Id: agent-a  # optional
 ```
 
+Before pointing an agent runtime at hosted Vexic, suppress that runtime's
+native durable memory where possible.
+[ADR 0004](adr/0004-native-agent-memory-is-host-integration-policy.md) defines
+this as host integration policy, not Vexic core behavior: Vexic cannot stop
+Claude Code, Codex, or another runtime from writing its own local memory. Use
+the local setup guidance in
+[README.md](../README.md#native-agent-memory); if suppression is unavailable,
+treat Vexic as authoritative only for memory that reaches Vexic through the
+hosted HTTP append route, recorder, or importer path. The Claude Code host
+transcript recorder flow is documented in
+[README.md](../README.md#claude-code-transcript-import) and
+[ADR 0002](adr/0002-host-recorders-ingest-complete-cleaned-transcripts.md).
+
 Smoke each configured client with the same sequence:
 
 1. `initialize` succeeds and returns protocol version `2025-11-25`.
