@@ -39,7 +39,10 @@ function ConsoleChrome({ children, controls }: { children: React.ReactNode; cont
   return (
     <div className="console-shell">
       <aside className="sidebar">
-        <div className="brand">Vexic Console</div>
+        <div className="brand">
+          <img src="/vexic-logo-reversed.svg" alt="Vexic" />
+          <span>Console</span>
+        </div>
         <nav aria-label="Console">
           <Link href="/console">Projects</Link>
           <Link href="/console/settings">Settings</Link>

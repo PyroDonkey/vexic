@@ -5,6 +5,7 @@ export default function HomePage() {
     <main className="landing">
       <section className="landing-hero">
         <div className="landing-copy">
+          <img className="landing-logo" src="/vexic-logo-reversed.svg" alt="Vexic" />
           <div className="eyebrow">Provenance-first memory control plane</div>
           <h1>Vexic Console</h1>
           <p>

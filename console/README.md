@@ -11,16 +11,28 @@ repository root and Python core remain `uv`-managed.
 
 ## Local Checks
 
+Run repository checks from the repository root:
+
 ```powershell
 uv run pytest
 ```
 
-Run repository checks from the repository root. This source slice does not carry
-its own package-manager manifest, lockfile, or alternate install/test flow.
+Run Console checks from this directory:
+
+```powershell
+npm install
+npm test
+npm run build
+```
+
+The npm package surface is scoped to `console/` for the Vercel app. It is not
+Vexic package runtime and is not part of the Python memory-engine install.
 
 ## Vercel
 
 - Root directory: `console/`
+- Framework preset: Next.js
+- Build command: `npm run build`
 
 ## Environment
 

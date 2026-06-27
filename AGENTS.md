@@ -198,7 +198,11 @@ under the triggers above.
 ## Development Rules
 
 - Python 3.13, managed with `uv`.
-- Install and test through `uv`; do not add a second package manager.
+- Install and test the Vexic memory core through `uv`; do not add a second
+  package manager to the core package.
+- The Vexic Console may use the isolated npm package surface in `console/` for
+  the Vercel Next.js app. Do not add Node package files at the repository root
+  or move Console runtime into `src/vexic`.
 - Type annotate new public functions and models.
 - Prefer Pydantic models and structured APIs over string parsing.
 - Keep code in focused modules that match the existing package boundaries.
