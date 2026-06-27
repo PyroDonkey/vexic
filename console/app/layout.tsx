@@ -1,8 +1,8 @@
 import type { Metadata } from "next";
-import { ClerkProvider } from "@clerk/nextjs";
 import { Geist, Geist_Mono } from "next/font/google";
 
 import "./globals.css";
+import { ClerkThemeProvider } from "@/components/clerk-theme-provider";
 import { ThemeProvider } from "@/components/theme-provider";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -27,7 +27,7 @@ export const metadata: Metadata = {
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
-  const body = isClerkConfigured() ? <ClerkProvider>{children}</ClerkProvider> : children;
+  const body = isClerkConfigured() ? <ClerkThemeProvider>{children}</ClerkThemeProvider> : children;
 
   return (
     <html lang="en" suppressHydrationWarning className={`${geistSans.variable} ${geistMono.variable}`}>

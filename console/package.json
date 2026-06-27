@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@clerk/nextjs": "6.39.5",
+    "@clerk/themes": "2.4.62",
     "class-variance-authority": "0.7.1",
     "clsx": "2.1.1",
     "lucide-react": "1.21.0",
