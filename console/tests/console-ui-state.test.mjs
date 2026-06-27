@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { dark } from "@clerk/themes";
+
+import { clerkBaseThemeFor } from "../lib/clerk-theme.mjs";
 import { projectCreateFailureMessage, usageMeterDisplay, usageRows } from "../lib/console-ui-state.mjs";
 
 test("project creation distinguishes missing organization from generic failures", () => {
@@ -39,4 +42,10 @@ test("usage meter display avoids invalid aria values", () => {
     ariaNow: 10,
     ariaText: "12 of 10 (over cap)"
   });
+});
+
+test("Clerk base theme follows the resolved app theme", () => {
+  assert.equal(clerkBaseThemeFor("dark"), dark);
+  assert.equal(clerkBaseThemeFor("light"), undefined);
+  assert.equal(clerkBaseThemeFor(undefined), undefined);
 });
