@@ -40,6 +40,10 @@ Required:
 
 - `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`
 - `CLERK_SECRET_KEY`
+- Clerk Organizations enabled, with user-created organizations allowed or at
+  least one organization created for the signed-in user. Console routes require
+  an active Clerk Organization; personal sessions cannot create Vexic projects
+  or agent keys.
 
 Route defaults:
 
@@ -55,3 +59,11 @@ Internal support:
 Reserved until hosted endpoints are wired:
 
 - `VEXIC_HOSTED_API_BASE_URL`
+
+## Stub Control Plane
+
+The current `/api/control-plane/*` routes use an in-memory store. Projects,
+usage, support metadata, and `vx_live_*` Agent API Keys are local stubs for
+Console smoke testing. Generated keys are shown once, can be revoked in the UI,
+and are not accepted by a durable hosted Vexic API until the production control
+plane is wired.
