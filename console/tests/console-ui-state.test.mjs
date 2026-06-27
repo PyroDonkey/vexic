@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { dark } from "@clerk/themes";
 
 import { clerkBaseThemeFor } from "../lib/clerk-theme.mjs";
 import { projectCreateFailureMessage, usageMeterDisplay, usageRows } from "../lib/console-ui-state.mjs";
+
+const root = fileURLToPath(new URL("..", import.meta.url));
 
 test("project creation distinguishes missing organization from generic failures", () => {
   assert.equal(projectCreateFailureMessage(403), "Project creation requires an active organization.");
@@ -48,4 +53,13 @@ test("Clerk base theme follows the resolved app theme", () => {
   assert.equal(clerkBaseThemeFor("dark"), dark);
   assert.equal(clerkBaseThemeFor("light"), undefined);
   assert.equal(clerkBaseThemeFor(undefined), undefined);
+});
+
+test("public Clerk theme APIs declare explicit types", () => {
+  const clerkThemeSource = readFileSync(path.join(root, "lib/clerk-theme.mjs"), "utf8");
+  const providerSource = readFileSync(path.join(root, "components/clerk-theme-provider.tsx"), "utf8");
+
+  assert.match(clerkThemeSource, /@param \{string \| undefined\} resolvedTheme/);
+  assert.match(clerkThemeSource, /@returns \{typeof dark \| undefined\}/);
+  assert.match(providerSource, /export function ClerkThemeProvider\(\{ children \}: \{ children: ReactNode \}\): ReactNode/);
 });

@@ -6,7 +6,7 @@ import { useEffect, useState, type ReactNode } from "react";
 
 import { clerkBaseThemeFor } from "@/lib/clerk-theme.mjs";
 
-export function ClerkThemeProvider({ children }: { children: ReactNode }) {
+export function ClerkThemeProvider({ children }: { children: ReactNode }): ReactNode {
   const [mounted, setMounted] = useState(false);
   const { resolvedTheme } = useTheme();
 
