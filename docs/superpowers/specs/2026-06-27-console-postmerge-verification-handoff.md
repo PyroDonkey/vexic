@@ -123,6 +123,6 @@ End your run with two clearly separated sections:
      not lose state (remount fix), and the usage meter reads correctly to a
      screen reader / has sane aria bounds (aria fix)
 
-Then update the tracking Linear issue (COA-243 or its successor) with the
-verification result and the manual-review list.
+Then update the downstream tracker with the verification result and the
+manual-review list.
 ```
