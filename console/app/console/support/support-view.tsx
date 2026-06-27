@@ -1,6 +1,11 @@
 "use client";
 
+import { LifeBuoy } from "lucide-react";
 import { useEffect, useState } from "react";
+
+import { Badge } from "@/components/ui/badge";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 
 type SupportRecord = {
   ticketId: string;
@@ -10,6 +15,8 @@ type SupportRecord = {
   createdAt: string;
   updatedAt: string;
 };
+
+const dateFormatter = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
 
 export default function SupportView() {
   const [records, setRecords] = useState<SupportRecord[]>([]);
@@ -31,36 +38,69 @@ export default function SupportView() {
   }, []);
 
   return (
-    <>
-      <header className="page-title">
-        <div>
-          <div className="eyebrow">Internal support</div>
-          <h1>Support metadata</h1>
-          <p className="muted">Ticket, organization, project, and timestamp metadata only.</p>
-        </div>
+    <div className="grid gap-6">
+      <header className="grid gap-1">
+        <Badge className="w-fit" variant="outline">
+          Internal support
+        </Badge>
+        <h1 className="text-2xl font-semibold text-foreground md:text-3xl">Support metadata</h1>
+        <p className="text-sm text-muted-foreground">Ticket, organization, project, and timestamp metadata only.</p>
       </header>
+
       {restricted ? (
-        <section className="notice">
-          <h2>Restricted</h2>
-          <p>Vexic-internal support access is required.</p>
-        </section>
+        <Card>
+          <CardHeader>
+            <CardTitle>Restricted</CardTitle>
+            <CardDescription>Vexic-internal support access is required.</CardDescription>
+          </CardHeader>
+        </Card>
       ) : (
-        <section className="panel">
-          {records.map((record) => (
-            <div className="metric-row" key={record.ticketId}>
-              <div>
-                <strong>{record.ticketId}</strong>
-                <div className="muted">{record.status}</div>
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <LifeBuoy className="size-4 text-primary" />
+              Support records
+            </CardTitle>
+            <CardDescription>No transcript, fact, search, or raw memory fields are exposed.</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {records.length === 0 ? (
+              <div className="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground">
+                No support records available.
               </div>
-              <div>
-                <code>{record.orgId}</code>
-                <div className="muted">{record.projectIds.length} projects</div>
-              </div>
-              <div className="muted">{record.updatedAt}</div>
-            </div>
-          ))}
-        </section>
+            ) : (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Ticket</TableHead>
+                    <TableHead>Organization</TableHead>
+                    <TableHead>Projects</TableHead>
+                    <TableHead>Status</TableHead>
+                    <TableHead>Updated</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {records.map((record) => (
+                    <TableRow key={record.ticketId}>
+                      <TableCell className="font-medium">{record.ticketId}</TableCell>
+                      <TableCell>
+                        <code>{record.orgId}</code>
+                      </TableCell>
+                      <TableCell>{record.projectIds.length}</TableCell>
+                      <TableCell>
+                        <Badge variant="secondary">{record.status}</Badge>
+                      </TableCell>
+                      <TableCell className="text-muted-foreground">
+                        {dateFormatter.format(new Date(record.updatedAt))}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            )}
+          </CardContent>
+        </Card>
       )}
-    </>
+    </div>
   );
 }

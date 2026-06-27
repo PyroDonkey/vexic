@@ -38,11 +38,11 @@ def test_console_defines_only_isolated_npm_package_surface() -> None:
         assert not (CONSOLE / filename).exists()
 
 
-def test_console_node_engine_pins_node_20_at_next_minimum() -> None:
+def test_console_node_engine_pins_node_22_lts_for_vercel() -> None:
     package = json.loads((CONSOLE / "package.json").read_text(encoding="utf-8"))
     package_lock = json.loads((CONSOLE / "package-lock.json").read_text(encoding="utf-8"))
 
-    expected_node_engine = ">=20.9.0 <21"
+    expected_node_engine = ">=22.0.0 <23"
     assert package["engines"]["node"] == expected_node_engine
     assert package_lock["packages"][""]["engines"]["node"] == expected_node_engine
 
