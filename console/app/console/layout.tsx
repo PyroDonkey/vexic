@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { FolderKanban, LifeBuoy, Menu, Settings } from "lucide-react";
-import { OrganizationSwitcher, UserButton } from "@clerk/nextjs";
+import { OrganizationList, OrganizationSwitcher, UserButton } from "@clerk/nextjs";
 
 import { ThemeToggle } from "@/components/theme-toggle";
 import { Badge } from "@/components/ui/badge";
@@ -10,6 +10,7 @@ import { Separator } from "@/components/ui/separator";
 import { Sheet, SheetClose, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
 import { readAuthContext } from "@/lib/auth";
 import { isClerkConfigured } from "@/lib/clerk-config";
+import { activeOrganizationListProps } from "@/lib/console-routes.mjs";
 
 // Vexic Console is repo-local control-plane UI, not memory-core runtime under src/vexic.
 export const dynamic = "force-dynamic";
@@ -146,7 +147,7 @@ function ActiveOrgRequired() {
         <CardDescription>Projects and Agent API Keys require an active Clerk Organization.</CardDescription>
       </CardHeader>
       <CardContent>
-        <OrganizationSwitcher hidePersonal />
+        <OrganizationList {...activeOrganizationListProps} />
       </CardContent>
     </Card>
   );

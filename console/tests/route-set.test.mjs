@@ -4,6 +4,8 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { activeOrganizationListProps } from "../lib/console-routes.mjs";
+
 const root = fileURLToPath(new URL("..", import.meta.url));
 
 const routes = [
@@ -26,4 +28,13 @@ test("project workspace route remounts client state per project", () => {
   const source = readFileSync(path.join(root, "app/console/projects/[projectId]/page.tsx"), "utf8");
 
   assert.match(source, /<ProjectWorkspace key=\{projectId\} projectId=\{projectId\} \/>/);
+});
+
+test("active organization gate offers organization creation", () => {
+  assert.deepEqual(activeOrganizationListProps, {
+    afterCreateOrganizationUrl: "/console",
+    afterSelectOrganizationUrl: "/console",
+    hidePersonal: true,
+    skipInvitationScreen: true
+  });
 });
