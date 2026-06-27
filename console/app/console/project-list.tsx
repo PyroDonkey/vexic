@@ -1,7 +1,17 @@
 "use client";
 
+import { FolderKanban, Plus, Rocket } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import { toast } from "sonner";
+
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { projectCreateFailureMessage } from "@/lib/console-ui-state.mjs";
 
 type Project = {
   id: string;
@@ -10,17 +20,27 @@ type Project = {
   createdAt: string;
 };
 
+const dateFormatter = new Intl.DateTimeFormat(undefined, { dateStyle: "medium" });
+type LoadState = "loading" | "ready" | "error";
+
 export default function ProjectList() {
   const router = useRouter();
   const [projects, setProjects] = useState<Project[]>([]);
   const [name, setName] = useState("");
   const [status, setStatus] = useState("");
+  const [loadState, setLoadState] = useState<LoadState>("loading");
 
   async function loadProjects() {
-    const response = await fetch("/api/control-plane/projects", { cache: "no-store" });
-    if (response.ok) {
+    try {
+      setLoadState("loading");
+      const response = await fetch("/api/control-plane/projects", { cache: "no-store" });
+      if (!response.ok) throw new Error(`Project list failed with ${response.status}`);
       const data = (await response.json()) as { projects: Project[] };
       setProjects(data.projects);
+      setLoadState("ready");
+    } catch {
+      setLoadState("error");
+      toast.error("Projects failed to load.");
     }
   }
 
@@ -29,14 +49,32 @@ export default function ProjectList() {
   }, []);
 
   async function createProject() {
-    const response = await fetch("/api/control-plane/projects", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ name })
-    });
+    const trimmedName = name.trim();
+    if (!trimmedName) return;
+
+    let response: Response;
+    try {
+      response = await fetch("/api/control-plane/projects", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: trimmedName })
+      });
+    } catch {
+      const message = projectCreateFailureMessage(500);
+      setStatus(message);
+      toast.error(message);
+      return;
+    }
 
     if (!response.ok) {
-      setStatus("Project creation requires an active organization.");
+      if (response.status === 403) {
+        setStatus("Project creation requires an active organization.");
+        toast.error("Project creation requires an active organization.");
+        return;
+      }
+      const message = projectCreateFailureMessage(response.status);
+      setStatus(message);
+      toast.error(message);
       return;
     }
 
@@ -44,49 +82,125 @@ export default function ProjectList() {
     setStatus("");
     setName("");
     setProjects((current) => [data.project, ...current.filter((project) => project.id !== data.project.id)]);
+    setLoadState("ready");
     router.push(`/console/projects/${data.project.id}`);
   }
 
   return (
-    <>
-      <header className="page-title">
-        <div>
-          <div className="eyebrow">Projects</div>
-          <h1>Project list</h1>
-          <p className="muted">Vexic-owned control-plane records under the active organization.</p>
+    <div className="grid gap-6">
+      <header className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+        <div className="grid gap-1">
+          <Badge className="w-fit" variant="outline">
+            Projects
+          </Badge>
+          <h1 className="text-2xl font-semibold text-foreground md:text-3xl">Project list</h1>
+          <p className="text-sm text-muted-foreground">
+            Vexic-owned control-plane records under the active organization.
+          </p>
         </div>
       </header>
 
-      <section className="grid">
-        <div className="panel">
-          <h2>Create project</h2>
-          <div className="form-row">
-            <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Project name" />
-            <button className="button" type="button" onClick={createProject}>
-              Create
-            </button>
-          </div>
-          {status ? <p className="muted">{status}</p> : null}
-        </div>
-        <div className="empty-state">
-          <h2>{projects.length === 0 ? "No projects yet" : `${projects.length} project${projects.length === 1 ? "" : "s"}`}</h2>
-          <p>Open a project workspace to manage agent keys, usage, and settings.</p>
-        </div>
-      </section>
+      <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_22rem]">
+        <Card>
+          <CardHeader>
+            <CardTitle>Create project</CardTitle>
+            <CardDescription>Add a project to the active Clerk Organization.</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <form
+              className="flex flex-col gap-3 sm:flex-row"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void createProject();
+              }}
+            >
+              <Input
+                aria-label="Project name"
+                value={name}
+                onChange={(event) => setName(event.target.value)}
+                placeholder="Project name"
+              />
+              <Button disabled={!name.trim()} type="submit">
+                <Plus />
+                Create
+              </Button>
+            </form>
+            {status ? <p className="mt-3 text-sm text-muted-foreground">{status}</p> : null}
+          </CardContent>
+        </Card>
 
-      <section className="panel" style={{ marginTop: 16 }}>
-        {projects.map((project) => (
-          <div className="project-row" key={project.id}>
-            <div>
-              <strong>{project.name}</strong>
-              <div className="muted">{project.environment}</div>
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Rocket className="size-4 text-primary" />
+              {loadState === "loading" ? (
+                <Skeleton className="h-5 w-28" />
+              ) : projects.length === 0 ? (
+                "No projects yet"
+              ) : (
+                `${projects.length} project${projects.length === 1 ? "" : "s"}`
+              )}
+            </CardTitle>
+            <CardDescription>Open a workspace to manage keys, usage, and settings.</CardDescription>
+          </CardHeader>
+        </Card>
+      </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <FolderKanban className="size-4 text-primary" />
+            Workspaces
+          </CardTitle>
+          <CardDescription>Project environments and creation dates.</CardDescription>
+        </CardHeader>
+        <CardContent>
+          {loadState === "loading" ? (
+            <div className="grid gap-3">
+              {Array.from({ length: 3 }, (_, index) => (
+                <Skeleton key={index} className="h-10 w-full" />
+              ))}
             </div>
-            <button className="button secondary" type="button" onClick={() => router.push(`/console/projects/${project.id}`)}>
-              Open
-            </button>
-          </div>
-        ))}
-      </section>
-    </>
+          ) : loadState === "error" ? (
+            <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-8 text-center text-sm text-destructive">
+              Projects could not be loaded. Refresh to try again.
+            </div>
+          ) : projects.length === 0 ? (
+            <div className="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground">
+              Create a project to start managing Agent API Keys.
+            </div>
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Name</TableHead>
+                  <TableHead>Environment</TableHead>
+                  <TableHead>Created</TableHead>
+                  <TableHead className="text-right">Action</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {projects.map((project) => (
+                  <TableRow key={project.id}>
+                    <TableCell className="font-medium">{project.name}</TableCell>
+                    <TableCell>
+                      <Badge variant="secondary">{project.environment}</Badge>
+                    </TableCell>
+                    <TableCell className="text-muted-foreground">
+                      {dateFormatter.format(new Date(project.createdAt))}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      <Button type="button" variant="outline" onClick={() => router.push(`/console/projects/${project.id}`)}>
+                        Open
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+        </CardContent>
+      </Card>
+    </div>
   );
 }

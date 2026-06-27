@@ -1,6 +1,20 @@
 "use client";
 
+import { Copy, KeyRound, ShieldCheck, SlidersHorizontal, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
+import { toast } from "sonner";
+
+import { BarList } from "@/components/tremor/bar-list";
+import { UsageMeter } from "@/components/tremor/usage-meter";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Separator } from "@/components/ui/separator";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { usageRows } from "@/lib/console-ui-state.mjs";
 
 type Project = {
   id: string;
@@ -19,11 +33,16 @@ type AgentKey = {
 };
 
 type Usage = {
+  periodStart: string;
+  periodEnd: string;
   totals: Record<string, number>;
   caps: Record<string, number>;
 };
 
 type Tab = "keys" | "usage" | "settings";
+type LoadState = "loading" | "ready" | "error";
+
+const dateFormatter = new Intl.DateTimeFormat(undefined, { dateStyle: "medium" });
 
 export default function ProjectWorkspace({ projectId }: { projectId: string }) {
   const [tab, setTab] = useState<Tab>("keys");
@@ -33,28 +52,49 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
   const [rawKey, setRawKey] = useState("");
   const [name, setName] = useState("");
   const [agentScope, setAgentScope] = useState("shared");
+  const [projectLoadState, setProjectLoadState] = useState<LoadState>("loading");
+  const [keysLoadState, setKeysLoadState] = useState<LoadState>("loading");
+  const [usageLoadState, setUsageLoadState] = useState<LoadState>("loading");
 
   async function loadProject() {
-    const response = await fetch(`/api/control-plane/projects/${projectId}`, { cache: "no-store" });
-    if (response.ok) {
+    try {
+      setProjectLoadState("loading");
+      const response = await fetch(`/api/control-plane/projects/${projectId}`, { cache: "no-store" });
+      if (!response.ok) throw new Error(`Project load failed with ${response.status}`);
       const data = (await response.json()) as { project: Project };
       setProject(data.project);
+      setProjectLoadState("ready");
+    } catch {
+      setProjectLoadState("error");
+      toast.error("Project details failed to load.");
     }
   }
 
   async function loadKeys() {
-    const response = await fetch(`/api/control-plane/projects/${projectId}/keys`, { cache: "no-store" });
-    if (response.ok) {
+    try {
+      setKeysLoadState("loading");
+      const response = await fetch(`/api/control-plane/projects/${projectId}/keys`, { cache: "no-store" });
+      if (!response.ok) throw new Error(`Key list failed with ${response.status}`);
       const data = (await response.json()) as { keys: AgentKey[] };
       setKeys(data.keys);
+      setKeysLoadState("ready");
+    } catch {
+      setKeysLoadState("error");
+      toast.error("Agent API Keys failed to load.");
     }
   }
 
   async function loadUsage() {
-    const response = await fetch(`/api/control-plane/projects/${projectId}/usage`, { cache: "no-store" });
-    if (response.ok) {
+    try {
+      setUsageLoadState("loading");
+      const response = await fetch(`/api/control-plane/projects/${projectId}/usage`, { cache: "no-store" });
+      if (!response.ok) throw new Error(`Usage load failed with ${response.status}`);
       const data = (await response.json()) as { usage: Usage };
       setUsage(data.usage);
+      setUsageLoadState("ready");
+    } catch {
+      setUsageLoadState("error");
+      toast.error("Usage failed to load.");
     }
   }
 
@@ -65,114 +105,272 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
   }, [projectId]);
 
   async function createKey() {
-    const response = await fetch(`/api/control-plane/projects/${projectId}/keys`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ name, agentScope })
-    });
+    const trimmedName = name.trim();
+    if (!trimmedName) return;
 
-    if (!response.ok) return;
+    let response: Response;
+    try {
+      response = await fetch(`/api/control-plane/projects/${projectId}/keys`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: trimmedName, agentScope: agentScope.trim() || "shared" })
+      });
+    } catch {
+      toast.error("Agent API Key creation failed.");
+      return;
+    }
+
+    if (!response.ok) {
+      toast.error("Agent API Key creation failed.");
+      return;
+    }
 
     const data = (await response.json()) as { rawKey: string; key: AgentKey };
     setRawKey(data.rawKey);
     setKeys((current) => [data.key, ...current.filter((key) => key.id !== data.key.id)]);
+    setKeysLoadState("ready");
     setName("");
   }
 
   async function revokeKey(keyId: string) {
-    const response = await fetch(`/api/control-plane/projects/${projectId}/keys/${keyId}`, { method: "DELETE" });
-    if (response.ok) {
+    try {
+      const response = await fetch(`/api/control-plane/projects/${projectId}/keys/${keyId}`, { method: "DELETE" });
+      if (!response.ok) throw new Error(`Key revoke failed with ${response.status}`);
       setKeys((current) => current.filter((key) => key.id !== keyId));
+    } catch {
+      toast.error("Agent API Key revocation failed.");
     }
   }
 
+  async function copyRawKey() {
+    try {
+      await navigator.clipboard.writeText(rawKey);
+      toast.success("Raw key copied.");
+    } catch {
+      toast.error("Raw key could not be copied.");
+    }
+  }
+
+  const usageRowData = usage ? usageRows(usage) : [];
+
   return (
-    <>
-      <header className="page-title">
-        <div>
-          <div className="eyebrow">Project workspace</div>
-          <h1>{project?.name ?? "Project"}</h1>
-          <p className="muted">Manage machine credentials and aggregate operational limits.</p>
+    <div className="grid gap-6">
+      <header className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+        <div className="grid gap-1">
+          <Badge className="w-fit" variant="outline">
+            Project workspace
+          </Badge>
+          {projectLoadState === "loading" ? (
+            <Skeleton className="h-8 w-48" />
+          ) : (
+            <h1 className="text-2xl font-semibold text-foreground md:text-3xl">{project?.name ?? "Project"}</h1>
+          )}
+          <p className="text-sm text-muted-foreground">Manage machine credentials and aggregate operational limits.</p>
         </div>
+        <Badge className="w-fit" variant="secondary">
+          {project?.environment ?? "production"}
+        </Badge>
       </header>
 
-      <div className="tabs" role="tablist" aria-label="Project workspace tabs">
-        <button className="tab" type="button" aria-selected={tab === "keys"} onClick={() => setTab("keys")}>
-          Agent API Keys
-        </button>
-        <button className="tab" type="button" aria-selected={tab === "usage"} onClick={() => setTab("usage")}>
-          Usage & Caps
-        </button>
-        <button className="tab" type="button" aria-selected={tab === "settings"} onClick={() => setTab("settings")}>
-          Project Settings
-        </button>
-      </div>
+      <Tabs value={tab} onValueChange={(value) => setTab(value as Tab)}>
+        <TabsList>
+          <TabsTrigger value="keys">
+            <KeyRound />
+            Agent API Keys
+          </TabsTrigger>
+          <TabsTrigger value="usage">
+            <ShieldCheck />
+            Usage & Caps
+          </TabsTrigger>
+          <TabsTrigger value="settings">
+            <SlidersHorizontal />
+            Project Settings
+          </TabsTrigger>
+        </TabsList>
 
-      {tab === "keys" ? (
-        <section className="panel">
-          <h2>Agent API Keys</h2>
-          <div className="form-row">
-            <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Key name" />
-            <input value={agentScope} onChange={(event) => setAgentScope(event.target.value)} placeholder="Agent scope" />
-            <button className="button" type="button" onClick={createKey}>
-              Create
-            </button>
-          </div>
-          {rawKey ? (
-            <div className="raw-key" role="status">
-              <strong>Raw key</strong>
-              <p>This value will not appear in the list again.</p>
-              <code>{rawKey}</code>
-              <div className="actions">
-                <button className="button secondary" type="button" onClick={() => setRawKey("")}>
-                  Dismiss
-                </button>
-              </div>
-            </div>
-          ) : null}
-          {keys.map((key) => (
-            <div className="key-row" key={key.id}>
-              <div>
-                <strong>{key.name}</strong>
-                <div className="muted">
-                  {key.capability} · {key.agentScope} · <code>{key.display}</code>
+        <TabsContent value="keys" className="grid gap-4">
+          <Card>
+            <CardHeader>
+              <CardTitle>Create Agent API Key</CardTitle>
+              <CardDescription>The raw key is shown once and never returned by list responses.</CardDescription>
+            </CardHeader>
+            <CardContent className="grid gap-4">
+              <form
+                className="grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(12rem,16rem)_auto]"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void createKey();
+                }}
+              >
+                <Input
+                  aria-label="Key name"
+                  value={name}
+                  onChange={(event) => setName(event.target.value)}
+                  placeholder="Key name"
+                />
+                <Input
+                  aria-label="Agent scope"
+                  value={agentScope}
+                  onChange={(event) => setAgentScope(event.target.value)}
+                  placeholder="Agent scope"
+                />
+                <Button disabled={!name.trim()} type="submit">
+                  <KeyRound />
+                  Create
+                </Button>
+              </form>
+
+              {rawKey ? (
+                <div className="grid gap-3 rounded-lg border border-primary/30 bg-primary/10 p-4" role="status">
+                  <div>
+                    <strong className="text-sm">Raw key</strong>
+                    <p className="text-sm text-muted-foreground">This value will not appear in the list again.</p>
+                  </div>
+                  <code className="block overflow-x-auto rounded-md bg-background/80 px-3 py-2 text-xs">{rawKey}</code>
+                  <div className="flex flex-wrap gap-2">
+                    <Button className="w-fit" type="button" variant="outline" onClick={copyRawKey}>
+                      <Copy />
+                      Copy
+                    </Button>
+                    <Button className="w-fit" type="button" variant="outline" onClick={() => setRawKey("")}>
+                      Dismiss
+                    </Button>
+                  </div>
                 </div>
-              </div>
-              <button className="button danger" type="button" onClick={() => revokeKey(key.id)}>
-                Revoke
-              </button>
-            </div>
-          ))}
-        </section>
-      ) : null}
+              ) : null}
+            </CardContent>
+          </Card>
 
-      {tab === "usage" ? (
-        <section className="metrics">
-          {usage
-            ? Object.entries(usage.totals).map(([label, value]) => (
-                <div className="metric" key={label}>
-                  <span className="muted">{label}</span>
-                  <strong>{value}</strong>
-                  <span className="muted">cap {usage.caps[label]}</span>
+          <Card>
+            <CardHeader>
+              <CardTitle>Active keys</CardTitle>
+              <CardDescription>List and revoke project-scoped credentials.</CardDescription>
+            </CardHeader>
+            <CardContent>
+              {keysLoadState === "loading" ? (
+                <div className="grid gap-3">
+                  {Array.from({ length: 3 }, (_, index) => (
+                    <Skeleton key={index} className="h-10 w-full" />
+                  ))}
                 </div>
-              ))
-            : null}
-        </section>
-      ) : null}
+              ) : keysLoadState === "error" ? (
+                <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-8 text-center text-sm text-destructive">
+                  Agent API Keys could not be loaded. Refresh to try again.
+                </div>
+              ) : keys.length === 0 ? (
+                <div className="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground">
+                  No active keys for this project.
+                </div>
+              ) : (
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Name</TableHead>
+                      <TableHead>Capability</TableHead>
+                      <TableHead>Display</TableHead>
+                      <TableHead>Created</TableHead>
+                      <TableHead className="text-right">Action</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {keys.map((key) => (
+                      <TableRow key={key.id}>
+                        <TableCell>
+                          <div className="font-medium">{key.name}</div>
+                          <div className="text-xs text-muted-foreground">{key.agentScope}</div>
+                        </TableCell>
+                        <TableCell>
+                          <Badge variant="secondary">{key.capability}</Badge>
+                        </TableCell>
+                        <TableCell>
+                          <code>{key.display}</code>
+                        </TableCell>
+                        <TableCell className="text-muted-foreground">
+                          {dateFormatter.format(new Date(key.createdAt))}
+                        </TableCell>
+                        <TableCell className="text-right">
+                          <Button type="button" variant="destructive" onClick={() => revokeKey(key.id)}>
+                            <Trash2 />
+                            Revoke
+                          </Button>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
 
-      {tab === "settings" ? (
-        <section className="panel">
-          <h2>Project Settings</h2>
-          <div className="metric-row">
-            <span className="muted">Project ID</span>
-            <code>{projectId}</code>
-          </div>
-          <div className="metric-row">
-            <span className="muted">Environment</span>
-            <strong>{project?.environment ?? "production"}</strong>
-          </div>
-        </section>
-      ) : null}
-    </>
+        <TabsContent value="usage">
+          <Card>
+            <CardHeader>
+              <CardTitle>Usage & Caps</CardTitle>
+              <CardDescription>
+                {usage
+                  ? `${dateFormatter.format(new Date(usage.periodStart))} to ${dateFormatter.format(new Date(usage.periodEnd))}`
+                  : "Aggregate telemetry for the current period."}
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="grid gap-5 md:grid-cols-2">
+              {usageLoadState === "loading" ? (
+                <>
+                  <Skeleton className="h-16 w-full" />
+                  <Skeleton className="h-16 w-full" />
+                </>
+              ) : usageLoadState === "error" ? (
+                <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-8 text-center text-sm text-destructive md:col-span-2">
+                  Usage could not be loaded. Refresh to try again.
+                </div>
+              ) : usageRowData.length > 0 ? (
+                <>
+                  <div className="grid gap-3 md:col-span-2">
+                    <div>
+                      <h3 className="text-sm font-medium">Metric totals</h3>
+                      <p className="text-sm text-muted-foreground">Current-period activity by metric.</p>
+                    </div>
+                    <BarList
+                      data={usageRowData.map((row) => ({ key: row.key, name: row.label, value: row.value }))}
+                    />
+                  </div>
+                  {usageRowData.map((row) => (
+                    <UsageMeter key={row.key} label={row.label} max={row.max} value={row.value} />
+                  ))}
+                </>
+              ) : (
+                <div className="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground md:col-span-2">
+                  No usage recorded for this period.
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="settings">
+          <Card>
+            <CardHeader>
+              <CardTitle>Project Settings</CardTitle>
+              <CardDescription>Read-only project identity for the local control-plane slice.</CardDescription>
+            </CardHeader>
+            <CardContent className="grid gap-4">
+              <div className="grid gap-1">
+                <span className="text-sm text-muted-foreground">Project ID</span>
+                <code>{projectId}</code>
+              </div>
+              <Separator />
+              <div className="grid gap-1">
+                <span className="text-sm text-muted-foreground">Environment</span>
+                {projectLoadState === "error" ? (
+                  <span className="text-sm text-destructive">Project details could not be loaded.</span>
+                ) : (
+                  <strong>{project?.environment ?? "production"}</strong>
+                )}
+              </div>
+            </CardContent>
+          </Card>
+        </TabsContent>
+      </Tabs>
+    </div>
   );
 }
