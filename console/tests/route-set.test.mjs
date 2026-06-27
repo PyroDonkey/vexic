@@ -27,3 +27,10 @@ test("project workspace route remounts client state per project", () => {
 
   assert.match(source, /<ProjectWorkspace key=\{projectId\} projectId=\{projectId\} \/>/);
 });
+
+test("active organization gate offers organization creation", () => {
+  const source = readFileSync(path.join(root, "app/console/layout.tsx"), "utf8");
+
+  assert.match(source, /<OrganizationList/);
+  assert.match(source, /afterCreateOrganizationUrl="\/console"/);
+});

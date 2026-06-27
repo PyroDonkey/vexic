@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { FolderKanban, LifeBuoy, Menu, Settings } from "lucide-react";
-import { OrganizationSwitcher, UserButton } from "@clerk/nextjs";
+import { OrganizationList, OrganizationSwitcher, UserButton } from "@clerk/nextjs";
 
 import { ThemeToggle } from "@/components/theme-toggle";
 import { Badge } from "@/components/ui/badge";
@@ -146,7 +146,12 @@ function ActiveOrgRequired() {
         <CardDescription>Projects and Agent API Keys require an active Clerk Organization.</CardDescription>
       </CardHeader>
       <CardContent>
-        <OrganizationSwitcher hidePersonal />
+        <OrganizationList
+          afterCreateOrganizationUrl="/console"
+          afterSelectOrganizationUrl="/console"
+          hidePersonal
+          skipInvitationScreen
+        />
       </CardContent>
     </Card>
   );
