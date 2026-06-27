@@ -63,3 +63,10 @@ test("public Clerk theme APIs declare explicit types", () => {
   assert.match(clerkThemeSource, /@returns \{typeof dark \| undefined\}/);
   assert.match(providerSource, /export function ClerkThemeProvider\(\{ children \}: \{ children: ReactNode \}\): ReactNode/);
 });
+
+test("Clerk theme provider keeps children rendered while theme resolves", () => {
+  const providerSource = readFileSync(path.join(root, "components/clerk-theme-provider.tsx"), "utf8");
+
+  assert.doesNotMatch(providerSource, /return null;/);
+  assert.match(providerSource, /<ClerkProvider[\s\S]*\{children\}[\s\S]*<\/ClerkProvider>/);
+});
