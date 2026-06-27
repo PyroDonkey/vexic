@@ -11,7 +11,7 @@ internal-alpha read-only HTTP MCP adapter are the narrow in-scope MCP slices.
 
 ## Running the Project
 
-Install and test with `uv`:
+Install and test the Python memory core with `uv`:
 
 ```powershell
 uv run pytest
@@ -20,9 +20,12 @@ uv run pytest
 The Vexic Console source lives in `console/` as a repo-local Next.js
 control-plane app. It is not Vexic package runtime, not a `vexic.*` entrypoint,
 and must not move under `src/vexic`; ADR 0012 keeps dashboard concerns outside
-the memory core. The Python core remains `uv`-managed at the repository root.
-Do not add package-manager manifests, lockfiles, or alternate install/test
-flows under `console/` without an explicit repository policy change.
+the memory core. The repository root remains `uv`-managed.
+
+For Vercel, Console may carry the isolated npm build contract in
+`console/package.json` and `console/package-lock.json`. Do not add Node package
+files at the repository root, and do not treat Console dependencies as memory
+engine install requirements.
 
 ## Agent Workflow
 

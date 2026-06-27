@@ -12,7 +12,7 @@ def test_next_env_uses_committed_next_type_references() -> None:
 
     assert '/// <reference types="next" />' in text
     assert '/// <reference types="next/image-types/global" />' in text
-    assert ".next/" not in text
-    assert "import " not in text
+    assert 'import "./.next/types/routes.d.ts";' in text
+    assert ".next/dev/" not in text
     assert ".next/types/**/*.ts" in tsconfig["include"]
     assert ".next/dev/types/**/*.ts" in tsconfig["include"]

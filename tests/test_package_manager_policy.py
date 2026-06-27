@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 
@@ -6,11 +7,6 @@ CONSOLE = ROOT / "console"
 
 
 def test_root_remains_uv_managed() -> None:
-    assert not (ROOT / "package.json").exists()
-    assert not (ROOT / "package-lock.json").exists()
-
-
-def test_console_does_not_define_package_manager_surface() -> None:
     for filename in (
         "package.json",
         "package-lock.json",
@@ -20,28 +16,42 @@ def test_console_does_not_define_package_manager_surface() -> None:
         "bun.lock",
         "bun.lockb",
     ):
+        assert not (ROOT / filename).exists()
+
+
+def test_console_defines_only_isolated_npm_package_surface() -> None:
+    assert (CONSOLE / "package.json").exists()
+    assert (CONSOLE / "package-lock.json").exists()
+
+    package = json.loads((CONSOLE / "package.json").read_text(encoding="utf-8"))
+    assert package["private"] is True
+    assert package["name"] == "vexic-console"
+    assert set(package["scripts"]) == {"dev", "build", "start", "test"}
+
+    for filename in (
+        "npm-shrinkwrap.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "bun.lock",
+        "bun.lockb",
+    ):
         assert not (CONSOLE / filename).exists()
 
 
-def test_readmes_do_not_document_console_npm_flows() -> None:
-    readmes = [
-        ROOT / "README.md",
-        CONSOLE / "README.md",
-    ]
-    forbidden_fragments = (
-        "console/package.json",
-        "package-lock.json",
-        "npm ci",
-        "npm install",
-        "npm run",
-        "npm test",
-        "npm-managed",
-    )
+def test_readmes_scope_console_npm_flows_away_from_core_runtime() -> None:
+    root_readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    console_readme = (CONSOLE / "README.md").read_text(encoding="utf-8")
+    compact_console_readme = " ".join(console_readme.split())
 
-    for readme in readmes:
-        text = readme.read_text(encoding="utf-8")
-        for fragment in forbidden_fragments:
-            assert fragment not in text
+    assert "repository root remains `uv`-managed" in root_readme
+    assert "`console/package.json`" in root_readme
+    assert "not Vexic package runtime" in root_readme
+    assert "Install and test the Python memory core with `uv`" in root_readme
+
+    assert "Root directory: `console/`" in console_readme
+    assert "npm install" in console_readme
+    assert "npm run build" in console_readme
+    assert "not Vexic package runtime" in compact_console_readme
 
 
 def test_console_env_contract_is_documented() -> None:
