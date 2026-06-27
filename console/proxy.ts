@@ -9,5 +9,5 @@ export default clerkMiddleware(async (auth, request) => {
 });
 
 export const config = {
-  matcher: ["/console/:path*", "/api/control-plane/:path*"]
+  matcher: ["/console/:path*", "/api/control-plane/:path*", "/__clerk/:path*"]
 };

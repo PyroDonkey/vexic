@@ -38,6 +38,15 @@ def test_console_defines_only_isolated_npm_package_surface() -> None:
         assert not (CONSOLE / filename).exists()
 
 
+def test_console_node_engine_pins_node_20_at_next_minimum() -> None:
+    package = json.loads((CONSOLE / "package.json").read_text(encoding="utf-8"))
+    package_lock = json.loads((CONSOLE / "package-lock.json").read_text(encoding="utf-8"))
+
+    expected_node_engine = ">=20.9.0 <21"
+    assert package["engines"]["node"] == expected_node_engine
+    assert package_lock["packages"][""]["engines"]["node"] == expected_node_engine
+
+
 def test_readmes_scope_console_npm_flows_away_from_core_runtime() -> None:
     root_readme = (ROOT / "README.md").read_text(encoding="utf-8")
     console_readme = (CONSOLE / "README.md").read_text(encoding="utf-8")
