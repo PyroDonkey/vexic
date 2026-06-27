@@ -1,8 +1,7 @@
 export const consoleHomePath = "/console";
 
-export const activeOrganizationListProps = {
+export const activeOrganizationCreateProps = /** @type {const} */ ({
   afterCreateOrganizationUrl: consoleHomePath,
-  afterSelectOrganizationUrl: consoleHomePath,
-  hidePersonal: true,
+  routing: "hash",
   skipInvitationScreen: true
-};
+});
