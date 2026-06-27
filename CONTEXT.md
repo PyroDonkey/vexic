@@ -46,6 +46,16 @@ The human account/team boundary represented by a Clerk Organization in the
 Vexic Console.
 _Avoid_: Memory scope, customer memory database
 
+**Customer Account Mapping**:
+The hosted control-plane relationship that links a Customer Account to
+Vexic-owned customer and tenant identity.
+_Avoid_: Clerk organization as memory tenant id, passive tenant provisioning
+
+**Customer Bootstrap**:
+The intentional first-write workflow that creates a Customer Account Mapping,
+Customer Memory Database handle, and first Project for a Customer Account.
+_Avoid_: Page-load provisioning, operator-only account setup
+
 **Project**:
 A Vexic-owned control-plane record under a Customer Account that maps human
 configuration to hosted API project scope.
@@ -55,6 +65,12 @@ _Avoid_: Clerk organization, memory database
 A Vexic-owned machine credential minted by the hosted API for agent access to
 project-scoped memory capabilities.
 _Avoid_: Clerk API key, human session
+
+**Console Service Credential**:
+A Vexic-owned control-plane credential that lets the Vexic Console call hosted
+control-plane routes as the Console service while carrying server-derived human
+and organization context.
+_Avoid_: Agent API Key, Clerk API key, human session
 
 **Support View**:
 The Vexic Console surface for account, project, key, usage, audit, job, and

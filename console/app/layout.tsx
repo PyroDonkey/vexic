@@ -6,7 +6,10 @@ import { isClerkConfigured } from "@/lib/clerk-config";
 
 export const metadata: Metadata = {
   title: "Vexic Console",
-  description: "Control plane for Vexic projects, agent keys, usage, and support."
+  description: "Control plane for Vexic projects, agent keys, usage, and support.",
+  icons: {
+    icon: "/favicon.svg"
+  }
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
