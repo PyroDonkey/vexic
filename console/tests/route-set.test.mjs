@@ -4,7 +4,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { activeOrganizationListProps } from "../lib/console-routes.mjs";
+import { activeOrganizationCreateProps } from "../lib/console-routes.mjs";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 
@@ -30,11 +30,10 @@ test("project workspace route remounts client state per project", () => {
   assert.match(source, /<ProjectWorkspace key=\{projectId\} projectId=\{projectId\} \/>/);
 });
 
-test("active organization gate offers organization creation", () => {
-  assert.deepEqual(activeOrganizationListProps, {
-    afterCreateOrganizationUrl: "/console",
-    afterSelectOrganizationUrl: "/console",
-    hidePersonal: true,
+test("active organization creation redirects through a fresh server render", () => {
+  assert.deepEqual(activeOrganizationCreateProps, {
+    afterCreateOrganizationUrl: "/console?orgCreated=1",
+    routing: "hash",
     skipInvitationScreen: true
   });
 });
