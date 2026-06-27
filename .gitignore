@@ -37,6 +37,10 @@ node_modules/
 !.env.sample
 .claude/settings.local.json
 
+# Local agent tooling
+.claude/launch.json
+.codex/
+
 # Local SQLite memory databases and sidecar files
 *.db
 *.db-*
