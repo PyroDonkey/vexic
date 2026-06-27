@@ -4,6 +4,7 @@ import { Geist, Geist_Mono } from "next/font/google";
 
 import "./globals.css";
 import { ThemeProvider } from "@/components/theme-provider";
+import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { isClerkConfigured } from "@/lib/clerk-config";
 
@@ -32,7 +33,10 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="en" suppressHydrationWarning className={`${geistSans.variable} ${geistMono.variable}`}>
       <body>
         <ThemeProvider attribute="class" defaultTheme="dark" enableSystem>
-          <TooltipProvider>{body}</TooltipProvider>
+          <TooltipProvider>
+            {body}
+            <Toaster />
+          </TooltipProvider>
         </ThemeProvider>
       </body>
     </html>

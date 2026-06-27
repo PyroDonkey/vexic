@@ -3,12 +3,15 @@
 import { FolderKanban, Plus, Rocket } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { projectCreateFailureMessage } from "@/lib/console-ui-state.mjs";
 
 type Project = {
   id: string;
@@ -18,18 +21,26 @@ type Project = {
 };
 
 const dateFormatter = new Intl.DateTimeFormat(undefined, { dateStyle: "medium" });
+type LoadState = "loading" | "ready" | "error";
 
 export default function ProjectList() {
   const router = useRouter();
   const [projects, setProjects] = useState<Project[]>([]);
   const [name, setName] = useState("");
   const [status, setStatus] = useState("");
+  const [loadState, setLoadState] = useState<LoadState>("loading");
 
   async function loadProjects() {
-    const response = await fetch("/api/control-plane/projects", { cache: "no-store" });
-    if (response.ok) {
+    try {
+      setLoadState("loading");
+      const response = await fetch("/api/control-plane/projects", { cache: "no-store" });
+      if (!response.ok) throw new Error(`Project list failed with ${response.status}`);
       const data = (await response.json()) as { projects: Project[] };
       setProjects(data.projects);
+      setLoadState("ready");
+    } catch {
+      setLoadState("error");
+      toast.error("Projects failed to load.");
     }
   }
 
@@ -41,14 +52,29 @@ export default function ProjectList() {
     const trimmedName = name.trim();
     if (!trimmedName) return;
 
-    const response = await fetch("/api/control-plane/projects", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ name: trimmedName })
-    });
+    let response: Response;
+    try {
+      response = await fetch("/api/control-plane/projects", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: trimmedName })
+      });
+    } catch {
+      const message = projectCreateFailureMessage(500);
+      setStatus(message);
+      toast.error(message);
+      return;
+    }
 
     if (!response.ok) {
-      setStatus("Project creation requires an active organization.");
+      if (response.status === 403) {
+        setStatus("Project creation requires an active organization.");
+        toast.error("Project creation requires an active organization.");
+        return;
+      }
+      const message = projectCreateFailureMessage(response.status);
+      setStatus(message);
+      toast.error(message);
       return;
     }
 
@@ -56,6 +82,7 @@ export default function ProjectList() {
     setStatus("");
     setName("");
     setProjects((current) => [data.project, ...current.filter((project) => project.id !== data.project.id)]);
+    setLoadState("ready");
     router.push(`/console/projects/${data.project.id}`);
   }
 
@@ -106,7 +133,13 @@ export default function ProjectList() {
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <Rocket className="size-4 text-primary" />
-              {projects.length === 0 ? "No projects yet" : `${projects.length} project${projects.length === 1 ? "" : "s"}`}
+              {loadState === "loading" ? (
+                <Skeleton className="h-5 w-28" />
+              ) : projects.length === 0 ? (
+                "No projects yet"
+              ) : (
+                `${projects.length} project${projects.length === 1 ? "" : "s"}`
+              )}
             </CardTitle>
             <CardDescription>Open a workspace to manage keys, usage, and settings.</CardDescription>
           </CardHeader>
@@ -122,7 +155,17 @@ export default function ProjectList() {
           <CardDescription>Project environments and creation dates.</CardDescription>
         </CardHeader>
         <CardContent>
-          {projects.length === 0 ? (
+          {loadState === "loading" ? (
+            <div className="grid gap-3">
+              {Array.from({ length: 3 }, (_, index) => (
+                <Skeleton key={index} className="h-10 w-full" />
+              ))}
+            </div>
+          ) : loadState === "error" ? (
+            <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-8 text-center text-sm text-destructive">
+              Projects could not be loaded. Refresh to try again.
+            </div>
+          ) : projects.length === 0 ? (
             <div className="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground">
               Create a project to start managing Agent API Keys.
             </div>

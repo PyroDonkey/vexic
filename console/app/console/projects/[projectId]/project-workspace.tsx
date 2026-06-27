@@ -1,16 +1,20 @@
 "use client";
 
-import { KeyRound, ShieldCheck, SlidersHorizontal, Trash2 } from "lucide-react";
+import { Copy, KeyRound, ShieldCheck, SlidersHorizontal, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
+import { toast } from "sonner";
 
+import { BarList } from "@/components/tremor/bar-list";
 import { UsageMeter } from "@/components/tremor/usage-meter";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { usageRows } from "@/lib/console-ui-state.mjs";
 
 type Project = {
   id: string;
@@ -36,6 +40,7 @@ type Usage = {
 };
 
 type Tab = "keys" | "usage" | "settings";
+type LoadState = "loading" | "ready" | "error";
 
 const dateFormatter = new Intl.DateTimeFormat(undefined, { dateStyle: "medium" });
 
@@ -47,28 +52,49 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
   const [rawKey, setRawKey] = useState("");
   const [name, setName] = useState("");
   const [agentScope, setAgentScope] = useState("shared");
+  const [projectLoadState, setProjectLoadState] = useState<LoadState>("loading");
+  const [keysLoadState, setKeysLoadState] = useState<LoadState>("loading");
+  const [usageLoadState, setUsageLoadState] = useState<LoadState>("loading");
 
   async function loadProject() {
-    const response = await fetch(`/api/control-plane/projects/${projectId}`, { cache: "no-store" });
-    if (response.ok) {
+    try {
+      setProjectLoadState("loading");
+      const response = await fetch(`/api/control-plane/projects/${projectId}`, { cache: "no-store" });
+      if (!response.ok) throw new Error(`Project load failed with ${response.status}`);
       const data = (await response.json()) as { project: Project };
       setProject(data.project);
+      setProjectLoadState("ready");
+    } catch {
+      setProjectLoadState("error");
+      toast.error("Project details failed to load.");
     }
   }
 
   async function loadKeys() {
-    const response = await fetch(`/api/control-plane/projects/${projectId}/keys`, { cache: "no-store" });
-    if (response.ok) {
+    try {
+      setKeysLoadState("loading");
+      const response = await fetch(`/api/control-plane/projects/${projectId}/keys`, { cache: "no-store" });
+      if (!response.ok) throw new Error(`Key list failed with ${response.status}`);
       const data = (await response.json()) as { keys: AgentKey[] };
       setKeys(data.keys);
+      setKeysLoadState("ready");
+    } catch {
+      setKeysLoadState("error");
+      toast.error("Agent API Keys failed to load.");
     }
   }
 
   async function loadUsage() {
-    const response = await fetch(`/api/control-plane/projects/${projectId}/usage`, { cache: "no-store" });
-    if (response.ok) {
+    try {
+      setUsageLoadState("loading");
+      const response = await fetch(`/api/control-plane/projects/${projectId}/usage`, { cache: "no-store" });
+      if (!response.ok) throw new Error(`Usage load failed with ${response.status}`);
       const data = (await response.json()) as { usage: Usage };
       setUsage(data.usage);
+      setUsageLoadState("ready");
+    } catch {
+      setUsageLoadState("error");
+      toast.error("Usage failed to load.");
     }
   }
 
@@ -82,26 +108,50 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
     const trimmedName = name.trim();
     if (!trimmedName) return;
 
-    const response = await fetch(`/api/control-plane/projects/${projectId}/keys`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ name: trimmedName, agentScope: agentScope.trim() || "shared" })
-    });
+    let response: Response;
+    try {
+      response = await fetch(`/api/control-plane/projects/${projectId}/keys`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: trimmedName, agentScope: agentScope.trim() || "shared" })
+      });
+    } catch {
+      toast.error("Agent API Key creation failed.");
+      return;
+    }
 
-    if (!response.ok) return;
+    if (!response.ok) {
+      toast.error("Agent API Key creation failed.");
+      return;
+    }
 
     const data = (await response.json()) as { rawKey: string; key: AgentKey };
     setRawKey(data.rawKey);
     setKeys((current) => [data.key, ...current.filter((key) => key.id !== data.key.id)]);
+    setKeysLoadState("ready");
     setName("");
   }
 
   async function revokeKey(keyId: string) {
-    const response = await fetch(`/api/control-plane/projects/${projectId}/keys/${keyId}`, { method: "DELETE" });
-    if (response.ok) {
+    try {
+      const response = await fetch(`/api/control-plane/projects/${projectId}/keys/${keyId}`, { method: "DELETE" });
+      if (!response.ok) throw new Error(`Key revoke failed with ${response.status}`);
       setKeys((current) => current.filter((key) => key.id !== keyId));
+    } catch {
+      toast.error("Agent API Key revocation failed.");
     }
   }
+
+  async function copyRawKey() {
+    try {
+      await navigator.clipboard.writeText(rawKey);
+      toast.success("Raw key copied.");
+    } catch {
+      toast.error("Raw key could not be copied.");
+    }
+  }
+
+  const usageRowData = usage ? usageRows(usage) : [];
 
   return (
     <div className="grid gap-6">
@@ -110,7 +160,11 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
           <Badge className="w-fit" variant="outline">
             Project workspace
           </Badge>
-          <h1 className="text-2xl font-semibold text-foreground md:text-3xl">{project?.name ?? "Project"}</h1>
+          {projectLoadState === "loading" ? (
+            <Skeleton className="h-8 w-48" />
+          ) : (
+            <h1 className="text-2xl font-semibold text-foreground md:text-3xl">{project?.name ?? "Project"}</h1>
+          )}
           <p className="text-sm text-muted-foreground">Manage machine credentials and aggregate operational limits.</p>
         </div>
         <Badge className="w-fit" variant="secondary">
@@ -172,10 +226,16 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
                     <strong className="text-sm">Raw key</strong>
                     <p className="text-sm text-muted-foreground">This value will not appear in the list again.</p>
                   </div>
-                  <code>{rawKey}</code>
-                  <Button className="w-fit" type="button" variant="outline" onClick={() => setRawKey("")}>
-                    Dismiss
-                  </Button>
+                  <code className="block overflow-x-auto rounded-md bg-background/80 px-3 py-2 text-xs">{rawKey}</code>
+                  <div className="flex flex-wrap gap-2">
+                    <Button className="w-fit" type="button" variant="outline" onClick={copyRawKey}>
+                      <Copy />
+                      Copy
+                    </Button>
+                    <Button className="w-fit" type="button" variant="outline" onClick={() => setRawKey("")}>
+                      Dismiss
+                    </Button>
+                  </div>
                 </div>
               ) : null}
             </CardContent>
@@ -187,7 +247,17 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
               <CardDescription>List and revoke project-scoped credentials.</CardDescription>
             </CardHeader>
             <CardContent>
-              {keys.length === 0 ? (
+              {keysLoadState === "loading" ? (
+                <div className="grid gap-3">
+                  {Array.from({ length: 3 }, (_, index) => (
+                    <Skeleton key={index} className="h-10 w-full" />
+                  ))}
+                </div>
+              ) : keysLoadState === "error" ? (
+                <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-8 text-center text-sm text-destructive">
+                  Agent API Keys could not be loaded. Refresh to try again.
+                </div>
+              ) : keys.length === 0 ? (
                 <div className="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground">
                   No active keys for this project.
                 </div>
@@ -244,11 +314,35 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
               </CardDescription>
             </CardHeader>
             <CardContent className="grid gap-5 md:grid-cols-2">
-              {usage
-                ? Object.entries(usage.totals).map(([label, value]) => (
-                    <UsageMeter key={label} label={formatLabel(label)} max={usage.caps[label] ?? 0} value={value} />
-                  ))
-                : null}
+              {usageLoadState === "loading" ? (
+                <>
+                  <Skeleton className="h-16 w-full" />
+                  <Skeleton className="h-16 w-full" />
+                </>
+              ) : usageLoadState === "error" ? (
+                <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-8 text-center text-sm text-destructive md:col-span-2">
+                  Usage could not be loaded. Refresh to try again.
+                </div>
+              ) : usageRowData.length > 0 ? (
+                <>
+                  <div className="grid gap-3 md:col-span-2">
+                    <div>
+                      <h3 className="text-sm font-medium">Metric totals</h3>
+                      <p className="text-sm text-muted-foreground">Current-period activity by metric.</p>
+                    </div>
+                    <BarList
+                      data={usageRowData.map((row) => ({ key: row.key, name: row.label, value: row.value }))}
+                    />
+                  </div>
+                  {usageRowData.map((row) => (
+                    <UsageMeter key={row.key} label={row.label} max={row.max} value={row.value} />
+                  ))}
+                </>
+              ) : (
+                <div className="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground md:col-span-2">
+                  No usage recorded for this period.
+                </div>
+              )}
             </CardContent>
           </Card>
         </TabsContent>
@@ -267,7 +361,11 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
               <Separator />
               <div className="grid gap-1">
                 <span className="text-sm text-muted-foreground">Environment</span>
-                <strong>{project?.environment ?? "production"}</strong>
+                {projectLoadState === "error" ? (
+                  <span className="text-sm text-destructive">Project details could not be loaded.</span>
+                ) : (
+                  <strong>{project?.environment ?? "production"}</strong>
+                )}
               </div>
             </CardContent>
           </Card>
@@ -275,8 +373,4 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
       </Tabs>
     </div>
   );
-}
-
-function formatLabel(value: string) {
-  return value.replace(/([A-Z])/g, " $1").replace(/^./, (match) => match.toUpperCase());
 }
