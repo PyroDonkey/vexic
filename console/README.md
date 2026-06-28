@@ -6,8 +6,9 @@ Boundary: this directory is a repo-local Next.js control-plane app, not Vexic
 package runtime and not a `vexic.*` entrypoint. Keep memory-core runtime under
 `src/vexic`; Console talks to hosted control-plane surfaces as a client.
 
-The control-plane API routes are stubs until hosted endpoints are live. The
-repository root and Python core remain `uv`-managed.
+The control-plane API routes call the hosted control-plane API when configured
+and keep a non-production in-memory fallback for local UI work. The repository
+root and Python core remain `uv`-managed.
 
 ## Local Checks
 
@@ -56,14 +57,16 @@ Internal support:
 
 - `VEXIC_INTERNAL_ORG_ID`
 
-Reserved until hosted endpoints are wired:
+Control-plane backend:
 
-- `VEXIC_HOSTED_API_BASE_URL`
+- `VEXIC_CONTROL_PLANE_URL`
+- `VEXIC_CONTROL_PLANE_TOKEN`
 
-## Stub Control Plane
+When `VEXIC_CONTROL_PLANE_URL` is set, Console uses the hosted control-plane
+client and sends `VEXIC_CONTROL_PLANE_TOKEN` as a bearer token. Missing or
+incorrect tokens fail closed through the hosted API; Console does not fall back
+to stub data when a URL is configured.
 
-The current `/api/control-plane/*` routes use an in-memory store. Projects,
-usage, support metadata, and `vx_live_*` Agent API Keys are local stubs for
-Console smoke testing. Generated keys are shown once, can be revoked in the UI,
-and are not accepted by a durable hosted Vexic API until the production control
-plane is wired.
+When `VEXIC_CONTROL_PLANE_URL` is unset outside production, `/api/control-plane/*`
+uses the in-memory store for local smoke testing. In production, a missing URL
+returns an error instead of fabricated project, key, or usage data.

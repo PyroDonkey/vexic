@@ -5,11 +5,12 @@ type UsageMeterProps = {
   label: string;
   value: number;
   max: number;
+  valueLabel?: string;
   className?: string;
 };
 
-export function UsageMeter({ label, value, max, className }: UsageMeterProps) {
-  const meter = usageMeterDisplay(value, max);
+export function UsageMeter({ label, value, max, valueLabel, className }: UsageMeterProps) {
+  const meter = usageMeterDisplay(value, max, valueLabel);
 
   return (
     <div className={cn("grid gap-2", className)} data-tremor-id="usage-meter">

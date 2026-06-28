@@ -331,11 +331,22 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
                       <p className="text-sm text-muted-foreground">Current-period activity by metric.</p>
                     </div>
                     <BarList
-                      data={usageRowData.map((row) => ({ key: row.key, name: row.label, value: row.value }))}
+                      data={usageRowData.map((row) => ({
+                        key: row.key,
+                        name: row.label,
+                        value: row.value,
+                        valueLabel: row.valueLabel
+                      }))}
                     />
                   </div>
                   {usageRowData.map((row) => (
-                    <UsageMeter key={row.key} label={row.label} max={row.max} value={row.value} />
+                    <UsageMeter
+                      key={row.key}
+                      label={row.label}
+                      max={row.max}
+                      value={row.value}
+                      valueLabel={row.valueLabel}
+                    />
                   ))}
                 </>
               ) : (

@@ -8,6 +8,7 @@ import {
   supportMetadata,
   usageSummary
 } from "./control-plane-store.mjs";
+import { ControlPlaneClientError } from "./control-plane-client.mjs";
 
 function json(body, status = 200) {
   return Response.json(body, { status });
@@ -39,47 +40,63 @@ async function body(request) {
 export async function listProjectsResponse(_request, auth) {
   const denied = requireOrg(auth);
   if (denied) return denied;
-  return json({ projects: listProjects(auth.orgId) });
+  return storeResponse(() => listProjects(auth.orgId), (projects) => json({ projects }));
 }
 
 export async function createProjectResponse(request, auth) {
   const denied = requireOrg(auth);
   if (denied) return denied;
-  return json({ project: createProject(auth.orgId, await body(request)) }, 201);
+  const payload = await body(request);
+  return storeResponse(
+    () => createProject(auth.orgId, payload),
+    (project) => json({ project }, 201)
+  );
 }
 
 export async function getProjectResponse(_request, auth, projectId) {
   const denied = requireOrg(auth);
   if (denied) return denied;
-  const project = getProject(auth.orgId, projectId);
-  return project ? json({ project }) : json({ error: "not_found" }, 404);
+  return storeResponse(
+    () => getProject(auth.orgId, projectId),
+    (project) => (project ? json({ project }) : json({ error: "not_found" }, 404))
+  );
 }
 
 export async function listAgentKeysResponse(_request, auth, projectId) {
   const denied = requireOrg(auth);
   if (denied) return denied;
-  const keys = listAgentKeys(auth.orgId, projectId);
-  return keys ? json({ keys }) : json({ error: "not_found" }, 404);
+  return storeResponse(
+    () => listAgentKeys(auth.orgId, projectId),
+    (keys) => (keys ? json({ keys }) : json({ error: "not_found" }, 404))
+  );
 }
 
 export async function createAgentKeyResponse(request, auth, projectId) {
   const denied = requireOrg(auth);
   if (denied) return denied;
-  const result = createAgentKey(auth.orgId, projectId, await body(request));
-  return result ? json(result, 201) : json({ error: "not_found" }, 404);
+  const payload = await body(request);
+  return storeResponse(
+    () => createAgentKey(auth.orgId, projectId, payload),
+    (result) => (result ? json(result, 201) : json({ error: "not_found" }, 404))
+  );
 }
 
 export async function revokeAgentKeyResponse(_request, auth, projectId, keyId) {
   const denied = requireOrg(auth);
   if (denied) return denied;
-  return revokeAgentKey(auth.orgId, projectId, keyId) ? new Response(null, { status: 204 }) : json({ error: "not_found" }, 404);
+  return storeResponse(
+    () => revokeAgentKey(auth.orgId, projectId, keyId),
+    (revoked) => (revoked ? new Response(null, { status: 204 }) : json({ error: "not_found" }, 404))
+  );
 }
 
 export async function usageSummaryResponse(_request, auth, projectId) {
   const denied = requireOrg(auth);
   if (denied) return denied;
-  const summary = usageSummary(auth.orgId, projectId);
-  return summary ? json({ usage: summary }) : json({ error: "not_found" }, 404);
+  return storeResponse(
+    () => usageSummary(auth.orgId, projectId),
+    (summary) => (summary ? json({ usage: summary }) : json({ error: "not_found" }, 404))
+  );
 }
 
 export async function supportMetadataResponse(_request, auth) {
@@ -88,5 +105,16 @@ export async function supportMetadataResponse(_request, auth) {
   if (!auth.isInternalSupport) {
     return json({ error: "internal_support_required" }, 403);
   }
-  return json({ records: supportMetadata(auth.orgId) });
+  return storeResponse(() => supportMetadata(auth.orgId), (records) => json({ records }));
+}
+
+async function storeResponse(operation, render) {
+  try {
+    return render(await operation());
+  } catch (error) {
+    if (error instanceof ControlPlaneClientError) {
+      return json({ error: error.code }, error.status);
+    }
+    throw error;
+  }
 }

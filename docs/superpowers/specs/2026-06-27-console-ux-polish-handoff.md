@@ -176,5 +176,5 @@ toggle theme.
 - Build, node tests, and pytest all green.
 - No changes outside `console/` client code (plus any `console/tests`).
 - Clerk and control-plane API untouched. Landing page untouched.
-- Move the tracking Linear issue to In Review with branch, commit, and
+- Move the tracking issue to In Review with branch, commit, and
   verification result.
