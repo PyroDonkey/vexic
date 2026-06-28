@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hmac
+import logging
 import os
 import sqlite3
 from collections.abc import Awaitable, Callable
@@ -15,6 +16,8 @@ from vexic.hosted import HostedMemoryService
 from vexic.hosted_http import create_app as create_hosted_memory_app
 from vexic.hosted_http import create_service_from_env
 
+
+logger = logging.getLogger(__name__)
 
 _ControlPlaneParams = ParamSpec("_ControlPlaneParams")
 _ControlPlaneResponseT = TypeVar("_ControlPlaneResponseT", bound=Response)
@@ -338,20 +341,70 @@ def _control_plane_storage_boundary(
     ) -> _ControlPlaneResponseT | JSONResponse:
         try:
             return await handler(*args, **kwargs)
-        except sqlite3.IntegrityError:
+        except sqlite3.IntegrityError as exc:
+            _log_control_plane_sqlite_error("integrity", exc, args, kwargs)
             return _error_response(409, "conflict", "Control-plane write conflict.")
         except sqlite3.OperationalError as exc:
             if _is_retryable_sqlite_operational_error(exc):
+                _log_control_plane_sqlite_error(
+                    "retryable_operational",
+                    exc,
+                    args,
+                    kwargs,
+                )
                 return _error_response(
                     503,
                     "storage_unavailable",
                     "Control-plane storage is temporarily unavailable.",
                 )
+            _log_control_plane_sqlite_error("operational", exc, args, kwargs)
             return _error_response(500, "internal_error", "Control-plane storage failed.")
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            _log_control_plane_sqlite_error("sqlite", exc, args, kwargs)
             return _error_response(500, "internal_error", "Control-plane storage failed.")
 
     return wrapped
+
+
+def _log_control_plane_sqlite_error(
+    category: str,
+    exc: sqlite3.Error,
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+) -> None:
+    request = _request_from_handler_call(args, kwargs)
+    path = request.url.path if request is not None else "<unknown>"
+    correlation_id = _correlation_id(request)
+    logger.warning(
+        "control-plane sqlite error category=%s exception_type=%s path=%s correlation_id=%s",
+        category,
+        type(exc).__name__,
+        path,
+        correlation_id or "<none>",
+    )
+
+
+def _request_from_handler_call(
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+) -> Request | None:
+    request = kwargs.get("request")
+    if isinstance(request, Request):
+        return request
+    for arg in args:
+        if isinstance(arg, Request):
+            return arg
+    return None
+
+
+def _correlation_id(request: Request | None) -> str | None:
+    if request is None:
+        return None
+    for header in ("x-request-id", "x-correlation-id"):
+        value = request.headers.get(header)
+        if value is not None and value.strip():
+            return value.strip()
+    return None
 
 
 def _is_retryable_sqlite_operational_error(exc: sqlite3.OperationalError) -> bool:

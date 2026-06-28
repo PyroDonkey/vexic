@@ -152,16 +152,27 @@ class HostedHttpTests(unittest.TestCase):
             "create_control_project",
             side_effect=sqlite3.IntegrityError("UNIQUE constraint failed: secret"),
         ):
-            response = client.post(
-                "/control/v1/clerk-orgs/org_123/projects",
-                headers=self._control_auth(),
-                json={"name": "A"},
-            )
+            with self.assertLogs("adapters.hosted_control_plane_http", level="WARNING") as logs:
+                response = client.post(
+                    "/control/v1/clerk-orgs/org_123/projects",
+                    headers={
+                        **self._control_auth(),
+                        "X-Request-Id": "req-integrity",
+                    },
+                    json={"name": "A"},
+                )
 
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json()["error"]["code"], "conflict")
         self.assertNotIn("UNIQUE", response.text)
         self.assertNotIn("secret", response.text)
+        log_text = "\n".join(logs.output)
+        self.assertIn("category=integrity", log_text)
+        self.assertIn("exception_type=IntegrityError", log_text)
+        self.assertIn("path=/control/v1/clerk-orgs/org_123/projects", log_text)
+        self.assertIn("correlation_id=req-integrity", log_text)
+        self.assertNotIn("UNIQUE", log_text)
+        self.assertNotIn("secret", log_text)
 
     def test_control_plane_sqlite_operational_errors_are_sanitized(self) -> None:
         client = TestClient(
@@ -174,30 +185,52 @@ class HostedHttpTests(unittest.TestCase):
             "list_control_projects",
             side_effect=sqlite3.OperationalError("database is locked: secret"),
         ):
-            response = client.get(
-                "/control/v1/clerk-orgs/org_123/projects",
-                headers=self._control_auth(),
-            )
+            with self.assertLogs("adapters.hosted_control_plane_http", level="WARNING") as logs:
+                response = client.get(
+                    "/control/v1/clerk-orgs/org_123/projects",
+                    headers={
+                        **self._control_auth(),
+                        "X-Request-Id": "req-locked",
+                    },
+                )
 
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json()["error"]["code"], "storage_unavailable")
         self.assertNotIn("database is locked", response.text)
         self.assertNotIn("secret", response.text)
+        log_text = "\n".join(logs.output)
+        self.assertIn("category=retryable_operational", log_text)
+        self.assertIn("exception_type=OperationalError", log_text)
+        self.assertIn("path=/control/v1/clerk-orgs/org_123/projects", log_text)
+        self.assertIn("correlation_id=req-locked", log_text)
+        self.assertNotIn("database is locked", log_text)
+        self.assertNotIn("secret", log_text)
 
         with patch.object(
             self.catalog,
             "list_control_projects",
             side_effect=sqlite3.OperationalError("syntax error near secret"),
         ):
-            response = client.get(
-                "/control/v1/clerk-orgs/org_123/projects",
-                headers=self._control_auth(),
-            )
+            with self.assertLogs("adapters.hosted_control_plane_http", level="WARNING") as logs:
+                response = client.get(
+                    "/control/v1/clerk-orgs/org_123/projects",
+                    headers={
+                        **self._control_auth(),
+                        "X-Correlation-Id": "corr-syntax",
+                    },
+                )
 
         self.assertEqual(response.status_code, 500)
         self.assertEqual(response.json()["error"]["code"], "internal_error")
         self.assertNotIn("syntax error", response.text)
         self.assertNotIn("secret", response.text)
+        log_text = "\n".join(logs.output)
+        self.assertIn("category=operational", log_text)
+        self.assertIn("exception_type=OperationalError", log_text)
+        self.assertIn("path=/control/v1/clerk-orgs/org_123/projects", log_text)
+        self.assertIn("correlation_id=corr-syntax", log_text)
+        self.assertNotIn("syntax error", log_text)
+        self.assertNotIn("secret", log_text)
 
     def test_control_plane_tenant_provisioning_is_idempotent_per_clerk_org(self) -> None:
         client = TestClient(
