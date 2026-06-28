@@ -103,6 +103,34 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.json()["error"]["code"], "unauthorized")
 
+    def test_control_plane_credentials_can_be_loaded_from_env_for_factory_startup(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"VEXIC_CONTROL_PLANE_TOKENS": "console-secret,rotated-secret"},
+        ):
+            client = TestClient(create_app(self.service))
+
+        response = client.post(
+            "/control/v1/clerk-orgs/org_123/tenant",
+            headers={"Authorization": "Bearer rotated-secret"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_control_plane_blank_clerk_org_returns_bad_request(self) -> None:
+        client = TestClient(
+            create_app(self.service, control_plane_tokens=("console-secret",)),
+            raise_server_exceptions=False,
+        )
+
+        response = client.post(
+            "/control/v1/clerk-orgs/%20/tenant",
+            headers=self._control_auth(),
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], "invalid_request")
+
     def test_control_plane_tenant_provisioning_is_idempotent_per_clerk_org(self) -> None:
         client = TestClient(
             create_app(self.service, control_plane_tokens=("console-secret",))
@@ -152,6 +180,27 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(fetched.status_code, 200)
         self.assertEqual([item["id"] for item in listed.json()["projects"]], [project["id"]])
         self.assertEqual(fetched.json()["project"]["id"], project["id"])
+
+    def test_control_plane_project_create_rejects_null_string_fields(self) -> None:
+        client = TestClient(
+            create_app(self.service, control_plane_tokens=("console-secret",))
+        )
+
+        null_name = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": None},
+        )
+        null_environment = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo", "environment": None},
+        )
+
+        self.assertEqual(null_name.status_code, 400)
+        self.assertEqual(null_environment.status_code, 400)
+        self.assertEqual(null_name.json()["error"]["code"], "invalid_request")
+        self.assertEqual(null_environment.json()["error"]["code"], "invalid_request")
 
     def test_control_plane_project_put_is_idempotent(self) -> None:
         client = TestClient(
@@ -227,6 +276,32 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual([key["id"] for key in listed.json()["keys"]], [payload["key"]["id"]])
         self.assertNotIn("rawKey", listed.text)
         self.assertNotIn("keyHash", listed.text)
+
+    def test_control_plane_key_create_rejects_null_string_fields(self) -> None:
+        client = TestClient(
+            create_app(self.service, control_plane_tokens=("console-secret",))
+        )
+        project = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo"},
+        ).json()["project"]
+
+        null_name = client.post(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/keys",
+            headers=self._control_auth(),
+            json={"name": None},
+        )
+        null_agent_scope = client.post(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/keys",
+            headers=self._control_auth(),
+            json={"name": "Worker", "agentScope": None},
+        )
+
+        self.assertEqual(null_name.status_code, 400)
+        self.assertEqual(null_agent_scope.status_code, 400)
+        self.assertEqual(null_name.json()["error"]["code"], "invalid_request")
+        self.assertEqual(null_agent_scope.json()["error"]["code"], "invalid_request")
 
     def test_control_plane_key_revoke_invalidates_v1_memory_access(self) -> None:
         client = TestClient(

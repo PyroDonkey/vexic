@@ -52,9 +52,11 @@ def create_app(
     service: HostedMemoryService | None = None,
     *,
     mcp_forbidden_secret_values: tuple[str, ...] = (),
-    control_plane_tokens: tuple[str, ...] = (),
+    control_plane_tokens: tuple[str, ...] | None = None,
 ) -> FastAPI:
     service = service or create_service_from_env()
+    if control_plane_tokens is None:
+        control_plane_tokens = _control_plane_tokens_from_env()
     control_plane_tokens = _normalize_control_plane_tokens(control_plane_tokens)
     app = FastAPI(title="Vexic Hosted Memory", version=CONTRACT_VERSION)
     register_mcp_routes(
@@ -85,6 +87,10 @@ def create_app(
     async def validation_error(_: Request, __: RequestValidationError) -> JSONResponse:
         return _error_response(422, "invalid_request", "Request body does not match the Vexic contract.")
 
+    @app.exception_handler(_ControlPlaneBadRequest)
+    async def control_plane_bad_request(_: Request, exc: _ControlPlaneBadRequest) -> JSONResponse:
+        return _error_response(400, "invalid_request", str(exc))
+
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok", "contract_version": CONTRACT_VERSION}
@@ -100,7 +106,7 @@ def create_app(
                 "unauthorized",
                 "Invalid control-plane credential.",
             )
-        tenant_id = service.catalog.provision_customer_account(clerk_org_id)
+        tenant_id = _provision_control_tenant(service, clerk_org_id)
         return JSONResponse(
             {"tenant": {"clerkOrgId": clerk_org_id, "tenantId": tenant_id}}
         )
@@ -112,7 +118,7 @@ def create_app(
     ) -> JSONResponse:
         if not _has_control_plane_credential(request, control_plane_tokens):
             return _error_response(401, "unauthorized", "Invalid control-plane credential.")
-        tenant_id = service.catalog.provision_customer_account(clerk_org_id)
+        tenant_id = _provision_control_tenant(service, clerk_org_id)
         projects = service.catalog.list_control_projects(tenant_id)
         return JSONResponse({"projects": [_project_payload(project) for project in projects]})
 
@@ -124,12 +130,12 @@ def create_app(
         if not _has_control_plane_credential(request, control_plane_tokens):
             return _error_response(401, "unauthorized", "Invalid control-plane credential.")
         payload = await _json_body(request)
-        tenant_id = service.catalog.provision_customer_account(clerk_org_id)
+        tenant_id = _provision_control_tenant(service, clerk_org_id)
         try:
             project = service.catalog.create_control_project(
                 tenant_id,
-                name=str(payload.get("name", "")).strip(),
-                environment=str(payload.get("environment", "production")),
+                name=_string_field(payload, "name", default=""),
+                environment=_string_field(payload, "environment", default="production"),
             )
         except ValueError as exc:
             return _error_response(400, "invalid_request", str(exc))
@@ -143,7 +149,7 @@ def create_app(
     ) -> JSONResponse:
         if not _has_control_plane_credential(request, control_plane_tokens):
             return _error_response(401, "unauthorized", "Invalid control-plane credential.")
-        tenant_id = service.catalog.provision_customer_account(clerk_org_id)
+        tenant_id = _provision_control_tenant(service, clerk_org_id)
         try:
             project = service.catalog.get_control_project(tenant_id, project_id)
         except PermissionError:
@@ -159,13 +165,13 @@ def create_app(
         if not _has_control_plane_credential(request, control_plane_tokens):
             return _error_response(401, "unauthorized", "Invalid control-plane credential.")
         payload = await _json_body(request)
-        tenant_id = service.catalog.provision_customer_account(clerk_org_id)
+        tenant_id = _provision_control_tenant(service, clerk_org_id)
         try:
             project = service.catalog.upsert_control_project(
                 tenant_id,
                 project_id,
-                name=str(payload.get("name", "")).strip(),
-                environment=str(payload.get("environment", "production")),
+                name=_string_field(payload, "name", default=""),
+                environment=_string_field(payload, "environment", default="production"),
             )
         except ValueError as exc:
             return _error_response(400, "invalid_request", str(exc))
@@ -181,7 +187,7 @@ def create_app(
     ) -> JSONResponse:
         if not _has_control_plane_credential(request, control_plane_tokens):
             return _error_response(401, "unauthorized", "Invalid control-plane credential.")
-        tenant_id = service.catalog.provision_customer_account(clerk_org_id)
+        tenant_id = _provision_control_tenant(service, clerk_org_id)
         try:
             service.catalog.get_control_project(tenant_id, project_id)
         except PermissionError:
@@ -201,10 +207,13 @@ def create_app(
         if not _has_control_plane_credential(request, control_plane_tokens):
             return _error_response(401, "unauthorized", "Invalid control-plane credential.")
         payload = await _json_body(request)
-        capability = str(payload.get("capability", "v1-memory")).strip() or "v1-memory"
-        if capability != "v1-memory":
-            return _error_response(400, "invalid_request", "Unsupported capability.")
-        tenant_id = service.catalog.provision_customer_account(clerk_org_id)
+        try:
+            capability = _string_field(payload, "capability", default="v1-memory")
+            if capability != "v1-memory":
+                return _error_response(400, "invalid_request", "Unsupported capability.")
+        except ValueError as exc:
+            return _error_response(400, "invalid_request", str(exc))
+        tenant_id = _provision_control_tenant(service, clerk_org_id)
         try:
             service.catalog.get_control_project(tenant_id, project_id)
         except PermissionError:
@@ -213,8 +222,8 @@ def create_app(
             provisioned, key = service.api_keys.create_control_plane_key(
                 tenant_id=tenant_id,
                 project_id=project_id,
-                name=str(payload.get("name", "")).strip(),
-                agent_scope=str(payload.get("agentScope", "shared")).strip() or "shared",
+                name=_string_field(payload, "name", default=""),
+                agent_scope=_string_field(payload, "agentScope", default="shared"),
             )
         except ValueError as exc:
             return _error_response(400, "invalid_request", str(exc))
@@ -229,7 +238,7 @@ def create_app(
     ) -> JSONResponse:
         if not _has_control_plane_credential(request, control_plane_tokens):
             return _error_response(401, "unauthorized", "Invalid control-plane credential.")
-        tenant_id = service.catalog.provision_customer_account(clerk_org_id)
+        tenant_id = _provision_control_tenant(service, clerk_org_id)
         try:
             service.api_keys.revoke_control_plane_key(
                 tenant_id=tenant_id,
@@ -248,7 +257,7 @@ def create_app(
     ) -> JSONResponse:
         if not _has_control_plane_credential(request, control_plane_tokens):
             return _error_response(401, "unauthorized", "Invalid control-plane credential.")
-        tenant_id = service.catalog.provision_customer_account(clerk_org_id)
+        tenant_id = _provision_control_tenant(service, clerk_org_id)
         events = service.catalog.usage_events(tenant_id)
         return JSONResponse({"usage": _usage_payload(events)})
 
@@ -260,7 +269,7 @@ def create_app(
     ) -> JSONResponse:
         if not _has_control_plane_credential(request, control_plane_tokens):
             return _error_response(401, "unauthorized", "Invalid control-plane credential.")
-        tenant_id = service.catalog.provision_customer_account(clerk_org_id)
+        tenant_id = _provision_control_tenant(service, clerk_org_id)
         try:
             service.catalog.get_control_project(tenant_id, project_id)
         except PermissionError:
@@ -372,6 +381,10 @@ def _has_control_plane_credential(
     return matched
 
 
+def _control_plane_tokens_from_env() -> tuple[str, ...]:
+    return tuple(os.environ.get("VEXIC_CONTROL_PLANE_TOKENS", "").split(","))
+
+
 def _normalize_control_plane_tokens(values: tuple[str, ...]) -> tuple[str, ...]:
     normalized: list[str] = []
     for value in values:
@@ -382,12 +395,37 @@ def _normalize_control_plane_tokens(values: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(normalized)
 
 
+class _ControlPlaneBadRequest(ValueError):
+    pass
+
+
+def _provision_control_tenant(service: HostedMemoryService, clerk_org_id: str) -> str:
+    try:
+        return service.catalog.provision_customer_account(clerk_org_id)
+    except ValueError as exc:
+        raise _ControlPlaneBadRequest(str(exc)) from exc
+
+
 async def _json_body(request: Request) -> dict[str, object]:
     try:
         payload = await request.json()
     except Exception:
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _string_field(
+    payload: dict[str, object],
+    key: str,
+    *,
+    default: str,
+) -> str:
+    if key not in payload:
+        return default
+    value = payload[key]
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be a string.")
+    return value.strip() or default
 
 
 def _project_payload(project) -> dict[str, str]:

@@ -102,8 +102,13 @@ For one internal hosted environment:
 Run the hosted HTTP adapter locally:
 
 ```powershell
+$env:VEXIC_CONTROL_PLANE_TOKENS = "console-secret"
 uv run --with-editable . --extra hosted python -m uvicorn vexic.hosted_http:create_app --factory --host 127.0.0.1 --port 8000
 ```
+
+`VEXIC_CONTROL_PLANE_TOKENS` is a comma-separated list for `/control/v1/*`
+Console service credentials. If it is unset or contains a blank token, the
+control plane fails closed.
 
 Issue a tester key against the same hosted root:
 
