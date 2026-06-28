@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import os
+import sqlite3
 import tempfile
 import textwrap
 import unittest
@@ -130,6 +131,64 @@ class HostedHttpTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"]["code"], "invalid_request")
+
+    def test_control_plane_sqlite_integrity_errors_are_sanitized(self) -> None:
+        client = TestClient(
+            create_app(self.service, control_plane_tokens=("console-secret",)),
+            raise_server_exceptions=False,
+        )
+
+        with patch.object(
+            self.catalog,
+            "create_control_project",
+            side_effect=sqlite3.IntegrityError("UNIQUE constraint failed: secret"),
+        ):
+            response = client.post(
+                "/control/v1/clerk-orgs/org_123/projects",
+                headers=self._control_auth(),
+                json={"name": "A"},
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"]["code"], "conflict")
+        self.assertNotIn("UNIQUE", response.text)
+        self.assertNotIn("secret", response.text)
+
+    def test_control_plane_sqlite_operational_errors_are_sanitized(self) -> None:
+        client = TestClient(
+            create_app(self.service, control_plane_tokens=("console-secret",)),
+            raise_server_exceptions=False,
+        )
+
+        with patch.object(
+            self.catalog,
+            "list_control_projects",
+            side_effect=sqlite3.OperationalError("database is locked: secret"),
+        ):
+            response = client.get(
+                "/control/v1/clerk-orgs/org_123/projects",
+                headers=self._control_auth(),
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "storage_unavailable")
+        self.assertNotIn("database is locked", response.text)
+        self.assertNotIn("secret", response.text)
+
+        with patch.object(
+            self.catalog,
+            "list_control_projects",
+            side_effect=sqlite3.OperationalError("syntax error near secret"),
+        ):
+            response = client.get(
+                "/control/v1/clerk-orgs/org_123/projects",
+                headers=self._control_auth(),
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["error"]["code"], "internal_error")
+        self.assertNotIn("syntax error", response.text)
+        self.assertNotIn("secret", response.text)
 
     def test_control_plane_tenant_provisioning_is_idempotent_per_clerk_org(self) -> None:
         client = TestClient(
@@ -499,47 +558,70 @@ class HostedHttpTests(unittest.TestCase):
             json={"name": "Worker B"},
         ).json()["rawKey"]
 
-        for raw_key, project_id, text in (
-            (raw_key_a, project_a["id"], "alpha cedar"),
-            (raw_key_b, project_b["id"], "beta cedar"),
-        ):
-            client.post(
-                "/v1/append_transcript",
-                headers=self._auth(raw_key),
-                json=AppendTranscriptRequest(
-                    scope=_scope(
-                        tenant_id=tenant["tenantId"],
-                        project_id=project_id,
-                        capabilities={MemoryCapability.WRITE},
-                    ),
-                    messages_json=[
-                        single_message_adapter.dump_json(
-                            ModelRequest(parts=[UserPromptPart(content=text)])
-                        )
-                    ],
-                    redaction=RedactionContext(forbidden_values=()),
-                ).model_dump(mode="json"),
-            )
+        with patch("vexic.hosted._now", return_value="2026-06-10T00:00:00Z"):
+            for raw_key, project_id, text in (
+                (raw_key_a, project_a["id"], "alpha cedar"),
+                (raw_key_b, project_b["id"], "beta cedar"),
+            ):
+                client.post(
+                    "/v1/append_transcript",
+                    headers=self._auth(raw_key),
+                    json=AppendTranscriptRequest(
+                        scope=_scope(
+                            tenant_id=tenant["tenantId"],
+                            project_id=project_id,
+                            capabilities={MemoryCapability.WRITE},
+                        ),
+                        messages_json=[
+                            single_message_adapter.dump_json(
+                                ModelRequest(parts=[UserPromptPart(content=text)])
+                            )
+                        ],
+                        redaction=RedactionContext(forbidden_values=()),
+                    ).model_dump(mode="json"),
+                )
 
-        self.catalog.record_usage_event(
+        for event in (
             HostedUsageEvent(
                 kind="request",
                 operation="legacy_unattributed",
                 tenant_id=tenant["tenantId"],
                 principal_id="legacy",
                 status="ok",
-                recorded_at="2026-06-27T00:00:00Z",
-            )
-        )
+                recorded_at="2026-06-11T00:00:00Z",
+            ),
+            HostedUsageEvent(
+                kind="request",
+                operation="old_unattributed",
+                tenant_id=tenant["tenantId"],
+                principal_id="legacy",
+                status="ok",
+                recorded_at="2000-01-01T00:00:00Z",
+            ),
+            HostedUsageEvent(
+                kind="request",
+                operation="append_transcript",
+                tenant_id=tenant["tenantId"],
+                principal_id="legacy",
+                status="ok",
+                recorded_at="2000-01-01T00:00:00Z",
+                project_id=project_a["id"],
+            ),
+        ):
+            self.catalog.record_usage_event(event)
 
-        tenant_usage = client.get(
-            "/control/v1/clerk-orgs/org_123/usage",
-            headers=self._control_auth(),
-        )
-        project_usage = client.get(
-            f"/control/v1/clerk-orgs/org_123/projects/{project_a['id']}/usage",
-            headers=self._control_auth(),
-        )
+        with patch(
+            "vexic.hosted_http._usage_period",
+            return_value=("2026-06-01T00:00:00Z", "2026-07-01T00:00:00Z"),
+        ):
+            tenant_usage = client.get(
+                "/control/v1/clerk-orgs/org_123/usage",
+                headers=self._control_auth(),
+            )
+            project_usage = client.get(
+                f"/control/v1/clerk-orgs/org_123/projects/{project_a['id']}/usage",
+                headers=self._control_auth(),
+            )
 
         self.assertEqual(tenant_usage.status_code, 200)
         self.assertEqual(project_usage.status_code, 200)

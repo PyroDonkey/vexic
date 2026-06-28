@@ -515,31 +515,43 @@ class HostedTenantCatalog:
                 ).fetchall()
         return [HostedAuditEvent(*row) for row in rows]
 
-    def usage_events(self, tenant_id: str | None) -> list[HostedUsageEvent]:
+    def usage_events(
+        self,
+        tenant_id: str | None,
+        *,
+        project_id: str | None = None,
+        recorded_at_gte: str | None = None,
+        recorded_at_lt: str | None = None,
+    ) -> list[HostedUsageEvent]:
+        conditions: list[str]
+        params: list[object] = []
+        if tenant_id is None:
+            conditions = ["tenant_id IS NULL"]
+        else:
+            conditions = ["tenant_id = ?"]
+            params.append(tenant_id)
+        if project_id is not None:
+            conditions.append("project_id = ?")
+            params.append(project_id)
+        if recorded_at_gte is not None:
+            conditions.append("julianday(recorded_at) >= julianday(?)")
+            params.append(recorded_at_gte)
+        if recorded_at_lt is not None:
+            conditions.append("julianday(recorded_at) < julianday(?)")
+            params.append(recorded_at_lt)
+        where_clause = " AND ".join(conditions)
         with closing(self._connect_control()) as conn:
-            if tenant_id is None:
-                rows = conn.execute(
-                    """
-                    SELECT kind, operation, tenant_id, principal_id, status, recorded_at,
-                           model_requests, input_tokens, output_tokens, total_tokens,
-                           estimated_cost_micros, error_type, project_id
-                    FROM hosted_usage_events
-                    WHERE tenant_id IS NULL
-                    ORDER BY id
-                    """
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """
-                    SELECT kind, operation, tenant_id, principal_id, status, recorded_at,
-                           model_requests, input_tokens, output_tokens, total_tokens,
-                           estimated_cost_micros, error_type, project_id
-                    FROM hosted_usage_events
-                    WHERE tenant_id = ?
-                    ORDER BY id
-                    """,
-                    (tenant_id,),
-                ).fetchall()
+            rows = conn.execute(
+                f"""
+                SELECT kind, operation, tenant_id, principal_id, status, recorded_at,
+                       model_requests, input_tokens, output_tokens, total_tokens,
+                       estimated_cost_micros, error_type, project_id
+                FROM hosted_usage_events
+                WHERE {where_clause}
+                ORDER BY id
+                """,
+                tuple(params),
+            ).fetchall()
         return [HostedUsageEvent(*row) for row in rows]
 
     def job_events(self, tenant_id: str) -> list[HostedJobEvent]:
@@ -649,6 +661,8 @@ class HostedTenantCatalog:
                     ON hosted_audit_events(tenant_id);
                 CREATE INDEX IF NOT EXISTS idx_hosted_usage_events_tenant_id
                     ON hosted_usage_events(tenant_id);
+                CREATE INDEX IF NOT EXISTS idx_hosted_usage_events_tenant_project_recorded_at
+                    ON hosted_usage_events(tenant_id, project_id, recorded_at);
                 CREATE INDEX IF NOT EXISTS idx_hosted_job_events_tenant_id
                     ON hosted_job_events(tenant_id);
                 """

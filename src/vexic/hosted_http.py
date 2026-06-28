@@ -4,10 +4,12 @@ import argparse
 import hmac
 import json
 import os
+import sqlite3
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from functools import wraps
 from pathlib import Path
-from typing import TypeVar
+from typing import ParamSpec, TypeVar
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -46,6 +48,8 @@ MAX_EXPAND_HISTORY_CHARS = 20_000
 
 _RequestT = TypeVar("_RequestT", bound=MemoryRequest)
 _ResultT = TypeVar("_ResultT", bound=MemoryResult)
+_ControlPlaneParams = ParamSpec("_ControlPlaneParams")
+_ControlPlaneResponseT = TypeVar("_ControlPlaneResponseT", bound=Response)
 
 
 def create_app(
@@ -96,6 +100,7 @@ def create_app(
         return {"status": "ok", "contract_version": CONTRACT_VERSION}
 
     @app.post("/control/v1/clerk-orgs/{clerk_org_id}/tenant")
+    @_control_plane_storage_boundary
     async def provision_control_plane_tenant(
         clerk_org_id: str,
         request: Request,
@@ -112,6 +117,7 @@ def create_app(
         )
 
     @app.get("/control/v1/clerk-orgs/{clerk_org_id}/projects")
+    @_control_plane_storage_boundary
     async def list_control_plane_projects(
         clerk_org_id: str,
         request: Request,
@@ -123,6 +129,7 @@ def create_app(
         return JSONResponse({"projects": [_project_payload(project) for project in projects]})
 
     @app.post("/control/v1/clerk-orgs/{clerk_org_id}/projects")
+    @_control_plane_storage_boundary
     async def create_control_plane_project(
         clerk_org_id: str,
         request: Request,
@@ -142,6 +149,7 @@ def create_app(
         return JSONResponse({"project": _project_payload(project)}, status_code=201)
 
     @app.get("/control/v1/clerk-orgs/{clerk_org_id}/projects/{project_id}")
+    @_control_plane_storage_boundary
     async def get_control_plane_project(
         clerk_org_id: str,
         project_id: str,
@@ -157,6 +165,7 @@ def create_app(
         return JSONResponse({"project": _project_payload(project)})
 
     @app.put("/control/v1/clerk-orgs/{clerk_org_id}/projects/{project_id}")
+    @_control_plane_storage_boundary
     async def put_control_plane_project(
         clerk_org_id: str,
         project_id: str,
@@ -180,6 +189,7 @@ def create_app(
         return JSONResponse({"project": _project_payload(project)})
 
     @app.get("/control/v1/clerk-orgs/{clerk_org_id}/projects/{project_id}/keys")
+    @_control_plane_storage_boundary
     async def list_control_plane_keys(
         clerk_org_id: str,
         project_id: str,
@@ -199,6 +209,7 @@ def create_app(
         return JSONResponse({"keys": [_key_payload(key) for key in keys]})
 
     @app.post("/control/v1/clerk-orgs/{clerk_org_id}/projects/{project_id}/keys")
+    @_control_plane_storage_boundary
     async def create_control_plane_key(
         clerk_org_id: str,
         project_id: str,
@@ -230,6 +241,7 @@ def create_app(
         return JSONResponse({"rawKey": provisioned.raw_key, "key": _key_payload(key)}, status_code=201)
 
     @app.post("/control/v1/clerk-orgs/{clerk_org_id}/projects/{project_id}/keys/{key_id}/revoke")
+    @_control_plane_storage_boundary
     async def revoke_control_plane_key(
         clerk_org_id: str,
         project_id: str,
@@ -251,6 +263,7 @@ def create_app(
         return Response(status_code=204)
 
     @app.get("/control/v1/clerk-orgs/{clerk_org_id}/usage")
+    @_control_plane_storage_boundary
     async def get_control_plane_tenant_usage(
         clerk_org_id: str,
         request: Request,
@@ -258,10 +271,24 @@ def create_app(
         if not _has_control_plane_credential(request, control_plane_tokens):
             return _error_response(401, "unauthorized", "Invalid control-plane credential.")
         tenant_id = _provision_control_tenant(service, clerk_org_id)
-        events = service.catalog.usage_events(tenant_id)
-        return JSONResponse({"usage": _usage_payload(events)})
+        period_start, period_end = _usage_period()
+        events = service.catalog.usage_events(
+            tenant_id,
+            recorded_at_gte=period_start,
+            recorded_at_lt=period_end,
+        )
+        return JSONResponse(
+            {
+                "usage": _usage_payload(
+                    events,
+                    period_start=period_start,
+                    period_end=period_end,
+                )
+            }
+        )
 
     @app.get("/control/v1/clerk-orgs/{clerk_org_id}/projects/{project_id}/usage")
+    @_control_plane_storage_boundary
     async def get_control_plane_project_usage(
         clerk_org_id: str,
         project_id: str,
@@ -274,12 +301,23 @@ def create_app(
             service.catalog.get_control_project(tenant_id, project_id)
         except PermissionError:
             return _error_response(404, "not_found", "Project not found.")
-        events = [
-            event
-            for event in service.catalog.usage_events(tenant_id)
-            if event.project_id == project_id
-        ]
-        return JSONResponse({"usage": _usage_payload(events, project_id=project_id)})
+        period_start, period_end = _usage_period()
+        events = service.catalog.usage_events(
+            tenant_id,
+            project_id=project_id,
+            recorded_at_gte=period_start,
+            recorded_at_lt=period_end,
+        )
+        return JSONResponse(
+            {
+                "usage": _usage_payload(
+                    events,
+                    period_start=period_start,
+                    period_end=period_end,
+                    project_id=project_id,
+                )
+            }
+        )
 
     @app.post("/v1/append_transcript")
     async def append_transcript(request: Request, payload: AppendTranscriptRequest) -> JSONResponse:
@@ -399,6 +437,47 @@ class _ControlPlaneBadRequest(ValueError):
     pass
 
 
+_RETRYABLE_SQLITE_OPERATIONAL_ERRORS = (
+    "database is locked",
+    "database table is locked",
+    "database schema is locked",
+    "database is busy",
+    "unable to open database file",
+    "disk i/o error",
+)
+
+
+def _control_plane_storage_boundary(
+    handler: Callable[_ControlPlaneParams, Awaitable[_ControlPlaneResponseT]],
+) -> Callable[_ControlPlaneParams, Awaitable[_ControlPlaneResponseT | JSONResponse]]:
+    @wraps(handler)
+    async def wrapped(
+        *args: _ControlPlaneParams.args,
+        **kwargs: _ControlPlaneParams.kwargs,
+    ) -> _ControlPlaneResponseT | JSONResponse:
+        try:
+            return await handler(*args, **kwargs)
+        except sqlite3.IntegrityError:
+            return _error_response(409, "conflict", "Control-plane write conflict.")
+        except sqlite3.OperationalError as exc:
+            if _is_retryable_sqlite_operational_error(exc):
+                return _error_response(
+                    503,
+                    "storage_unavailable",
+                    "Control-plane storage is temporarily unavailable.",
+                )
+            return _error_response(500, "internal_error", "Control-plane storage failed.")
+        except sqlite3.Error:
+            return _error_response(500, "internal_error", "Control-plane storage failed.")
+
+    return wrapped
+
+
+def _is_retryable_sqlite_operational_error(exc: sqlite3.OperationalError) -> bool:
+    message = str(exc).lower()
+    return any(fragment in message for fragment in _RETRYABLE_SQLITE_OPERATIONAL_ERRORS)
+
+
 def _provision_control_tenant(service: HostedMemoryService, clerk_org_id: str) -> str:
     try:
         return service.catalog.provision_customer_account(clerk_org_id)
@@ -452,9 +531,23 @@ def _key_payload(key) -> dict[str, str | None]:
     }
 
 
-def _usage_payload(events, *, project_id: str | None = None) -> dict[str, object]:
+def _usage_period() -> tuple[str, str]:
     now = datetime.now(UTC)
     period_start = datetime(now.year, now.month, 1, tzinfo=UTC)
+    return _utc_iso(period_start), _utc_iso(now)
+
+
+def _utc_iso(value: datetime) -> str:
+    return value.isoformat().replace("+00:00", "Z")
+
+
+def _usage_payload(
+    events,
+    *,
+    period_start: str,
+    period_end: str,
+    project_id: str | None = None,
+) -> dict[str, object]:
     totals = {
         "requests": len(events),
         "writes": sum(1 for event in events if event.operation == "append_transcript"),
@@ -470,8 +563,8 @@ def _usage_payload(events, *, project_id: str | None = None) -> dict[str, object
         "estimatedCostMicros": sum(event.estimated_cost_micros for event in events),
     }
     payload: dict[str, object] = {
-        "periodStart": period_start.isoformat().replace("+00:00", "Z"),
-        "periodEnd": now.isoformat().replace("+00:00", "Z"),
+        "periodStart": period_start,
+        "periodEnd": period_end,
         "totals": totals,
         "caps": {},
     }

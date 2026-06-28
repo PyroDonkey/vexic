@@ -697,6 +697,64 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(usage_event.total_tokens, 425)
         self.assertEqual(usage_event.estimated_cost_micros, 9876)
 
+    def test_usage_events_can_filter_by_project_and_recorded_at(self) -> None:
+        self.catalog.provision_tenant(
+            "tenant-a",
+            project_ids={"project-a", "project-b"},
+        )
+        for event in (
+            HostedUsageEvent(
+                kind="request",
+                operation="append_transcript",
+                tenant_id="tenant-a",
+                principal_id="agent-a",
+                status="ok",
+                recorded_at="2026-06-01T00:00:00.123456Z",
+                project_id="project-a",
+            ),
+            HostedUsageEvent(
+                kind="request",
+                operation="search_transcript",
+                tenant_id="tenant-a",
+                principal_id="agent-a",
+                status="ok",
+                recorded_at="2026-06-10T00:00:00Z",
+                project_id="project-a",
+            ),
+            HostedUsageEvent(
+                kind="request",
+                operation="append_transcript",
+                tenant_id="tenant-a",
+                principal_id="agent-a",
+                status="ok",
+                recorded_at="2026-05-31T23:59:59Z",
+                project_id="project-a",
+            ),
+            HostedUsageEvent(
+                kind="request",
+                operation="append_transcript",
+                tenant_id="tenant-a",
+                principal_id="agent-a",
+                status="ok",
+                recorded_at="2026-06-10T00:00:00Z",
+                project_id="project-b",
+            ),
+        ):
+            self.catalog.record_usage_event(event)
+
+        usage_events = self.catalog.usage_events(
+            "tenant-a",
+            project_id="project-a",
+            recorded_at_gte="2026-06-01T00:00:00Z",
+            recorded_at_lt="2026-07-01T00:00:00Z",
+        )
+
+        self.assertEqual(
+            [event.recorded_at for event in usage_events],
+            ["2026-06-01T00:00:00.123456Z", "2026-06-10T00:00:00Z"],
+        )
+        self.assertEqual([event.project_id for event in usage_events], ["project-a", "project-a"])
+
     async def test_telemetry_is_filtered_per_tenant_in_control_plane(self) -> None:
         self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
         self.catalog.provision_tenant("tenant-b", project_ids={"project-b"})
