@@ -71,6 +71,21 @@ test("listProjects gets the hosted org project list", async () => {
   assert.equal(calls[0].options.body, undefined);
 });
 
+test("control-plane URL is trimmed before hosted requests", async () => {
+  useClientEnv();
+  process.env.VEXIC_CONTROL_PLANE_URL = " \nhttps://api.example.test/// \t";
+  const calls = [];
+  mock.method(globalThis, "fetch", async (url, options) => {
+    calls.push({ url: String(url), options });
+    return Response.json({ projects: [] });
+  });
+
+  await listProjects("org_123");
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://api.example.test/control/v1/clerk-orgs/org_123/projects");
+});
+
 test("project and key operations map to hosted control-plane endpoints", async () => {
   useClientEnv();
   const calls = [];
