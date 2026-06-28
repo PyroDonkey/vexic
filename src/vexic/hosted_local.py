@@ -663,6 +663,8 @@ class HostedTenantCatalog:
                     ON hosted_usage_events(tenant_id);
                 CREATE INDEX IF NOT EXISTS idx_hosted_usage_events_tenant_project_recorded_at
                     ON hosted_usage_events(tenant_id, project_id, recorded_at);
+                CREATE INDEX IF NOT EXISTS idx_hosted_usage_events_tenant_project_recorded_at_jd
+                    ON hosted_usage_events(tenant_id, project_id, julianday(recorded_at));
                 CREATE INDEX IF NOT EXISTS idx_hosted_job_events_tenant_id
                     ON hosted_job_events(tenant_id);
                 """

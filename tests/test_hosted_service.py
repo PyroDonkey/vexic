@@ -755,6 +755,46 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual([event.project_id for event in usage_events], ["project-a", "project-a"])
 
+    def test_usage_events_project_time_window_uses_julianday_index(self) -> None:
+        root = Path(self.temp_dir.name)
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        self.catalog.record_usage_event(
+            HostedUsageEvent(
+                kind="request",
+                operation="append_transcript",
+                tenant_id="tenant-a",
+                principal_id="agent-a",
+                status="ok",
+                recorded_at="2026-06-01T00:00:00.123456Z",
+                project_id="project-a",
+            )
+        )
+
+        with closing(sqlite3.connect(root / "control-plane.db")) as conn:
+            plan_rows = conn.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT kind, operation, tenant_id, principal_id, status, recorded_at,
+                       model_requests, input_tokens, output_tokens, total_tokens,
+                       estimated_cost_micros, error_type, project_id
+                FROM hosted_usage_events
+                WHERE tenant_id = ?
+                  AND project_id = ?
+                  AND julianday(recorded_at) >= julianday(?)
+                  AND julianday(recorded_at) < julianday(?)
+                ORDER BY id
+                """,
+                (
+                    "tenant-a",
+                    "project-a",
+                    "2026-06-01T00:00:00Z",
+                    "2026-07-01T00:00:00Z",
+                ),
+            ).fetchall()
+
+        plan = " ".join(str(row) for row in plan_rows)
+        self.assertIn("idx_hosted_usage_events_tenant_project_recorded_at_jd", plan)
+
     async def test_telemetry_is_filtered_per_tenant_in_control_plane(self) -> None:
         self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
         self.catalog.provision_tenant("tenant-b", project_ids={"project-b"})
