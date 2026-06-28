@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { activeOrganizationCreateProps } from "../lib/console-routes.mjs";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
+const appRoot = path.join(root, "app");
 
 const routes = [
   ["public home", "app/page.tsx"],
@@ -24,11 +25,34 @@ test("COA-230 route set exists", () => {
 });
 
 test("COA-249 console does not expose self-serve sign-up", () => {
-  const homeSource = readFileSync(path.join(root, "app/page.tsx"), "utf8");
+  const appFiles = filesUnder(appRoot);
+  const signUpRouteFiles = appFiles.filter((file) => isRouteFile(file) && hasPathSegment(file, "sign-up"));
+  const signUpLinks = appFiles
+    .filter((file) => file.endsWith(".tsx"))
+    .filter((file) => readFileSync(file, "utf8").includes("/sign-up"));
 
-  assert.equal(existsSync(path.join(root, "app/sign-up/[[...sign-up]]/page.tsx")), false);
-  assert.doesNotMatch(homeSource, /href="\/sign-up"|Create Account/);
+  assert.deepEqual(signUpRouteFiles.map(relativeToRoot), []);
+  assert.deepEqual(signUpLinks.map(relativeToRoot), []);
 });
+
+function filesUnder(directory) {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const entryPath = path.join(directory, entry.name);
+    return entry.isDirectory() ? filesUnder(entryPath) : [entryPath];
+  });
+}
+
+function isRouteFile(file) {
+  return /(^|[\\/])(page|route)\.[^.]+$/.test(file);
+}
+
+function hasPathSegment(file, segment) {
+  return path.relative(appRoot, file).split(path.sep).includes(segment);
+}
+
+function relativeToRoot(file) {
+  return path.relative(root, file).replaceAll(path.sep, "/");
+}
 
 test("project workspace route remounts client state per project", () => {
   const source = readFileSync(path.join(root, "app/console/projects/[projectId]/page.tsx"), "utf8");
