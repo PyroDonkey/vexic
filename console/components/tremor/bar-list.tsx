@@ -6,6 +6,7 @@ type BarListItem = {
   key?: string
   name: string
   value: number
+  valueLabel?: string
 }
 
 type BarListProps = React.HTMLAttributes<HTMLDivElement> & {
@@ -29,7 +30,7 @@ export function BarList({ className, data, valueFormatter = formatNumber, ...pro
                 {item.name}
               </span>
             </div>
-            <span className="font-mono text-sm text-foreground">{valueFormatter(item.value)}</span>
+            <span className="font-mono text-sm text-foreground">{item.valueLabel ?? valueFormatter(item.value)}</span>
           </div>
         )
       })}

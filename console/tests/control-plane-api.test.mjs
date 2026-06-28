@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { mock } from "node:test";
 
 import {
   createProjectResponse,
@@ -14,6 +14,17 @@ import { resetStoreForTests } from "../lib/control-plane-store.mjs";
 
 const authedOrg = { userId: "user_123", orgId: "org_123", isInternalSupport: false };
 const staff = { userId: "user_staff", orgId: "org_vexic", isInternalSupport: true };
+const originalEnv = {
+  NODE_ENV: process.env.NODE_ENV,
+  VEXIC_CONTROL_PLANE_TOKEN: process.env.VEXIC_CONTROL_PLANE_TOKEN,
+  VEXIC_CONTROL_PLANE_URL: process.env.VEXIC_CONTROL_PLANE_URL
+};
+
+test.afterEach(() => {
+  restoreEnv();
+  mock.restoreAll();
+  resetStoreForTests();
+});
 
 function request(method, url, body) {
   return new Request(`https://console.test${url}`, {
@@ -116,3 +127,52 @@ test("usage and support responses expose aggregates and metadata only", async ()
   const support = JSON.parse(supportText);
   assert.equal(support.records[0].orgId, "org_vexic");
 });
+
+test("configured control-plane URL uses the hosted client and maps upstream auth failure", async () => {
+  resetStoreForTests();
+  process.env.NODE_ENV = "test";
+  process.env.VEXIC_CONTROL_PLANE_URL = "https://api.example.test";
+  delete process.env.VEXIC_CONTROL_PLANE_TOKEN;
+  const calls = [];
+  mock.method(console, "error", () => {});
+  mock.method(globalThis, "fetch", async (url, options) => {
+    calls.push({ url: String(url), options });
+    return Response.json({ error: { code: "unauthorized", message: "bad token" } }, { status: 401 });
+  });
+
+  const response = await listProjectsResponse(request("GET", "/api/control-plane/projects"), authedOrg);
+  const body = await json(response);
+
+  assert.equal(response.status, 500);
+  assert.deepEqual(body, { error: "control_plane_unavailable" });
+  assert.equal(calls.length, 1);
+  assert.match(new Headers(calls[0].options.headers).get("authorization"), /^Bearer/);
+});
+
+test("production without a control-plane URL fails closed after org guards", async () => {
+  resetStoreForTests();
+  process.env.NODE_ENV = "production";
+  delete process.env.VEXIC_CONTROL_PLANE_URL;
+
+  const denied = await listProjectsResponse(request("GET", "/api/control-plane/projects"), {
+    userId: "user_123",
+    orgId: null,
+    isInternalSupport: false
+  });
+  assert.equal(denied.status, 403);
+  assert.deepEqual(await json(denied), { error: "active_org_required" });
+
+  const response = await listProjectsResponse(request("GET", "/api/control-plane/projects"), authedOrg);
+  assert.equal(response.status, 500);
+  assert.deepEqual(await json(response), { error: "control_plane_unavailable" });
+});
+
+function restoreEnv() {
+  for (const [key, value] of Object.entries(originalEnv)) {
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+}

@@ -7,16 +7,17 @@ export function usageRows(usage) {
     key,
     label: formatLabel(key),
     value,
-    max: usage.caps[key] ?? 0
+    max: usage.caps[key] ?? 0,
+    ...(key === "cost" ? { valueLabel: formatCost(value) } : {})
   }));
 }
 
-export function usageMeterDisplay(value, max) {
+export function usageMeterDisplay(value, max, valueLabel = formatNumber(value)) {
   if (max <= 0) {
     return {
       hasCap: false,
       percentage: 0,
-      valueLabel: `${formatNumber(value)} / No cap`,
+      valueLabel: `${valueLabel} / No cap`,
       statusLabel: "No cap",
       ariaNow: null,
       ariaText: "No cap"
@@ -46,4 +47,12 @@ function formatLabel(value) {
 
 function formatNumber(value) {
   return new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(value);
+}
+
+function formatCost(value) {
+  return new Intl.NumberFormat(undefined, {
+    currency: "USD",
+    currencyDisplay: "narrowSymbol",
+    style: "currency"
+  }).format(value);
 }

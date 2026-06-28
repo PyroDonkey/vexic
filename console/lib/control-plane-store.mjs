@@ -1,6 +1,8 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 
-// ponytail: in-memory stub; replace with hosted control-plane endpoints once they exist.
+import * as client from "./control-plane-client.mjs";
+import { ControlPlaneClientError } from "./control-plane-client.mjs";
+
 const projectsByOrg = new Map();
 const keysByProject = new Map();
 
@@ -30,6 +32,38 @@ export function resetStoreForTests() {
 }
 
 export function createProject(orgId, input = {}) {
+  return selectedStore().createProject(orgId, input);
+}
+
+export function listProjects(orgId) {
+  return selectedStore().listProjects(orgId);
+}
+
+export function getProject(orgId, projectId) {
+  return selectedStore().getProject(orgId, projectId);
+}
+
+export function createAgentKey(orgId, projectId, input = {}) {
+  return selectedStore().createAgentKey(orgId, projectId, input);
+}
+
+export function listAgentKeys(orgId, projectId) {
+  return selectedStore().listAgentKeys(orgId, projectId);
+}
+
+export function revokeAgentKey(orgId, projectId, keyId) {
+  return selectedStore().revokeAgentKey(orgId, projectId, keyId);
+}
+
+export function usageSummary(orgId, projectId) {
+  return selectedStore().usageSummary(orgId, projectId);
+}
+
+export function supportMetadata(orgId) {
+  return selectedStore().supportMetadata(orgId);
+}
+
+function stubCreateProject(orgId, input = {}) {
   const timestamp = now();
   const project = {
     id: id("proj"),
@@ -43,16 +77,16 @@ export function createProject(orgId, input = {}) {
   return project;
 }
 
-export function listProjects(orgId) {
+function stubListProjects(orgId) {
   return [...orgProjects(orgId)];
 }
 
-export function getProject(orgId, projectId) {
+function stubGetProject(orgId, projectId) {
   return orgProjects(orgId).find((project) => project.id === projectId) ?? null;
 }
 
-export function createAgentKey(orgId, projectId, input = {}) {
-  if (!getProject(orgId, projectId)) {
+function stubCreateAgentKey(orgId, projectId, input = {}) {
+  if (!stubGetProject(orgId, projectId)) {
     return null;
   }
 
@@ -82,16 +116,16 @@ export function createAgentKey(orgId, projectId, input = {}) {
   };
 }
 
-export function listAgentKeys(orgId, projectId) {
-  if (!getProject(orgId, projectId)) {
+function stubListAgentKeys(orgId, projectId) {
+  if (!stubGetProject(orgId, projectId)) {
     return null;
   }
 
   return (keysByProject.get(projectId) ?? []).filter((key) => !key.revokedAt).map(publicKey);
 }
 
-export function revokeAgentKey(orgId, projectId, keyId) {
-  if (!getProject(orgId, projectId)) {
+function stubRevokeAgentKey(orgId, projectId, keyId) {
+  if (!stubGetProject(orgId, projectId)) {
     return false;
   }
 
@@ -104,8 +138,8 @@ export function revokeAgentKey(orgId, projectId, keyId) {
   return true;
 }
 
-export function usageSummary(orgId, projectId) {
-  const project = getProject(orgId, projectId);
+function stubUsageSummary(orgId, projectId) {
+  const project = stubGetProject(orgId, projectId);
   if (!project) {
     return null;
   }
@@ -113,7 +147,7 @@ export function usageSummary(orgId, projectId) {
   const current = new Date();
   const periodStart = new Date(Date.UTC(current.getUTCFullYear(), current.getUTCMonth(), 1));
   const periodEnd = new Date(Date.UTC(current.getUTCFullYear(), current.getUTCMonth() + 1, 0, 23, 59, 59, 999));
-  const keyCount = listAgentKeys(orgId, projectId)?.length ?? 0;
+  const keyCount = stubListAgentKeys(orgId, projectId)?.length ?? 0;
   return {
     projectId,
     periodStart: periodStart.toISOString(),
@@ -135,8 +169,8 @@ export function usageSummary(orgId, projectId) {
   };
 }
 
-export function supportMetadata(orgId) {
-  const projects = listProjects(orgId);
+function stubSupportMetadata(orgId) {
+  const projects = stubListProjects(orgId);
   const timestamp = now();
   return [
     {
@@ -163,4 +197,44 @@ function publicKey(key) {
     createdAt: key.createdAt,
     revokedAt: key.revokedAt
   };
+}
+
+function selectedStore() {
+  if (controlPlaneUrlConfigured()) {
+    return client;
+  }
+  if (process.env.NODE_ENV === "production") {
+    return failClosedStore;
+  }
+  return stubStore;
+}
+
+function controlPlaneUrlConfigured() {
+  return String(process.env.VEXIC_CONTROL_PLANE_URL ?? "").trim().length > 0;
+}
+
+const stubStore = {
+  createProject: stubCreateProject,
+  listProjects: stubListProjects,
+  getProject: stubGetProject,
+  createAgentKey: stubCreateAgentKey,
+  listAgentKeys: stubListAgentKeys,
+  revokeAgentKey: stubRevokeAgentKey,
+  usageSummary: stubUsageSummary,
+  supportMetadata: stubSupportMetadata
+};
+
+const failClosedStore = {
+  createProject: notConfigured,
+  listProjects: notConfigured,
+  getProject: notConfigured,
+  createAgentKey: notConfigured,
+  listAgentKeys: notConfigured,
+  revokeAgentKey: notConfigured,
+  usageSummary: notConfigured,
+  supportMetadata: notConfigured
+};
+
+function notConfigured() {
+  throw new ControlPlaneClientError(500, "control_plane_unavailable", "Control plane is not configured.");
 }

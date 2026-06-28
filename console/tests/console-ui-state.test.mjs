@@ -29,11 +29,26 @@ test("usage rows include totals, caps, and readable labels", () => {
   );
 });
 
+test("usage rows format cost values as dollars", () => {
+  assert.deepEqual(usageRows({ totals: { cost: 0.123456 }, caps: {} }), [
+    { key: "cost", label: "Cost", value: 0.123456, max: 0, valueLabel: "$0.12" }
+  ]);
+});
+
 test("usage meter display avoids invalid aria values", () => {
   assert.deepEqual(usageMeterDisplay(2, 0), {
     hasCap: false,
     percentage: 0,
     valueLabel: "2 / No cap",
+    statusLabel: "No cap",
+    ariaNow: null,
+    ariaText: "No cap"
+  });
+
+  assert.deepEqual(usageMeterDisplay(0.123456, 0, "$0.12"), {
+    hasCap: false,
+    percentage: 0,
+    valueLabel: "$0.12 / No cap",
     statusLabel: "No cap",
     ariaNow: null,
     ariaText: "No cap"
