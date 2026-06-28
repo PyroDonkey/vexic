@@ -14,6 +14,8 @@ def test_hosted_docker_runtime_exposes_src_package(tmp_path: Path) -> None:
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
 
     assert re.search(r"(?m)^ENV\s+PYTHONPATH=([\"']?)/app/src\1\s*$", dockerfile)
+    assert "COPY adapters ./adapters" not in dockerfile
+    assert "vexic.hosted_control_plane_http:create_app" in dockerfile
 
     pythonpath_export = (
         r"PYTHONPATH\s*=\s*([\"'])/app/src\$\{PYTHONPATH:\+:\$PYTHONPATH\}\1"
@@ -23,7 +25,8 @@ def test_hosted_docker_runtime_exposes_src_package(tmp_path: Path) -> None:
         dockerfile,
     )
     assert re.search(
-        rf"(?m)^CMD\s+{pythonpath_export}\s+uv run --no-sync python -m uvicorn ",
+        rf"(?m)^CMD\s+{pythonpath_export}\s+uv run --no-sync python -m uvicorn "
+        r"vexic\.hosted_control_plane_http:create_app --factory ",
         dockerfile,
     )
 

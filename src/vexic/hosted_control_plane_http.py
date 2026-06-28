@@ -311,9 +311,8 @@ def _normalize_control_plane_tokens(values: tuple[str, ...]) -> tuple[str, ...]:
     normalized: list[str] = []
     for value in values:
         stripped = value.strip()
-        if not stripped:
-            return ()
-        normalized.append(stripped)
+        if stripped:
+            normalized.append(stripped)
     return tuple(normalized)
 
 

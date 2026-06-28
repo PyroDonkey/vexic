@@ -12,7 +12,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
-from adapters.hosted_control_plane_http import create_app as create_control_plane_app
+from vexic.hosted_control_plane_http import create_app as create_control_plane_app
 from vexic import hosted_http
 from vexic.contract import (
     AppendTranscriptRequest,
@@ -127,6 +127,23 @@ class HostedHttpTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
 
+    def test_control_plane_env_token_parser_ignores_blank_entries(self) -> None:
+        for env_value, accepted_tokens in (
+            ("console-secret,", ("console-secret",)),
+            ("console-secret,,rotated-secret", ("console-secret", "rotated-secret")),
+        ):
+            with self.subTest(env_value=env_value):
+                with patch.dict(os.environ, {"VEXIC_CONTROL_PLANE_TOKENS": env_value}):
+                    client = TestClient(create_control_plane_app(self.service))
+
+                for token in accepted_tokens:
+                    response = client.post(
+                        "/control/v1/clerk-orgs/org_123/tenant",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+
+                    self.assertEqual(response.status_code, 200)
+
     def test_control_plane_blank_clerk_org_returns_bad_request(self) -> None:
         client = TestClient(
             create_control_plane_app(self.service, control_plane_tokens=("console-secret",)),
@@ -152,7 +169,7 @@ class HostedHttpTests(unittest.TestCase):
             "create_control_project",
             side_effect=sqlite3.IntegrityError("UNIQUE constraint failed: secret"),
         ):
-            with self.assertLogs("adapters.hosted_control_plane_http", level="WARNING") as logs:
+            with self.assertLogs("vexic.hosted_control_plane_http", level="WARNING") as logs:
                 response = client.post(
                     "/control/v1/clerk-orgs/org_123/projects",
                     headers={
@@ -185,7 +202,7 @@ class HostedHttpTests(unittest.TestCase):
             "list_control_projects",
             side_effect=sqlite3.OperationalError("database is locked: secret"),
         ):
-            with self.assertLogs("adapters.hosted_control_plane_http", level="WARNING") as logs:
+            with self.assertLogs("vexic.hosted_control_plane_http", level="WARNING") as logs:
                 response = client.get(
                     "/control/v1/clerk-orgs/org_123/projects",
                     headers={
@@ -211,7 +228,7 @@ class HostedHttpTests(unittest.TestCase):
             "list_control_projects",
             side_effect=sqlite3.OperationalError("syntax error near secret"),
         ):
-            with self.assertLogs("adapters.hosted_control_plane_http", level="WARNING") as logs:
+            with self.assertLogs("vexic.hosted_control_plane_http", level="WARNING") as logs:
                 response = client.get(
                     "/control/v1/clerk-orgs/org_123/projects",
                     headers={
@@ -653,7 +670,7 @@ class HostedHttpTests(unittest.TestCase):
             self.catalog.record_usage_event(event)
 
         with patch(
-            "adapters.hosted_control_plane_http._usage_period",
+            "vexic.hosted_control_plane_http._usage_period",
             return_value=("2026-06-01T00:00:00Z", "2026-07-01T00:00:00Z"),
         ):
             tenant_usage = client.get(
@@ -709,7 +726,7 @@ class HostedHttpTests(unittest.TestCase):
             calls.append(left)
             return left == right
 
-        with patch("adapters.hosted_control_plane_http.hmac.compare_digest", side_effect=fake_compare_digest):
+        with patch("vexic.hosted_control_plane_http.hmac.compare_digest", side_effect=fake_compare_digest):
             client = TestClient(
                 create_control_plane_app(
                     self.service,

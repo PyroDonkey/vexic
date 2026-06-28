@@ -168,6 +168,7 @@ test("upstream HTTP statuses map to console-safe errors", async () => {
   const cases = [
     [400, 400, "invalid_request", false],
     [404, 404, "not_found", false],
+    [409, 409, "conflict", true],
     [401, 500, "control_plane_unavailable", true],
     [403, 500, "control_plane_unavailable", true],
     [503, 500, "control_plane_unavailable", true]

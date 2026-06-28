@@ -36,9 +36,9 @@ this boundary without changing the memory contract.
   `HostedMemoryService` for `append_transcript`, `search_transcript`,
   `search_long_term`, and `expand_history`, with API-key auth, request caps,
   error mapping, and `/health`.
-- `adapters.hosted_control_plane_http` is the repo-local control-plane HTTP
-  adapter. It wraps the hosted memory app and registers `/control/v1/*` outside
-  the `vexic` package.
+- `vexic.hosted_control_plane_http` is the hosted control-plane HTTP adapter.
+  It wraps the hosted memory app and registers `/control/v1/*` without adding
+  control-plane routes to the core `vexic.hosted_http` app.
 - `vexic.mcp_stdio` stays the local Claude Code stdio MCP process; the
   `vexic.hosted_mcp` adapter lets the supported launcher point
   that MCP process at the hosted HTTP API.
@@ -106,11 +106,11 @@ Run the hosted HTTP adapter locally:
 
 ```powershell
 $env:VEXIC_CONTROL_PLANE_TOKENS = "console-secret"
-uv run --with-editable . --extra hosted python -m uvicorn adapters.hosted_control_plane_http:create_app --factory --host 127.0.0.1 --port 8000
+uv run --with-editable . --extra hosted python -m uvicorn vexic.hosted_control_plane_http:create_app --factory --host 127.0.0.1 --port 8000
 ```
 
 `VEXIC_CONTROL_PLANE_TOKENS` is read only by the repo-local
-`adapters.hosted_control_plane_http` adapter as a comma-separated list for
+`vexic.hosted_control_plane_http` adapter as a comma-separated list for
 `/control/v1/*` Console service credentials. If it is unset or contains a blank
 token, the control plane fails closed. Running `vexic.hosted_http:create_app`
 directly starts the hosted memory and MCP app without control-plane routes.
@@ -133,7 +133,7 @@ serves:
 - `POST /v1/search_long_term`
 - `POST /v1/expand_history`
 - `POST /mcp`
-- `/control/v1/*` when started through `adapters.hosted_control_plane_http`
+- `/control/v1/*` when started through `vexic.hosted_control_plane_http`
 
 `POST /mcp` is the native read-only Streamable HTTP MCP route. It differs from
 the `/v1/*` routes deliberately:
@@ -216,6 +216,7 @@ Required Railway config:
 
 - `PORT`: provided by Railway.
 - `VEXIC_HOSTED_ROOT=/data/vexic`
+- `VEXIC_CONTROL_PLANE_TOKENS=<comma-separated Console service tokens>`
 - Persistent volume mounted at `/data/vexic`
 - Health check path: `/health`
 
