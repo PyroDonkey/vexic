@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 
@@ -70,3 +71,18 @@ def test_console_boundary_is_documented_as_outside_vexic_package() -> None:
         assert "`vexic.*` entrypoint" in text
 
     assert "not memory-core runtime under src/vexic" in console_layout
+
+
+def test_superpowers_specs_do_not_embed_tracking_references() -> None:
+    tracker_name = "L" + "inear"
+    ticket_pattern = re.compile(r"\b" + "C" + r"OA-\d+\b")
+    offenders: list[str] = []
+    specs_dir = ROOT / "docs" / "superpowers" / "specs"
+    for path in specs_dir.glob("*.md"):
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for line_number, line in enumerate(lines, 1):
+            if tracker_name in line or ticket_pattern.search(line):
+                location = f"{path.relative_to(ROOT)}:{line_number}"
+                offenders.append(f"{location}: {line.strip()}")
+
+    assert offenders == []

@@ -1,8 +1,8 @@
-# COA-244 - Wire Vexic Console control-plane to the hosted Vexic API
+# Wire Vexic Console control-plane to the hosted Vexic API
 
 Date: 2026-06-27
 Status: Design (pending review)
-Linear: COA-244 (Wire Vexic Console control-plane to the hosted Vexic API, replace in-memory stub)
+Related ADR: `docs/adr/0013-hosted-control-plane-http-api.md`
 
 ## Problem
 
@@ -11,9 +11,9 @@ control-plane data layer is an in-memory stub. `console/lib/control-plane-store.
 stores projects and keys in process-local `Map`s and fabricates usage totals.
 Keys created in the dashboard are never persisted, never reach the Python
 authenticator (`HostedApiKeyStore`), and vanish on restart. The hosted side
-already exposes the real control-plane HTTP API (COA-247, ADR 0013) and a
-SQLite-backed key store (COA-242/243). This work replaces the stub with a real
-HTTP client so the dashboard manages genuine, authenticatable hosted keys.
+already exposes the real control-plane HTTP API described by ADR 0013 and a
+SQLite-backed key store. This work replaces the stub with a real HTTP client so
+the dashboard manages genuine, authenticatable hosted keys.
 
 This makes the "working API key system" goal true end to end and turns the
 dashboard from a facade over fake data into an MVP over real data.
@@ -30,9 +30,9 @@ In scope:
 - Tests for the client (mocked `fetch`) plus preservation of existing stub
   tests.
 
-Out of scope (tracked elsewhere):
+Out of scope:
 
-- Railway/Vercel deployment (COA-235, COA-233).
+- Railway/Vercel deployment.
 - Server-side support metadata endpoint (no hosted endpoint exists).
 - Billing and caps semantics.
 - Server-side tenant auto-provision behavior on GET (see Known Behavior C3).
@@ -203,8 +203,9 @@ The server `_key_payload` returns the fields the UI uses (`id`, `name`,
 
 - C2: Wiring removes the cap bars the stub showed; intentional per ADR 0013.
 - C3: The hosted server provisions a tenant and SQLite DB file as a side effect
-  of read-only GETs. This is existing accepted server behavior (COA-247);
-  flagged here as a follow-up, out of scope for COA-244.
+  of read-only GETs. This is existing accepted server behavior described by
+  ADR 0013; flagged here as a follow-up, out of scope for this console-client
+  work.
 - M1: Revoking an already-revoked or unknown key yields a 404 the UI surfaces as
   a failed-revoke toast; behavior matches the prior stub.
 - m4: The org-level `GET /clerk-orgs/{org}/usage` endpoint is not wired; only
@@ -219,4 +220,4 @@ This work stays within settled boundaries:
 - No provider secrets, billing, or hosted auth logic is added to the core
   package. The console holds only the shared control-plane bearer token via
   environment configuration.
-- No Linear SDK, secret, or runtime dependency is added.
+- No project-tracking SDK, secret, or runtime dependency is added.
