@@ -72,9 +72,7 @@ def test_console_env_contract_is_documented() -> None:
         "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY",
         "CLERK_SECRET_KEY",
         "NEXT_PUBLIC_CLERK_SIGN_IN_URL",
-        "NEXT_PUBLIC_CLERK_SIGN_UP_URL",
         "NEXT_PUBLIC_CLERK_AFTER_SIGN_IN_URL",
-        "NEXT_PUBLIC_CLERK_AFTER_SIGN_UP_URL",
         "VEXIC_INTERNAL_ORG_ID",
         "VEXIC_CONTROL_PLANE_URL",
         "VEXIC_CONTROL_PLANE_TOKEN",
@@ -83,6 +81,10 @@ def test_console_env_contract_is_documented() -> None:
         assert name in console_readme
 
     required_section = console_readme.split("Route defaults:", 1)[0]
+    assert "NEXT_PUBLIC_CLERK_SIGN_UP_URL" not in env_example
+    assert "NEXT_PUBLIC_CLERK_SIGN_UP_URL" not in console_readme
+    assert "NEXT_PUBLIC_CLERK_AFTER_SIGN_UP_URL" not in env_example
+    assert "NEXT_PUBLIC_CLERK_AFTER_SIGN_UP_URL" not in console_readme
     assert "VEXIC_CONTROL_PLANE_URL" not in required_section
     assert "Control-plane backend:" in console_readme
     assert "does not fall back to stub data when a URL is configured" in compact_console_readme
