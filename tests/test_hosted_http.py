@@ -12,7 +12,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
-from adapters.hosted_control_plane_http import create_app as create_control_plane_app
+from vexic.hosted_control_plane_http import create_app as create_control_plane_app
 from vexic import hosted_http
 from vexic.contract import (
     AppendTranscriptRequest,
@@ -169,7 +169,7 @@ class HostedHttpTests(unittest.TestCase):
             "create_control_project",
             side_effect=sqlite3.IntegrityError("UNIQUE constraint failed: secret"),
         ):
-            with self.assertLogs("adapters.hosted_control_plane_http", level="WARNING") as logs:
+            with self.assertLogs("vexic.hosted_control_plane_http", level="WARNING") as logs:
                 response = client.post(
                     "/control/v1/clerk-orgs/org_123/projects",
                     headers={
@@ -202,7 +202,7 @@ class HostedHttpTests(unittest.TestCase):
             "list_control_projects",
             side_effect=sqlite3.OperationalError("database is locked: secret"),
         ):
-            with self.assertLogs("adapters.hosted_control_plane_http", level="WARNING") as logs:
+            with self.assertLogs("vexic.hosted_control_plane_http", level="WARNING") as logs:
                 response = client.get(
                     "/control/v1/clerk-orgs/org_123/projects",
                     headers={
@@ -228,7 +228,7 @@ class HostedHttpTests(unittest.TestCase):
             "list_control_projects",
             side_effect=sqlite3.OperationalError("syntax error near secret"),
         ):
-            with self.assertLogs("adapters.hosted_control_plane_http", level="WARNING") as logs:
+            with self.assertLogs("vexic.hosted_control_plane_http", level="WARNING") as logs:
                 response = client.get(
                     "/control/v1/clerk-orgs/org_123/projects",
                     headers={
@@ -670,7 +670,7 @@ class HostedHttpTests(unittest.TestCase):
             self.catalog.record_usage_event(event)
 
         with patch(
-            "adapters.hosted_control_plane_http._usage_period",
+            "vexic.hosted_control_plane_http._usage_period",
             return_value=("2026-06-01T00:00:00Z", "2026-07-01T00:00:00Z"),
         ):
             tenant_usage = client.get(
@@ -726,7 +726,7 @@ class HostedHttpTests(unittest.TestCase):
             calls.append(left)
             return left == right
 
-        with patch("adapters.hosted_control_plane_http.hmac.compare_digest", side_effect=fake_compare_digest):
+        with patch("vexic.hosted_control_plane_http.hmac.compare_digest", side_effect=fake_compare_digest):
             client = TestClient(
                 create_control_plane_app(
                     self.service,

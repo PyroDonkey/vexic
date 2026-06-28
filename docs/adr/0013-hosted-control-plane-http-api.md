@@ -24,12 +24,12 @@ memory-core operations into `src/vexic`.
 Expose a narrow `/control/v1/*` surface on the repo-local hosted FastAPI
 adapter for internal-alpha Console and operator use.
 
-The control-plane surface is hosted-adapter code only and lives outside the
-`vexic` package, currently in `adapters.hosted_control_plane_http`. It may call
-`HostedTenantCatalog`, `HostedApiKeyStore`, and hosted telemetry readers, but
-it does not add operations to `MemoryService`, change Vexic core storage, or
-move Console code into `src/vexic`. The package app in `vexic.hosted_http`
-remains the hosted memory and read-only MCP transport.
+The control-plane surface is hosted-adapter code only, currently in
+`vexic.hosted_control_plane_http`. It may call `HostedTenantCatalog`,
+`HostedApiKeyStore`, and hosted telemetry readers, but it does not add
+operations to `MemoryService`, change Vexic core storage, or move Console code
+into `src/vexic`. The core app in `vexic.hosted_http` remains the hosted memory
+and read-only MCP transport without `/control/v1/*` routes.
 
 Every `/control/v1/*` request requires a configured control-plane credential.
 The adapter may accept multiple configured Console Service Credential bearer
