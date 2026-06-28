@@ -23,7 +23,12 @@ from vexic.contract import (
     SearchTranscriptRequest,
     TrustBoundary,
 )
-from vexic.hosted import HostedInMemoryRateLimiter, HostedMemoryService, HostedRateLimitRule
+from vexic.hosted import (
+    HostedInMemoryRateLimiter,
+    HostedMemoryService,
+    HostedRateLimitRule,
+    HostedUsageEvent,
+)
 from vexic.storage import single_message_adapter
 from vexic.hosted_http import create_app
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
@@ -79,11 +84,588 @@ class HostedHttpTests(unittest.TestCase):
     def _auth(self, api_key: str) -> dict[str, str]:
         return {"Authorization": f"Bearer {api_key}"}
 
+    def _control_auth(self) -> dict[str, str]:
+        return {"Authorization": "Bearer console-secret"}
+
     def test_health_requires_no_api_key(self) -> None:
         response = self.client.get("/health")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "ok")
+
+    def test_control_plane_tenant_provisioning_requires_console_service_credential(self) -> None:
+        client = TestClient(
+            create_app(self.service, control_plane_tokens=("console-secret",))
+        )
+
+        response = client.post("/control/v1/clerk-orgs/org_123/tenant")
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"]["code"], "unauthorized")
+
+    def test_control_plane_credentials_can_be_loaded_from_env_for_factory_startup(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"VEXIC_CONTROL_PLANE_TOKENS": "console-secret,rotated-secret"},
+        ):
+            client = TestClient(create_app(self.service))
+
+        response = client.post(
+            "/control/v1/clerk-orgs/org_123/tenant",
+            headers={"Authorization": "Bearer rotated-secret"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_control_plane_blank_clerk_org_returns_bad_request(self) -> None:
+        client = TestClient(
+            create_app(self.service, control_plane_tokens=("console-secret",)),
+            raise_server_exceptions=False,
+        )
+
+        response = client.post(
+            "/control/v1/clerk-orgs/%20/tenant",
+            headers=self._control_auth(),
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], "invalid_request")
+
+    def test_control_plane_tenant_provisioning_is_idempotent_per_clerk_org(self) -> None:
+        client = TestClient(
+            create_app(self.service, control_plane_tokens=("console-secret",))
+        )
+
+        first = client.post(
+            "/control/v1/clerk-orgs/org_123/tenant",
+            headers=self._control_auth(),
+        )
+        second = client.post(
+            "/control/v1/clerk-orgs/org_123/tenant",
+            headers=self._control_auth(),
+        )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(first.json()["tenant"]["clerkOrgId"], "org_123")
+        self.assertEqual(first.json()["tenant"]["tenantId"], second.json()["tenant"]["tenantId"])
+
+    def test_control_plane_project_create_list_and_get_use_hosted_project_ids(self) -> None:
+        client = TestClient(
+            create_app(self.service, control_plane_tokens=("console-secret",))
+        )
+
+        created = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo", "environment": "staging"},
+        )
+
+        self.assertEqual(created.status_code, 201)
+        project = created.json()["project"]
+        self.assertTrue(project["id"].startswith("proj_"))
+        self.assertEqual(project["name"], "Solo")
+        self.assertEqual(project["environment"], "staging")
+
+        listed = client.get(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+        )
+        fetched = client.get(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}",
+            headers=self._control_auth(),
+        )
+
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(fetched.status_code, 200)
+        self.assertEqual([item["id"] for item in listed.json()["projects"]], [project["id"]])
+        self.assertEqual(fetched.json()["project"]["id"], project["id"])
+
+    def test_control_plane_project_create_rejects_null_string_fields(self) -> None:
+        client = TestClient(
+            create_app(self.service, control_plane_tokens=("console-secret",))
+        )
+
+        null_name = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": None},
+        )
+        null_environment = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo", "environment": None},
+        )
+
+        self.assertEqual(null_name.status_code, 400)
+        self.assertEqual(null_environment.status_code, 400)
+        self.assertEqual(null_name.json()["error"]["code"], "invalid_request")
+        self.assertEqual(null_environment.json()["error"]["code"], "invalid_request")
+
+    def test_control_plane_project_put_is_idempotent(self) -> None:
+        client = TestClient(
+            create_app(self.service, control_plane_tokens=("console-secret",))
+        )
+
+        first = client.put(
+            "/control/v1/clerk-orgs/org_123/projects/proj_manual",
+            headers=self._control_auth(),
+            json={"name": "Manual", "environment": "production"},
+        )
+        second = client.put(
+            "/control/v1/clerk-orgs/org_123/projects/proj_manual",
+            headers=self._control_auth(),
+            json={"name": "Manual", "environment": "production"},
+        )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(first.json()["project"]["id"], "proj_manual")
+        self.assertEqual(second.json()["project"]["id"], "proj_manual")
+
+    def test_control_plane_project_put_hides_cross_tenant_project_id_collision(self) -> None:
+        client = TestClient(
+            create_app(self.service, control_plane_tokens=("console-secret",))
+        )
+
+        created = client.put(
+            "/control/v1/clerk-orgs/org_a/projects/proj_manual",
+            headers=self._control_auth(),
+            json={"name": "Alpha", "environment": "production"},
+        )
+        collided = client.put(
+            "/control/v1/clerk-orgs/org_b/projects/proj_manual",
+            headers=self._control_auth(),
+            json={"name": "Beta", "environment": "staging"},
+        )
+
+        self.assertEqual(created.status_code, 200)
+        self.assertEqual(collided.status_code, 404)
+        self.assertEqual(collided.json()["error"]["code"], "not_found")
+
+    def test_control_plane_key_create_and_list_hide_raw_secret(self) -> None:
+        client = TestClient(
+            create_app(self.service, control_plane_tokens=("console-secret",))
+        )
+        project = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo"},
+        ).json()["project"]
+
+        created = client.post(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/keys",
+            headers=self._control_auth(),
+            json={"name": "Worker", "agentScope": "agent-a"},
+        )
+
+        self.assertEqual(created.status_code, 201)
+        payload = created.json()
+        self.assertTrue(payload["rawKey"].startswith("vx_"))
+        self.assertEqual(payload["key"]["name"], "Worker")
+        self.assertEqual(payload["key"]["capability"], "v1-memory")
+        self.assertEqual(payload["key"]["agentScope"], "agent-a")
+        self.assertNotIn(payload["rawKey"], json.dumps(payload["key"]))
+
+        listed = client.get(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/keys",
+            headers=self._control_auth(),
+        )
+
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual([key["id"] for key in listed.json()["keys"]], [payload["key"]["id"]])
+        self.assertNotIn("rawKey", listed.text)
+        self.assertNotIn("keyHash", listed.text)
+
+    def test_control_plane_key_create_rejects_null_string_fields(self) -> None:
+        client = TestClient(
+            create_app(self.service, control_plane_tokens=("console-secret",))
+        )
+        project = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo"},
+        ).json()["project"]
+
+        null_name = client.post(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/keys",
+            headers=self._control_auth(),
+            json={"name": None},
+        )
+        null_agent_scope = client.post(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/keys",
+            headers=self._control_auth(),
+            json={"name": "Worker", "agentScope": None},
+        )
+
+        self.assertEqual(null_name.status_code, 400)
+        self.assertEqual(null_agent_scope.status_code, 400)
+        self.assertEqual(null_name.json()["error"]["code"], "invalid_request")
+        self.assertEqual(null_agent_scope.json()["error"]["code"], "invalid_request")
+
+    def test_control_plane_key_revoke_invalidates_v1_memory_access(self) -> None:
+        client = TestClient(
+            create_app(self.service, control_plane_tokens=("console-secret",))
+        )
+        tenant = client.post(
+            "/control/v1/clerk-orgs/org_123/tenant",
+            headers=self._control_auth(),
+        ).json()["tenant"]
+        project = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo"},
+        ).json()["project"]
+        created = client.post(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/keys",
+            headers=self._control_auth(),
+            json={"name": "Worker"},
+        ).json()
+        raw_key = created["rawKey"]
+        key_id = created["key"]["id"]
+        message_json = single_message_adapter.dump_json(
+            ModelRequest(parts=[UserPromptPart(content="control plane key cedar")])
+        )
+
+        append_response = client.post(
+            "/v1/append_transcript",
+            headers=self._auth(raw_key),
+            json=AppendTranscriptRequest(
+                scope=_scope(
+                    tenant_id=tenant["tenantId"],
+                    project_id=project["id"],
+                    capabilities={MemoryCapability.WRITE},
+                ),
+                messages_json=[message_json],
+                redaction=RedactionContext(forbidden_values=()),
+            ).model_dump(mode="json"),
+        )
+
+        self.assertEqual(append_response.status_code, 200)
+
+        revoked = client.post(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/keys/{key_id}/revoke",
+            headers=self._control_auth(),
+        )
+        denied = client.post(
+            "/v1/search_transcript",
+            headers=self._auth(raw_key),
+            json=SearchTranscriptRequest(
+                scope=_scope(
+                    tenant_id=tenant["tenantId"],
+                    project_id=project["id"],
+                    capabilities={MemoryCapability.SEARCH},
+                ),
+                query="cedar",
+            ).model_dump(mode="json"),
+        )
+
+        self.assertEqual(revoked.status_code, 204)
+        self.assertEqual(denied.status_code, 401)
+
+    def test_control_plane_key_authenticates_against_mcp(self) -> None:
+        client = TestClient(
+            create_app(self.service, control_plane_tokens=("console-secret",))
+        )
+        tenant = client.post(
+            "/control/v1/clerk-orgs/org_123/tenant",
+            headers=self._control_auth(),
+        ).json()["tenant"]
+        project = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo"},
+        ).json()["project"]
+        raw_key = client.post(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/keys",
+            headers=self._control_auth(),
+            json={"name": "Worker"},
+        ).json()["rawKey"]
+        message_json = single_message_adapter.dump_json(
+            ModelRequest(parts=[UserPromptPart(content="mcp cedar")])
+        )
+        client.post(
+            "/v1/append_transcript",
+            headers=self._auth(raw_key),
+            json=AppendTranscriptRequest(
+                scope=_scope(
+                    tenant_id=tenant["tenantId"],
+                    project_id=project["id"],
+                    capabilities={MemoryCapability.WRITE},
+                ),
+                messages_json=[message_json],
+                redaction=RedactionContext(forbidden_values=()),
+            ).model_dump(mode="json"),
+        )
+
+        response = client.post(
+            "/mcp",
+            headers={
+                "Accept": "application/json, text/event-stream",
+                "Authorization": f"Bearer {raw_key}",
+                "X-Vexic-Project-Id": project["id"],
+                "X-Vexic-Session-Id": "session-a",
+            },
+            json={
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "search_transcript",
+                    "arguments": {"query": "cedar"},
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = json.loads(response.json()["result"]["content"][0]["text"])
+        self.assertEqual([hit["body"] for hit in payload["hits"]], ["User: mcp cedar"])
+
+    def test_control_plane_routes_and_keys_are_tenant_isolated(self) -> None:
+        client = TestClient(
+            create_app(self.service, control_plane_tokens=("console-secret",))
+        )
+        tenant_a = client.post(
+            "/control/v1/clerk-orgs/org_a/tenant",
+            headers=self._control_auth(),
+        ).json()["tenant"]
+        tenant_b = client.post(
+            "/control/v1/clerk-orgs/org_b/tenant",
+            headers=self._control_auth(),
+        ).json()["tenant"]
+        project_a = client.post(
+            "/control/v1/clerk-orgs/org_a/projects",
+            headers=self._control_auth(),
+            json={"name": "A"},
+        ).json()["project"]
+        project_b = client.post(
+            "/control/v1/clerk-orgs/org_b/projects",
+            headers=self._control_auth(),
+            json={"name": "B"},
+        ).json()["project"]
+        raw_key_a = client.post(
+            f"/control/v1/clerk-orgs/org_a/projects/{project_a['id']}/keys",
+            headers=self._control_auth(),
+            json={"name": "Worker A"},
+        ).json()["rawKey"]
+
+        hidden = client.get(
+            f"/control/v1/clerk-orgs/org_b/projects/{project_a['id']}",
+            headers=self._control_auth(),
+        )
+        denied = client.post(
+            "/v1/search_transcript",
+            headers=self._auth(raw_key_a),
+            json=SearchTranscriptRequest(
+                scope=_scope(
+                    tenant_id=tenant_b["tenantId"],
+                    project_id=project_b["id"],
+                    capabilities={MemoryCapability.SEARCH},
+                ),
+                query="cedar",
+            ).model_dump(mode="json"),
+        )
+
+        self.assertEqual(hidden.status_code, 404)
+        self.assertEqual(denied.status_code, 403)
+        self.assertNotEqual(tenant_a["tenantId"], tenant_b["tenantId"])
+
+    def test_control_plane_usage_reads_are_tenant_scoped_and_project_attributed(self) -> None:
+        client = TestClient(
+            create_app(self.service, control_plane_tokens=("console-secret",))
+        )
+        tenant = client.post(
+            "/control/v1/clerk-orgs/org_123/tenant",
+            headers=self._control_auth(),
+        ).json()["tenant"]
+        project_a = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "A"},
+        ).json()["project"]
+        project_b = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "B"},
+        ).json()["project"]
+        raw_key_a = client.post(
+            f"/control/v1/clerk-orgs/org_123/projects/{project_a['id']}/keys",
+            headers=self._control_auth(),
+            json={"name": "Worker A"},
+        ).json()["rawKey"]
+        raw_key_b = client.post(
+            f"/control/v1/clerk-orgs/org_123/projects/{project_b['id']}/keys",
+            headers=self._control_auth(),
+            json={"name": "Worker B"},
+        ).json()["rawKey"]
+
+        for raw_key, project_id, text in (
+            (raw_key_a, project_a["id"], "alpha cedar"),
+            (raw_key_b, project_b["id"], "beta cedar"),
+        ):
+            client.post(
+                "/v1/append_transcript",
+                headers=self._auth(raw_key),
+                json=AppendTranscriptRequest(
+                    scope=_scope(
+                        tenant_id=tenant["tenantId"],
+                        project_id=project_id,
+                        capabilities={MemoryCapability.WRITE},
+                    ),
+                    messages_json=[
+                        single_message_adapter.dump_json(
+                            ModelRequest(parts=[UserPromptPart(content=text)])
+                        )
+                    ],
+                    redaction=RedactionContext(forbidden_values=()),
+                ).model_dump(mode="json"),
+            )
+
+        self.catalog.record_usage_event(
+            HostedUsageEvent(
+                kind="request",
+                operation="legacy_unattributed",
+                tenant_id=tenant["tenantId"],
+                principal_id="legacy",
+                status="ok",
+                recorded_at="2026-06-27T00:00:00Z",
+            )
+        )
+
+        tenant_usage = client.get(
+            "/control/v1/clerk-orgs/org_123/usage",
+            headers=self._control_auth(),
+        )
+        project_usage = client.get(
+            f"/control/v1/clerk-orgs/org_123/projects/{project_a['id']}/usage",
+            headers=self._control_auth(),
+        )
+
+        self.assertEqual(tenant_usage.status_code, 200)
+        self.assertEqual(project_usage.status_code, 200)
+        self.assertEqual(tenant_usage.json()["usage"]["totals"]["requests"], 3)
+        self.assertEqual(project_usage.json()["usage"]["totals"]["requests"], 1)
+        self.assertEqual(project_usage.json()["usage"]["projectId"], project_a["id"])
+
+    def test_control_plane_blank_token_config_fails_closed(self) -> None:
+        client = TestClient(create_app(self.service, control_plane_tokens=("",)))
+
+        response = client.post(
+            "/control/v1/clerk-orgs/org_123/tenant",
+            headers=self._control_auth(),
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_control_plane_rotation_accepts_multiple_tokens(self) -> None:
+        client = TestClient(
+            create_app(
+                self.service,
+                control_plane_tokens=("console-secret", "rotated-secret"),
+            )
+        )
+
+        first = client.post(
+            "/control/v1/clerk-orgs/org_123/tenant",
+            headers={"Authorization": "Bearer console-secret"},
+        )
+        second = client.post(
+            "/control/v1/clerk-orgs/org_123/tenant",
+            headers={"Authorization": "Bearer rotated-secret"},
+        )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(first.json()["tenant"]["tenantId"], second.json()["tenant"]["tenantId"])
+
+    def test_control_plane_compare_digest_checks_each_configured_token(self) -> None:
+        calls: list[str] = []
+
+        def fake_compare_digest(left: str, right: str) -> bool:
+            calls.append(left)
+            return left == right
+
+        with patch("vexic.hosted_http.hmac.compare_digest", side_effect=fake_compare_digest):
+            client = TestClient(
+                create_app(
+                    self.service,
+                    control_plane_tokens=("console-secret", "rotated-secret"),
+                )
+            )
+            response = client.post(
+                "/control/v1/clerk-orgs/org_123/tenant",
+                headers=self._control_auth(),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(calls, ["console-secret", "rotated-secret"])
+
+    def test_control_plane_auth_failures_do_not_echo_supplied_token(self) -> None:
+        client = TestClient(
+            create_app(self.service, control_plane_tokens=("console-secret",))
+        )
+        bad_token = "leaky-console-token"
+
+        response = client.post(
+            "/control/v1/clerk-orgs/org_123/tenant",
+            headers={"Authorization": f"Bearer {bad_token}"},
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertNotIn(bad_token, response.text)
+
+    def test_control_plane_agent_scoped_key_only_allows_matching_agent_id(self) -> None:
+        client = TestClient(
+            create_app(self.service, control_plane_tokens=("console-secret",))
+        )
+        tenant = client.post(
+            "/control/v1/clerk-orgs/org_123/tenant",
+            headers=self._control_auth(),
+        ).json()["tenant"]
+        project = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo"},
+        ).json()["project"]
+        raw_key = client.post(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/keys",
+            headers=self._control_auth(),
+            json={"name": "Worker", "agentScope": "agent-a"},
+        ).json()["rawKey"]
+        message_json = single_message_adapter.dump_json(
+            ModelRequest(parts=[UserPromptPart(content="agent cedar")])
+        )
+        allowed_scope = _scope(
+            tenant_id=tenant["tenantId"],
+            project_id=project["id"],
+            capabilities={MemoryCapability.WRITE},
+        ).model_copy(update={"agent_id": "agent-a"})
+        denied_scope = _scope(
+            tenant_id=tenant["tenantId"],
+            project_id=project["id"],
+            capabilities={MemoryCapability.SEARCH},
+        ).model_copy(update={"agent_id": "agent-b"})
+
+        allowed = client.post(
+            "/v1/append_transcript",
+            headers=self._auth(raw_key),
+            json=AppendTranscriptRequest(
+                scope=allowed_scope,
+                messages_json=[message_json],
+                redaction=RedactionContext(forbidden_values=()),
+            ).model_dump(mode="json"),
+        )
+        denied = client.post(
+            "/v1/search_transcript",
+            headers=self._auth(raw_key),
+            json=SearchTranscriptRequest(
+                scope=denied_scope,
+                query="cedar",
+            ).model_dump(mode="json"),
+        )
+
+        self.assertEqual(allowed.status_code, 200)
+        self.assertEqual(denied.status_code, 403)
 
     def test_append_and_search_round_trip_through_hosted_service(self) -> None:
         api_key = self._api_key(
