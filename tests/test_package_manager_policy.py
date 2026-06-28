@@ -66,6 +66,7 @@ def test_readmes_scope_console_npm_flows_away_from_core_runtime() -> None:
 def test_console_env_contract_is_documented() -> None:
     env_example = (CONSOLE / ".env.example").read_text(encoding="utf-8")
     console_readme = (CONSOLE / "README.md").read_text(encoding="utf-8")
+    compact_console_readme = " ".join(console_readme.split())
 
     for name in (
         "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY",
@@ -75,12 +76,15 @@ def test_console_env_contract_is_documented() -> None:
         "NEXT_PUBLIC_CLERK_AFTER_SIGN_IN_URL",
         "NEXT_PUBLIC_CLERK_AFTER_SIGN_UP_URL",
         "VEXIC_INTERNAL_ORG_ID",
-        "VEXIC_HOSTED_API_BASE_URL",
+        "VEXIC_CONTROL_PLANE_URL",
+        "VEXIC_CONTROL_PLANE_TOKEN",
     ):
         assert name in env_example
         assert name in console_readme
 
     required_section = console_readme.split("Route defaults:", 1)[0]
-    assert "VEXIC_HOSTED_API_BASE_URL" not in required_section
-    assert "Reserved until hosted endpoints are wired:" in console_readme
-    assert "Reserved until hosted control-plane endpoints are wired." in env_example
+    assert "VEXIC_CONTROL_PLANE_URL" not in required_section
+    assert "Control-plane backend:" in console_readme
+    assert "does not fall back to stub data when a URL is configured" in compact_console_readme
+    assert "In production, a missing URL returns an error" in compact_console_readme
+    assert "VEXIC_HOSTED_API_BASE_URL" not in env_example
