@@ -98,6 +98,10 @@ async function errorForResponse(response, url) {
   if (response.status === 404) {
     return new ControlPlaneClientError(404, "not_found", upstreamMessage ?? "Control-plane resource not found.");
   }
+  if (response.status === 409) {
+    logUpstreamFailure(response.status, upstreamCode, url);
+    return new ControlPlaneClientError(409, "conflict", upstreamMessage ?? "Control-plane write conflict.");
+  }
 
   if (response.status === 401 || response.status === 403 || response.status >= 500) {
     logUpstreamFailure(response.status, upstreamCode, url);

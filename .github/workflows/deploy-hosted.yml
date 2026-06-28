@@ -49,3 +49,9 @@ jobs:
         run: railway up --ci --project ${{ vars.RAILWAY_PROJECT_ID }} --environment production --service vexic
       - name: Verify hosted health
         run: curl --fail --retry 12 --retry-all-errors --retry-delay 10 --connect-timeout 5 --max-time 15 --retry-connrefused https://api.vexic.dev/health
+      - name: Verify hosted control-plane route
+        shell: bash
+        run: |
+          status="$(curl --silent --show-error --output /tmp/control-plane-smoke.json --write-out "%{http_code}" --retry 12 --retry-all-errors --retry-delay 10 --connect-timeout 5 --max-time 15 --retry-connrefused https://api.vexic.dev/control/v1/clerk-orgs/deploy-smoke/projects)"
+          cat /tmp/control-plane-smoke.json
+          test "$status" = "401"

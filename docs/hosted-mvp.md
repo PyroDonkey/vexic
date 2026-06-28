@@ -216,6 +216,7 @@ Required Railway config:
 
 - `PORT`: provided by Railway.
 - `VEXIC_HOSTED_ROOT=/data/vexic`
+- `VEXIC_CONTROL_PLANE_TOKENS=<comma-separated Console service tokens>`
 - Persistent volume mounted at `/data/vexic`
 - Health check path: `/health`
 
