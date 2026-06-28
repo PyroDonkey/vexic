@@ -25,7 +25,7 @@ missing from this index (and the reverse).
 | 0010 | Native read-only HTTP MCP is a stateless hosted adapter slice   | accepted |
 | 0011 | Hosted migration is operator-run canonical row migration        | accepted |
 | 0012 | Vexic Console starts as one Next.js app                         | accepted |
-| 0013 | Hosted control-plane HTTP API is a console-facing adapter slice | proposed |
+| 0013 | Hosted control-plane HTTP API is a console-facing adapter slice | accepted |
 
 Notes:
 
@@ -40,8 +40,8 @@ Notes:
 - 0012 corresponds to the COA-190 website and account dashboard implementation
   path. Vexic Console is a separate Next.js control-plane app; it does not move
   dashboard concerns into `src/vexic`.
-- 0013 is proposed for COA-247. It records the decision needed before adding a
-  hosted control-plane HTTP surface and distinct control-plane auth.
+- 0013 is accepted for COA-247. It records the control-plane HTTP surface and
+  distinct control-plane auth boundary for the hosted adapter.
 - These numbers are the Vexic `docs/adr/` series. Some source comments under
   `src/vexic` cite an `upstream ADR-00NN` label from the extraction source
   (for example `upstream ADR-0010` for candidate-fallback retrieval); those

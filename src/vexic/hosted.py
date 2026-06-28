@@ -103,6 +103,7 @@ class HostedUsageEvent:
     total_tokens: int = 0
     estimated_cost_micros: int = 0
     error_type: str | None = None
+    project_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -547,12 +548,15 @@ class HostedMemoryService:
         if request is not None:
             tenant_id = request.scope.tenant_id
             principal_id = request.scope.principal.principal_id
+            project_id = request.scope.project_id
         elif auth is not None:
             tenant_id = auth.tenant_id
             principal_id = auth.principal.principal_id
+            project_id = None
         else:
             tenant_id = None
             principal_id = None
+            project_id = None
         recorded_at = _now()
         self.telemetry.record_audit_event(
             HostedAuditEvent(
@@ -573,6 +577,7 @@ class HostedMemoryService:
                 status=status,
                 recorded_at=recorded_at,
                 error_type=error_type,
+                project_id=project_id,
             )
         )
 
@@ -585,6 +590,7 @@ class HostedMemoryService:
         status: str,
         usage: UsageSummary | None = None,
         error_type: str | None = None,
+        project_id: str | None = None,
     ) -> None:
         if self.telemetry is None:
             return
@@ -604,6 +610,7 @@ class HostedMemoryService:
                     total_tokens=counters.total_tokens,
                     estimated_cost_micros=counters.estimated_cost_micros,
                     error_type=error_type,
+                    project_id=project_id,
                 )
             )
         except Exception:
@@ -648,6 +655,7 @@ class HostedBackgroundJobRunner:
                 principal_id=auth.principal.principal_id,
                 status="error",
                 error_type=type(exc).__name__,
+                project_id=request.scope.project_id,
             )
             raise
         self._record_job(job_id, request, auth, status="ok")
@@ -657,6 +665,7 @@ class HostedBackgroundJobRunner:
             principal_id=auth.principal.principal_id,
             status="ok",
             usage=usage,
+            project_id=request.scope.project_id,
         )
         return result
 

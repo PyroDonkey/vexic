@@ -23,12 +23,43 @@ from vexic.service import LocalMemoryService
 
 
 _CONTROL_DB_MODE = 0o600
+_CONTROL_PLANE_AGENT_CAPABILITIES = frozenset(
+    {
+        MemoryCapability.WRITE,
+        MemoryCapability.SEARCH,
+        MemoryCapability.EXPAND_HISTORY,
+    }
+)
 
 
 @dataclass(frozen=True)
 class ProvisionedApiKey:
     key_id: str
     raw_key: str
+
+
+@dataclass(frozen=True)
+class HostedProjectRecord:
+    project_id: str
+    tenant_id: str
+    name: str
+    environment: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class HostedApiKeyRecord:
+    key_id: str
+    tenant_id: str
+    project_id: str
+    name: str
+    capability: str
+    agent_scope: str
+    prefix: str
+    last4: str
+    display: str
+    created_at: str
+    revoked_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -103,6 +134,32 @@ class HostedTenantCatalog:
             conn.commit()
             return self._tenant_from_filename(conn, tenant_id, db_filename)
 
+    def provision_customer_account(self, clerk_org_id: str) -> str:
+        if not clerk_org_id.strip():
+            raise ValueError("clerk_org_id must not be blank.")
+        with closing(self._connect_control()) as conn:
+            row = conn.execute(
+                """
+                SELECT tenant_id
+                FROM customer_account_mappings
+                WHERE clerk_org_id = ?
+                """,
+                (clerk_org_id,),
+            ).fetchone()
+            tenant_id = self._allocate_tenant_id(conn) if row is None else str(row[0])
+        self.provision_tenant(tenant_id)
+        if row is None:
+            with closing(self._connect_control()) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO customer_account_mappings (clerk_org_id, tenant_id)
+                    VALUES (?, ?)
+                    """,
+                    (clerk_org_id, tenant_id),
+                )
+                conn.commit()
+        return tenant_id
+
     def provision_project(self, tenant_id: str, project_id: str) -> HostedTenant:
         if not project_id.strip():
             raise ValueError("project_id must not be blank.")
@@ -120,6 +177,143 @@ class HostedTenantCatalog:
             self._insert_projects(conn, tenant_id, {project_id})
             conn.commit()
             return self._tenant_from_filename(conn, tenant_id, row[0])
+
+    def create_control_project(
+        self,
+        tenant_id: str,
+        *,
+        name: str,
+        environment: str = "production",
+    ) -> HostedProjectRecord:
+        if not name.strip():
+            raise ValueError("name must not be blank.")
+        environment = environment.strip() or "production"
+        created_at = _now()
+        with closing(self._connect_control()) as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM tenants
+                WHERE tenant_id = ? AND active = 1
+                """,
+                (tenant_id,),
+            ).fetchone()
+            if row is None:
+                raise PermissionError("Unknown hosted tenant.")
+            project_id = self._allocate_project_id(conn)
+            conn.execute(
+                """
+                INSERT INTO hosted_projects (
+                    project_id, tenant_id, name, environment, created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (project_id, tenant_id, name.strip(), environment, created_at),
+            )
+            self._insert_projects(conn, tenant_id, {project_id})
+            conn.commit()
+        return HostedProjectRecord(
+            project_id=project_id,
+            tenant_id=tenant_id,
+            name=name.strip(),
+            environment=environment,
+            created_at=created_at,
+        )
+
+    def list_control_projects(self, tenant_id: str) -> list[HostedProjectRecord]:
+        with closing(self._connect_control()) as conn:
+            rows = conn.execute(
+                """
+                SELECT project_id, tenant_id, name, environment, created_at
+                FROM hosted_projects
+                WHERE tenant_id = ?
+                ORDER BY created_at, project_id
+                """,
+                (tenant_id,),
+            ).fetchall()
+        return [
+            HostedProjectRecord(
+                project_id=row[0],
+                tenant_id=row[1],
+                name=row[2],
+                environment=row[3],
+                created_at=row[4],
+            )
+            for row in rows
+        ]
+
+    def get_control_project(self, tenant_id: str, project_id: str) -> HostedProjectRecord:
+        with closing(self._connect_control()) as conn:
+            row = conn.execute(
+                """
+                SELECT project_id, tenant_id, name, environment, created_at
+                FROM hosted_projects
+                WHERE tenant_id = ? AND project_id = ?
+                """,
+                (tenant_id, project_id),
+            ).fetchone()
+        if row is None:
+            raise PermissionError("Unknown hosted project.")
+        return HostedProjectRecord(
+            project_id=row[0],
+            tenant_id=row[1],
+            name=row[2],
+            environment=row[3],
+            created_at=row[4],
+        )
+
+    def upsert_control_project(
+        self,
+        tenant_id: str,
+        project_id: str,
+        *,
+        name: str,
+        environment: str = "production",
+    ) -> HostedProjectRecord:
+        if not project_id.strip():
+            raise ValueError("project_id must not be blank.")
+        if not name.strip():
+            raise ValueError("name must not be blank.")
+        environment = environment.strip() or "production"
+        with closing(self._connect_control()) as conn:
+            row = conn.execute(
+                """
+                SELECT created_at
+                FROM hosted_projects
+                WHERE tenant_id = ? AND project_id = ?
+                """,
+                (tenant_id, project_id),
+            ).fetchone()
+            if row is None:
+                created_at = _now()
+                conn.execute(
+                    """
+                    INSERT INTO hosted_projects (
+                        project_id, tenant_id, name, environment, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (project_id, tenant_id, name.strip(), environment, created_at),
+                )
+            else:
+                created_at = str(row[0])
+                conn.execute(
+                    """
+                    UPDATE hosted_projects
+                    SET name = ?, environment = ?
+                    WHERE tenant_id = ? AND project_id = ?
+                    """,
+                    (name.strip(), environment, tenant_id, project_id),
+                )
+            self._insert_projects(conn, tenant_id, {project_id})
+            conn.commit()
+        return HostedProjectRecord(
+            project_id=project_id,
+            tenant_id=tenant_id,
+            name=name.strip(),
+            environment=environment,
+            created_at=created_at,
+        )
 
     def activate_replacement_database(
         self,
@@ -241,9 +435,9 @@ class HostedTenantCatalog:
                 INSERT INTO hosted_usage_events (
                     kind, operation, tenant_id, principal_id, status, recorded_at,
                     model_requests, input_tokens, output_tokens, total_tokens,
-                    estimated_cost_micros, error_type
+                    estimated_cost_micros, error_type, project_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.kind,
@@ -258,6 +452,7 @@ class HostedTenantCatalog:
                     event.total_tokens,
                     event.estimated_cost_micros,
                     event.error_type,
+                    event.project_id,
                 ),
             )
             conn.commit()
@@ -315,7 +510,7 @@ class HostedTenantCatalog:
                     """
                     SELECT kind, operation, tenant_id, principal_id, status, recorded_at,
                            model_requests, input_tokens, output_tokens, total_tokens,
-                           estimated_cost_micros, error_type
+                           estimated_cost_micros, error_type, project_id
                     FROM hosted_usage_events
                     WHERE tenant_id IS NULL
                     ORDER BY id
@@ -326,7 +521,7 @@ class HostedTenantCatalog:
                     """
                     SELECT kind, operation, tenant_id, principal_id, status, recorded_at,
                            model_requests, input_tokens, output_tokens, total_tokens,
-                           estimated_cost_micros, error_type
+                           estimated_cost_micros, error_type, project_id
                     FROM hosted_usage_events
                     WHERE tenant_id = ?
                     ORDER BY id
@@ -383,6 +578,22 @@ class HostedTenantCatalog:
                     FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS customer_account_mappings (
+                    clerk_org_id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS hosted_projects (
+                    project_id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    environment TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS hosted_audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     operation TEXT NOT NULL,
@@ -406,7 +617,8 @@ class HostedTenantCatalog:
                     output_tokens INTEGER NOT NULL DEFAULT 0,
                     total_tokens INTEGER NOT NULL DEFAULT 0,
                     estimated_cost_micros INTEGER NOT NULL DEFAULT 0,
-                    error_type TEXT
+                    error_type TEXT,
+                    project_id TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS hosted_job_events (
@@ -429,6 +641,12 @@ class HostedTenantCatalog:
                     ON hosted_job_events(tenant_id);
                 """
             )
+            columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(hosted_usage_events)").fetchall()
+            }
+            if "project_id" not in columns:
+                conn.execute("ALTER TABLE hosted_usage_events ADD COLUMN project_id TEXT")
             conn.commit()
 
     def _allocate_db_filename(self, conn: sqlite3.Connection) -> str:
@@ -447,6 +665,36 @@ class HostedTenantCatalog:
             if exists is None:
                 return db_filename
         raise RuntimeError("Unable to allocate hosted tenant database path.")
+
+    def _allocate_tenant_id(self, conn: sqlite3.Connection) -> str:
+        for _ in range(100):
+            tenant_id = f"tenant_{secrets.token_hex(8)}"
+            exists = conn.execute(
+                """
+                SELECT 1
+                FROM tenants
+                WHERE tenant_id = ?
+                """,
+                (tenant_id,),
+            ).fetchone()
+            if exists is None:
+                return tenant_id
+        raise RuntimeError("Unable to allocate hosted tenant id.")
+
+    def _allocate_project_id(self, conn: sqlite3.Connection) -> str:
+        for _ in range(100):
+            project_id = f"proj_{secrets.token_hex(8)}"
+            exists = conn.execute(
+                """
+                SELECT 1
+                FROM hosted_projects
+                WHERE project_id = ?
+                """,
+                (project_id,),
+            ).fetchone()
+            if exists is None:
+                return project_id
+        raise RuntimeError("Unable to allocate hosted project id.")
 
     def _insert_projects(
         self,
@@ -489,6 +737,7 @@ class HostedTenantCatalog:
 class HostedApiKeyStore:
     def __init__(self, root_path: str | Path | None = None) -> None:
         self._keys: dict[str, _HostedApiKey] = {}
+        self._control_metadata: dict[str, HostedApiKeyRecord] = {}
         self.root_path = Path(root_path) if root_path is not None else None
         self._control_db_path: Path | None = None
         if self.root_path is not None:
@@ -597,6 +846,139 @@ class HostedApiKeyStore:
             )
             conn.commit()
 
+    def create_control_plane_key(
+        self,
+        *,
+        tenant_id: str,
+        project_id: str,
+        name: str,
+        agent_scope: str = "shared",
+    ) -> tuple[ProvisionedApiKey, HostedApiKeyRecord]:
+        if not name.strip():
+            raise ValueError("name must not be blank.")
+        agent_scope = agent_scope.strip() or "shared"
+        provisioned = self.create_key(
+            tenant_id=tenant_id,
+            principal_id=agent_scope,
+            capabilities=_CONTROL_PLANE_AGENT_CAPABILITIES,
+            project_ids={project_id},
+            agent_ids=frozenset() if agent_scope == "shared" else {agent_scope},
+        )
+        stored = self._load_key(provisioned.key_id)
+        prefix = provisioned.raw_key[:16]
+        last4 = provisioned.raw_key[-4:]
+        record = HostedApiKeyRecord(
+            key_id=provisioned.key_id,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            name=name.strip(),
+            capability="v1-memory",
+            agent_scope=agent_scope,
+            prefix=prefix,
+            last4=last4,
+            display=f"{prefix}...{last4}",
+            created_at=stored.created_at or _now(),
+        )
+        if self._control_db_path is None:
+            self._control_metadata[record.key_id] = record
+        else:
+            with closing(self._connect_control()) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO hosted_api_key_metadata (
+                        key_id, tenant_id, project_id, name, capability, agent_scope,
+                        key_prefix, last4, display, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.key_id,
+                        record.tenant_id,
+                        record.project_id,
+                        record.name,
+                        record.capability,
+                        record.agent_scope,
+                        record.prefix,
+                        record.last4,
+                        record.display,
+                        record.created_at,
+                    ),
+                )
+                conn.commit()
+        return provisioned, record
+
+    def list_control_plane_keys(
+        self,
+        *,
+        tenant_id: str,
+        project_id: str,
+    ) -> list[HostedApiKeyRecord]:
+        if self._control_db_path is None:
+            return [
+                replace(record, revoked_at=self._keys[record.key_id].revoked_at)
+                for record in self._control_metadata.values()
+                if record.tenant_id == tenant_id
+                and record.project_id == project_id
+                and self._keys[record.key_id].revoked_at is None
+            ]
+        with closing(self._connect_control()) as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    meta.key_id, meta.tenant_id, meta.project_id, meta.name,
+                    meta.capability, meta.agent_scope, meta.key_prefix,
+                    meta.last4, meta.display, meta.created_at, keys.revoked_at
+                FROM hosted_api_key_metadata AS meta
+                JOIN hosted_api_keys AS keys ON keys.key_id = meta.key_id
+                WHERE meta.tenant_id = ? AND meta.project_id = ? AND keys.revoked_at IS NULL
+                ORDER BY meta.created_at, meta.key_id
+                """,
+                (tenant_id, project_id),
+            ).fetchall()
+        return [
+            HostedApiKeyRecord(
+                key_id=row[0],
+                tenant_id=row[1],
+                project_id=row[2],
+                name=row[3],
+                capability=row[4],
+                agent_scope=row[5],
+                prefix=row[6],
+                last4=row[7],
+                display=row[8],
+                created_at=row[9],
+                revoked_at=row[10],
+            )
+            for row in rows
+        ]
+
+    def revoke_control_plane_key(
+        self,
+        *,
+        tenant_id: str,
+        project_id: str,
+        key_id: str,
+        revoked_by: str | None = None,
+    ) -> None:
+        if self._control_db_path is None:
+            record = self._control_metadata.get(key_id)
+            if record is None or record.tenant_id != tenant_id or record.project_id != project_id:
+                raise PermissionError("Unknown hosted API key.")
+            self.revoke_key(key_id, revoked_by=revoked_by)
+            return
+        with closing(self._connect_control()) as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM hosted_api_key_metadata
+                WHERE key_id = ? AND tenant_id = ? AND project_id = ?
+                """,
+                (key_id, tenant_id, project_id),
+            ).fetchone()
+        if row is None:
+            raise PermissionError("Unknown hosted API key.")
+        self.revoke_key(key_id, revoked_by=revoked_by)
+
     @staticmethod
     def _hash(raw_key: str) -> str:
         return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
@@ -628,6 +1010,23 @@ class HostedApiKeyStore:
                     created_at TEXT NOT NULL,
                     revoked_at TEXT,
                     revoked_by TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS hosted_api_key_metadata (
+                    key_id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    capability TEXT NOT NULL,
+                    agent_scope TEXT NOT NULL,
+                    key_prefix TEXT NOT NULL,
+                    last4 TEXT NOT NULL,
+                    display TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (key_id) REFERENCES hosted_api_keys(key_id)
                 )
                 """
             )
