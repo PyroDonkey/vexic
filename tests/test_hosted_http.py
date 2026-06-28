@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import os
+import sqlite3
 import tempfile
 import textwrap
 import unittest
@@ -11,6 +12,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
+from adapters.hosted_control_plane_http import create_app as create_control_plane_app
 from vexic import hosted_http
 from vexic.contract import (
     AppendTranscriptRequest,
@@ -93,9 +95,17 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "ok")
 
+    def test_core_hosted_http_app_does_not_expose_control_plane_routes(self) -> None:
+        response = self.client.post(
+            "/control/v1/clerk-orgs/org_123/tenant",
+            headers=self._control_auth(),
+        )
+
+        self.assertEqual(response.status_code, 404)
+
     def test_control_plane_tenant_provisioning_requires_console_service_credential(self) -> None:
         client = TestClient(
-            create_app(self.service, control_plane_tokens=("console-secret",))
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
         )
 
         response = client.post("/control/v1/clerk-orgs/org_123/tenant")
@@ -108,7 +118,7 @@ class HostedHttpTests(unittest.TestCase):
             os.environ,
             {"VEXIC_CONTROL_PLANE_TOKENS": "console-secret,rotated-secret"},
         ):
-            client = TestClient(create_app(self.service))
+            client = TestClient(create_control_plane_app(self.service))
 
         response = client.post(
             "/control/v1/clerk-orgs/org_123/tenant",
@@ -119,7 +129,7 @@ class HostedHttpTests(unittest.TestCase):
 
     def test_control_plane_blank_clerk_org_returns_bad_request(self) -> None:
         client = TestClient(
-            create_app(self.service, control_plane_tokens=("console-secret",)),
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",)),
             raise_server_exceptions=False,
         )
 
@@ -131,9 +141,100 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"]["code"], "invalid_request")
 
+    def test_control_plane_sqlite_integrity_errors_are_sanitized(self) -> None:
+        client = TestClient(
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",)),
+            raise_server_exceptions=False,
+        )
+
+        with patch.object(
+            self.catalog,
+            "create_control_project",
+            side_effect=sqlite3.IntegrityError("UNIQUE constraint failed: secret"),
+        ):
+            with self.assertLogs("adapters.hosted_control_plane_http", level="WARNING") as logs:
+                response = client.post(
+                    "/control/v1/clerk-orgs/org_123/projects",
+                    headers={
+                        **self._control_auth(),
+                        "X-Request-Id": "req-integrity",
+                    },
+                    json={"name": "A"},
+                )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"]["code"], "conflict")
+        self.assertNotIn("UNIQUE", response.text)
+        self.assertNotIn("secret", response.text)
+        log_text = "\n".join(logs.output)
+        self.assertIn("category=integrity", log_text)
+        self.assertIn("exception_type=IntegrityError", log_text)
+        self.assertIn("path=/control/v1/clerk-orgs/org_123/projects", log_text)
+        self.assertIn("correlation_id=req-integrity", log_text)
+        self.assertNotIn("UNIQUE", log_text)
+        self.assertNotIn("secret", log_text)
+
+    def test_control_plane_sqlite_operational_errors_are_sanitized(self) -> None:
+        client = TestClient(
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",)),
+            raise_server_exceptions=False,
+        )
+
+        with patch.object(
+            self.catalog,
+            "list_control_projects",
+            side_effect=sqlite3.OperationalError("database is locked: secret"),
+        ):
+            with self.assertLogs("adapters.hosted_control_plane_http", level="WARNING") as logs:
+                response = client.get(
+                    "/control/v1/clerk-orgs/org_123/projects",
+                    headers={
+                        **self._control_auth(),
+                        "X-Request-Id": "req-locked",
+                    },
+                )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "storage_unavailable")
+        self.assertNotIn("database is locked", response.text)
+        self.assertNotIn("secret", response.text)
+        log_text = "\n".join(logs.output)
+        self.assertIn("category=retryable_operational", log_text)
+        self.assertIn("exception_type=OperationalError", log_text)
+        self.assertIn("path=/control/v1/clerk-orgs/org_123/projects", log_text)
+        self.assertIn("correlation_id=req-locked", log_text)
+        self.assertNotIn("database is locked", log_text)
+        self.assertNotIn("secret", log_text)
+
+        with patch.object(
+            self.catalog,
+            "list_control_projects",
+            side_effect=sqlite3.OperationalError("syntax error near secret"),
+        ):
+            with self.assertLogs("adapters.hosted_control_plane_http", level="WARNING") as logs:
+                response = client.get(
+                    "/control/v1/clerk-orgs/org_123/projects",
+                    headers={
+                        **self._control_auth(),
+                        "X-Correlation-Id": "corr-syntax",
+                    },
+                )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["error"]["code"], "internal_error")
+        self.assertNotIn("syntax error", response.text)
+        self.assertNotIn("secret", response.text)
+        log_text = "\n".join(logs.output)
+        self.assertIn("category=operational", log_text)
+        self.assertIn("exception_type=OperationalError", log_text)
+        self.assertIn("path=/control/v1/clerk-orgs/org_123/projects", log_text)
+        self.assertIn("correlation_id=corr-syntax", log_text)
+        self.assertNotIn("syntax error", log_text)
+        self.assertNotIn("secret", log_text)
+
     def test_control_plane_tenant_provisioning_is_idempotent_per_clerk_org(self) -> None:
         client = TestClient(
-            create_app(self.service, control_plane_tokens=("console-secret",))
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
         )
 
         first = client.post(
@@ -152,7 +253,7 @@ class HostedHttpTests(unittest.TestCase):
 
     def test_control_plane_project_create_list_and_get_use_hosted_project_ids(self) -> None:
         client = TestClient(
-            create_app(self.service, control_plane_tokens=("console-secret",))
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
         )
 
         created = client.post(
@@ -183,7 +284,7 @@ class HostedHttpTests(unittest.TestCase):
 
     def test_control_plane_project_create_rejects_null_string_fields(self) -> None:
         client = TestClient(
-            create_app(self.service, control_plane_tokens=("console-secret",))
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
         )
 
         null_name = client.post(
@@ -204,7 +305,7 @@ class HostedHttpTests(unittest.TestCase):
 
     def test_control_plane_project_put_is_idempotent(self) -> None:
         client = TestClient(
-            create_app(self.service, control_plane_tokens=("console-secret",))
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
         )
 
         first = client.put(
@@ -225,7 +326,7 @@ class HostedHttpTests(unittest.TestCase):
 
     def test_control_plane_project_put_hides_cross_tenant_project_id_collision(self) -> None:
         client = TestClient(
-            create_app(self.service, control_plane_tokens=("console-secret",))
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
         )
 
         created = client.put(
@@ -245,7 +346,7 @@ class HostedHttpTests(unittest.TestCase):
 
     def test_control_plane_key_create_and_list_hide_raw_secret(self) -> None:
         client = TestClient(
-            create_app(self.service, control_plane_tokens=("console-secret",))
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
         )
         project = client.post(
             "/control/v1/clerk-orgs/org_123/projects",
@@ -279,7 +380,7 @@ class HostedHttpTests(unittest.TestCase):
 
     def test_control_plane_key_create_rejects_null_string_fields(self) -> None:
         client = TestClient(
-            create_app(self.service, control_plane_tokens=("console-secret",))
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
         )
         project = client.post(
             "/control/v1/clerk-orgs/org_123/projects",
@@ -305,7 +406,7 @@ class HostedHttpTests(unittest.TestCase):
 
     def test_control_plane_key_revoke_invalidates_v1_memory_access(self) -> None:
         client = TestClient(
-            create_app(self.service, control_plane_tokens=("console-secret",))
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
         )
         tenant = client.post(
             "/control/v1/clerk-orgs/org_123/tenant",
@@ -365,7 +466,7 @@ class HostedHttpTests(unittest.TestCase):
 
     def test_control_plane_key_authenticates_against_mcp(self) -> None:
         client = TestClient(
-            create_app(self.service, control_plane_tokens=("console-secret",))
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
         )
         tenant = client.post(
             "/control/v1/clerk-orgs/org_123/tenant",
@@ -423,7 +524,7 @@ class HostedHttpTests(unittest.TestCase):
 
     def test_control_plane_routes_and_keys_are_tenant_isolated(self) -> None:
         client = TestClient(
-            create_app(self.service, control_plane_tokens=("console-secret",))
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
         )
         tenant_a = client.post(
             "/control/v1/clerk-orgs/org_a/tenant",
@@ -472,7 +573,7 @@ class HostedHttpTests(unittest.TestCase):
 
     def test_control_plane_usage_reads_are_tenant_scoped_and_project_attributed(self) -> None:
         client = TestClient(
-            create_app(self.service, control_plane_tokens=("console-secret",))
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
         )
         tenant = client.post(
             "/control/v1/clerk-orgs/org_123/tenant",
@@ -499,47 +600,70 @@ class HostedHttpTests(unittest.TestCase):
             json={"name": "Worker B"},
         ).json()["rawKey"]
 
-        for raw_key, project_id, text in (
-            (raw_key_a, project_a["id"], "alpha cedar"),
-            (raw_key_b, project_b["id"], "beta cedar"),
-        ):
-            client.post(
-                "/v1/append_transcript",
-                headers=self._auth(raw_key),
-                json=AppendTranscriptRequest(
-                    scope=_scope(
-                        tenant_id=tenant["tenantId"],
-                        project_id=project_id,
-                        capabilities={MemoryCapability.WRITE},
-                    ),
-                    messages_json=[
-                        single_message_adapter.dump_json(
-                            ModelRequest(parts=[UserPromptPart(content=text)])
-                        )
-                    ],
-                    redaction=RedactionContext(forbidden_values=()),
-                ).model_dump(mode="json"),
-            )
+        with patch("vexic.hosted._now", return_value="2026-06-10T00:00:00Z"):
+            for raw_key, project_id, text in (
+                (raw_key_a, project_a["id"], "alpha cedar"),
+                (raw_key_b, project_b["id"], "beta cedar"),
+            ):
+                client.post(
+                    "/v1/append_transcript",
+                    headers=self._auth(raw_key),
+                    json=AppendTranscriptRequest(
+                        scope=_scope(
+                            tenant_id=tenant["tenantId"],
+                            project_id=project_id,
+                            capabilities={MemoryCapability.WRITE},
+                        ),
+                        messages_json=[
+                            single_message_adapter.dump_json(
+                                ModelRequest(parts=[UserPromptPart(content=text)])
+                            )
+                        ],
+                        redaction=RedactionContext(forbidden_values=()),
+                    ).model_dump(mode="json"),
+                )
 
-        self.catalog.record_usage_event(
+        for event in (
             HostedUsageEvent(
                 kind="request",
                 operation="legacy_unattributed",
                 tenant_id=tenant["tenantId"],
                 principal_id="legacy",
                 status="ok",
-                recorded_at="2026-06-27T00:00:00Z",
-            )
-        )
+                recorded_at="2026-06-11T00:00:00Z",
+            ),
+            HostedUsageEvent(
+                kind="request",
+                operation="old_unattributed",
+                tenant_id=tenant["tenantId"],
+                principal_id="legacy",
+                status="ok",
+                recorded_at="2000-01-01T00:00:00Z",
+            ),
+            HostedUsageEvent(
+                kind="request",
+                operation="append_transcript",
+                tenant_id=tenant["tenantId"],
+                principal_id="legacy",
+                status="ok",
+                recorded_at="2000-01-01T00:00:00Z",
+                project_id=project_a["id"],
+            ),
+        ):
+            self.catalog.record_usage_event(event)
 
-        tenant_usage = client.get(
-            "/control/v1/clerk-orgs/org_123/usage",
-            headers=self._control_auth(),
-        )
-        project_usage = client.get(
-            f"/control/v1/clerk-orgs/org_123/projects/{project_a['id']}/usage",
-            headers=self._control_auth(),
-        )
+        with patch(
+            "adapters.hosted_control_plane_http._usage_period",
+            return_value=("2026-06-01T00:00:00Z", "2026-07-01T00:00:00Z"),
+        ):
+            tenant_usage = client.get(
+                "/control/v1/clerk-orgs/org_123/usage",
+                headers=self._control_auth(),
+            )
+            project_usage = client.get(
+                f"/control/v1/clerk-orgs/org_123/projects/{project_a['id']}/usage",
+                headers=self._control_auth(),
+            )
 
         self.assertEqual(tenant_usage.status_code, 200)
         self.assertEqual(project_usage.status_code, 200)
@@ -548,7 +672,7 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(project_usage.json()["usage"]["projectId"], project_a["id"])
 
     def test_control_plane_blank_token_config_fails_closed(self) -> None:
-        client = TestClient(create_app(self.service, control_plane_tokens=("",)))
+        client = TestClient(create_control_plane_app(self.service, control_plane_tokens=("",)))
 
         response = client.post(
             "/control/v1/clerk-orgs/org_123/tenant",
@@ -559,7 +683,7 @@ class HostedHttpTests(unittest.TestCase):
 
     def test_control_plane_rotation_accepts_multiple_tokens(self) -> None:
         client = TestClient(
-            create_app(
+            create_control_plane_app(
                 self.service,
                 control_plane_tokens=("console-secret", "rotated-secret"),
             )
@@ -585,9 +709,9 @@ class HostedHttpTests(unittest.TestCase):
             calls.append(left)
             return left == right
 
-        with patch("vexic.hosted_http.hmac.compare_digest", side_effect=fake_compare_digest):
+        with patch("adapters.hosted_control_plane_http.hmac.compare_digest", side_effect=fake_compare_digest):
             client = TestClient(
-                create_app(
+                create_control_plane_app(
                     self.service,
                     control_plane_tokens=("console-secret", "rotated-secret"),
                 )
@@ -602,7 +726,7 @@ class HostedHttpTests(unittest.TestCase):
 
     def test_control_plane_auth_failures_do_not_echo_supplied_token(self) -> None:
         client = TestClient(
-            create_app(self.service, control_plane_tokens=("console-secret",))
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
         )
         bad_token = "leaky-console-token"
 
@@ -616,7 +740,7 @@ class HostedHttpTests(unittest.TestCase):
 
     def test_control_plane_agent_scoped_key_only_allows_matching_agent_id(self) -> None:
         client = TestClient(
-            create_app(self.service, control_plane_tokens=("console-secret",))
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
         )
         tenant = client.post(
             "/control/v1/clerk-orgs/org_123/tenant",

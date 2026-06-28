@@ -1,0 +1,521 @@
+from __future__ import annotations
+
+import hmac
+import logging
+import os
+import sqlite3
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
+from functools import wraps
+from typing import ParamSpec, TypeVar
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response
+
+from vexic.hosted import HostedMemoryService
+from vexic.hosted_http import create_app as create_hosted_memory_app
+from vexic.hosted_http import create_service_from_env
+
+
+logger = logging.getLogger(__name__)
+
+_ControlPlaneParams = ParamSpec("_ControlPlaneParams")
+_ControlPlaneResponseT = TypeVar("_ControlPlaneResponseT", bound=Response)
+
+
+def create_app(
+    service: HostedMemoryService | None = None,
+    *,
+    mcp_forbidden_secret_values: tuple[str, ...] = (),
+    control_plane_tokens: tuple[str, ...] | None = None,
+) -> FastAPI:
+    service = service or create_service_from_env()
+    if control_plane_tokens is None:
+        control_plane_tokens = _control_plane_tokens_from_env()
+    app = create_hosted_memory_app(
+        service,
+        mcp_forbidden_secret_values=mcp_forbidden_secret_values,
+    )
+    register_control_plane_routes(
+        app,
+        service,
+        control_plane_tokens=_normalize_control_plane_tokens(control_plane_tokens),
+    )
+    return app
+
+
+def register_control_plane_routes(
+    app: FastAPI,
+    service: HostedMemoryService,
+    *,
+    control_plane_tokens: tuple[str, ...],
+) -> None:
+    @app.exception_handler(_ControlPlaneBadRequest)
+    async def control_plane_bad_request(
+        _: Request,
+        exc: _ControlPlaneBadRequest,
+    ) -> JSONResponse:
+        return _error_response(400, "invalid_request", str(exc))
+
+    @app.post("/control/v1/clerk-orgs/{clerk_org_id}/tenant")
+    @_control_plane_storage_boundary
+    async def provision_control_plane_tenant(
+        clerk_org_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        if not _has_control_plane_credential(request, control_plane_tokens):
+            return _error_response(
+                401,
+                "unauthorized",
+                "Invalid control-plane credential.",
+            )
+        tenant_id = _provision_control_tenant(service, clerk_org_id)
+        return JSONResponse(
+            {"tenant": {"clerkOrgId": clerk_org_id, "tenantId": tenant_id}}
+        )
+
+    @app.get("/control/v1/clerk-orgs/{clerk_org_id}/projects")
+    @_control_plane_storage_boundary
+    async def list_control_plane_projects(
+        clerk_org_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        if not _has_control_plane_credential(request, control_plane_tokens):
+            return _error_response(401, "unauthorized", "Invalid control-plane credential.")
+        tenant_id = _provision_control_tenant(service, clerk_org_id)
+        projects = service.catalog.list_control_projects(tenant_id)
+        return JSONResponse({"projects": [_project_payload(project) for project in projects]})
+
+    @app.post("/control/v1/clerk-orgs/{clerk_org_id}/projects")
+    @_control_plane_storage_boundary
+    async def create_control_plane_project(
+        clerk_org_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        if not _has_control_plane_credential(request, control_plane_tokens):
+            return _error_response(401, "unauthorized", "Invalid control-plane credential.")
+        payload = await _json_body(request)
+        tenant_id = _provision_control_tenant(service, clerk_org_id)
+        try:
+            project = service.catalog.create_control_project(
+                tenant_id,
+                name=_string_field(payload, "name", default=""),
+                environment=_string_field(payload, "environment", default="production"),
+            )
+        except ValueError as exc:
+            return _error_response(400, "invalid_request", str(exc))
+        return JSONResponse({"project": _project_payload(project)}, status_code=201)
+
+    @app.get("/control/v1/clerk-orgs/{clerk_org_id}/projects/{project_id}")
+    @_control_plane_storage_boundary
+    async def get_control_plane_project(
+        clerk_org_id: str,
+        project_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        if not _has_control_plane_credential(request, control_plane_tokens):
+            return _error_response(401, "unauthorized", "Invalid control-plane credential.")
+        tenant_id = _provision_control_tenant(service, clerk_org_id)
+        try:
+            project = service.catalog.get_control_project(tenant_id, project_id)
+        except PermissionError:
+            return _error_response(404, "not_found", "Project not found.")
+        return JSONResponse({"project": _project_payload(project)})
+
+    @app.put("/control/v1/clerk-orgs/{clerk_org_id}/projects/{project_id}")
+    @_control_plane_storage_boundary
+    async def put_control_plane_project(
+        clerk_org_id: str,
+        project_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        if not _has_control_plane_credential(request, control_plane_tokens):
+            return _error_response(401, "unauthorized", "Invalid control-plane credential.")
+        payload = await _json_body(request)
+        tenant_id = _provision_control_tenant(service, clerk_org_id)
+        try:
+            project = service.catalog.upsert_control_project(
+                tenant_id,
+                project_id,
+                name=_string_field(payload, "name", default=""),
+                environment=_string_field(payload, "environment", default="production"),
+            )
+        except ValueError as exc:
+            return _error_response(400, "invalid_request", str(exc))
+        except PermissionError:
+            return _error_response(404, "not_found", "Project not found.")
+        return JSONResponse({"project": _project_payload(project)})
+
+    @app.get("/control/v1/clerk-orgs/{clerk_org_id}/projects/{project_id}/keys")
+    @_control_plane_storage_boundary
+    async def list_control_plane_keys(
+        clerk_org_id: str,
+        project_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        if not _has_control_plane_credential(request, control_plane_tokens):
+            return _error_response(401, "unauthorized", "Invalid control-plane credential.")
+        tenant_id = _provision_control_tenant(service, clerk_org_id)
+        try:
+            service.catalog.get_control_project(tenant_id, project_id)
+        except PermissionError:
+            return _error_response(404, "not_found", "Project not found.")
+        keys = service.api_keys.list_control_plane_keys(
+            tenant_id=tenant_id,
+            project_id=project_id,
+        )
+        return JSONResponse({"keys": [_key_payload(key) for key in keys]})
+
+    @app.post("/control/v1/clerk-orgs/{clerk_org_id}/projects/{project_id}/keys")
+    @_control_plane_storage_boundary
+    async def create_control_plane_key(
+        clerk_org_id: str,
+        project_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        if not _has_control_plane_credential(request, control_plane_tokens):
+            return _error_response(401, "unauthorized", "Invalid control-plane credential.")
+        payload = await _json_body(request)
+        try:
+            capability = _string_field(payload, "capability", default="v1-memory")
+            if capability != "v1-memory":
+                return _error_response(400, "invalid_request", "Unsupported capability.")
+        except ValueError as exc:
+            return _error_response(400, "invalid_request", str(exc))
+        tenant_id = _provision_control_tenant(service, clerk_org_id)
+        try:
+            service.catalog.get_control_project(tenant_id, project_id)
+        except PermissionError:
+            return _error_response(404, "not_found", "Project not found.")
+        try:
+            provisioned, key = service.api_keys.create_control_plane_key(
+                tenant_id=tenant_id,
+                project_id=project_id,
+                name=_string_field(payload, "name", default=""),
+                agent_scope=_string_field(payload, "agentScope", default="shared"),
+            )
+        except ValueError as exc:
+            return _error_response(400, "invalid_request", str(exc))
+        return JSONResponse({"rawKey": provisioned.raw_key, "key": _key_payload(key)}, status_code=201)
+
+    @app.post("/control/v1/clerk-orgs/{clerk_org_id}/projects/{project_id}/keys/{key_id}/revoke")
+    @_control_plane_storage_boundary
+    async def revoke_control_plane_key(
+        clerk_org_id: str,
+        project_id: str,
+        key_id: str,
+        request: Request,
+    ) -> Response:
+        if not _has_control_plane_credential(request, control_plane_tokens):
+            return _error_response(401, "unauthorized", "Invalid control-plane credential.")
+        tenant_id = _provision_control_tenant(service, clerk_org_id)
+        try:
+            service.api_keys.revoke_control_plane_key(
+                tenant_id=tenant_id,
+                project_id=project_id,
+                key_id=key_id,
+                revoked_by="console-service",
+            )
+        except PermissionError:
+            return _error_response(404, "not_found", "Key not found.")
+        return Response(status_code=204)
+
+    @app.get("/control/v1/clerk-orgs/{clerk_org_id}/usage")
+    @_control_plane_storage_boundary
+    async def get_control_plane_tenant_usage(
+        clerk_org_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        if not _has_control_plane_credential(request, control_plane_tokens):
+            return _error_response(401, "unauthorized", "Invalid control-plane credential.")
+        tenant_id = _provision_control_tenant(service, clerk_org_id)
+        period_start, period_end = _usage_period()
+        events = service.catalog.usage_events(
+            tenant_id,
+            recorded_at_gte=period_start,
+            recorded_at_lt=period_end,
+        )
+        return JSONResponse(
+            {
+                "usage": _usage_payload(
+                    events,
+                    period_start=period_start,
+                    period_end=period_end,
+                )
+            }
+        )
+
+    @app.get("/control/v1/clerk-orgs/{clerk_org_id}/projects/{project_id}/usage")
+    @_control_plane_storage_boundary
+    async def get_control_plane_project_usage(
+        clerk_org_id: str,
+        project_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        if not _has_control_plane_credential(request, control_plane_tokens):
+            return _error_response(401, "unauthorized", "Invalid control-plane credential.")
+        tenant_id = _provision_control_tenant(service, clerk_org_id)
+        try:
+            service.catalog.get_control_project(tenant_id, project_id)
+        except PermissionError:
+            return _error_response(404, "not_found", "Project not found.")
+        period_start, period_end = _usage_period()
+        events = service.catalog.usage_events(
+            tenant_id,
+            project_id=project_id,
+            recorded_at_gte=period_start,
+            recorded_at_lt=period_end,
+        )
+        return JSONResponse(
+            {
+                "usage": _usage_payload(
+                    events,
+                    period_start=period_start,
+                    period_end=period_end,
+                    project_id=project_id,
+                )
+            }
+        )
+
+
+def _api_key(request: Request) -> str | None:
+    authorization = request.headers.get("authorization")
+    if authorization is not None:
+        scheme, _, value = authorization.partition(" ")
+        if scheme.lower() == "bearer" and value.strip():
+            return value.strip()
+    explicit = request.headers.get("x-vexic-api-key")
+    if explicit is not None and explicit.strip():
+        return explicit.strip()
+    return None
+
+
+def _has_control_plane_credential(
+    request: Request,
+    control_plane_tokens: tuple[str, ...],
+) -> bool:
+    presented = _api_key(request)
+    if presented is None or not control_plane_tokens:
+        return False
+    matched = False
+    for configured in control_plane_tokens:
+        matched = hmac.compare_digest(configured, presented) or matched
+    return matched
+
+
+def _control_plane_tokens_from_env() -> tuple[str, ...]:
+    return tuple(os.environ.get("VEXIC_CONTROL_PLANE_TOKENS", "").split(","))
+
+
+def _normalize_control_plane_tokens(values: tuple[str, ...]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    for value in values:
+        stripped = value.strip()
+        if not stripped:
+            return ()
+        normalized.append(stripped)
+    return tuple(normalized)
+
+
+class _ControlPlaneBadRequest(ValueError):
+    pass
+
+
+_RETRYABLE_SQLITE_OPERATIONAL_ERRORS = (
+    "database is locked",
+    "database table is locked",
+    "database schema is locked",
+    "database is busy",
+    "unable to open database file",
+    "disk i/o error",
+)
+
+
+def _control_plane_storage_boundary(
+    handler: Callable[_ControlPlaneParams, Awaitable[_ControlPlaneResponseT]],
+) -> Callable[_ControlPlaneParams, Awaitable[_ControlPlaneResponseT | JSONResponse]]:
+    @wraps(handler)
+    async def wrapped(
+        *args: _ControlPlaneParams.args,
+        **kwargs: _ControlPlaneParams.kwargs,
+    ) -> _ControlPlaneResponseT | JSONResponse:
+        try:
+            return await handler(*args, **kwargs)
+        except sqlite3.IntegrityError as exc:
+            _log_control_plane_sqlite_error("integrity", exc, args, kwargs)
+            return _error_response(409, "conflict", "Control-plane write conflict.")
+        except sqlite3.OperationalError as exc:
+            if _is_retryable_sqlite_operational_error(exc):
+                _log_control_plane_sqlite_error(
+                    "retryable_operational",
+                    exc,
+                    args,
+                    kwargs,
+                )
+                return _error_response(
+                    503,
+                    "storage_unavailable",
+                    "Control-plane storage is temporarily unavailable.",
+                )
+            _log_control_plane_sqlite_error("operational", exc, args, kwargs)
+            return _error_response(500, "internal_error", "Control-plane storage failed.")
+        except sqlite3.Error as exc:
+            _log_control_plane_sqlite_error("sqlite", exc, args, kwargs)
+            return _error_response(500, "internal_error", "Control-plane storage failed.")
+
+    return wrapped
+
+
+def _log_control_plane_sqlite_error(
+    category: str,
+    exc: sqlite3.Error,
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+) -> None:
+    request = _request_from_handler_call(args, kwargs)
+    path = request.url.path if request is not None else "<unknown>"
+    correlation_id = _correlation_id(request)
+    logger.warning(
+        "control-plane sqlite error category=%s exception_type=%s path=%s correlation_id=%s",
+        category,
+        type(exc).__name__,
+        path,
+        correlation_id or "<none>",
+    )
+
+
+def _request_from_handler_call(
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+) -> Request | None:
+    request = kwargs.get("request")
+    if isinstance(request, Request):
+        return request
+    for arg in args:
+        if isinstance(arg, Request):
+            return arg
+    return None
+
+
+def _correlation_id(request: Request | None) -> str | None:
+    if request is None:
+        return None
+    for header in ("x-request-id", "x-correlation-id"):
+        value = request.headers.get(header)
+        if value is not None and value.strip():
+            return value.strip()
+    return None
+
+
+def _is_retryable_sqlite_operational_error(exc: sqlite3.OperationalError) -> bool:
+    message = str(exc).lower()
+    return any(fragment in message for fragment in _RETRYABLE_SQLITE_OPERATIONAL_ERRORS)
+
+
+def _provision_control_tenant(service: HostedMemoryService, clerk_org_id: str) -> str:
+    try:
+        return service.catalog.provision_customer_account(clerk_org_id)
+    except ValueError as exc:
+        raise _ControlPlaneBadRequest(str(exc)) from exc
+
+
+async def _json_body(request: Request) -> dict[str, object]:
+    try:
+        payload = await request.json()
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _string_field(
+    payload: dict[str, object],
+    key: str,
+    *,
+    default: str,
+) -> str:
+    if key not in payload:
+        return default
+    value = payload[key]
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be a string.")
+    return value.strip() or default
+
+
+def _project_payload(project) -> dict[str, str]:
+    return {
+        "id": project.project_id,
+        "name": project.name,
+        "environment": project.environment,
+        "createdAt": project.created_at,
+    }
+
+
+def _key_payload(key) -> dict[str, str | None]:
+    return {
+        "id": key.key_id,
+        "projectId": key.project_id,
+        "name": key.name,
+        "capability": key.capability,
+        "agentScope": key.agent_scope,
+        "prefix": key.prefix,
+        "last4": key.last4,
+        "display": key.display,
+        "createdAt": key.created_at,
+        "revokedAt": key.revoked_at,
+    }
+
+
+def _usage_period() -> tuple[str, str]:
+    now = datetime.now(UTC)
+    period_start = datetime(now.year, now.month, 1, tzinfo=UTC)
+    return _utc_iso(period_start), _utc_iso(now)
+
+
+def _utc_iso(value: datetime) -> str:
+    return value.isoformat().replace("+00:00", "Z")
+
+
+def _usage_payload(
+    events,
+    *,
+    period_start: str,
+    period_end: str,
+    project_id: str | None = None,
+) -> dict[str, object]:
+    totals = {
+        "requests": len(events),
+        "writes": sum(1 for event in events if event.operation == "append_transcript"),
+        "retrievals": sum(
+            1
+            for event in events
+            if event.operation in {"search_transcript", "search_long_term"}
+        ),
+        "modelRequests": sum(event.model_requests for event in events),
+        "inputTokens": sum(event.input_tokens for event in events),
+        "outputTokens": sum(event.output_tokens for event in events),
+        "totalTokens": sum(event.total_tokens for event in events),
+        "estimatedCostMicros": sum(event.estimated_cost_micros for event in events),
+    }
+    payload: dict[str, object] = {
+        "periodStart": period_start,
+        "periodEnd": period_end,
+        "totals": totals,
+        "caps": {},
+    }
+    if project_id is not None:
+        payload["projectId"] = project_id
+    return payload
+
+
+def _error_response(
+    status_code: int,
+    code: str,
+    message: str,
+    *,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    return JSONResponse(
+        {"error": {"code": code, "message": message}},
+        status_code=status_code,
+        headers=headers,
+    )
