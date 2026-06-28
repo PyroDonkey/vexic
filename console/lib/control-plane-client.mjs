@@ -74,7 +74,7 @@ async function request(orgId, method, path, { body } = {}) {
 }
 
 function urlFor(orgId, path) {
-  const baseUrl = String(process.env.VEXIC_CONTROL_PLANE_URL ?? "").replace(/\/+$/, "");
+  const baseUrl = String(process.env.VEXIC_CONTROL_PLANE_URL ?? "").trim().replace(/\/+$/, "");
   return `${baseUrl}/control/v1/clerk-orgs/${encodeURIComponent(orgId)}${path}`;
 }
 
