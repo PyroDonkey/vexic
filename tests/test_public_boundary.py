@@ -46,6 +46,17 @@ def test_hosted_core_does_not_own_infrastructure_provisioning() -> None:
         assert forbidden not in mcp_stdio_text
 
 
+def test_core_hosted_http_does_not_own_control_plane_adapter() -> None:
+    text = (ROOT / "src" / "vexic" / "hosted_http.py").read_text(encoding="utf-8")
+
+    for forbidden in (
+        "/control/v1",
+        "_control_plane_storage_boundary",
+        "VEXIC_CONTROL_PLANE_TOKENS",
+    ):
+        assert forbidden not in text
+
+
 def test_console_boundary_is_documented_as_outside_vexic_package() -> None:
     root_readme = (ROOT / "README.md").read_text(encoding="utf-8")
     console_readme = (ROOT / "console" / "README.md").read_text(encoding="utf-8")
