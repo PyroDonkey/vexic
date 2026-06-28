@@ -23,7 +23,8 @@ account sessions must not create Vexic Projects or Agent API Keys.
 The first Vexic Console route set is intentionally small:
 
 - `/` public landing page;
-- `/sign-in` and `/sign-up` through Clerk;
+- `/sign-in` through Clerk; public `/sign-up` is not exposed, and account
+  creation is controlled by Clerk invite or admin allowlist policy;
 - `/console` authenticated project list and empty "create first project" state;
 - `/console/projects/[projectId]` project workspace with API Keys, Usage & Caps,
   and minimal Project Settings tabs;

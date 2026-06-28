@@ -41,17 +41,14 @@ Required:
 
 - `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`
 - `CLERK_SECRET_KEY`
-- Clerk Organizations enabled, with user-created organizations allowed or at
-  least one organization created for the signed-in user. Console routes require
-  an active Clerk Organization; personal sessions cannot create Vexic projects
-  or agent keys.
+- Clerk Organizations enabled, with users and organizations provisioned by
+  invite or admin allowlist. Console routes require an active Clerk
+  Organization; personal sessions cannot create Vexic projects or agent keys.
 
 Route defaults:
 
 - `NEXT_PUBLIC_CLERK_SIGN_IN_URL=/sign-in`
-- `NEXT_PUBLIC_CLERK_SIGN_UP_URL=/sign-up`
 - `NEXT_PUBLIC_CLERK_AFTER_SIGN_IN_URL=/console`
-- `NEXT_PUBLIC_CLERK_AFTER_SIGN_UP_URL=/console`
 
 Internal support:
 

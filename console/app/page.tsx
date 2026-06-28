@@ -15,9 +15,6 @@ export default function HomePage() {
             <Link className="button" href="/console">
               Open Console
             </Link>
-            <Link className="button secondary" href="/sign-up">
-              Create Account
-            </Link>
           </div>
         </div>
       </section>
