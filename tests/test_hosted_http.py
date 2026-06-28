@@ -127,6 +127,23 @@ class HostedHttpTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
 
+    def test_control_plane_env_token_parser_ignores_blank_entries(self) -> None:
+        for env_value, accepted_tokens in (
+            ("console-secret,", ("console-secret",)),
+            ("console-secret,,rotated-secret", ("console-secret", "rotated-secret")),
+        ):
+            with self.subTest(env_value=env_value):
+                with patch.dict(os.environ, {"VEXIC_CONTROL_PLANE_TOKENS": env_value}):
+                    client = TestClient(create_control_plane_app(self.service))
+
+                for token in accepted_tokens:
+                    response = client.post(
+                        "/control/v1/clerk-orgs/org_123/tenant",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+
+                    self.assertEqual(response.status_code, 200)
+
     def test_control_plane_blank_clerk_org_returns_bad_request(self) -> None:
         client = TestClient(
             create_control_plane_app(self.service, control_plane_tokens=("console-secret",)),
