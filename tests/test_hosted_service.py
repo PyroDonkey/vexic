@@ -432,7 +432,6 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                     query="cedar",
                 ),
             )
-
         control_db_bytes = control_db.read_bytes()
         self.assertNotIn(api_key.raw_key.encode("utf-8"), control_db_bytes)
         self.assertNotIn(raw_key_secret.encode("utf-8"), control_db_bytes)
@@ -452,6 +451,49 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row[4], "operator-a")
         self.assertNotIn(api_key.raw_key, repr(row))
         self.assertNotIn(raw_key_secret, repr(row))
+
+    def test_control_plane_key_creation_failure_does_not_leave_live_key(self) -> None:
+        root = Path(self.temp_dir.name)
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        keys = HostedApiKeyStore(root)
+        original_connect = keys._connect_control
+
+        class _FailMetadataInsertConnection:
+            def __init__(self, conn: sqlite3.Connection) -> None:
+                self._conn = conn
+
+            def execute(self, sql: str, params: tuple[object, ...] = ()) -> sqlite3.Cursor:
+                if "INSERT INTO hosted_api_key_metadata" in sql:
+                    raise sqlite3.IntegrityError("metadata write failed")
+                return self._conn.execute(sql, params)
+
+            def commit(self) -> None:
+                self._conn.commit()
+
+            def close(self) -> None:
+                self._conn.close()
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self._conn, name)
+
+        def failing_connect() -> _FailMetadataInsertConnection:
+            return _FailMetadataInsertConnection(original_connect())
+
+        raw_key = "vx_deadbeefcafebabe_deterministic-secret"
+        with (
+            patch.object(keys, "_connect_control", side_effect=failing_connect),
+            patch("vexic.hosted_local.secrets.token_hex", return_value="deadbeefcafebabe"),
+            patch("vexic.hosted_local.secrets.token_urlsafe", return_value="deterministic-secret"),
+        ):
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "metadata write failed"):
+                keys.create_control_plane_key(
+                    tenant_id="tenant-a",
+                    project_id="project-a",
+                    name="Worker",
+                )
+
+        with self.assertRaisesRegex(PermissionError, "Invalid hosted API key."):
+            keys.authenticate(raw_key)
 
     def test_durable_api_key_store_rejects_corrupt_key_rows(self) -> None:
         root = Path(self.temp_dir.name)
@@ -1133,6 +1175,53 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-b"})
 
         self.assertEqual(tenant.project_ids, frozenset({"project-a", "project-b"}))
+
+    def test_customer_account_provisioning_handles_competing_mapping_claim(self) -> None:
+        original = self.catalog.provision_tenant
+        control_db = Path(self.temp_dir.name) / "control-plane.db"
+
+        def simulate_competing_claim(
+            tenant_id: str,
+            *,
+            project_ids: set[str] | frozenset[str] = frozenset(),
+        ):
+            tenant = original(tenant_id, project_ids=project_ids)
+            with closing(sqlite3.connect(control_db)) as conn:
+                row = conn.execute(
+                    """
+                    SELECT tenant_id
+                    FROM customer_account_mappings
+                    WHERE clerk_org_id = ?
+                    """,
+                    ("org_123",),
+                ).fetchone()
+                if row is None:
+                    original("tenant-racer")
+                    conn.execute(
+                        """
+                        INSERT INTO customer_account_mappings (clerk_org_id, tenant_id)
+                        VALUES (?, ?)
+                        """,
+                        ("org_123", "tenant-racer"),
+                    )
+                    conn.commit()
+            return tenant
+
+        with patch.object(self.catalog, "provision_tenant", side_effect=simulate_competing_claim):
+            tenant_id = self.catalog.provision_customer_account("org_123")
+
+        with closing(sqlite3.connect(control_db)) as conn:
+            rows = conn.execute(
+                """
+                SELECT tenant_id
+                FROM customer_account_mappings
+                WHERE clerk_org_id = ?
+                """,
+                ("org_123",),
+            ).fetchall()
+
+        self.assertEqual(rows, [(tenant_id,)])
+        self.assertEqual(self.catalog.get_tenant(tenant_id).tenant_id, tenant_id)
 
     def test_inactive_tenant_can_be_provisioned_again_with_existing_database(self) -> None:
         original = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})

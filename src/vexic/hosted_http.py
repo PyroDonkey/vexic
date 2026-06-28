@@ -169,6 +169,8 @@ def create_app(
             )
         except ValueError as exc:
             return _error_response(400, "invalid_request", str(exc))
+        except PermissionError:
+            return _error_response(404, "not_found", "Project not found.")
         return JSONResponse({"project": _project_payload(project)})
 
     @app.get("/control/v1/clerk-orgs/{clerk_org_id}/projects/{project_id}/keys")

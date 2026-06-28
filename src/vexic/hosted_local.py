@@ -6,7 +6,7 @@ import json
 import os
 import secrets
 import sqlite3
-from contextlib import closing
+from contextlib import closing, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -138,6 +138,7 @@ class HostedTenantCatalog:
         if not clerk_org_id.strip():
             raise ValueError("clerk_org_id must not be blank.")
         with closing(self._connect_control()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
                 SELECT tenant_id
@@ -146,10 +147,16 @@ class HostedTenantCatalog:
                 """,
                 (clerk_org_id,),
             ).fetchone()
-            tenant_id = self._allocate_tenant_id(conn) if row is None else str(row[0])
-        self.provision_tenant(tenant_id)
-        if row is None:
-            with closing(self._connect_control()) as conn:
+            if row is None:
+                tenant_id = self._allocate_tenant_id(conn)
+                db_filename = self._allocate_db_filename(conn)
+                conn.execute(
+                    """
+                    INSERT INTO tenants (tenant_id, db_filename, active)
+                    VALUES (?, ?, 0)
+                    """,
+                    (tenant_id, db_filename),
+                )
                 conn.execute(
                     """
                     INSERT INTO customer_account_mappings (clerk_org_id, tenant_id)
@@ -157,7 +164,10 @@ class HostedTenantCatalog:
                     """,
                     (clerk_org_id, tenant_id),
                 )
-                conn.commit()
+            else:
+                tenant_id = str(row[0])
+            conn.commit()
+        self.provision_tenant(tenant_id)
         return tenant_id
 
     def provision_project(self, tenant_id: str, project_id: str) -> HostedTenant:
@@ -278,11 +288,11 @@ class HostedTenantCatalog:
         with closing(self._connect_control()) as conn:
             row = conn.execute(
                 """
-                SELECT created_at
+                SELECT tenant_id, created_at
                 FROM hosted_projects
-                WHERE tenant_id = ? AND project_id = ?
+                WHERE project_id = ?
                 """,
-                (tenant_id, project_id),
+                (project_id,),
             ).fetchone()
             if row is None:
                 created_at = _now()
@@ -296,7 +306,9 @@ class HostedTenantCatalog:
                     (project_id, tenant_id, name.strip(), environment, created_at),
                 )
             else:
-                created_at = str(row[0])
+                if str(row[0]) != tenant_id:
+                    raise PermissionError("Unknown hosted project.")
+                created_at = str(row[1])
                 conn.execute(
                     """
                     UPDATE hosted_projects
@@ -882,29 +894,38 @@ class HostedApiKeyStore:
         if self._control_db_path is None:
             self._control_metadata[record.key_id] = record
         else:
-            with closing(self._connect_control()) as conn:
-                conn.execute(
-                    """
-                    INSERT INTO hosted_api_key_metadata (
-                        key_id, tenant_id, project_id, name, capability, agent_scope,
-                        key_prefix, last4, display, created_at
+            try:
+                with closing(self._connect_control()) as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO hosted_api_key_metadata (
+                            key_id, tenant_id, project_id, name, capability, agent_scope,
+                            key_prefix, last4, display, created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            record.key_id,
+                            record.tenant_id,
+                            record.project_id,
+                            record.name,
+                            record.capability,
+                            record.agent_scope,
+                            record.prefix,
+                            record.last4,
+                            record.display,
+                            record.created_at,
+                        ),
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        record.key_id,
-                        record.tenant_id,
-                        record.project_id,
-                        record.name,
-                        record.capability,
-                        record.agent_scope,
-                        record.prefix,
-                        record.last4,
-                        record.display,
-                        record.created_at,
-                    ),
-                )
-                conn.commit()
+                    conn.commit()
+            except Exception:
+                # ponytail: compensate here instead of threading a shared transaction through create_key.
+                with suppress(PermissionError):
+                    self.revoke_key(
+                        provisioned.key_id,
+                        revoked_by="control-plane-metadata-failure",
+                    )
+                raise
         return provisioned, record
 
     def list_control_plane_keys(

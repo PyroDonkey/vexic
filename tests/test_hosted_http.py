@@ -174,6 +174,26 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(first.json()["project"]["id"], "proj_manual")
         self.assertEqual(second.json()["project"]["id"], "proj_manual")
 
+    def test_control_plane_project_put_hides_cross_tenant_project_id_collision(self) -> None:
+        client = TestClient(
+            create_app(self.service, control_plane_tokens=("console-secret",))
+        )
+
+        created = client.put(
+            "/control/v1/clerk-orgs/org_a/projects/proj_manual",
+            headers=self._control_auth(),
+            json={"name": "Alpha", "environment": "production"},
+        )
+        collided = client.put(
+            "/control/v1/clerk-orgs/org_b/projects/proj_manual",
+            headers=self._control_auth(),
+            json={"name": "Beta", "environment": "staging"},
+        )
+
+        self.assertEqual(created.status_code, 200)
+        self.assertEqual(collided.status_code, 404)
+        self.assertEqual(collided.json()["error"]["code"], "not_found")
+
     def test_control_plane_key_create_and_list_hide_raw_secret(self) -> None:
         client = TestClient(
             create_app(self.service, control_plane_tokens=("console-secret",))
