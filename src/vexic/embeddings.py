@@ -1,3 +1,4 @@
+from importlib.util import find_spec
 from threading import Lock
 from typing import Any
 
@@ -5,6 +6,9 @@ from vexic.ports import missing_host_port
 
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 EMBEDDING_DIM = 384
+_LOCAL_EMBED_HINT = (
+    "Install the optional local adapter with `pip install vexic[local-embed]`."
+)
 
 _EMBEDDING_MODEL: Any | None = None
 _EMBEDDING_MODEL_LOCK = Lock()
@@ -20,6 +24,11 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     return vectors
 
 
+def ensure_local_embeddings_available() -> None:
+    if find_spec("fastembed") is None:
+        raise missing_host_port("Embeddings", hint=_LOCAL_EMBED_HINT)
+
+
 def _embedding_model() -> Any:
     global _EMBEDDING_MODEL
     if _EMBEDDING_MODEL is None:
@@ -28,13 +37,7 @@ def _embedding_model() -> Any:
                 try:
                     from fastembed import TextEmbedding
                 except ImportError as exc:
-                    raise missing_host_port(
-                        "Embeddings",
-                        hint=(
-                            "Install the optional local adapter with "
-                            "`pip install vexic[local-embed]`."
-                        ),
-                    ) from exc
+                    raise missing_host_port("Embeddings", hint=_LOCAL_EMBED_HINT) from exc
                 _EMBEDDING_MODEL = TextEmbedding(model_name=EMBEDDING_MODEL_NAME)
     return _EMBEDDING_MODEL
 

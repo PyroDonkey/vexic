@@ -17,6 +17,7 @@ from vexic.embeddings import EMBEDDING_DIM
 from vexic.deep import run_deep_phase
 from vexic.models import ContradictionJudgment, FactCandidate, RemBoost, RemBoostPlan
 from vexic.pipeline import _main, run_light_phase
+from vexic.ports import HostPortNotConfigured
 from vexic.rem import run_rem_phase
 from vexic.storage import (
     CandidateRetirementDecision,
@@ -168,6 +169,55 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(agent_factory_called)
             self.assertEqual(embedded_texts, ["Ryan prefers compact reports."])
             self.assertEqual(embedded_count, 1)
+
+    async def test_light_phase_preflights_default_embedding_before_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            save_messages(
+                db_path,
+                [ModelRequest(parts=[UserPromptPart(content="I prefer compact reports.")])],
+            )
+            agent_calls = 0
+            fastembed_imports = 0
+            original_import = __import__
+
+            class ExtractionAgent:
+                async def run(self, transcript: str) -> object:
+                    nonlocal agent_calls
+                    agent_calls += 1
+                    return SimpleNamespace(
+                        output=[
+                            FactCandidate(
+                                fact_text="Ryan prefers compact reports.",
+                                subject="Ryan",
+                                category="preference",
+                                importance=7,
+                                confidence=0.9,
+                                source_message_ids=[1],
+                            )
+                        ]
+                    )
+
+            def blocked_import(name: str, *args: object, **kwargs: object) -> object:
+                nonlocal fastembed_imports
+                if name == "fastembed":
+                    fastembed_imports += 1
+                    raise ModuleNotFoundError("No module named 'fastembed'")
+                return original_import(name, *args, **kwargs)
+
+            with (
+                patch("vexic.embeddings.find_spec", return_value=None, create=True),
+                patch("builtins.__import__", side_effect=blocked_import),
+                self.assertRaises(HostPortNotConfigured),
+            ):
+                await run_light_phase(
+                    db_path,
+                    "glm",
+                    extraction_agent_factory=lambda *_args, **_kwargs: ExtractionAgent(),
+                )
+
+        self.assertEqual((agent_calls, fastembed_imports), (0, 0))
 
     async def test_light_phase_redaction_failure_does_not_call_embedder(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -11,7 +11,7 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
-from vexic.embeddings import embed_texts
+from vexic.embeddings import embed_texts, ensure_local_embeddings_available
 from vexic.models import FactCandidate
 from vexic.ports import AgentFactory, EmbedTexts, HostPortNotConfigured, missing_host_port
 from vexic.redaction import assert_no_forbidden_secret_values
@@ -27,6 +27,7 @@ from vexic.timeutil import utc_now_iso
 from vexic.usage import UsageSummary, summarize_agent_usage
 
 LIGHT_PHASE_BATCH_SIZE = 50
+_LOCAL_EMBEDDER = embed_texts
 
 
 def build_extraction_agent(
@@ -34,6 +35,11 @@ def build_extraction_agent(
     secrets: Mapping[str, str] | None = None,
 ) -> Any:
     raise missing_host_port("Light extraction")
+
+
+def _ensure_embedding_adapter(embedder: EmbedTexts) -> None:
+    if embedder is _LOCAL_EMBEDDER:
+        ensure_local_embeddings_available()
 
 
 def render_transcript(rows: list[tuple[int, ModelMessage]]) -> str:
@@ -125,6 +131,7 @@ async def run_light_phase(
                 agent_id=agent_id,
             )
             if missing_embeddings:
+                _ensure_embedding_adapter(embedder)
                 assert_no_forbidden_secret_values(
                     forbidden,
                     *(fact_text for _, fact_text in missing_embeddings),
@@ -153,6 +160,7 @@ async def run_light_phase(
         transcript = render_transcript(rows)
         evidence_ids = rendered_message_ids(rows)
         assert_no_forbidden_secret_values(forbidden, transcript)
+        _ensure_embedding_adapter(embedder)
 
         agent = agent_factory(model_group, secrets=secrets)
         result = await agent.run(transcript)
