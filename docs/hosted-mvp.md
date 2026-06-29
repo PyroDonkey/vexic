@@ -204,8 +204,12 @@ Claude Code, Codex, or another runtime from writing its own local memory. Use
 the local setup guidance in
 [README.md](../README.md#native-agent-memory); if suppression is unavailable,
 treat Vexic as authoritative only for memory that reaches Vexic through the
-hosted HTTP append route, recorder, or importer path. The Claude Code host
-transcript recorder flow is documented in
+hosted HTTP append route, recorder, or importer path. Claude Code hosted
+auto-recording uses `vexic setup claude-code`; the command installs user-local
+Claude Code hook config and Vexic recorder config, then the recorder sends
+cleaned transcript rows to `/v1/ingest_source_transcript`. Claude Code reads
+hosted memory through the read-only MCP route. The Claude Code host transcript
+recorder flow is documented in
 [README.md](../README.md#claude-code-transcript-import) and
 [ADR 0002](adr/0002-host-recorders-ingest-complete-cleaned-transcripts.md).
 
@@ -233,10 +237,11 @@ For the internal Railway alpha, use `https://api.vexic.dev` as the
 hosted HTTP API. Claude Code then searches the hosted memory through the stdio
 MCP tools.
 
-Configuring Claude Code with hosted MCP does not automatically write the
-conversation into Vexic. Automatic hosted Claude Code recording remains a
-separate backlog item; until then, cleaned transcript writes must come through
-the hosted HTTP append/ingest routes or a host-owned recorder/importer.
+For hosted auto-recording, run `vexic setup claude-code` with the hosted base
+URL, raw key, project ID, and session ID. It installs user-local Claude Code
+hook config plus Vexic recorder config; the hook posts cleaned Claude Code
+transcript rows to `/v1/ingest_source_transcript`, and reads remain on the
+read-only MCP path.
 
 ## Railway Alpha Deploy
 
