@@ -3,9 +3,9 @@
 Vexic was extracted from Coalescent under Linear issue COA-138.
 
 - Extraction date: 2026-06-19
-- Source repository: `C:\Users\Ryan\Documents\GitHub\Coalescent`
+- Source repository: private Coalescent repository
 - Source commit: `6001d35` (`COA-172 sync memory docs references`)
-- Target repository: `C:\Users\Ryan\Documents\GitHub\Vexic`
+- Target repository: Vexic
 - History strategy: clean provenance snapshot, not git-filtered history
 
 Original source areas:

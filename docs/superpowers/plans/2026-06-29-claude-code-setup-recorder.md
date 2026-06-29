@@ -1700,7 +1700,7 @@ Run:
 
 ```powershell
 rg -n "^(from|import) engine\\." src/vexic tests
-rg -n "C[o]alescent|A[g]entOS|T[e]legram|B[lo]g Writer|t[e]ammate" AGENTS.md README.md docs src/vexic tests console
+rg -n "C[o]alescent|A[g]entOS|T[e]legram|B[lo]g Writer|t[e]ammate" docs/ai/AGENTS.md README.md docs src/vexic tests console
 rg -n "C[O]A-[0-9]|L[inear]" src/vexic tests console docs --glob '!docs/adr/**' --glob '!docs/runbooks/**' --glob '!docs/provenance.md'
 ```
 

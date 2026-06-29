@@ -6,7 +6,7 @@ Status: pass-with-caveats
 
 - Drill ID: coa-232-20260626T153308Z-3eeed3
 - Date: 2026-06-26
-- Operator: Codex on Ryan's Railway-linked workstation
+- Operator: Codex on a maintainer Railway-linked workstation
 - Environment: Railway production hosted alpha volume
 - Runbook reference: `docs/runbooks/restore-drills/hosted-restore-drill.md`
 - Scenario: hosted alpha Railway-volume SQLite backup/restore
