@@ -8,6 +8,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, TextIO, TypeVar
 
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
+
 from vexic.contract import (
     ExpandHistoryResult,
     ExpandHistoryRequest,
@@ -21,11 +23,77 @@ from vexic.mcp_stdio import McpServerConfig
 _ResultT = TypeVar("_ResultT")
 
 
-def _required_config_string(config: dict[str, Any], name: str) -> str:
-    value = config.get(name)
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"recorder config {name} must be a non-empty string.")
-    return value.strip()
+class _RecorderProxyConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: str
+    api_key: str
+    project_id: str
+    session_id: str
+    agent_id: str | None = None
+    status_path: Path | None = None
+
+    @field_validator("base_url", "api_key", "project_id", "session_id", mode="before")
+    @classmethod
+    def _required_string(cls, value: object) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("must be a non-empty string")
+        return value.strip()
+
+    @field_validator("agent_id", mode="before")
+    @classmethod
+    def _optional_string(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("must be a string")
+        return value.strip() or None
+
+
+def _load_recorder_proxy_config(path: Path) -> _RecorderProxyConfig:
+    try:
+        return _RecorderProxyConfig.model_validate_json(path.read_text(encoding="utf-8"))
+    except ValidationError as exc:
+        raise ValueError(f"invalid recorder config: {exc}") from exc
+
+
+def _jsonrpc_id(line: str) -> Any:
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    return payload.get("id") if isinstance(payload, dict) else None
+
+
+def _write_jsonrpc_error(stdout: TextIO, message_id: Any, message: str) -> None:
+    stdout.write(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": message_id,
+                "error": {"code": -32000, "message": message},
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    stdout.flush()
+
+
+def _forward_http_error(
+    exc: urllib.error.HTTPError,
+    *,
+    stdout: TextIO,
+    message_id: Any,
+) -> None:
+    raw = exc.read().decode("utf-8", errors="replace")
+    try:
+        json.loads(raw)
+    except json.JSONDecodeError:
+        _write_jsonrpc_error(stdout, message_id, f"Hosted MCP returned HTTP {exc.code}.")
+        return
+    stdout.write(raw + ("\n" if not raw.endswith("\n") else ""))
+    stdout.flush()
 
 
 def run_recorder_config_proxy(
@@ -35,36 +103,39 @@ def run_recorder_config_proxy(
     stdout: TextIO,
     stderr: TextIO,
 ) -> int:
-    raw_config = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(raw_config, dict):
-        raise ValueError("recorder config must be a JSON object.")
-    base_url = _required_config_string(raw_config, "base_url").rstrip("/")
-    api_key = _required_config_string(raw_config, "api_key")
+    path = Path(os.path.expandvars(str(path))).expanduser()
+    config = _load_recorder_proxy_config(path)
+    base_url = config.base_url.rstrip("/")
     headers = {
-        "Authorization": f"Bearer {api_key}",
+        "Authorization": f"Bearer {config.api_key}",
         "Accept": "application/json, text/event-stream",
         "Content-Type": "application/json",
-        "X-Vexic-Project-Id": _required_config_string(raw_config, "project_id"),
-        "X-Vexic-Session-Id": _required_config_string(raw_config, "session_id"),
+        "X-Vexic-Project-Id": config.project_id,
+        "X-Vexic-Session-Id": config.session_id,
     }
-    agent_id = raw_config.get("agent_id")
-    if isinstance(agent_id, str) and agent_id.strip():
-        headers["X-Vexic-Agent-Id"] = agent_id.strip()
+    if config.agent_id is not None:
+        headers["X-Vexic-Agent-Id"] = config.agent_id
 
     for line in stdin:
         if not line.strip():
             continue
+        message_id = _jsonrpc_id(line)
         request = urllib.request.Request(
             f"{base_url}/mcp",
             data=line.encode("utf-8"),
             headers=headers,
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=30) as response:
-            if response.status == 202:
-                continue
-            stdout.write(response.read().decode("utf-8") + "\n")
-            stdout.flush()
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                if response.status == 202:
+                    continue
+                stdout.write(response.read().decode("utf-8") + "\n")
+                stdout.flush()
+        except urllib.error.HTTPError as exc:
+            _forward_http_error(exc, stdout=stdout, message_id=message_id)
+        except (TimeoutError, urllib.error.URLError):
+            _write_jsonrpc_error(stdout, message_id, "Hosted MCP upstream request failed.")
         stderr.flush()
     return 0
 

@@ -82,7 +82,32 @@ def _write_secret_json(path: Path, payload: dict[str, object]) -> None:
         raise
 
 
-def _write_mcp_config(project_root: Path, config_path: Path) -> Path:
+def _recorder_config_arg(config_path: Path, home: Path) -> str:
+    try:
+        if home.resolve(strict=False) == Path.home().resolve(strict=False):
+            relative = config_path.resolve(strict=False).relative_to(
+                home.resolve(strict=False)
+            )
+            return f"~/{relative.as_posix()}"
+    except ValueError:
+        pass
+    return str(config_path)
+
+
+def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
+    text = json.dumps(payload, sort_keys=True)
+    temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp_path.write_text(text, encoding="utf-8")
+        os.replace(temp_path, path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def _write_mcp_config(project_root: Path, config_path: Path, home: Path) -> Path:
+    if not project_root.is_dir():
+        raise ValueError("project_root must be an existing directory")
     mcp_path = project_root / ".mcp.json"
     config = _load_json(mcp_path)
     servers = config.get("mcpServers")
@@ -96,10 +121,10 @@ def _write_mcp_config(project_root: Path, config_path: Path) -> Path:
             "python",
             "scripts/vexic-mcp-stdio.py",
             "--recorder-config",
-            str(config_path),
+            _recorder_config_arg(config_path, home),
         ],
     }
-    mcp_path.write_text(json.dumps(config, sort_keys=True), encoding="utf-8")
+    _write_json_atomic(mcp_path, config)
     return mcp_path
 
 
@@ -110,7 +135,7 @@ def _remove_mcp_config(project_root: Path) -> bool:
     if not isinstance(servers, dict) or "vexic" not in servers:
         return False
     del servers["vexic"]
-    mcp_path.write_text(json.dumps(config, sort_keys=True), encoding="utf-8")
+    _write_json_atomic(mcp_path, config)
     return True
 
 
@@ -157,6 +182,9 @@ def install_claude_code_setup(
     session_id = _require_nonblank("session_id", session_id)
     settings_path, config_path, status_path = _paths(home)
     hook_command = f"{_bash_safe(command)} --config {shlex.quote(_bash_safe(str(config_path)))}"
+    mcp_config_path = (
+        _write_mcp_config(project_root, config_path, home) if project_root else None
+    )
 
     _write_secret_json(
         config_path,
@@ -192,7 +220,6 @@ def install_claude_code_setup(
     hooks["Stop"] = stop_groups
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings_path.write_text(json.dumps(settings, sort_keys=True), encoding="utf-8")
-    mcp_config_path = _write_mcp_config(project_root, config_path) if project_root else None
 
     return ClaudeCodeSetupResult(
         settings_path=settings_path,

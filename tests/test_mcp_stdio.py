@@ -4,10 +4,12 @@ import json
 import os
 import tempfile
 import unittest
+import urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from threading import Thread
 from typing import ClassVar
+from unittest.mock import patch
 
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
@@ -26,6 +28,7 @@ from vexic.hosted_mcp import create_hosted_http_memory_service, run_recorder_con
 class _HostedApiHandler(BaseHTTPRequestHandler):
     captured: ClassVar[dict[str, object]] = {}
     response_payload: ClassVar[dict[str, object]] = {}
+    response_status: ClassVar[int] = 200
 
     def do_POST(self) -> None:
         length = int(self.headers["Content-Length"])
@@ -39,7 +42,7 @@ class _HostedApiHandler(BaseHTTPRequestHandler):
             "body": json.loads(body),
         }
         payload = json.dumps(type(self).response_payload).encode("utf-8")
-        self.send_response(200)
+        self.send_response(type(self).response_status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
@@ -53,6 +56,9 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_path = str(Path(self.temp_dir.name) / "memory.db")
+        _HostedApiHandler.captured = {}
+        _HostedApiHandler.response_payload = {}
+        _HostedApiHandler.response_status = 200
         self.config = McpServerConfig(
             db_path=self.db_path,
             tenant_id="tenant-a",
@@ -221,6 +227,140 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["body"]["method"], "tools/list")
         self.assertNotIn("vx_test_key", stdout.getvalue())
         self.assertNotIn("vx_test_key", stderr.getvalue())
+
+    def test_recorder_config_proxy_forwards_hosted_mcp_http_error_body(self) -> None:
+        _HostedApiHandler.response_status = 401
+        _HostedApiHandler.response_payload = {
+            "error": {"code": "unauthorized", "message": "Invalid hosted API key."},
+        }
+        server = HTTPServer(("127.0.0.1", 0), _HostedApiHandler)
+        thread = Thread(target=server.handle_request)
+        thread.start()
+        try:
+            config_path = Path(self.temp_dir.name) / "claude-code-recorder.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": f"http://127.0.0.1:{server.server_port}",
+                        "api_key": "vx_test_key",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            code = run_recorder_config_proxy(
+                config_path,
+                stdin=io.StringIO('{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n'),
+                stdout=stdout,
+                stderr=stderr,
+            )
+        finally:
+            server.server_close()
+            thread.join(timeout=1)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), _HostedApiHandler.response_payload)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertNotIn("vx_test_key", stdout.getvalue())
+
+    def test_recorder_config_proxy_reports_upstream_connection_errors(self) -> None:
+        config_path = Path(self.temp_dir.name) / "claude-code-recorder.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "base_url": "https://api.example.test",
+                    "api_key": "vx_test_key",
+                    "project_id": "project-a",
+                    "session_id": "session-a",
+                }
+            ),
+            encoding="utf-8",
+        )
+        stdout = io.StringIO()
+
+        with patch(
+            "vexic.hosted_mcp.urllib.request.urlopen",
+            side_effect=urllib.error.URLError("offline"),
+        ):
+            code = run_recorder_config_proxy(
+                config_path,
+                stdin=io.StringIO('{"jsonrpc":"2.0","id":7,"method":"tools/list"}\n'),
+                stdout=stdout,
+                stderr=io.StringIO(),
+            )
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["id"], 7)
+        self.assertIn("upstream", payload["error"]["message"])
+        self.assertNotIn("vx_test_key", stdout.getvalue())
+
+    def test_recorder_config_proxy_expands_home_relative_config_path(self) -> None:
+        _HostedApiHandler.response_payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": []},
+        }
+        server = HTTPServer(("127.0.0.1", 0), _HostedApiHandler)
+        thread = Thread(target=server.handle_request)
+        thread.start()
+        try:
+            home = Path(self.temp_dir.name) / "home"
+            config_path = home / ".vexic" / "claude-code-recorder.json"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": f"http://127.0.0.1:{server.server_port}",
+                        "api_key": "vx_test_key",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+
+            with patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}):
+                code = run_recorder_config_proxy(
+                    Path("~/.vexic/claude-code-recorder.json"),
+                    stdin=io.StringIO('{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n'),
+                    stdout=stdout,
+                    stderr=io.StringIO(),
+                )
+        finally:
+            server.server_close()
+            thread.join(timeout=1)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), _HostedApiHandler.response_payload)
+
+    def test_recorder_config_proxy_rejects_unknown_config_fields(self) -> None:
+        config_path = Path(self.temp_dir.name) / "claude-code-recorder.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "base_url": "https://api.example.test",
+                    "api_key": "vx_test_key",
+                    "project_id": "project-a",
+                    "session_id": "session-a",
+                    "unexpected": "value",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "invalid recorder config"):
+            run_recorder_config_proxy(
+                config_path,
+                stdin=io.StringIO(),
+                stdout=io.StringIO(),
+                stderr=io.StringIO(),
+            )
 
     async def test_hosted_api_backed_search_uses_bearer_api_key(self) -> None:
         _HostedApiHandler.response_payload = SearchTranscriptResult(

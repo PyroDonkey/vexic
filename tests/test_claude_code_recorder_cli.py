@@ -678,6 +678,30 @@ class ClaudeCodeSetupTests(unittest.TestCase):
             )
             self.assertNotIn("vx_secret", json.dumps(mcp_config))
 
+    def test_setup_uses_home_relative_recorder_path_in_project_mcp_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            project_root = home / "project"
+            project_root.mkdir()
+
+            with patch("vexic.recorders.claude_setup.Path.home", return_value=home):
+                result = install_claude_code_setup(
+                    home=home,
+                    base_url="https://api.example.test",
+                    api_key="vx_secret",
+                    project_id="project-a",
+                    session_id="session-a",
+                    agent_id=None,
+                    command="python -m vexic.cli recorder ingest",
+                    project_root=project_root,
+                )
+
+            mcp_config = json.loads((project_root / ".mcp.json").read_text(encoding="utf-8"))
+            args = mcp_config["mcpServers"]["vexic"]["args"]
+            self.assertEqual(args[-1], "~/.vexic/claude-code-recorder.json")
+            self.assertNotIn(str(home), json.dumps(mcp_config))
+            self.assertTrue(result.config_path.exists())
+
     def test_setup_writes_config_owner_only_when_supported(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
@@ -712,6 +736,26 @@ class ClaudeCodeSetupTests(unittest.TestCase):
                     session_id="session-a",
                     agent_id=None,
                     command="python -m vexic.cli recorder ingest",
+                )
+
+            self.assertFalse((home / ".vexic" / "claude-code-recorder.json").exists())
+            self.assertFalse((home / ".claude" / "settings.json").exists())
+
+    def test_setup_rejects_missing_project_root_before_writing_setup_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            project_root = home / "missing-project"
+
+            with self.assertRaisesRegex(ValueError, "project_root must be an existing directory"):
+                install_claude_code_setup(
+                    home=home,
+                    base_url="https://api.example.test",
+                    api_key="vx_secret",
+                    project_id="project-a",
+                    session_id="session-a",
+                    agent_id=None,
+                    command="python -m vexic.cli recorder ingest",
+                    project_root=project_root,
                 )
 
             self.assertFalse((home / ".vexic" / "claude-code-recorder.json").exists())
