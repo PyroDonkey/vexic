@@ -311,8 +311,8 @@ def _ensure_long_term_memory_embeddings(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_retrieval_events(conn: sqlite3.Connection) -> None:
-    # One row per fact surfaced by one Tier 3 retrieval (upstream ADR-0008). The durable
-    # source that makes retrieved_count/used_count derivable and rebuild-safe.
+    # One row per fact surfaced by one Tier 3 retrieval. The durable source that
+    # makes retrieved_count/used_count derivable and rebuild-safe.
     # `used` is tri-state: NULL = use judge never ran, 0 = judged not used,
     # 1 = judged used — the only mutation a row ever receives is that judgment.
     conn.execute(
@@ -363,10 +363,10 @@ def _ensure_retrieval_events(conn: sqlite3.Connection) -> None:
 
 def _ensure_memory_candidates_fts(conn: sqlite3.Connection) -> None:
     # External-content FTS5 shadow over candidate fact_text for the Tier 2
-    # candidate-fallback keyword retriever (upstream ADR-0010), mirroring
-    # long_term_memory_fts. Light-phase merge updates hit_count/source ids/
-    # embedding but not fact_text, so the update trigger rarely fires; it is
-    # kept for correctness regardless.
+    # candidate-fallback keyword retriever, mirroring long_term_memory_fts.
+    # Light-phase merge updates hit_count/source ids/embedding but not
+    # fact_text, so the update trigger rarely fires; it is kept for
+    # correctness regardless.
     #
     # Unlike long_term_memory (created together with its shadow), the candidate
     # base table predates this shadow, so existing rows are not covered by the
@@ -419,11 +419,10 @@ def _ensure_memory_candidates_fts(conn: sqlite3.Connection) -> None:
 
 def _ensure_candidate_retrieval_events(conn: sqlite3.Connection) -> None:
     # One row per Tier 2 candidate surfaced by one candidate-fallback retrieval
-    # (upstream ADR-0010). Parallel to retrieval_events, never an extension of it: the
-    # referent is a mutable candidate, not a durable fact, so the shipped Tier 3
-    # events path stays untouched. `used` is tri-state like retrieval_events
-    # (NULL = no candidate use judge ran yet — deferred), reserved for a future
-    # candidate use verdict.
+    # path. Parallel to retrieval_events, never an extension of it: the referent
+    # is a mutable candidate, not a durable fact, so the shipped Tier 3 events
+    # path stays untouched. `used` is tri-state like retrieval_events (NULL = no
+    # candidate use judge ran yet — deferred), reserved for a future verdict.
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS candidate_retrieval_events (
@@ -486,7 +485,7 @@ def _ensure_scope_tombstones(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_promotion_labels(conn: sqlite3.Connection) -> None:
-    # Human promote/reject judgments over candidates (COA-93): the eval corpus
+    # Human promote/reject judgments over candidates: the eval corpus
     # that will eventually tune Deep scoring weights. fact_text is snapshotted
     # at label time so the label survives later candidate edits/retirement.
     conn.execute(

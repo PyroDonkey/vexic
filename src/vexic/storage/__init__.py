@@ -97,7 +97,7 @@ from vexic.storage.transcript import (
 # The facade preserves the full public surface of the former single module: the
 # names callers and tests import, plus the non-underscore module-level names the
 # old module exposed (dataclasses, dedup constants, message helpers), plus the
-# one private `_assert_no_forbidden_secret_values` that teammate_agent imports.
+# one private `_assert_no_forbidden_secret_values` used by host adapters.
 __all__ = [
     "CATEGORY_CHECK",
     "DEDUP_MERGE_THRESHOLD",

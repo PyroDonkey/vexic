@@ -6,9 +6,9 @@ from typing import Literal
 from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage.schema import init_db
 
-# Promotion labels (COA-93): human promote/reject judgments over Tier 2
-# candidates, accumulating toward the ~100-pair eval corpus that will tune
-# Deep scoring weights. Read-mostly eval data — never touched by dream cycles.
+# Promotion labels: human promote/reject judgments over Tier 2 candidates,
+# accumulating toward the ~100-pair eval corpus that will tune Deep scoring
+# weights. Read-mostly eval data; never touched by dream cycles.
 
 PromotionLabelValue = Literal["promote", "reject"]
 _VALID_LABELS = ("promote", "reject")
@@ -28,7 +28,7 @@ def record_promotion_label(
 
     The snapshotted `fact_text` and operator-entered `reason` are persisted to
     SQLite, so both are scrubbed against the tenant's loaded secret values
-    before the INSERT (COA-116). Callers are responsible for passing the loaded
+    before the INSERT. Callers are responsible for passing the loaded
     tenant secret values as `forbidden_secret_values`; omitting them means there
     are no values to scrub."""
     if label not in _VALID_LABELS:

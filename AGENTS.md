@@ -344,8 +344,8 @@ For boundary-sensitive changes, inspect these explicitly:
 
 ```powershell
 rg -n "^(from|import) engine\\." src/vexic tests
-rg -n "C[o]alescent|A[g]entOS|Telegram|Blog Writer|teammate|COA-" AGENTS.md docs src/vexic tests
-rg -n "Linear" src/vexic tests
+rg -n "C[o]alescent|A[g]entOS|Telegram|Blog Writer|teammate" AGENTS.md README.md docs src/vexic tests console
+rg -n "COA-[0-9]|Linear" src/vexic tests console docs --glob '!docs/adr/**' --glob '!docs/runbooks/**' --glob '!docs/provenance.md'
 ```
 
 Alongside the two SessionStart hooks (`.claude/hooks/check_doc_drift.py` and
@@ -359,9 +359,14 @@ See `docs/examples.md` for worked examples.
 
 Private source-host references are allowed in `docs/provenance.md` and compatibility
 sections. They should not become Vexic runtime instructions.
-Linear references are allowed as project-tracking workflow in `AGENTS.md`,
-`README.md`, and `docs/provenance.md`. They should not become Vexic runtime
-code.
+`COA-*` and Linear issue references are allowed only as project-tracking,
+traceability, or evidence pointers in `AGENTS.md`, `README.md`,
+`docs/provenance.md`, `docs/adr/**`, and `docs/runbooks/**`. Do not allow
+Linear or private-host issue IDs in `src/vexic`, `tests`, `console/**`, schema
+values, public contract fields, `docs/architecture.md`, `docs/hosted-mvp.md`,
+or `docs/memory-service-contract.md`, except in explicit provenance or
+compatibility sections. Replace legacy source comments and docstrings with
+Vexic-native ADR or doc wording when touched or in approved cleanup.
 
 ---
 
