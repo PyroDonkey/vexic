@@ -7,8 +7,16 @@ from pathlib import Path
 from typing import Any
 
 from vexic.recorders.claude_code import iter_claude_code_source_messages
+from vexic.recorders.claude_setup import (
+    install_claude_code_setup,
+    uninstall_claude_code_setup,
+)
 from vexic.recorders.hosted_ingest import HostedIngestConfig, post_source_messages
 from vexic.recorders.status import RecorderStatus, write_status
+
+
+class MissingIngestOption(ValueError):
+    pass
 
 
 def _argv_status_path(argv: list[str]) -> Path | None:
@@ -36,15 +44,62 @@ def _parser() -> argparse.ArgumentParser:
 
     ingest = subparsers.add_parser("ingest")
     ingest.add_argument("--hook-input", type=Path)
-    ingest.add_argument("--base-url", required=True)
-    ingest.add_argument("--api-key", required=True)
-    ingest.add_argument("--project-id", required=True)
-    ingest.add_argument("--session-id", required=True)
+    ingest.add_argument("--config", type=Path)
+    ingest.add_argument("--base-url")
+    ingest.add_argument("--api-key")
+    ingest.add_argument("--project-id")
+    ingest.add_argument("--session-id")
     ingest.add_argument("--agent-id")
     ingest.add_argument("--timeout-seconds", type=float, default=10.0)
     ingest.add_argument("--forbidden-value", action="append", default=[])
     ingest.add_argument("--status-path", type=Path)
+
+    setup = subparsers.add_parser("setup-claude-code")
+    setup.add_argument("--home", type=Path, default=Path.home())
+    setup.add_argument("--base-url", required=True)
+    setup.add_argument("--api-key", required=True)
+    setup.add_argument("--project-id", required=True)
+    setup.add_argument("--session-id", required=True)
+    setup.add_argument("--agent-id")
+    setup.add_argument(
+        "--hook-command",
+        dest="hook_command",
+        default=f"{sys.executable} -m vexic.cli recorder ingest",
+    )
+
+    uninstall = subparsers.add_parser("uninstall-claude-code")
+    uninstall.add_argument("--home", type=Path, default=Path.home())
     return parser
+
+
+def _load_config(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("config must be a JSON object")
+    return payload
+
+
+def _apply_ingest_config(args: argparse.Namespace) -> None:
+    if args.config is not None:
+        config = _load_config(args.config)
+        for name in ("base_url", "api_key", "project_id", "session_id", "agent_id"):
+            if name in config:
+                setattr(args, name, config[name])
+        if "status_path" in config and config["status_path"] is not None:
+            args.status_path = Path(config["status_path"])
+
+    missing = [
+        option
+        for option, value in (
+            ("--base-url", args.base_url),
+            ("--api-key", args.api_key),
+            ("--project-id", args.project_id),
+            ("--session-id", args.session_id),
+        )
+        if not isinstance(value, str) or not value.strip()
+    ]
+    if missing:
+        raise MissingIngestOption(f"missing required ingest option: {missing[0]}")
 
 
 def _read_hook_payload(path: Path | None) -> dict[str, Any]:
@@ -120,6 +175,37 @@ def _ingest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _setup_claude_code(args: argparse.Namespace) -> int:
+    result = install_claude_code_setup(
+        home=args.home,
+        base_url=args.base_url,
+        api_key=args.api_key,
+        project_id=args.project_id,
+        session_id=args.session_id,
+        agent_id=args.agent_id,
+        command=args.hook_command,
+    )
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "settings_path": str(result.settings_path),
+                "config_path": str(result.config_path),
+                "status_path": str(result.status_path),
+                "hook_command": result.command,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _uninstall_claude_code(args: argparse.Namespace) -> int:
+    removed = uninstall_claude_code_setup(home=args.home)
+    print(json.dumps({"ok": True, "removed": removed}, sort_keys=True))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_argv = sys.argv[1:] if argv is None else argv
     parser = _parser()
@@ -141,7 +227,12 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.command == "ingest":
+            _apply_ingest_config(args)
             return _ingest(args)
+        if args.command == "setup-claude-code":
+            return _setup_claude_code(args)
+        if args.command == "uninstall-claude-code":
+            return _uninstall_claude_code(args)
         raise ValueError(f"unknown command: {args.command}")
     except Exception as exc:
         _try_write_status(
@@ -151,7 +242,7 @@ def main(argv: list[str] | None = None) -> int:
                 operation=args.command,
                 source_session_id=None,
                 transcript_path=None,
-                error=str(exc),
+                error="argument parsing failed" if isinstance(exc, MissingIngestOption) else str(exc),
             ),
         )
         print(f"error: {exc}", file=sys.stderr)

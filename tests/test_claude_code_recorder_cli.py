@@ -6,6 +6,10 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 
 from vexic.recorders.cli import main as recorder_main
+from vexic.recorders.claude_setup import (
+    install_claude_code_setup,
+    uninstall_claude_code_setup,
+)
 from vexic.recorders.hosted_ingest import HostedIngestConfig, post_source_messages
 from vexic.recorders.status import RecorderStatus, write_status
 
@@ -210,6 +214,200 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
             self.assertEqual(status["inserted"], 1)
             self.assertEqual(status["ignored"], 1)
 
+
+class ClaudeCodeSetupTests(unittest.TestCase):
+    def test_setup_merges_user_settings_without_raw_secret_in_hook(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            settings_path = home / ".claude" / "settings.json"
+            settings_path.parent.mkdir(parents=True)
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "hooks": {
+                            "Stop": [
+                                {
+                                    "hooks": [
+                                        {
+                                            "type": "command",
+                                            "command": "echo existing",
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = install_claude_code_setup(
+                home=home,
+                base_url="https://api.example.test",
+                api_key="vx_secret",
+                project_id="project-a",
+                session_id="session-a",
+                agent_id="agent-a",
+                command="python -m vexic.cli recorder ingest",
+            )
+
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            stop_groups = settings["hooks"]["Stop"]
+            commands = [
+                hook["command"]
+                for group in stop_groups
+                for hook in group["hooks"]
+            ]
+            self.assertIn("echo existing", commands)
+            vexic_commands = [command for command in commands if "vexic" in command]
+            self.assertEqual(len(vexic_commands), 1)
+            self.assertNotIn("vx_secret", vexic_commands[0])
+            self.assertIn(str(result.config_path), vexic_commands[0])
+            config = json.loads(result.config_path.read_text(encoding="utf-8"))
+            self.assertEqual(config["api_key"], "vx_secret")
+            self.assertEqual(config["agent_id"], "agent-a")
+
+    def test_setup_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            for _ in range(2):
+                install_claude_code_setup(
+                    home=home,
+                    base_url="https://api.example.test",
+                    api_key="vx_secret",
+                    project_id="project-a",
+                    session_id="session-a",
+                    agent_id=None,
+                    command="python -m vexic.cli recorder ingest",
+                )
+
+            settings = json.loads((home / ".claude" / "settings.json").read_text(encoding="utf-8"))
+            commands = [
+                hook["command"]
+                for group in settings["hooks"]["Stop"]
+                for hook in group["hooks"]
+                if "vexic" in hook["command"]
+            ]
+            self.assertEqual(len(commands), 1)
+
+    def test_uninstall_removes_only_vexic_hook(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            install_claude_code_setup(
+                home=home,
+                base_url="https://api.example.test",
+                api_key="vx_secret",
+                project_id="project-a",
+                session_id="session-a",
+                agent_id=None,
+                command="python -m vexic.cli recorder ingest",
+            )
+            settings_path = home / ".claude" / "settings.json"
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            settings["hooks"]["Stop"].append(
+                {"hooks": [{"type": "command", "command": "echo keep"}]}
+            )
+            settings_path.write_text(json.dumps(settings), encoding="utf-8")
+
+            removed = uninstall_claude_code_setup(home=home)
+
+            self.assertTrue(removed)
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            commands = [
+                hook["command"]
+                for group in settings["hooks"]["Stop"]
+                for hook in group["hooks"]
+            ]
+            self.assertEqual(commands, ["echo keep"])
+
+    def test_top_level_setup_claude_code_dispatches(self) -> None:
+        from vexic.cli import main as vexic_main
+
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            code = vexic_main(
+                [
+                    "setup",
+                    "claude-code",
+                    "--home",
+                    str(home),
+                    "--base-url",
+                    "https://api.example.test",
+                    "--api-key",
+                    "vx_secret",
+                    "--project-id",
+                    "project-a",
+                    "--session-id",
+                    "session-a",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+
+    def test_ingest_uses_config_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            transcript = root / "session.jsonl"
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "sessionId": "claude-session",
+                        "uuid": "uuid-1",
+                        "message": {"role": "user", "content": "remember cedar"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "hook.json"
+            hook_payload.write_text(
+                json.dumps({"session_id": "claude-session", "transcript_path": str(transcript)}),
+                encoding="utf-8",
+            )
+            status_path = root / "status.json"
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                        "agent_id": "agent-a",
+                        "status_path": str(status_path),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            calls = []
+
+            def fake_post(config, *, messages, forbidden_values):
+                calls.append((config, messages, forbidden_values))
+                return {"items": [{"status": "inserted"}]}
+
+            with patch("vexic.recorders.cli.post_source_messages", fake_post):
+                code = recorder_main(
+                    [
+                        "ingest",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            config, messages, _forbidden_values = calls[0]
+            self.assertEqual(config.base_url, "https://api.example.test")
+            self.assertEqual(config.api_key, "vx_secret")
+            self.assertEqual(config.project_id, "project-a")
+            self.assertEqual(config.session_id, "session-a")
+            self.assertEqual(config.agent_id, "agent-a")
+            self.assertEqual(len(messages), 1)
+            self.assertTrue(status_path.exists())
+
+
+class ClaudeCodeRecorderIngestCommandMoreTests(unittest.TestCase):
     def test_ingest_failure_writes_status_and_returns_two(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

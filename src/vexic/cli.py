@@ -10,6 +10,10 @@ def main(argv: list[str] | None = None) -> int:
         from vexic.recorders.cli import main as recorder_main
 
         return recorder_main(args[1:])
+    if len(args) >= 2 and args[:2] == ["setup", "claude-code"]:
+        from vexic.recorders.cli import main as recorder_main
+
+        return recorder_main(["setup-claude-code", *args[2:]])
 
     parser = argparse.ArgumentParser(prog="vexic")
     parser.add_argument("command", nargs="?")
