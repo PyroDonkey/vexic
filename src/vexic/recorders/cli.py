@@ -5,8 +5,9 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Iterator
 
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from vexic.contract import SourceTranscriptMessage
 from vexic.hosted import HOSTED_WRITE_MAX_CHARS, HOSTED_WRITE_MAX_MESSAGES
 from vexic.recorders.claude_code import iter_claude_code_source_messages
@@ -20,6 +21,31 @@ from vexic.recorders.status import RecorderStatus, write_status
 
 class MissingIngestOption(ValueError):
     pass
+
+
+class _RecorderIngestConfigFile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: str | None = None
+    api_key: str | None = None
+    project_id: str | None = None
+    session_id: str | None = None
+    agent_id: str | None = None
+    status_path: Path | None = None
+
+
+class _ClaudeHookPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    transcript_path: str
+    session_id: str | None = None
+
+    @field_validator("transcript_path")
+    @classmethod
+    def _transcript_path_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("hook input transcript_path must be a nonblank string")
+        return value
 
 
 def _iter_hosted_message_batches(
@@ -106,21 +132,22 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _load_config(path: Path) -> dict[str, Any]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError("config must be a JSON object")
-    return payload
+def _load_config(path: Path) -> _RecorderIngestConfigFile:
+    try:
+        return _RecorderIngestConfigFile.model_validate_json(path.read_text(encoding="utf-8"))
+    except ValidationError as exc:
+        raise ValueError(f"invalid recorder config: {exc}") from exc
 
 
 def _apply_ingest_config(args: argparse.Namespace) -> None:
     if args.config is not None:
         config = _load_config(args.config)
+        provided = config.model_fields_set
         for name in ("base_url", "api_key", "project_id", "session_id", "agent_id"):
-            if name in config:
-                setattr(args, name, config[name])
-        if "status_path" in config and config["status_path"] is not None:
-            args.status_path = Path(config["status_path"])
+            if name in provided:
+                setattr(args, name, getattr(config, name))
+        if "status_path" in provided and config.status_path is not None:
+            args.status_path = config.status_path
 
     missing = [
         option
@@ -136,23 +163,18 @@ def _apply_ingest_config(args: argparse.Namespace) -> None:
         raise MissingIngestOption(f"missing required ingest option: {missing[0]}")
 
 
-def _read_hook_payload(path: Path | None) -> dict[str, Any]:
+def _read_hook_payload(path: Path | None) -> _ClaudeHookPayload:
     raw = path.read_text(encoding="utf-8") if path is not None else sys.stdin.read()
-    payload = json.loads(raw)
-    if not isinstance(payload, dict):
-        raise ValueError("hook input must be a JSON object")
-    return payload
+    try:
+        return _ClaudeHookPayload.model_validate_json(raw)
+    except ValidationError as exc:
+        raise ValueError(f"invalid hook input: {exc}") from exc
 
 
 def _ingest(args: argparse.Namespace) -> int:
     payload = _read_hook_payload(args.hook_input)
-    transcript_path = payload.get("transcript_path")
-    if not isinstance(transcript_path, str) or not transcript_path.strip():
-        raise ValueError("hook input transcript_path must be a nonblank string")
-
-    source_session_id = payload.get("session_id")
-    if not isinstance(source_session_id, str):
-        source_session_id = None
+    transcript_path = payload.transcript_path
+    source_session_id = payload.session_id
 
     messages = []
     ignored = 0

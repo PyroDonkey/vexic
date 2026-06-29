@@ -970,6 +970,86 @@ class ClaudeCodeRecorderIngestCommandMoreTests(unittest.TestCase):
             self.assertEqual(status["error"], "argument parsing failed")
             self.assertNotIn("vx_secret", json.dumps(status))
 
+    def test_ingest_rejects_config_with_unknown_fields_before_post(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            hook_payload = root / "hook.json"
+            hook_payload.write_text(
+                json.dumps(
+                    {
+                        "session_id": "claude-session",
+                        "transcript_path": str(root / "session.jsonl"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            status_path = root / "status.json"
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                        "unexpected": "value",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("vexic.recorders.cli.post_source_messages") as post_source_messages_mock:
+                code = recorder_main(
+                    [
+                        "ingest",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--status-path",
+                        str(status_path),
+                    ]
+                )
+
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual(code, 2)
+            self.assertIn("invalid recorder config", status["error"])
+            post_source_messages_mock.assert_not_called()
+
+    def test_ingest_rejects_malformed_hook_payload_before_post(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            hook_payload = root / "hook.json"
+            hook_payload.write_text(
+                json.dumps({"session_id": 123, "transcript_path": str(root / "session.jsonl")}),
+                encoding="utf-8",
+            )
+            status_path = root / "status.json"
+
+            with patch("vexic.recorders.cli.post_source_messages") as post_source_messages_mock:
+                code = recorder_main(
+                    [
+                        "ingest",
+                        "--hook-input",
+                        str(hook_payload),
+                        "--base-url",
+                        "https://api.example.test",
+                        "--api-key",
+                        "vx_secret",
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "vexic-session",
+                        "--status-path",
+                        str(status_path),
+                    ]
+                )
+
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual(code, 2)
+            self.assertIn("invalid hook input", status["error"])
+            post_source_messages_mock.assert_not_called()
+
     def test_top_level_recorder_dispatches_ingest(self) -> None:
         from vexic.cli import main as vexic_main
 
