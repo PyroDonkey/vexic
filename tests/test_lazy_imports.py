@@ -1,7 +1,10 @@
+import os
 import subprocess
 import sys
+import threading
+import time
 import unittest
-import os
+from concurrent.futures import ThreadPoolExecutor
 from math import sqrt
 from pathlib import Path
 from types import ModuleType
@@ -91,6 +94,38 @@ class VexicLazyImportTests(unittest.TestCase):
                 abs(sqrt(sum(value * value for value in vector)) - 1.0) < 1e-12
                 for vector in [*vectors, *cached_vectors]
             )
+        )
+
+    def test_embed_texts_initializes_fastembed_once_under_concurrency(self) -> None:
+        fake = ModuleType("fastembed")
+        model_names: list[str] = []
+        start = threading.Event()
+
+        class TextEmbedding:
+            def __init__(self, model_name: str) -> None:
+                model_names.append(model_name)
+                time.sleep(0.05)
+
+            def embed(self, texts: list[str]) -> object:
+                vector = [1.0] + [0.0] * (embeddings.EMBEDDING_DIM - 1)
+                return [vector for _ in texts]
+
+        fake.TextEmbedding = TextEmbedding
+        sys.modules["fastembed"] = fake
+
+        def embed_once() -> list[list[float]]:
+            start.wait(timeout=1)
+            return embeddings.embed_texts(["first"])
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(embed_once) for _ in range(8)]
+            start.set()
+            vectors = [future.result(timeout=2) for future in futures]
+
+        self.assertEqual(model_names, [embeddings.EMBEDDING_MODEL_NAME])
+        self.assertEqual(
+            vectors,
+            [[[1.0] + [0.0] * (embeddings.EMBEDDING_DIM - 1)] for _ in range(8)],
         )
 
 
