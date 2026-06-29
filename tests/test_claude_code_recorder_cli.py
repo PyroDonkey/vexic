@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
+from urllib.parse import urlsplit
 
 from fastapi.testclient import TestClient
 
@@ -290,11 +291,24 @@ class ClaudeCodeRecorderHostedRoundTripTests(unittest.TestCase):
                     return self._content
 
             def fake_urlopen(request, timeout):
-                response = client.post(
-                    "/v1/ingest_source_transcript",
+                target = urlsplit(request.full_url)
+                path = target.path
+                if target.query:
+                    path = f"{path}?{target.query}"
+                response = client.request(
+                    request.get_method(),
+                    path,
                     headers=dict(request.header_items()),
                     content=request.data,
                 )
+                if not 200 <= response.status_code < 300:
+                    raise HTTPError(
+                        request.full_url,
+                        response.status_code,
+                        response.reason_phrase,
+                        response.headers,
+                        io.BytesIO(response.content),
+                    )
                 return _Response(response.content)
 
             stdout = io.StringIO()

@@ -145,7 +145,7 @@ For hosted Claude Code recording, install the user-local hook and recorder
 config:
 
 ```powershell
-uv run python -m vexic.cli setup claude-code --base-url https://api.vexic.dev --api-key <raw-key> --project-id project-a --session-id session-a
+uv run --with-editable . python -m vexic.cli setup claude-code --base-url https://api.vexic.dev --api-key <raw-key> --project-id project-a --session-id session-a
 ```
 
 The setup command updates the user's Claude Code hook config and writes a Vexic
@@ -158,7 +158,7 @@ To replay a missed hosted hook manually, point the recorder at the setup config
 and a hook payload containing `session_id` and `transcript_path`:
 
 ```powershell
-uv run python -m vexic.cli recorder ingest --config "$env:USERPROFILE\.vexic\claude-code-recorder.json" --hook-input .\claude-hook-replay.json
+uv run --with-editable . python -m vexic.cli recorder ingest --config "$env:USERPROFILE\.vexic\claude-code-recorder.json" --hook-input .\claude-hook-replay.json
 ```
 
 For local recovery/import, import cleaned Claude Code JSONL transcript rows into
