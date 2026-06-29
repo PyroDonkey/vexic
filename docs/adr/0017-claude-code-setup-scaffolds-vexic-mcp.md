@@ -38,9 +38,11 @@ the user performs one explicit enable step.
   Code's new-server approval prompt as the natural "disabled until the user
   enables it" gate.
 - The scaffolded server is a local stdio launcher
-  (`scripts/vexic-mcp-stdio.py` / `vexic mcp ...`) configured to read its
-  credentials from the existing `~/.vexic/claude-code-recorder.json`. The
-  launcher, not the Claude config, holds the path to the secret.
+  (`scripts/vexic-mcp-stdio.py`) configured to read its credentials from the
+  existing `~/.vexic/claude-code-recorder.json`. The launcher, not the Claude
+  config, holds the path to the secret. (There is no `vexic mcp` CLI subcommand
+  today; the follow-up issue may add one, but the supported launcher is the
+  script.)
 - The raw API key is never written into `.mcp.json` or `~/.claude.json`. The
   recorder config remains the single source of truth for the base URL and key.
 - No hosted MCP server changes are required. This is a setup/install-UX decision
