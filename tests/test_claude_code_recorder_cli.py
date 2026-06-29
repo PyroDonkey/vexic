@@ -1,10 +1,12 @@
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
 
+from vexic.recorders.cli import main as recorder_main
 from vexic.recorders.hosted_ingest import HostedIngestConfig, post_source_messages
 from vexic.recorders.status import RecorderStatus, write_status
 
@@ -126,3 +128,135 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
         self.assertEqual(payload["rejected"], 3)
         self.assertEqual(payload["ignored"], 4)
         self.assertNotIn("vx_secret", json.dumps(payload))
+
+
+class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
+    def test_ingest_from_hook_payload_posts_clean_rows_and_writes_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            transcript = root / "session.jsonl"
+            transcript.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "user",
+                                "sessionId": "claude-session",
+                                "uuid": "uuid-1",
+                                "message": {"role": "user", "content": "remember cedar"},
+                            }
+                        ),
+                        json.dumps({"type": "summary", "summary": "ignore cedar"}),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "hook.json"
+            hook_payload.write_text(
+                json.dumps(
+                    {
+                        "hook_event_name": "Stop",
+                        "session_id": "claude-session",
+                        "transcript_path": str(transcript),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            status_path = root / "status.json"
+            calls = []
+
+            def fake_post(config, *, messages, forbidden_values):
+                calls.append((config, messages, forbidden_values))
+                return {
+                    "items": [
+                        {
+                            "source_host": "claude-code",
+                            "source_session_id": "claude-session",
+                            "source_message_id": "uuid-1",
+                            "status": "inserted",
+                        }
+                    ]
+                }
+
+            with patch("vexic.recorders.cli.post_source_messages", fake_post):
+                code = recorder_main(
+                    [
+                        "ingest",
+                        "--hook-input",
+                        str(hook_payload),
+                        "--base-url",
+                        "https://api.example.test",
+                        "--api-key",
+                        "vx_secret",
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "vexic-session",
+                        "--agent-id",
+                        "agent-a",
+                        "--status-path",
+                        str(status_path),
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            config, messages, forbidden_values = calls[0]
+            self.assertEqual(config.session_id, "vexic-session")
+            self.assertEqual(config.agent_id, "agent-a")
+            self.assertEqual(forbidden_values, ())
+            self.assertEqual(len(messages), 1)
+            self.assertEqual(messages[0].source_message_id, "uuid-1")
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertTrue(status["ok"])
+            self.assertEqual(status["inserted"], 1)
+            self.assertEqual(status["ignored"], 1)
+
+    def test_ingest_failure_writes_status_and_returns_two(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            transcript = root / "session.jsonl"
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "sessionId": "claude-session",
+                        "uuid": "uuid-1",
+                        "message": {"role": "user", "content": "remember cedar"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "hook.json"
+            hook_payload.write_text(
+                json.dumps({"session_id": "claude-session", "transcript_path": str(transcript)}),
+                encoding="utf-8",
+            )
+            status_path = root / "status.json"
+
+            with patch(
+                "vexic.recorders.cli.post_source_messages",
+                side_effect=RuntimeError("hosted ingest failed: HTTP 403"),
+            ):
+                code = recorder_main(
+                    [
+                        "ingest",
+                        "--hook-input",
+                        str(hook_payload),
+                        "--base-url",
+                        "https://api.example.test",
+                        "--api-key",
+                        "vx_secret",
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "vexic-session",
+                        "--status-path",
+                        str(status_path),
+                    ]
+                )
+
+            self.assertEqual(code, 2)
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertFalse(status["ok"])
+            self.assertEqual(status["error"], "hosted ingest failed: HTTP 403")
+            self.assertNotIn("vx_secret", json.dumps(status))
