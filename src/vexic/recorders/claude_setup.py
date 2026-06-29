@@ -40,7 +40,7 @@ def _paths(home: Path) -> tuple[Path, Path, Path]:
 def _require_nonblank(name: str, value: str | None) -> str:
     if value is None or not value.strip():
         raise ValueError(f"{name} must be nonblank")
-    return value
+    return value.strip()
 
 
 def _ensure_owner_only(path: Path) -> None:
@@ -113,6 +113,7 @@ def install_claude_code_setup(
     agent_id: str | None,
     command: str,
 ) -> ClaudeCodeSetupResult:
+    base_url = _require_nonblank("base_url", base_url)
     api_key = _require_nonblank("api_key", api_key)
     project_id = _require_nonblank("project_id", project_id)
     session_id = _require_nonblank("session_id", session_id)
