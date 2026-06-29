@@ -812,6 +812,32 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(usage_events[-1].status, "error")
         self.assertNotIn("telemetry cedar", repr(audit_events) + repr(usage_events))
 
+    def test_hosted_write_unexpected_auth_failure_returns_json_and_telemetry(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE})
+
+        def _boom(_: str) -> object:
+            raise RuntimeError("key store unavailable: cedar-secret")
+
+        self.service.api_keys.authenticate = _boom  # type: ignore[method-assign]
+
+        response = self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key),
+            json=self._append_body("preflight cedar"),
+        )
+        audit_events = self.catalog.audit_events(None)
+        usage_events = self.catalog.usage_events(None)
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.headers["content-type"], "application/json")
+        self.assertEqual(response.json()["error"]["code"], "internal_error")
+        self.assertNotIn("cedar-secret", response.text)
+        self.assertEqual(audit_events[-1].operation, "append_transcript")
+        self.assertEqual(audit_events[-1].status, "error")
+        self.assertEqual(audit_events[-1].error_type, "RuntimeError")
+        self.assertEqual(usage_events[-1].operation, "append_transcript")
+        self.assertEqual(usage_events[-1].status, "error")
+
     def test_hosted_ingest_rejects_polluted_rows_per_row(self) -> None:
         api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
         polluted = single_message_adapter.dump_json(

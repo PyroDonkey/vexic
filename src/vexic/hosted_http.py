@@ -10,30 +10,23 @@ from typing import TypeVar
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict
 
 from vexic import CONTRACT_VERSION
 from vexic.contract import (
-    AppendTranscriptRequest,
     ExpandHistoryResult,
     ExpandHistoryRequest,
-    IngestSourceTranscriptRequest,
     MemoryCapability,
     MemoryRequest,
     MemoryResult,
-    MemoryScope,
-    RedactionContext,
     SearchLongTermRequest,
     SearchTranscriptRequest,
-    SourceTranscriptMessage,
-    TrustBoundary,
 )
 from vexic.hosted import (
-    HostedAuthContext,
     HostedInMemoryRateLimiter,
     HostedMemoryService,
     HostedRateLimitExceeded,
     add_run_dream_phase_subcommand,
+    register_hosted_write_routes,
     run_dream_phase_command,
 )
 from vexic.mcp_http import register_mcp_routes
@@ -42,8 +35,6 @@ from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 
 
 MAX_BODY_BYTES = 1_000_000
-MAX_APPEND_MESSAGES = 100
-MAX_APPEND_CHARS = 250_000
 MAX_QUERY_CHARS = 1_000
 MAX_LIMIT = 20
 MAX_EXPAND_HISTORY_MESSAGES = 100
@@ -51,20 +42,6 @@ MAX_EXPAND_HISTORY_CHARS = 20_000
 
 _RequestT = TypeVar("_RequestT", bound=MemoryRequest)
 _ResultT = TypeVar("_ResultT", bound=MemoryResult)
-
-
-class HostedAppendTranscriptBody(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    messages_json: list[str]
-    redaction: RedactionContext
-
-
-class HostedIngestSourceTranscriptBody(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    messages: list[SourceTranscriptMessage]
-    redaction: RedactionContext
 
 
 def create_app(
@@ -106,39 +83,13 @@ def create_app(
     async def health() -> dict[str, str]:
         return {"status": "ok", "contract_version": CONTRACT_VERSION}
 
-    @app.post("/v1/append_transcript")
-    async def append_transcript(
-        request: Request,
-        payload: HostedAppendTranscriptBody,
-    ) -> JSONResponse:
-        return await _handle_hosted_write(
-            "append_transcript",
-            request,
-            service,
-            lambda scope: AppendTranscriptRequest(
-                scope=scope,
-                messages_json=payload.messages_json,
-                redaction=payload.redaction,
-            ),
-            service.append_transcript,
-        )
-
-    @app.post("/v1/ingest_source_transcript")
-    async def ingest_source_transcript(
-        request: Request,
-        payload: HostedIngestSourceTranscriptBody,
-    ) -> JSONResponse:
-        return await _handle_hosted_write(
-            "ingest_source_transcript",
-            request,
-            service,
-            lambda scope: IngestSourceTranscriptRequest(
-                scope=scope,
-                messages=payload.messages,
-                redaction=payload.redaction,
-            ),
-            service.ingest_source_transcript,
-        )
+    register_hosted_write_routes(
+        app,
+        service,
+        api_key_from_request=_api_key,
+        handle_payload=_handle_payload,
+        error_response=_error_response,
+    )
 
     @app.post("/v1/search_transcript")
     async def search_transcript(request: Request, payload: SearchTranscriptRequest) -> JSONResponse:
@@ -186,44 +137,6 @@ async def _handle(
     return await _handle_payload(api_key, payload, call)
 
 
-async def _handle_hosted_write(
-    operation: str,
-    request: Request,
-    service: HostedMemoryService,
-    build: Callable[[MemoryScope], _RequestT],
-    call: Callable[[str, _RequestT], Awaitable[_ResultT]],
-) -> JSONResponse:
-    api_key = _api_key(request)
-    if api_key is None:
-        return _error_response(401, "unauthorized", "Missing hosted API key.")
-    auth: HostedAuthContext | None = None
-    try:
-        auth = service.api_keys.authenticate(api_key)
-        scope = _write_scope_from_headers(request, auth)
-        payload = build(scope)
-    except PermissionError as exc:
-        service._record_request(
-            operation,
-            None,
-            status="error",
-            error_type=type(exc).__name__,
-            auth=auth,
-        )
-        if str(exc) == "Invalid hosted API key.":
-            return _error_response(401, "unauthorized", "Invalid hosted API key.")
-        return _error_response(403, "permission_denied", str(exc))
-    except ValueError as exc:
-        service._record_request(
-            operation,
-            None,
-            status="error",
-            error_type=type(exc).__name__,
-            auth=auth,
-        )
-        return _error_response(400, "invalid_request", str(exc))
-    return await _handle_payload(api_key, payload, call)
-
-
 async def _handle_payload(
     api_key: str,
     payload: _RequestT,
@@ -257,28 +170,6 @@ async def _handle_payload(
     return JSONResponse(result.model_dump(mode="json"))
 
 
-def _write_scope_from_headers(request: Request, auth: HostedAuthContext) -> MemoryScope:
-    if request.headers.get("x-vexic-user-id") is not None:
-        raise ValueError("X-Vexic-User-Id is not supported for hosted writes.")
-    if request.headers.get("x-vexic-correlation-id") is not None:
-        raise ValueError("X-Vexic-Correlation-Id is not supported for hosted writes.")
-    project_id = request.headers.get("x-vexic-project-id")
-    if project_id is None or not project_id.strip():
-        raise ValueError("X-Vexic-Project-Id header is required.")
-    session_id = request.headers.get("x-vexic-session-id")
-    if session_id is None or not session_id.strip():
-        raise ValueError("X-Vexic-Session-Id header is required.")
-    return MemoryScope(
-        tenant_id=auth.tenant_id,
-        project_id=project_id,
-        session_id=session_id,
-        agent_id=request.headers.get("x-vexic-agent-id"),
-        principal=auth.principal,
-        trust_boundary=TrustBoundary.NETWORKED,
-        capabilities={MemoryCapability.WRITE},
-    )
-
-
 def _api_key(request: Request) -> str | None:
     authorization = request.headers.get("authorization")
     if authorization is not None:
@@ -292,16 +183,6 @@ def _api_key(request: Request) -> str | None:
 
 
 def _cap_error(payload: MemoryRequest) -> JSONResponse | None:
-    if isinstance(payload, AppendTranscriptRequest):
-        if len(payload.messages_json) > MAX_APPEND_MESSAGES:
-            return _too_large("append_transcript message count is capped.")
-        if sum(len(message) for message in payload.messages_json) > MAX_APPEND_CHARS:
-            return _too_large("append_transcript payload is capped.")
-    if isinstance(payload, IngestSourceTranscriptRequest):
-        if len(payload.messages) > MAX_APPEND_MESSAGES:
-            return _too_large("ingest_source_transcript message count is capped.")
-        if sum(len(message.message_json) for message in payload.messages) > MAX_APPEND_CHARS:
-            return _too_large("ingest_source_transcript payload is capped.")
     if isinstance(payload, (SearchTranscriptRequest, SearchLongTermRequest)):
         if len(payload.query) > MAX_QUERY_CHARS:
             return _too_large("query is capped.")
