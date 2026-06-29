@@ -2,7 +2,7 @@
 
 Date: 2026-06-27
 Branch: dev
-Owner: Ryan (directs/reviews architecture)
+Owner: Project maintainer (directs/reviews architecture)
 Executor: Codex (grunt work)
 
 ## Goal
@@ -15,14 +15,14 @@ version.
 This is a UI rebuild plus a runtime/dependency bump. It is NOT a backend or
 contract change.
 
-## Hard Boundaries (from AGENTS.md - do not cross)
+## Hard Boundaries (from docs/ai/AGENTS.md - do not cross)
 
 - All work stays under `console/`. Do NOT touch `src/vexic`. Do NOT add Node
   package files at the repo root.
 - Console keeps its isolated npm surface in `console/`. It is a Vercel Next.js
   app, not memory-core runtime.
 - Work on the `dev` branch only. Do not create feature/worktree/codex branches
-  unless Ryan names one.
+  unless the requester names one.
 - Keep Clerk wiring intact and functional:
   - `console/app/console/layout.tsx` (OrganizationSwitcher, UserButton, shell)
   - `console/lib/auth.ts`, `console/lib/clerk-config.ts`
@@ -48,7 +48,7 @@ contract change.
   config), not the `@tremor/react` npm package, to avoid a second version pin.
   Verify current Tremor Raw upstream before relying on import paths.
 - Node.js: bump to Node 22 LTS (active LTS; Node 20 reached EOL ~2026-04).
-  Node 24 is an acceptable alternative if Ryan prefers. Update:
+  Node 24 is an acceptable alternative if the requester prefers. Update:
   - `console/package.json` `engines.node` (currently `>=20.9.0 <21`)
   - `@types/node` devDependency to the matching major
   - any Vercel project Node version setting / `.nvmrc` if present
@@ -116,16 +116,17 @@ Use it where the cost of being wrong outweighs a few extra completions:
 - USE for: resolving the React/Next/Tailwind version-compatibility matrix
   (high-stakes, fast-moving, easy to get subtly wrong); choosing the shadcn +
   Tremor Raw integration approach under Tailwind v4; any architecture call that
-  would otherwise need Ryan.
+  would otherwise need project maintainer input.
 - DO NOT USE for: routine component scaffolding, simple lookups, mechanical
   edits, or anything speed-sensitive. Single-model is fine there.
 - Keep Opus on the panel for architecture/contract-adjacent questions.
 - /fuse advises; it does not settle settled boundaries. Architecture, contract,
-  and boundary questions still defer to Ryan (AGENTS.md Working Rules).
+  and boundary questions still defer to the project maintainer
+  (docs/ai/AGENTS.md Working Rules).
 
 ## Escalation
 
-- Stop after 3 failed verification cycles on the same target; report to Ryan.
+- Stop after 3 failed verification cycles on the same target; report to the requester.
 - No destructive retry loops (no reset/delete to force a green run).
 - If the version mismatch cannot be resolved within pins, report the blocker;
   do not silently downgrade scope.

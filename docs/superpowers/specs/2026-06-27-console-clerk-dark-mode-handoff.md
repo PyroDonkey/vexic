@@ -2,7 +2,7 @@
 
 Date: 2026-06-27
 Branch: dev
-Owner: Ryan
+Owner: Project maintainer
 Executor: Codex
 Self-contained: yes. Assumes NO prior chat context.
 
@@ -79,7 +79,7 @@ in cleanly.
 ## Scope Limits
 
 - This task is ONLY Clerk dark mode. Do NOT fix other UI bugs in this change;
-  Ryan has noted separate UI cleanup that will be handled on its own.
+  separate UI cleanup has been noted and will be handled on its own.
 - Theme must follow the resolved theme (system -> actual dark/light).
 
 ## Boundaries (do not cross)
@@ -95,7 +95,7 @@ in cleanly.
   `console/lib/control-plane-*.mjs`, or the public landing page.
 - Work on `dev` only. Sync first: `git fetch --prune origin`,
   `git switch dev`, `git pull --ff-only origin dev`. No feature/worktree/codex
-  branches unless Ryan names one.
+  branches unless the requester names one.
 
 ## Method
 
@@ -112,7 +112,7 @@ in cleanly.
 Skip /fuse for the implementation. Use it ONLY if the `@clerk/themes` x Clerk JS
 v5 x React 19 SSR/hydration interaction turns out to be non-obvious (e.g.
 hydration mismatch you cannot cleanly resolve) and you want a cross-model check.
-Keep Opus on the panel. /fuse advises; Ryan settles boundaries.
+Keep Opus on the panel. /fuse advises; the project maintainer settles boundaries.
 
 ## Verification
 
@@ -131,9 +131,9 @@ issue.
 End with:
 
 1. "Verified by Codex" - build/tests/unit-test-for-mapping results with evidence.
-2. "Ryan must check manually" - the authenticated visual checks Codex cannot run
+2. "Manual reviewer must check" - the authenticated visual checks Codex cannot run
    without signing in on https://vexic.dev (Clerk is behind login; do NOT enter
-   Ryan's credentials):
+   personal credentials):
    - In dark mode: UserButton dropdown, OrganizationSwitcher, UserProfile and
      OrganizationProfile (settings page), and the sign-in / sign-up pages all
      render dark.

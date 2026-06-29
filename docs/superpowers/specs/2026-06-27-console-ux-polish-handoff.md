@@ -2,7 +2,7 @@
 
 Date: 2026-06-27
 Branch: dev
-Owner: Ryan (directs/reviews architecture)
+Owner: Project maintainer (directs/reviews architecture)
 Executor: Codex (grunt work)
 Self-contained: yes. This brief assumes NO prior chat context.
 
@@ -56,8 +56,8 @@ Data shapes the UI consumes (do not change these):
   client-UI-only change.
 - Do NOT redesign or restyle the public landing page (`console/app/page.tsx`)
   or its `globals.css` landing rules.
-- Work on the `dev` branch only. No feature/worktree/codex branches unless Ryan
-  names one. Before starting, sync dev: `git fetch --prune origin`,
+- Work on the `dev` branch only. No feature/worktree/codex branches unless the
+  requester names one. Before starting, sync dev: `git fetch --prune origin`,
   `git switch dev`, `git pull --ff-only origin dev`.
 
 ## Tasks (ranked)
@@ -140,11 +140,11 @@ being wrong outweighs a few extra completions.
   mechanical; single-model is fine.
 - Keep Opus on the panel for any architecture-adjacent question.
 - /fuse advises; it does not settle boundaries. Architecture/contract/boundary
-  questions still defer to Ryan.
+  questions still defer to the project maintainer.
 
 ## Escalation
 
-- Stop after 3 failed verification cycles on the same target; report to Ryan.
+- Stop after 3 failed verification cycles on the same target; report to the requester.
 - No destructive retry loops (no reset/delete to force a green run).
 - If a P2 item cannot be done without changing an API contract or a boundary,
   stop and report; do not change the contract.

@@ -16,7 +16,7 @@ This tabletop contains metadata only. It does not include raw memory, transcript
 | --- | --- |
 | Incident id | INC-SYN-2026-06-26-COA203-01 |
 | Severity | Synthetic SEV-2 exercise |
-| IC | Ryan, with conflict checkpoint active |
+| IC | Project maintainer, with conflict checkpoint active |
 | Deputy/secondary reviewer | Dana Example, not yet operationally trained |
 | Affected tenant/project ids | tenant_demo_7f3a, project_demo_19c2 |
 | Timeline | 09:00 signal opened; 09:06 scoped key marked suspect; 09:12 key revoked; 09:18 processor pause considered; 09:31 synthetic access review complete; 09:45 tabletop closed pass-with-caveats |
@@ -45,7 +45,7 @@ Customer-facing template fields must be bland and metadata-only: status, affecte
 
 ## IC Conflict Checkpoint
 
-Exercise condition: Ryan is implicated in the suspect config/routing change. The secondary reviewer/deputy is identified but not yet operationally trained.
+Exercise condition: the project maintainer is implicated in the suspect config/routing change. The secondary reviewer/deputy is identified but not yet operationally trained.
 
 Result: pass-with-caveats, not a clean pass. The tabletop confirms the conflict checkpoint is visible, but the deputy path is not operationally ready. Follow-up required under COA-231.
 

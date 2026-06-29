@@ -1,13 +1,20 @@
 # Vexic
 
-Vexic is the standalone memory system extracted from a private source host: a
-provenance-first, replayable memory core for long-running agents.
+Vexic gives long-running AI agents a memory they can trust. It stores cleaned
+conversation history, stages possible memories for review, and promotes durable
+facts with provenance so agents can recall what happened without replaying raw
+logs or guessing at stale context.
 
-This first package slice is a local Python core with a SQLite adapter, public
-contract models, and conformance tests. Managed billing, dashboards, public
-HTTP, mature remote MCP, and production hosted operations are intentionally out
-of scope for v0.1. The read-only local stdio MCP MVP and the hosted
-internal-alpha read-only HTTP MCP adapter are the narrow in-scope MCP slices.
+Reliable agent memory matters because recall needs to be auditable, scoped, and
+reversible. Vexic treats transcript rows as the source of truth, keeps derived
+search indexes rebuildable, and records where each long-term fact came from so
+memory behavior can be tested, migrated, and debugged.
+
+Vexic is for engineers building agent products, internal automation, or
+research systems that need local-first memory primitives today and a path to
+hosted integrations later. The current package is a Python core with a SQLite
+reference service, public contract models, retrieval primitives, and
+conformance tests.
 
 ## Running the Project
 
@@ -27,15 +34,31 @@ For Vercel, Console may carry the isolated npm build contract in
 files at the repository root, and do not treat Console dependencies as memory
 engine install requirements.
 
-## Agent Workflow
+## Maintainer Notes
 
-Agents should follow `AGENTS.md`: sync `main` and `dev` before edits, do all
-project work on `dev`, push completed updates to `origin/dev`, and keep Linear
-issues current for non-trivial plans and changes. Do not create feature,
-`codex/*`, worktree, cleanup, or recovery branches unless Ryan explicitly names
-that branch in the same request. Before opening a `dev` to `main` PR, agents
-must fetch origin, ensure `dev` is not behind `origin/main`, and verify GitHub's
-compare file list only contains intended files.
+Operational AI-agent and maintainer instructions live in `docs/ai/`. They are
+not product documentation, but they describe how automated agents should work in
+this repository. Agents should follow `docs/ai/AGENTS.md`: sync `main` and
+`dev` before edits, do all project work on `dev`, push completed updates to
+`origin/dev`, and keep Linear issues current for non-trivial plans and changes.
+Do not create feature, `codex/*`, worktree, cleanup, or recovery branches
+unless the requester explicitly names that branch in the same request. Before
+opening a `dev` to `main` PR, agents must fetch origin, ensure `dev` is not
+behind `origin/main`, and verify GitHub's compare file list only contains
+intended files.
+
+For Linear-backed traceability, review relevant issues at session start, map
+non-trivial work to an issue, keep status/comments current when scope, blockers,
+decisions, or follow-ups change, and reconcile roadmap/todo docs when the
+`docs/ai/AGENTS.md` reconciliation triggers fire. If Linear tooling is
+unavailable, say so and do not invent issue IDs; record the required
+reconciliation in the commit message or session report.
+
+To confirm the agent rules stay tracker-neutral:
+
+```powershell
+rg -n "COA-[0-9]|Linear" docs/ai/AGENTS.md
+```
 
 ## Local MCP MVP
 
@@ -84,7 +107,7 @@ args = [
   # Optional privileged egress:
   # "--enable-expand-history",
 ]
-cwd = "C:\\Users\\Ryan\\Documents\\GitHub\\Vexic"
+cwd = "<absolute-path-to-vexic-repo>"
 ```
 
 Claude Code local MCP config:
@@ -116,7 +139,7 @@ Vexic-connected agent:
 ```
 
 Alternatively, launch Claude Code with `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`.
-`CLAUDE.md` files remain useful project instructions, but they are prompt
+`docs/ai/CLAUDE.md` remains useful project instruction context, but it is prompt
 context rather than storage enforcement.
 
 For Codex/local agents, keep Codex memories disabled for the Vexic profile. If a
@@ -188,7 +211,7 @@ The opt-in live provider retrieval smoke is:
 ```powershell
 uv run --with-editable . python -m vexic.live_retrieval_baseline `
   --allow-live `
-  --fixture .\longmemeval_s_smoke.jsonl `
+  --fixture .\tests\fixtures\longmemeval_s_smoke.jsonl `
   --adapter .\adapters\openrouter_live_adapter.py `
   --provider openrouter `
   --model-group retrieval-smoke `

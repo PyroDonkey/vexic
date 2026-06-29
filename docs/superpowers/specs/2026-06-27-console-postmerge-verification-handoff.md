@@ -2,7 +2,7 @@
 
 Date: 2026-06-27
 Branch: dev
-Owner: Ryan
+Owner: Project maintainer
 Executor: Codex
 Self-contained: yes. Assumes NO prior chat context.
 
@@ -18,22 +18,22 @@ LIVE in production.
 - `main` and `dev` are even.
 
 Your job: verify what can be verified WITHOUT signing in, review the two late
-fix commits that were not in the PR review, and produce a clear "Ryan must
-check manually" list for everything that is behind Clerk auth.
+fix commits that were not in the PR review, and produce a clear "manual
+reviewer must check" list for everything that is behind Clerk auth.
 
 ## Auth Constraint (read this)
 
 The signed-in console is behind Clerk. Production Clerk keys are domain-locked to
 `vexic.dev`. You almost certainly CANNOT complete the authenticated flow:
 
-- Do NOT enter Ryan's (or anyone's) credentials. Logging in on his behalf is out
+- Do NOT enter personal credentials. Logging in on someone else's behalf is out
   of scope. Never type passwords or complete sign-in.
 - Localhost cannot authenticate (prod keys reject non-`vexic.dev` origins).
 - If you have a browser tool that can reach `https://vexic.dev`, you may load
   public routes and READ what renders, but stop at the login wall.
 
 Everything you cannot reach without auth goes into the manual-review list for
-Ryan (see "Required Output").
+the requester (see "Required Output").
 
 ## Tasks
 
@@ -83,7 +83,8 @@ Do not attempt to bypass the login wall.
   (`console/lib/auth.ts`, `console/lib/clerk-config.ts`, the console/root
   layouts, sign-in/sign-up routes), any `console/app/api/control-plane/*` route
   or contract, the `console/lib/control-plane-*.mjs` files, or the landing page.
-- Work on `dev` only. No feature/worktree/codex branches unless Ryan names one.
+- Work on `dev` only. No feature/worktree/codex branches unless the requester
+  names one.
 - If verification reveals a real bug, you may fix it test-first using the `tdd`
   skill, within the client-UI boundary, on `dev`. If a fix would require
   crossing a boundary, stop and report instead.
@@ -93,12 +94,12 @@ Do not attempt to bypass the login wall.
 `/fuse` runs a panel of models with a judge for high-stakes deliberation
 (~4-5x cost). Use it only if review of the two late commits surfaces a
 non-obvious correctness or accessibility question worth cross-checking. Skip it
-for routine verification. Keep Opus on the panel. /fuse advises; Ryan settles
-boundaries.
+for routine verification. Keep Opus on the panel. /fuse advises; the project
+maintainer settles boundaries.
 
 ## Escalation
 
-- Stop after 3 failed verification cycles on the same target; report to Ryan.
+- Stop after 3 failed verification cycles on the same target; report to the requester.
 - No destructive retry loops.
 
 ## Required Output
@@ -107,8 +108,9 @@ End your run with two clearly separated sections:
 
 1. "Verified by Codex" - build/tests/late-commit-review/public-surface results
    with actual evidence.
-2. "Ryan must check manually" - the explicit authenticated-flow checklist Codex
-   could not run, so Ryan knows exactly what to click on https://vexic.dev :
+2. "Manual reviewer must check" - the explicit authenticated-flow checklist
+   Codex could not run, so the reviewer knows exactly what to click on
+   https://vexic.dev :
    - sign in -> `/console` loads
    - project list: skeleton -> data, no false-empty flash
    - create project -> redirect to workspace

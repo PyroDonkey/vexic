@@ -162,7 +162,7 @@ def record_long_term_retrieval(
     """
     if not fact_ids:
         return []
-    # Persistence secret guard (AGENTS.md): retrieval persists original and
+    # Persistence secret guard (docs/ai/AGENTS.md): retrieval persists original and
     # rewritten query text, so both fail closed exactly like save_messages.
     assert_no_forbidden_secret_values(
         forbidden_secret_values,
