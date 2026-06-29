@@ -4,8 +4,8 @@ This index is the canonical in-repo list of Vexic ADRs. It is authoritative
 over any downstream tracking view (the project roadmap/todo). When an ADR is
 added, changed, or its status moves, update this index in the same change and
 reconcile the downstream tracking roadmap/todo against it. See "Docs Are
-Downstream Of Code" in `docs/ai/AGENTS.md`, which names the tracking system and the
-reconciliation triggers.
+Downstream Of Code" in `docs/ai/AGENTS.md`, which defines the reconciliation
+triggers.
 
 Every ADR file in this directory must appear in the table below. The
 `.claude/hooks/check_doc_drift.py` SessionStart hook flags any ADR file that is

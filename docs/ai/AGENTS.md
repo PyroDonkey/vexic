@@ -168,23 +168,24 @@ If a doc describes contract fields or operation semantics, verify it against
 In-repo `docs/ai/AGENTS.md` and `docs/adr/*` are authoritative for architecture
 decisions, settled boundaries, and the service operation surface. Code under
 `src/vexic` and `tests/` is authoritative for behavior. Any project-tracking
-view of this repository - including the Linear roadmap, todo, and planning
+view of this repository - including external roadmap, todo, and planning
 docs - is downstream. When a tracking doc disagrees with `docs/ai/AGENTS.md`,
 `docs/adr/*`, or the code, the tracking doc is wrong and must be reconciled
 against the repo, not the other way around.
 
 Do not let downstream tracking drift silently. The following are reconciliation
-triggers. When one fires in your change, reconcile the downstream Linear
-roadmap/todo against the in-repo source of truth in the same work session (or,
-if Linear tooling is unavailable, record the required reconciliation per the
-Linear Tracking rules):
+triggers. When one fires in your change, reconcile the downstream tracking docs
+against the in-repo source of truth in the same work session (or, if tracking
+tooling is unavailable, record the required reconciliation per the External
+Tracking rules):
 
-- A new or changed ADR under `docs/adr/`. Update the Linear roadmap/todo to
+- A new or changed ADR under `docs/adr/`. Update the downstream roadmap/todo to
   match the ADR set and statuses, and confirm `docs/adr/README.md` lists every
-  ADR file. The in-repo ADR index, not Linear, is the canonical ADR list.
+  ADR file. The in-repo ADR index, not the tracking system, is the canonical
+  ADR list.
 - A change to the `LocalMemoryService` operation surface in
   `src/vexic/service.py` (an operation added, removed, renamed, or moved
-  between implemented and host-port/deferred). Update any Linear roadmap/todo
+  between implemented and host-port/deferred). Update any downstream roadmap/todo
   that enumerates implemented vs deferred operations to match the
   `MemoryService` contract and `LocalMemoryService`, as recorded in the
   "v0.1 Local Service Surface" section above.
@@ -195,8 +196,8 @@ Linear Tracking rules):
 `.claude/hooks/check_doc_drift.py` enforces the in-repo half of this loop at
 session start: it checks that `docs/adr/README.md` lists every ADR file and
 that the documented service surface matches `src/vexic`. A hook cannot read
-Linear, so closing the loop against the tracking docs remains a manual step
-under the triggers above.
+the external tracking system, so closing the loop against the tracking docs
+remains a manual step under the triggers above.
 
 ---
 
@@ -302,28 +303,28 @@ names the branch to create.
 If a dirty worktree blocks branch sync, inspect and preserve the existing
 changes. Do not stash, reset, or commit user work unless the requester asks.
 
-### Linear Tracking
+### External Tracking
 
-Linear is project tracking only. Do not add Linear SDKs, secrets, imports, or
-runtime dependencies to `src/vexic`. Linear is downstream of the repo: see
-"Docs Are Downstream Of Code". The Linear roadmap, todo, and planning docs
-never override `docs/ai/AGENTS.md`, `docs/adr/*`, or the code; they are
-reconciled against them.
+The external tracking system is project tracking only. Do not add tracker SDKs,
+secrets, imports, or runtime dependencies to `src/vexic`. Tracking docs are
+downstream of the repo: see "Docs Are Downstream Of Code". The roadmap, todo,
+and planning docs never override `docs/ai/AGENTS.md`, `docs/adr/*`, or the code;
+they are reconciled against them.
 
-At the start of each work session, review relevant Linear project issues through
-the configured Linear connector or MCP tools when tooling and auth are
-available. Map the requested work to an existing issue, or create one for
-non-trivial plans and changes.
+At the start of each work session, review relevant project issues through the
+configured tracker connector or MCP tools when tooling and auth are available.
+Map the requested work to an existing issue, or create one for non-trivial plans
+and changes.
 
 During work, keep the issue status and comments current when scope changes,
 blockers, decisions, or follow-up work appear. When a reconciliation trigger
 from "Docs Are Downstream Of Code" fires (a new or changed ADR, a change to the
 `LocalMemoryService` operation surface, or a test-count change), reconcile the
-affected Linear roadmap/todo against the in-repo source of truth before
-finishing. At finish, update the issue with the branch, commit, verification
-result, and any generated follow-up issues.
+affected roadmap/todo against the in-repo source of truth before finishing. At
+finish, update the issue with the branch, commit, verification result, and any
+generated follow-up issues.
 
-If Linear tooling is unavailable, say so plainly and do not invent issue IDs.
+If tracking tooling is unavailable, say so plainly and do not invent issue IDs.
 Record the reconciliation that the triggers above require - for example, in the
 commit message or the session report - so it is not lost.
 
@@ -350,7 +351,6 @@ For boundary-sensitive changes, inspect these explicitly:
 ```powershell
 rg -n "^(from|import) engine\\." src/vexic tests
 rg -n "C[o]alescent|A[g]entOS|Telegram|Blog Writer|teammate" docs/ai/AGENTS.md README.md docs src/vexic tests console
-rg -n "COA-[0-9]|Linear" src/vexic tests console docs --glob '!docs/adr/**' --glob '!docs/runbooks/**' --glob '!docs/provenance.md'
 ```
 
 Alongside the two SessionStart hooks (`.claude/hooks/check_doc_drift.py` and
@@ -364,12 +364,12 @@ See `docs/examples.md` for worked examples.
 
 Private source-host references are allowed in `docs/provenance.md` and compatibility
 sections. They should not become Vexic runtime instructions.
-`COA-*` and Linear issue references are allowed only as project-tracking,
-traceability, or evidence pointers in `docs/ai/AGENTS.md`, `README.md`,
-`docs/provenance.md`, `docs/adr/**`, and `docs/runbooks/**`. Do not allow
-Linear or private-host issue IDs in `src/vexic`, `tests`, `console/**`, schema
-values, public contract fields, `docs/architecture.md`, `docs/hosted-mvp.md`,
-or `docs/memory-service-contract.md`, except in explicit provenance or
+Private tracker issue references are allowed only as project-tracking,
+traceability, or evidence pointers in `README.md`, `docs/provenance.md`,
+`docs/adr/**`, and `docs/runbooks/**`. Do not allow private tracker or
+private-host issue IDs in `src/vexic`, `tests`, `console/**`, schema values,
+public contract fields, `docs/architecture.md`, `docs/hosted-mvp.md`, or
+`docs/memory-service-contract.md`, except in explicit provenance or
 compatibility sections. Replace legacy source comments and docstrings with
 Vexic-native ADR or doc wording when touched or in approved cleanup.
 

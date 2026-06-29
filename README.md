@@ -47,6 +47,19 @@ opening a `dev` to `main` PR, agents must fetch origin, ensure `dev` is not
 behind `origin/main`, and verify GitHub's compare file list only contains
 intended files.
 
+For Linear-backed traceability, review relevant issues at session start, map
+non-trivial work to an issue, keep status/comments current when scope, blockers,
+decisions, or follow-ups change, and reconcile roadmap/todo docs when the
+`docs/ai/AGENTS.md` reconciliation triggers fire. If Linear tooling is
+unavailable, say so and do not invent issue IDs; record the required
+reconciliation in the commit message or session report.
+
+To confirm the agent rules stay tracker-neutral:
+
+```powershell
+rg -n "COA-[0-9]|Linear" docs/ai/AGENTS.md
+```
+
 ## Local MCP MVP
 
 Run the read-only stdio MCP server against a local Vexic database:

@@ -11,8 +11,8 @@ in-repo half of the "Docs Are Downstream Of Code" loop in docs/ai/AGENTS.md:
    operation surface, and docs/ai/AGENTS.md mentions each operation, so an
    operation added in code without a doc update is surfaced.
 
-Closing the loop against the downstream tracking roadmap/todo (named in
-docs/ai/AGENTS.md) stays a manual step under the reconciliation triggers there.
+Closing the loop against the downstream tracking roadmap/todo stays a manual
+step under the reconciliation triggers in docs/ai/AGENTS.md.
 """
 
 from __future__ import annotations
