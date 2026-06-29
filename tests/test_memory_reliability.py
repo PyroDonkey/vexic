@@ -464,11 +464,13 @@ class ContradictionSupersessionReliabilityTests(unittest.IsolatedAsyncioTestCase
         )
         self._stage_candidate("Ryan uses Neovim now.", candidate_id=2, confidence=0.9)
 
-        with patch(
-            "vexic.deep.build_contradiction_agent",
-            return_value=_ContradictionAgent(contradicts=True),
-        ):
-            await run_deep_phase(self.db_path, "glm")
+        await run_deep_phase(
+            self.db_path,
+            "glm",
+            contradiction_agent_factory=lambda *_args, **_kwargs: _ContradictionAgent(
+                contradicts=True
+            ),
+        )
 
         with closing(sqlite3.connect(self.db_path)) as conn:
             facts = conn.execute(

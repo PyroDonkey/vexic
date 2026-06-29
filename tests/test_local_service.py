@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 from pydantic_ai.messages import (
     ModelRequest,
@@ -203,16 +204,86 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "limit must be at least 1"):
             search_messages(self.db_path, "cedar", limit=0)
 
-    async def test_search_long_term_without_embedder_fails_closed(self) -> None:
+    async def test_search_long_term_uses_default_embedder_for_facts(self) -> None:
         from vexic.service import LocalMemoryService
 
         service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
         service.init_schema()
+        commit_dream_cycle(
+            self.db_path,
+            [
+                FactCandidate(
+                    fact_text="Ryan prefers compact reports.",
+                    subject="Ryan",
+                    category="preference",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[1],
+                )
+            ],
+            candidate_embeddings=[_unit_vector(1.0)],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+        commit_deep_cycle(
+            self.db_path,
+            [PromotionDecision(candidate_id=1, embedding=_unit_vector(1.0))],
+            started_at="2026-06-01T00:01:00+00:00",
+            finished_at="2026-06-01T00:01:01+00:00",
+        )
 
-        with self.assertRaisesRegex(HostPortNotConfigured, "Embeddings"):
-            await service.search_long_term(
+        with patch(
+            "vexic.subagents.retrieval.embed_texts",
+            side_effect=lambda texts: [_unit_vector(1.0) for _ in texts],
+        ):
+            result = await service.search_long_term(
                 SearchLongTermRequest(scope=_scope(), query="compact reports")
             )
+
+        self.assertEqual([fact.fact_text for fact in result.facts], ["Ryan prefers compact reports."])
+
+    async def test_search_long_term_uses_default_embedder_for_candidate_fallback(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        commit_dream_cycle(
+            self.db_path,
+            [
+                FactCandidate(
+                    fact_text="Ryan keeps cedar notes tentative.",
+                    subject="Ryan",
+                    category="fact",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[1],
+                )
+            ],
+            candidate_embeddings=[_unit_vector(1.0)],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+
+        with patch(
+            "vexic.subagents.retrieval.embed_texts",
+            side_effect=lambda texts: [_unit_vector(1.0) for _ in texts],
+        ):
+            result = await service.search_long_term(
+                SearchLongTermRequest(scope=_scope(), query="cedar notes")
+            )
+
+        self.assertEqual(
+            [note.fact_text for note in result.candidate_notes],
+            ["Ryan keeps cedar notes tentative."],
+        )
 
     async def test_search_long_term_returns_contract_facts(self) -> None:
         from vexic.service import LocalMemoryService

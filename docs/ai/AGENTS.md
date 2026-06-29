@@ -51,11 +51,13 @@ into Vexic.
 ### Host Ports
 
 Vexic core does not read provider secrets, choose model providers, or build live
-models directly. Model-backed operations depend on host-supplied ports.
+provider-backed models directly. LLM-backed operations depend on host-supplied
+ports. Embeddings may also use the optional lazy local adapter from ADR 0016.
 
 - Use the port types in `src/vexic/ports.py`.
-- A missing model-backed host adapter should fail with
-  `HostPortNotConfigured` through `missing_host_port`.
+- A missing LLM-backed host adapter should fail with `HostPortNotConfigured`
+  through `missing_host_port`. A missing local embedding extra should fail with
+  an actionable install message.
 - Do not replace host ports with ambient environment reads, provider SDK wiring,
   process globals, or private host runtime imports.
 
@@ -98,7 +100,8 @@ not part of the public `MemoryService` Protocol.
 `LocalMemoryService` authorizes and checks lifecycle state, executes only when
 explicit dream-phase host ports are supplied, and fails closed with
 `HostPortNotConfigured` through `missing_host_port` when no host adapter is
-provided.
+provided. Inside supplied dream-phase ports, embedding may fall back to the
+optional local adapter and Deep contradiction may be deferred.
 
 Do not "fix" model-backed dream execution by importing private host runtime code.
 Implement a scoped Vexic adapter slice only when the project maintainer starts

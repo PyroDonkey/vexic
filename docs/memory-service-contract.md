@@ -105,9 +105,11 @@ behavioral contract and the current `LocalMemoryService` v0.1 surface.
 
 Host-port backed means `LocalMemoryService` authorizes and checks lifecycle
 state, then executes Light, REM, or Deep only when a host supplies explicit
-model-backed dream-phase ports. Without those ports it fails closed with
-`HostPortNotConfigured` through `missing_host_port`. Do not wire this by
-importing private host runtime code.
+dream-phase ports. Without those ports it fails closed with
+`HostPortNotConfigured` through `missing_host_port`. Inside supplied ports,
+embedding may fall back to the optional `vexic[local-embed]` adapter and Deep
+contradiction may be deferred. Do not wire this by importing private host
+runtime code.
 
 ## Redaction
 
@@ -194,12 +196,14 @@ Vexic core does not:
 - authenticate network callers
 - read provider secrets from the environment
 - build provider-backed model clients directly
-- load or download embedding models directly
+- require embedding model dependencies unless the optional local embedding extra
+  is installed
 - choose hosted storage backends
 - own host-specific extension tables
 
-Those are adapter or host responsibilities. Model-backed operations, including
-embedding text for vector search, use host ports from `src/vexic/ports.py`.
+Those are adapter or host responsibilities. LLM-backed operations use host ports
+from `src/vexic/ports.py`; embedding text for vector search can use a host port
+or the optional lazy local adapter from ADR 0016.
 
 ## Coalescent Compatibility Map
 
@@ -213,7 +217,7 @@ not runtime dependencies.
 | `search_memory` transcript behavior | `SearchTranscriptRequest` / `search_transcript` over scoped clean Transcript |
 | `search_long_term` | `SearchLongTermRequest` / `search_long_term` with durable facts first and candidate fallback on zero Tier 3 hits |
 | `expand_history` | `ExpandHistoryRequest` / privileged, session-scoped verbatim egress |
-| Light, REM, Deep | `vexic.pipeline`, `vexic.rem`, and `vexic.deep` primitives with host-supplied model ports |
+| Light, REM, Deep | `vexic.pipeline`, `vexic.rem`, and `vexic.deep` primitives with host-supplied agent ports, optional local embeddings, and deferrable Deep contradiction |
 | Per-tenant SQLite `memory.db` | local SQLite adapter opened through validated scope/context |
 
 Coalescent remains a private host and first-party consumer. Vexic must stay
