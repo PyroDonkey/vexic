@@ -175,6 +175,8 @@ def _ingest(args: argparse.Namespace) -> int:
     payload = _read_hook_payload(args.hook_input)
     transcript_path = payload.transcript_path
     source_session_id = payload.session_id
+    args.transcript_path = transcript_path
+    args.source_session_id = source_session_id
 
     messages = []
     ignored = 0
@@ -300,8 +302,8 @@ def main(argv: list[str] | None = None) -> int:
             RecorderStatus(
                 ok=False,
                 operation=args.command,
-                source_session_id=None,
-                transcript_path=None,
+                source_session_id=getattr(args, "source_session_id", None),
+                transcript_path=getattr(args, "transcript_path", None),
                 error="argument parsing failed" if isinstance(exc, MissingIngestOption) else str(exc),
             ),
         )

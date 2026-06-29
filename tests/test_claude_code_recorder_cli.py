@@ -949,6 +949,8 @@ class ClaudeCodeRecorderIngestCommandMoreTests(unittest.TestCase):
             status = json.loads(status_path.read_text(encoding="utf-8"))
             self.assertFalse(status["ok"])
             self.assertEqual(status["error"], "hosted ingest failed: HTTP 403")
+            self.assertEqual(status["source_session_id"], "claude-session")
+            self.assertEqual(status["transcript_path"], str(transcript))
             self.assertNotIn("vx_secret", json.dumps(status))
 
     def test_ingest_status_write_failure_returns_two_without_traceback(self) -> None:
