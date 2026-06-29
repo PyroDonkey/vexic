@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -79,7 +80,7 @@ def install_claude_code_setup(
     project_id = _require_nonblank("project_id", project_id)
     session_id = _require_nonblank("session_id", session_id)
     settings_path, config_path, status_path = _paths(home)
-    hook_command = f"{command} --config {config_path}"
+    hook_command = f"{command} --config {subprocess.list2cmdline([str(config_path)])}"
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(

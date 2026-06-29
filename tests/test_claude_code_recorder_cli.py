@@ -267,6 +267,26 @@ class ClaudeCodeSetupTests(unittest.TestCase):
             self.assertEqual(config["api_key"], "vx_secret")
             self.assertEqual(config["agent_id"], "agent-a")
 
+    def test_setup_quotes_config_path_with_spaces_in_hook(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vexic home ") as temp:
+            home = Path(temp)
+
+            result = install_claude_code_setup(
+                home=home,
+                base_url="https://api.example.test",
+                api_key="vx_secret",
+                project_id="project-a",
+                session_id="session-a",
+                agent_id=None,
+                command="python -m vexic.cli recorder ingest",
+            )
+
+            settings = json.loads(result.settings_path.read_text(encoding="utf-8"))
+            command = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+            self.assertIn(str(result.config_path), command)
+            self.assertIn(f'--config "{result.config_path}"', command)
+            self.assertNotIn("vx_secret", command)
+
     def test_setup_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)

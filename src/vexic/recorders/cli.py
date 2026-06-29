@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -64,7 +65,9 @@ def _parser() -> argparse.ArgumentParser:
     setup.add_argument(
         "--hook-command",
         dest="hook_command",
-        default=f"{sys.executable} -m vexic.cli recorder ingest",
+        default=subprocess.list2cmdline(
+            [sys.executable, "-m", "vexic.cli", "recorder", "ingest"]
+        ),
     )
 
     uninstall = subparsers.add_parser("uninstall-claude-code")
