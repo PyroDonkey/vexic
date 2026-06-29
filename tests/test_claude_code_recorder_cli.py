@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -230,6 +231,79 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
             self.assertEqual(status["inserted"], 1)
             self.assertEqual(status["ignored"], 1)
 
+    def test_ingest_batches_hosted_posts_at_one_hundred_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            transcript = root / "session.jsonl"
+            rows = [
+                {
+                    "type": "user",
+                    "sessionId": "claude-session",
+                    "uuid": f"uuid-{index}",
+                    "message": {"role": "user", "content": f"remember cedar {index}"},
+                }
+                for index in range(205)
+            ]
+            rows.append({"type": "summary", "summary": "ignore cedar"})
+            transcript.write_text(
+                "\n".join(json.dumps(row) for row in rows),
+                encoding="utf-8",
+            )
+            hook_payload = root / "hook.json"
+            hook_payload.write_text(
+                json.dumps({"session_id": "claude-session", "transcript_path": str(transcript)}),
+                encoding="utf-8",
+            )
+            status_path = root / "status.json"
+            calls = []
+
+            def fake_post(config, *, messages, forbidden_values):
+                calls.append(messages)
+                if len(calls) == 1:
+                    return {"items": [{"status": "inserted"} for _ in messages]}
+                if len(calls) == 2:
+                    return {
+                        "items": [{"status": "skipped"} for _ in messages[:-1]]
+                        + [{"status": "rejected"}]
+                    }
+                return {"items": [{"status": "inserted"} for _ in messages]}
+
+            stdout = io.StringIO()
+            with (
+                patch("vexic.recorders.cli.post_source_messages", fake_post),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    [
+                        "ingest",
+                        "--hook-input",
+                        str(hook_payload),
+                        "--base-url",
+                        "https://api.example.test",
+                        "--api-key",
+                        "vx_secret",
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "vexic-session",
+                        "--status-path",
+                        str(status_path),
+                    ]
+                )
+
+            output = json.loads(stdout.getvalue())
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual(code, 0)
+            self.assertEqual([len(batch) for batch in calls], [100, 100, 5])
+            self.assertEqual(output["inserted"], 105)
+            self.assertEqual(output["skipped"], 99)
+            self.assertEqual(output["rejected"], 1)
+            self.assertEqual(output["ignored"], 1)
+            self.assertEqual(status["inserted"], 105)
+            self.assertEqual(status["skipped"], 99)
+            self.assertEqual(status["rejected"], 1)
+            self.assertEqual(status["ignored"], 1)
+
 
 class ClaudeCodeRecorderHostedRoundTripTests(unittest.TestCase):
     def test_ingest_cli_posts_to_hosted_http_and_search_finds_cleaned_row(self) -> None:
@@ -419,6 +493,27 @@ class ClaudeCodeSetupTests(unittest.TestCase):
             config = json.loads(result.config_path.read_text(encoding="utf-8"))
             self.assertEqual(config["api_key"], "vx_secret")
             self.assertEqual(config["agent_id"], "agent-a")
+
+    def test_setup_writes_config_owner_only_when_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            probe = home / "probe"
+            probe.write_text("", encoding="utf-8")
+            probe.chmod(0o600)
+            if stat.S_IMODE(probe.stat().st_mode) != 0o600:
+                self.skipTest("filesystem does not report owner-only file mode")
+
+            result = install_claude_code_setup(
+                home=home,
+                base_url="https://api.example.test",
+                api_key="vx_secret",
+                project_id="project-a",
+                session_id="session-a",
+                agent_id=None,
+                command="python -m vexic.cli recorder ingest",
+            )
+
+            self.assertEqual(stat.S_IMODE(result.config_path.stat().st_mode), 0o600)
 
     def test_setup_quotes_config_path_with_spaces_in_hook(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vexic home ") as temp:

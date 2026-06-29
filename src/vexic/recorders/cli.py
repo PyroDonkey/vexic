@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from vexic.hosted import HOSTED_WRITE_MAX_MESSAGES
 from vexic.recorders.claude_code import iter_claude_code_source_messages
 from vexic.recorders.claude_setup import (
     install_claude_code_setup,
@@ -131,21 +132,24 @@ def _ingest(args: argparse.Namespace) -> int:
         else:
             messages.append(message)
 
-    result = post_source_messages(
-        HostedIngestConfig(
-            base_url=args.base_url,
-            api_key=args.api_key,
-            project_id=args.project_id,
-            session_id=args.session_id,
-            agent_id=args.agent_id,
-            timeout_seconds=args.timeout_seconds,
-        ),
-        messages=messages,
-        forbidden_values=tuple(args.forbidden_value),
+    config = HostedIngestConfig(
+        base_url=args.base_url,
+        api_key=args.api_key,
+        project_id=args.project_id,
+        session_id=args.session_id,
+        agent_id=args.agent_id,
+        timeout_seconds=args.timeout_seconds,
     )
-    items = result.get("items")
-    if not isinstance(items, list):
-        items = []
+    items = []
+    for start in range(0, max(len(messages), 1), HOSTED_WRITE_MAX_MESSAGES):
+        result = post_source_messages(
+            config,
+            messages=messages[start : start + HOSTED_WRITE_MAX_MESSAGES],
+            forbidden_values=tuple(args.forbidden_value),
+        )
+        batch_items = result.get("items")
+        if isinstance(batch_items, list):
+            items.extend(batch_items)
     inserted = sum(1 for item in items if isinstance(item, dict) and item.get("status") == "inserted")
     skipped = sum(1 for item in items if isinstance(item, dict) and item.get("status") == "skipped")
     rejected = sum(1 for item in items if isinstance(item, dict) and item.get("status") == "rejected")

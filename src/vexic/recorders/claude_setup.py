@@ -40,6 +40,13 @@ def _require_nonblank(name: str, value: str | None) -> str:
     return value
 
 
+def _chmod_owner_only(path: Path) -> None:
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
 def _without_vexic_hook(stop_groups: Any) -> tuple[list[dict[str, Any]], bool]:
     groups = stop_groups if isinstance(stop_groups, list) else []
     changed = False
@@ -83,6 +90,8 @@ def install_claude_code_setup(
     hook_command = f"{command} --config {subprocess.list2cmdline([str(config_path)])}"
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.touch(mode=0o600, exist_ok=True)
+    _chmod_owner_only(config_path)
     config_path.write_text(
         json.dumps(
             {
@@ -97,6 +106,7 @@ def install_claude_code_setup(
         ),
         encoding="utf-8",
     )
+    _chmod_owner_only(config_path)
 
     settings = _load_json(settings_path)
     hooks = settings.get("hooks")
