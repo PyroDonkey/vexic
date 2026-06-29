@@ -29,8 +29,7 @@ Key modules:
 
 Session summary and active-context helpers are local storage primitives. They
 do not yet expose a hosted fresh-conversation context API, and Vexic does not
-yet inject summary recaps into new hosted Claude Code sessions. That hosted
-slice is tracked in COA-254.
+yet inject summary recaps into new hosted Claude Code sessions.
 
 The package must not import legacy `engine.*` modules. The private source host
 is a consumer, not a dependency.
