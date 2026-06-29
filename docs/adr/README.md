@@ -26,6 +26,7 @@ missing from this index (and the reverse).
 | 0011 | Hosted migration is operator-run canonical row migration        | accepted |
 | 0012 | Vexic Console starts as one Next.js app                         | accepted |
 | 0013 | Hosted control-plane HTTP API is a console-facing adapter slice | accepted |
+| 0014 | Transcript writes are out-of-band auto-record, not an MCP tool   | accepted |
 
 Notes:
 
@@ -42,6 +43,10 @@ Notes:
   dashboard concerns into `src/vexic`.
 - 0013 is accepted for COA-247. It records the control-plane HTTP surface and
   distinct control-plane auth boundary for the hosted adapter.
+- 0014 settles that transcript writes are out-of-band auto-record (the recorder,
+  COA-253; its design deliberation, COA-257) and that MCP stays read-only on
+  both surfaces. It cancels the MCP write slice (COA-175) and affirms ADR 0002
+  and ADR 0010.
 - These numbers are the Vexic `docs/adr/` series. Some source comments under
   `src/vexic` cite an `upstream ADR-00NN` label from the extraction source
   (for example `upstream ADR-0010` for candidate-fallback retrieval); those
