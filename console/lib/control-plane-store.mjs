@@ -14,6 +14,10 @@ function id(prefix) {
   return `${prefix}_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
 }
 
+function tenantId(orgId) {
+  return `tenant_${createHash("sha256").update(String(orgId)).digest("hex").slice(0, 16)}`;
+}
+
 function safeName(value, fallback) {
   const name = String(value ?? "").trim();
   return name.length > 0 ? name.slice(0, 80) : fallback;
@@ -67,6 +71,7 @@ function stubCreateProject(orgId, input = {}) {
   const timestamp = now();
   const project = {
     id: id("proj"),
+    tenantId: tenantId(orgId),
     orgId,
     name: safeName(input.name, "Untitled project"),
     environment: safeName(input.environment, "production"),
@@ -86,7 +91,8 @@ function stubGetProject(orgId, projectId) {
 }
 
 function stubCreateAgentKey(orgId, projectId, input = {}) {
-  if (!stubGetProject(orgId, projectId)) {
+  const project = stubGetProject(orgId, projectId);
+  if (!project) {
     return null;
   }
 
@@ -94,6 +100,7 @@ function stubCreateAgentKey(orgId, projectId, input = {}) {
   const timestamp = now();
   const key = {
     id: id("key"),
+    tenantId: project.tenantId,
     projectId,
     name: safeName(input.name, "Agent key"),
     capability: "v1-memory",
@@ -187,15 +194,31 @@ function stubSupportMetadata(orgId) {
 function publicKey(key) {
   return {
     id: key.id,
+    tenantId: key.tenantId,
     projectId: key.projectId,
     name: key.name,
     capability: key.capability,
     agentScope: key.agentScope,
+    scopeTemplate: scopeTemplate(key),
     prefix: key.prefix,
     last4: key.last4,
     display: key.display,
     createdAt: key.createdAt,
     revokedAt: key.revokedAt
+  };
+}
+
+function scopeTemplate(key) {
+  return {
+    tenant_id: key.tenantId,
+    project_id: key.projectId,
+    agent_id: key.agentScope === "shared" ? null : key.agentScope,
+    principal: {
+      principal_id: key.agentScope,
+      principal_type: "agent"
+    },
+    trust_boundary: "networked",
+    capabilities: ["memory:write", "memory:search", "memory:expand"]
   };
 }
 

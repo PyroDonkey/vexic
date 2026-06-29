@@ -18,16 +18,32 @@ import { usageRows } from "@/lib/console-ui-state.mjs";
 
 type Project = {
   id: string;
+  tenantId: string;
   name: string;
   environment: string;
   createdAt: string;
 };
 
+type ScopeTemplate = {
+  tenant_id: string;
+  project_id: string;
+  session_id?: string;
+  agent_id: string | null;
+  principal: {
+    principal_id: string;
+    principal_type: string;
+  };
+  trust_boundary: string;
+  capabilities: string[];
+};
+
 type AgentKey = {
   id: string;
+  tenantId: string;
   name: string;
   capability: string;
   agentScope: string;
+  scopeTemplate: ScopeTemplate;
   display: string;
   createdAt: string;
 };
@@ -50,6 +66,7 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
   const [keys, setKeys] = useState<AgentKey[]>([]);
   const [usage, setUsage] = useState<Usage | null>(null);
   const [rawKey, setRawKey] = useState("");
+  const [createdKey, setCreatedKey] = useState<AgentKey | null>(null);
   const [name, setName] = useState("");
   const [agentScope, setAgentScope] = useState("shared");
   const [projectLoadState, setProjectLoadState] = useState<LoadState>("loading");
@@ -127,6 +144,7 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
 
     const data = (await response.json()) as { rawKey: string; key: AgentKey };
     setRawKey(data.rawKey);
+    setCreatedKey(data.key);
     setKeys((current) => [data.key, ...current.filter((key) => key.id !== data.key.id)]);
     setKeysLoadState("ready");
     setName("");
@@ -148,6 +166,15 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
       toast.success("Raw key copied.");
     } catch {
       toast.error("Raw key could not be copied.");
+    }
+  }
+
+  async function copyScope(scope: ScopeTemplate) {
+    try {
+      await navigator.clipboard.writeText(scopeJson(scope));
+      toast.success("Scope template copied.");
+    } catch {
+      toast.error("Scope template could not be copied.");
     }
   }
 
@@ -227,12 +254,37 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
                     <p className="text-sm text-muted-foreground">This value will not appear in the list again.</p>
                   </div>
                   <code className="block overflow-x-auto rounded-md bg-background/80 px-3 py-2 text-xs">{rawKey}</code>
+                  {createdKey ? (
+                    <div className="grid gap-2">
+                      <strong className="text-sm">Scope template</strong>
+                      <pre className="max-h-52 overflow-auto rounded-md bg-background/80 p-3 text-xs">{scopeJson(createdKey.scopeTemplate)}</pre>
+                    </div>
+                  ) : null}
                   <div className="flex flex-wrap gap-2">
                     <Button className="w-fit" type="button" variant="outline" onClick={copyRawKey}>
                       <Copy />
                       Copy
                     </Button>
-                    <Button className="w-fit" type="button" variant="outline" onClick={() => setRawKey("")}>
+                    {createdKey ? (
+                      <Button
+                        className="w-fit"
+                        type="button"
+                        variant="outline"
+                        onClick={() => copyScope(createdKey.scopeTemplate)}
+                      >
+                        <Copy />
+                        Copy scope
+                      </Button>
+                    ) : null}
+                    <Button
+                      className="w-fit"
+                      type="button"
+                      variant="outline"
+                      onClick={() => {
+                        setRawKey("");
+                        setCreatedKey(null);
+                      }}
+                    >
                       Dismiss
                     </Button>
                   </div>
@@ -289,10 +341,16 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
                           {dateFormatter.format(new Date(key.createdAt))}
                         </TableCell>
                         <TableCell className="text-right">
-                          <Button type="button" variant="destructive" onClick={() => revokeKey(key.id)}>
-                            <Trash2 />
-                            Revoke
-                          </Button>
+                          <div className="flex justify-end gap-2">
+                            <Button type="button" variant="outline" onClick={() => copyScope(key.scopeTemplate)}>
+                              <Copy />
+                              Scope
+                            </Button>
+                            <Button type="button" variant="destructive" onClick={() => revokeKey(key.id)}>
+                              <Trash2 />
+                              Revoke
+                            </Button>
+                          </div>
                         </TableCell>
                       </TableRow>
                     ))}
@@ -371,6 +429,15 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
               </div>
               <Separator />
               <div className="grid gap-1">
+                <span className="text-sm text-muted-foreground">Tenant ID</span>
+                {projectLoadState === "error" ? (
+                  <span className="text-sm text-destructive">Project details could not be loaded.</span>
+                ) : (
+                  <code>{project?.tenantId ?? "loading"}</code>
+                )}
+              </div>
+              <Separator />
+              <div className="grid gap-1">
                 <span className="text-sm text-muted-foreground">Environment</span>
                 {projectLoadState === "error" ? (
                   <span className="text-sm text-destructive">Project details could not be loaded.</span>
@@ -384,4 +451,8 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
       </Tabs>
     </div>
   );
+}
+
+function scopeJson(scope: ScopeTemplate) {
+  return JSON.stringify(scope, null, 2);
 }

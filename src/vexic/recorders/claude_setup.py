@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import stat
-import subprocess
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +41,10 @@ def _require_nonblank(name: str, value: str | None) -> str:
     if value is None or not value.strip():
         raise ValueError(f"{name} must be nonblank")
     return value.strip()
+
+
+def _bash_safe(value: str) -> str:
+    return value.replace("\\", "/")
 
 
 def _ensure_owner_only(path: Path) -> None:
@@ -118,7 +122,7 @@ def install_claude_code_setup(
     project_id = _require_nonblank("project_id", project_id)
     session_id = _require_nonblank("session_id", session_id)
     settings_path, config_path, status_path = _paths(home)
-    hook_command = f"{command} --config {subprocess.list2cmdline([str(config_path)])}"
+    hook_command = f"{_bash_safe(command)} --config {shlex.quote(_bash_safe(str(config_path)))}"
 
     _write_secret_json(
         config_path,
@@ -144,7 +148,7 @@ def install_claude_code_setup(
                 {
                     "type": "command",
                     "command": hook_command,
-                    "async": True,
+                    "async": False,
                     "timeout": 120,
                     "vexicHookId": VEXIC_HOOK_ID,
                 }

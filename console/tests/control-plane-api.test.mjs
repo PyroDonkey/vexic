@@ -76,6 +76,16 @@ test("agent key creation reveals the raw key once and later responses never expo
     )
   );
   assert.match(created.rawKey, /^vx_live_/);
+  assert.equal(created.key.tenantId, project.tenantId);
+  assert.equal(created.key.scopeTemplate.tenant_id, project.tenantId);
+  assert.equal(created.key.scopeTemplate.project_id, project.id);
+  assert.equal(created.key.scopeTemplate.agent_id, "writer");
+  assert.equal(created.key.scopeTemplate.principal.principal_id, "writer");
+  assert.deepEqual(created.key.scopeTemplate.capabilities, [
+    "memory:write",
+    "memory:search",
+    "memory:expand"
+  ]);
 
   const listedResponse = await listAgentKeysResponse(
     request("GET", `/api/control-plane/projects/${project.id}/keys`),
@@ -89,6 +99,7 @@ test("agent key creation reveals the raw key once and later responses never expo
   assert.equal(listed.keys.length, 1);
   assert.equal("rawKey" in listed.keys[0], false);
   assert.match(listed.keys[0].display, /^vx_live_[a-z0-9]+.../);
+  assert.equal(listed.keys[0].scopeTemplate.tenant_id, project.tenantId);
 
   const revoked = await revokeAgentKeyResponse(
     request("DELETE", `/api/control-plane/projects/${project.id}/keys/${created.key.id}`),

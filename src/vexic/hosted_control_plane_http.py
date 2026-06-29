@@ -440,27 +440,56 @@ def _string_field(
     return value.strip() or default
 
 
+_CONTROL_PLANE_SCOPE_CAPABILITIES = [
+    "memory:write",
+    "memory:search",
+    "memory:expand",
+]
+
+
 def _project_payload(project) -> dict[str, str]:
     return {
         "id": project.project_id,
+        "tenantId": project.tenant_id,
         "name": project.name,
         "environment": project.environment,
         "createdAt": project.created_at,
     }
 
 
-def _key_payload(key) -> dict[str, str | None]:
+def _key_payload(key) -> dict[str, object]:
     return {
         "id": key.key_id,
+        "tenantId": key.tenant_id,
         "projectId": key.project_id,
         "name": key.name,
         "capability": key.capability,
         "agentScope": key.agent_scope,
+        "scopeTemplate": _scope_template(key.tenant_id, key.project_id, key.agent_scope),
         "prefix": key.prefix,
         "last4": key.last4,
         "display": key.display,
         "createdAt": key.created_at,
         "revokedAt": key.revoked_at,
+    }
+
+
+def _scope_template(
+    tenant_id: str,
+    project_id: str,
+    agent_scope: str,
+) -> dict[str, object]:
+    agent_id = None if agent_scope == "shared" else agent_scope
+    return {
+        "tenant_id": tenant_id,
+        "project_id": project_id,
+        "agent_id": agent_id,
+        "principal": {
+            "principal_id": agent_scope,
+            "principal_type": "agent",
+        },
+        "trust_boundary": "networked",
+        "capabilities": list(_CONTROL_PLANE_SCOPE_CAPABILITIES),
     }
 
 
