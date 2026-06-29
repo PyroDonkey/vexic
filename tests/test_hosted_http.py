@@ -22,7 +22,9 @@ from vexic.contract import (
     Principal,
     PrincipalType,
     RedactionContext,
+    SearchLongTermRequest,
     SearchTranscriptRequest,
+    SourceTranscriptMessage,
     TrustBoundary,
 )
 from vexic.hosted import (
@@ -31,6 +33,8 @@ from vexic.hosted import (
     HostedRateLimitRule,
     HostedUsageEvent,
 )
+from vexic.embeddings import EMBEDDING_DIM
+from vexic.ports import DreamPhasePorts
 from vexic.storage import single_message_adapter
 from vexic.hosted_http import create_app
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
@@ -425,6 +429,119 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual([key["id"] for key in listed.json()["keys"]], [payload["key"]["id"]])
         self.assertNotIn("rawKey", listed.text)
         self.assertNotIn("keyHash", listed.text)
+
+    def test_control_plane_key_scope_template_runs_memory_round_trip_and_revocation(self) -> None:
+        service = HostedMemoryService(
+            self.catalog,
+            self.keys,
+            telemetry=self.catalog,
+            dream_phase_ports=DreamPhasePorts(
+                model_group="test",
+                embed=lambda texts: [[1.0] + [0.0] * (EMBEDDING_DIM - 1) for _ in texts],
+            ),
+        )
+        client = TestClient(
+            create_control_plane_app(service, control_plane_tokens=("console-secret",))
+        )
+        project = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo"},
+        ).json()["project"]
+        created = client.post(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/keys",
+            headers=self._control_auth(),
+            json={"name": "Worker", "agentScope": "agent-a"},
+        ).json()
+        raw_key = created["rawKey"]
+        key = created["key"]
+        scope_template = key["scopeTemplate"]
+
+        self.assertEqual(project["tenantId"], key["tenantId"])
+        self.assertEqual(scope_template["tenant_id"], project["tenantId"])
+        self.assertEqual(scope_template["project_id"], project["id"])
+        self.assertEqual(scope_template["agent_id"], "agent-a")
+        self.assertEqual(scope_template["principal"]["principal_id"], "agent-a")
+        self.assertEqual(scope_template["trust_boundary"], "networked")
+        self.assertIn("memory:search", scope_template["capabilities"])
+
+        append_response = client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(raw_key, project_id=project["id"], agent_id="agent-a"),
+            json=self._append_body("control plane scope cedar"),
+        )
+        search_scope = MemoryScope.model_validate(scope_template | {"session_id": "session-a"})
+        search_response = client.post(
+            "/v1/search_transcript",
+            headers=self._auth(raw_key),
+            json=SearchTranscriptRequest(
+                scope=search_scope,
+                query="cedar",
+            ).model_dump(mode="json"),
+        )
+        long_term_response = client.post(
+            "/v1/search_long_term",
+            headers=self._auth(raw_key),
+            json=SearchLongTermRequest(
+                scope=MemoryScope.model_validate(scope_template),
+                query="cedar",
+            ).model_dump(mode="json"),
+        )
+
+        source_message = SourceTranscriptMessage(
+            source_host="claude-code",
+            source_session_id="claude-session",
+            source_message_id="source-message-1",
+            message_json=single_message_adapter.dump_json(
+                ModelRequest(parts=[UserPromptPart(content="recorder hosted orchid")])
+            ).decode(),
+        )
+        ingest_response = client.post(
+            "/v1/ingest_source_transcript",
+            headers=self._write_headers(raw_key, project_id=project["id"], agent_id="agent-a"),
+            json={
+                "messages": [source_message.model_dump(mode="json")],
+                "redaction": {"forbidden_values": []},
+            },
+        )
+        ingest_search_response = client.post(
+            "/v1/search_transcript",
+            headers=self._auth(raw_key),
+            json=SearchTranscriptRequest(
+                scope=search_scope,
+                query="orchid",
+            ).model_dump(mode="json"),
+        )
+        revoked = client.post(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/keys/{key['id']}/revoke",
+            headers=self._control_auth(),
+        )
+        denied = client.post(
+            "/v1/search_long_term",
+            headers=self._auth(raw_key),
+            json=SearchLongTermRequest(
+                scope=MemoryScope.model_validate(scope_template),
+                query="cedar",
+            ).model_dump(mode="json"),
+        )
+
+        self.assertEqual(append_response.status_code, 200)
+        self.assertEqual(search_response.status_code, 200)
+        self.assertEqual(
+            [hit["body"] for hit in search_response.json()["hits"]],
+            ["User: control plane scope cedar"],
+        )
+        self.assertEqual(long_term_response.status_code, 200)
+        self.assertEqual(long_term_response.json()["facts"], [])
+        self.assertEqual(long_term_response.json()["candidate_notes"], [])
+        self.assertEqual(ingest_response.status_code, 200)
+        self.assertEqual(ingest_response.json()["items"][0]["status"], "inserted")
+        self.assertEqual(
+            [hit["body"] for hit in ingest_search_response.json()["hits"]],
+            ["User: recorder hosted orchid"],
+        )
+        self.assertEqual(revoked.status_code, 204)
+        self.assertEqual(denied.status_code, 401)
 
     def test_control_plane_key_create_rejects_null_string_fields(self) -> None:
         client = TestClient(

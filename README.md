@@ -259,6 +259,11 @@ Hosted transcript writes use the same project/session/agent headers as hosted
 MCP reads. The write body does not include `scope` or `tenant_id`; the tenant is
 bound from the Agent API key.
 
+Console-created projects expose `tenantId`; Agent API Key create/list responses
+include a `scopeTemplate` with the correct `tenant_id`, `project_id`,
+`principal`, `trust_boundary`, and key capabilities. Use that template for
+direct `/v1/search_*` calls instead of guessing a tenant id.
+
 Claude Code hosted auto-recording is installed with `vexic setup claude-code`.
 It writes cleaned transcript rows through `/v1/ingest_source_transcript`; the
 read-only hosted MCP server is still used for search.
@@ -276,6 +281,21 @@ curl.exe -s https://api.vexic.dev/v1/append_transcript `
   -H "X-Vexic-Session-Id: session-a" `
   -H "Content-Type: application/json" `
   -d "{\"messages_json\":[\"<clean-model-message-json>\"],\"redaction\":{\"forbidden_values\":[]}}"
+```
+
+Search the hosted memory API with the copied `scopeTemplate`. Add `session_id`
+for session-scoped transcript search:
+
+```powershell
+curl.exe -s https://api.vexic.dev/v1/search_transcript `
+  -H "Authorization: Bearer <raw-key>" `
+  -H "Content-Type: application/json" `
+  -d "{\"scope\":{\"tenant_id\":\"tenant_from_console\",\"project_id\":\"project-a\",\"session_id\":\"session-a\",\"agent_id\":\"agent-a\",\"principal\":{\"principal_id\":\"agent-a\",\"principal_type\":\"agent\"},\"trust_boundary\":\"networked\",\"capabilities\":[\"memory:search\"]},\"query\":\"cedar\",\"limit\":5}"
+
+curl.exe -s https://api.vexic.dev/v1/search_long_term `
+  -H "Authorization: Bearer <raw-key>" `
+  -H "Content-Type: application/json" `
+  -d "{\"scope\":{\"tenant_id\":\"tenant_from_console\",\"project_id\":\"project-a\",\"agent_id\":\"agent-a\",\"principal\":{\"principal_id\":\"agent-a\",\"principal_type\":\"agent\"},\"trust_boundary\":\"networked\",\"capabilities\":[\"memory:search\"]},\"query\":\"cedar\",\"limit\":5}"
 ```
 
 ## Native HTTP MCP

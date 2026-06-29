@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 import stat
 import tempfile
 import unittest
@@ -655,7 +656,7 @@ class ClaudeCodeSetupTests(unittest.TestCase):
             vexic_commands = [command for command in commands if "vexic" in command]
             self.assertEqual(len(vexic_commands), 1)
             self.assertNotIn("vx_secret", vexic_commands[0])
-            self.assertIn(str(result.config_path), vexic_commands[0])
+            self.assertIn(str(result.config_path).replace("\\", "/"), vexic_commands[0])
             config = json.loads(result.config_path.read_text(encoding="utf-8"))
             self.assertEqual(config["api_key"], "vx_secret")
             self.assertEqual(config["agent_id"], "agent-a")
@@ -734,9 +735,38 @@ class ClaudeCodeSetupTests(unittest.TestCase):
 
             settings = json.loads(result.settings_path.read_text(encoding="utf-8"))
             command = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
-            self.assertIn(str(result.config_path), command)
-            self.assertIn(f'--config "{result.config_path}"', command)
+            config_path = str(result.config_path).replace("\\", "/")
+            self.assertIn(config_path, command)
+            self.assertIn(f"--config '{config_path}'", command)
             self.assertNotIn("vx_secret", command)
+
+    def test_setup_writes_bash_safe_windows_hook_command(self) -> None:
+        if os.name != "nt":
+            self.skipTest("Windows hook command escaping only")
+        with tempfile.TemporaryDirectory(prefix="vexic home ") as temp:
+            home = Path(temp)
+
+            result = install_claude_code_setup(
+                home=home,
+                base_url="https://api.example.test",
+                api_key="vx_secret",
+                project_id="project-a",
+                session_id="session-a",
+                agent_id=None,
+                command=(
+                    "C:\\Users\\Ryan\\.local\\bin\\uv.exe run --with-editable "
+                    "C:\\Users\\Ryan\\Documents\\GitHub\\Vexic "
+                    "python -m vexic.cli recorder ingest"
+                ),
+            )
+
+            settings = json.loads(result.settings_path.read_text(encoding="utf-8"))
+            hook = settings["hooks"]["Stop"][0]["hooks"][0]
+            command = hook["command"]
+            self.assertIn("C:/Users/Ryan/.local/bin/uv.exe", command)
+            self.assertIn(str(result.config_path).replace("\\", "/"), command)
+            self.assertNotIn("\\", command)
+            self.assertFalse(hook["async"])
 
     def test_setup_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
