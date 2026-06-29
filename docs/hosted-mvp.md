@@ -47,7 +47,7 @@ this boundary without changing the memory contract.
   only, and exposes `search_transcript` and `search_long_term`.
 - Session summary and active-context helpers exist in the local core. The
   hosted fresh-conversation context API and agent-side recap injection are not
-  built yet.
+  built yet (tracked in COA-254).
 
 ## Local Staging
 
