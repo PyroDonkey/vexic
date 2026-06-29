@@ -29,6 +29,7 @@ missing from this index (and the reverse).
 | 0014 | Transcript writes are out-of-band auto-record, not an MCP tool   | accepted |
 | 0015 | Claude Code setup recorder is hook-triggered                   | accepted |
 | 0016 | Local embedding and deferrable contradiction lower the LLM floor | accepted |
+| 0017 | Claude Code setup scaffolds a disabled Vexic MCP entry           | accepted |
 
 Notes:
 
@@ -53,6 +54,12 @@ Notes:
   rather than an external file-tail daemon.
 - 0016 records the optional local embedding adapter and the first-pass Deep
   promotion path that defers contradiction judging to a later audit.
+- 0017 settles COA-260: `vexic setup claude-code` scaffolds a disabled,
+  user-enabled Vexic MCP entry (local stdio launcher reusing the recorder
+  config) rather than auto-installing a live entry, keeps raw keys out of Claude
+  config, and requires no hosted MCP server changes. It builds on the COA-250 /
+  COA-253 evidence and affirms ADR 0010 and ADR 0015. A follow-up implementation
+  issue owns the scaffold install/uninstall, built test-first.
 - These numbers are the Vexic `docs/adr/` series. Some source comments under
   `src/vexic` cite an `upstream ADR-00NN` label from the extraction source
   (for example `upstream ADR-0010` for candidate-fallback retrieval); those
