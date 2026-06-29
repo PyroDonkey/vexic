@@ -770,6 +770,48 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(append_response.status_code, 400)
         self.assertEqual(search_response.json()["hits"], [])
 
+    def test_hosted_append_rejects_polluted_rows_without_persisting(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
+        polluted = single_message_adapter.dump_json(
+            ModelResponse(parts=[ToolCallPart(tool_name="lookup", args={})])
+        ).decode()
+
+        append_response = self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key),
+            json={"messages_json": [polluted], "redaction": {"forbidden_values": []}},
+        )
+        search_response = self.client.post(
+            "/v1/search_transcript",
+            headers=self._auth(api_key),
+            json=SearchTranscriptRequest(
+                scope=_scope(capabilities={MemoryCapability.SEARCH}),
+                query="lookup",
+            ).model_dump(mode="json"),
+        )
+
+        self.assertEqual(append_response.status_code, 400)
+        self.assertEqual(search_response.json()["hits"], [])
+
+    def test_hosted_write_header_rejection_records_sanitized_telemetry(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE})
+
+        response = self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key) | {"X-Vexic-User-Id": "user-a"},
+            json=self._append_body("telemetry cedar"),
+        )
+        audit_events = self.catalog.audit_events("tenant-a")
+        usage_events = self.catalog.usage_events("tenant-a")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(audit_events[-1].operation, "append_transcript")
+        self.assertEqual(audit_events[-1].status, "error")
+        self.assertEqual(audit_events[-1].error_type, "ValueError")
+        self.assertEqual(usage_events[-1].operation, "append_transcript")
+        self.assertEqual(usage_events[-1].status, "error")
+        self.assertNotIn("telemetry cedar", repr(audit_events) + repr(usage_events))
+
     def test_hosted_ingest_rejects_polluted_rows_per_row(self) -> None:
         api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
         polluted = single_message_adapter.dump_json(

@@ -112,6 +112,7 @@ def create_app(
         payload: HostedAppendTranscriptBody,
     ) -> JSONResponse:
         return await _handle_hosted_write(
+            "append_transcript",
             request,
             service,
             lambda scope: AppendTranscriptRequest(
@@ -128,6 +129,7 @@ def create_app(
         payload: HostedIngestSourceTranscriptBody,
     ) -> JSONResponse:
         return await _handle_hosted_write(
+            "ingest_source_transcript",
             request,
             service,
             lambda scope: IngestSourceTranscriptRequest(
@@ -185,6 +187,7 @@ async def _handle(
 
 
 async def _handle_hosted_write(
+    operation: str,
     request: Request,
     service: HostedMemoryService,
     build: Callable[[MemoryScope], _RequestT],
@@ -193,14 +196,30 @@ async def _handle_hosted_write(
     api_key = _api_key(request)
     if api_key is None:
         return _error_response(401, "unauthorized", "Missing hosted API key.")
+    auth: HostedAuthContext | None = None
     try:
-        scope = _write_scope_from_headers(request, service.api_keys.authenticate(api_key))
+        auth = service.api_keys.authenticate(api_key)
+        scope = _write_scope_from_headers(request, auth)
         payload = build(scope)
     except PermissionError as exc:
+        service._record_request(
+            operation,
+            None,
+            status="error",
+            error_type=type(exc).__name__,
+            auth=auth,
+        )
         if str(exc) == "Invalid hosted API key.":
             return _error_response(401, "unauthorized", "Invalid hosted API key.")
         return _error_response(403, "permission_denied", str(exc))
     except ValueError as exc:
+        service._record_request(
+            operation,
+            None,
+            status="error",
+            error_type=type(exc).__name__,
+            auth=auth,
+        )
         return _error_response(400, "invalid_request", str(exc))
     return await _handle_payload(api_key, payload, call)
 

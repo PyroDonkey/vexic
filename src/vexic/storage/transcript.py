@@ -258,6 +258,9 @@ def save_messages(
     with closing(sqlite3.connect(db_path)) as conn:
         with conn:
             for msg in messages:
+                reason = _polluted_transcript_reason(msg)
+                if reason is not None:
+                    raise ValueError(f"message is not clean transcript text: {reason}")
                 sanitized_msg = strip_prompt_payloads(msg)
                 msg_json = single_message_adapter.dump_json(sanitized_msg).decode()
                 body = message_search_text(sanitized_msg)
