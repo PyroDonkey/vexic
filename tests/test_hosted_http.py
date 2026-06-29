@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
-from pydantic_ai.messages import ModelRequest, UserPromptPart
+from pydantic_ai.messages import ModelRequest, ModelResponse, ToolCallPart, UserPromptPart
 
 from vexic.hosted_control_plane_http import create_app as create_control_plane_app
 from vexic import hosted_http
@@ -85,6 +85,37 @@ class HostedHttpTests(unittest.TestCase):
 
     def _auth(self, api_key: str) -> dict[str, str]:
         return {"Authorization": f"Bearer {api_key}"}
+
+    def _write_headers(
+        self,
+        api_key: str,
+        *,
+        project_id: str = "project-a",
+        session_id: str = "session-a",
+        agent_id: str | None = None,
+    ) -> dict[str, str]:
+        headers = {
+            **self._auth(api_key),
+            "X-Vexic-Project-Id": project_id,
+            "X-Vexic-Session-Id": session_id,
+        }
+        if agent_id is not None:
+            headers["X-Vexic-Agent-Id"] = agent_id
+        return headers
+
+    def _append_body(
+        self,
+        text: str,
+        *,
+        forbidden_values: tuple[str, ...] = (),
+    ) -> dict[str, object]:
+        message_json = single_message_adapter.dump_json(
+            ModelRequest(parts=[UserPromptPart(content=text)])
+        ).decode()
+        return {
+            "messages_json": [message_json],
+            "redaction": {"forbidden_values": list(forbidden_values)},
+        }
 
     def _control_auth(self) -> dict[str, str]:
         return {"Authorization": "Bearer console-secret"}
@@ -441,22 +472,10 @@ class HostedHttpTests(unittest.TestCase):
         ).json()
         raw_key = created["rawKey"]
         key_id = created["key"]["id"]
-        message_json = single_message_adapter.dump_json(
-            ModelRequest(parts=[UserPromptPart(content="control plane key cedar")])
-        )
-
         append_response = client.post(
             "/v1/append_transcript",
-            headers=self._auth(raw_key),
-            json=AppendTranscriptRequest(
-                scope=_scope(
-                    tenant_id=tenant["tenantId"],
-                    project_id=project["id"],
-                    capabilities={MemoryCapability.WRITE},
-                ),
-                messages_json=[message_json],
-                redaction=RedactionContext(forbidden_values=()),
-            ).model_dump(mode="json"),
+            headers=self._write_headers(raw_key, project_id=project["id"]),
+            json=self._append_body("control plane key cedar"),
         )
 
         self.assertEqual(append_response.status_code, 200)
@@ -485,10 +504,10 @@ class HostedHttpTests(unittest.TestCase):
         client = TestClient(
             create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
         )
-        tenant = client.post(
+        client.post(
             "/control/v1/clerk-orgs/org_123/tenant",
             headers=self._control_auth(),
-        ).json()["tenant"]
+        )
         project = client.post(
             "/control/v1/clerk-orgs/org_123/projects",
             headers=self._control_auth(),
@@ -499,21 +518,10 @@ class HostedHttpTests(unittest.TestCase):
             headers=self._control_auth(),
             json={"name": "Worker"},
         ).json()["rawKey"]
-        message_json = single_message_adapter.dump_json(
-            ModelRequest(parts=[UserPromptPart(content="mcp cedar")])
-        )
         client.post(
             "/v1/append_transcript",
-            headers=self._auth(raw_key),
-            json=AppendTranscriptRequest(
-                scope=_scope(
-                    tenant_id=tenant["tenantId"],
-                    project_id=project["id"],
-                    capabilities={MemoryCapability.WRITE},
-                ),
-                messages_json=[message_json],
-                redaction=RedactionContext(forbidden_values=()),
-            ).model_dump(mode="json"),
+            headers=self._write_headers(raw_key, project_id=project["id"]),
+            json=self._append_body("mcp cedar"),
         )
 
         response = client.post(
@@ -538,6 +546,368 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = json.loads(response.json()["result"]["content"][0]["text"])
         self.assertEqual([hit["body"] for hit in payload["hits"]], ["User: mcp cedar"])
+
+    def test_control_plane_key_appends_without_body_tenant_and_reads_through_mcp(self) -> None:
+        client = TestClient(
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
+        )
+        client.post(
+            "/control/v1/clerk-orgs/org_123/tenant",
+            headers=self._control_auth(),
+        )
+        project = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo"},
+        ).json()["project"]
+        raw_key = client.post(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/keys",
+            headers=self._control_auth(),
+            json={"name": "Worker"},
+        ).json()["rawKey"]
+        message_json = single_message_adapter.dump_json(
+            ModelRequest(parts=[UserPromptPart(content="header-bound cedar")])
+        ).decode()
+        write_headers = {
+            **self._auth(raw_key),
+            "X-Vexic-Project-Id": project["id"],
+            "X-Vexic-Session-Id": "session-a",
+        }
+
+        append_response = client.post(
+            "/v1/append_transcript",
+            headers=write_headers,
+            json={
+                "messages_json": [message_json],
+                "redaction": {"forbidden_values": []},
+            },
+        )
+        response = client.post(
+            "/mcp",
+            headers={
+                "Accept": "application/json, text/event-stream",
+                "Authorization": f"Bearer {raw_key}",
+                "X-Vexic-Project-Id": project["id"],
+                "X-Vexic-Session-Id": "session-a",
+            },
+            json={
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "search_transcript",
+                    "arguments": {"query": "cedar"},
+                },
+            },
+        )
+
+        self.assertEqual(append_response.status_code, 200)
+        payload = json.loads(response.json()["result"]["content"][0]["text"])
+        self.assertEqual([hit["body"] for hit in payload["hits"]], ["User: header-bound cedar"])
+
+    def test_control_plane_key_ingests_source_rows_without_body_tenant(self) -> None:
+        client = TestClient(
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
+        )
+        client.post(
+            "/control/v1/clerk-orgs/org_123/tenant",
+            headers=self._control_auth(),
+        )
+        project = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo"},
+        ).json()["project"]
+        raw_key = client.post(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/keys",
+            headers=self._control_auth(),
+            json={"name": "Worker"},
+        ).json()["rawKey"]
+        message_json = single_message_adapter.dump_json(
+            ModelRequest(parts=[UserPromptPart(content="ingested cedar")])
+        ).decode()
+
+        ingest_response = client.post(
+            "/v1/ingest_source_transcript",
+            headers={
+                **self._auth(raw_key),
+                "X-Vexic-Project-Id": project["id"],
+                "X-Vexic-Session-Id": "session-a",
+            },
+            json={
+                "messages": [
+                    {
+                        "source_host": "claude-code",
+                        "source_session_id": "source-session-a",
+                        "source_message_id": "source-message-a",
+                        "message_json": message_json,
+                    }
+                ],
+                "redaction": {"forbidden_values": []},
+            },
+        )
+        response = client.post(
+            "/mcp",
+            headers={
+                "Accept": "application/json, text/event-stream",
+                "Authorization": f"Bearer {raw_key}",
+                "X-Vexic-Project-Id": project["id"],
+                "X-Vexic-Session-Id": "session-a",
+            },
+            json={
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "search_transcript",
+                    "arguments": {"query": "cedar"},
+                },
+            },
+        )
+
+        self.assertEqual(ingest_response.status_code, 200)
+        self.assertEqual(ingest_response.json()["items"][0]["status"], "inserted")
+        payload = json.loads(response.json()["result"]["content"][0]["text"])
+        self.assertEqual([hit["body"] for hit in payload["hits"]], ["User: ingested cedar"])
+
+    def test_hosted_writes_reject_unsupported_scope_inputs(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE})
+
+        for extra in (
+            {"scope": {"tenant_id": "tenant-a"}},
+            {"user_id": "user-a"},
+            {"correlation_id": "trace-a"},
+        ):
+            with self.subTest(extra=extra):
+                response = self.client.post(
+                    "/v1/append_transcript",
+                    headers=self._write_headers(api_key),
+                    json=self._append_body("scope cedar") | extra,
+                )
+                self.assertEqual(response.status_code, 422)
+
+        for header in ("X-Vexic-User-Id", "X-Vexic-Correlation-Id"):
+            with self.subTest(header=header):
+                response = self.client.post(
+                    "/v1/append_transcript",
+                    headers=self._write_headers(api_key) | {header: "unsupported"},
+                    json=self._append_body("scope cedar"),
+                )
+                self.assertEqual(response.status_code, 400)
+
+    def test_hosted_writes_require_project_and_session_headers(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE})
+
+        for missing in ("X-Vexic-Project-Id", "X-Vexic-Session-Id"):
+            with self.subTest(missing=missing):
+                headers = self._write_headers(api_key)
+                del headers[missing]
+                response = self.client.post(
+                    "/v1/append_transcript",
+                    headers=headers,
+                    json=self._append_body("missing header cedar"),
+                )
+                self.assertEqual(response.status_code, 400)
+
+    def test_hosted_write_accepts_legacy_v1_api_key_header_for_self_hosting(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
+        headers = {
+            "X-Vexic-Api-Key": api_key,
+            "X-Vexic-Project-Id": "project-a",
+            "X-Vexic-Session-Id": "session-a",
+        }
+
+        response = self.client.post(
+            "/v1/append_transcript",
+            headers=headers,
+            json=self._append_body("legacy header cedar"),
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_hosted_write_bearer_takes_precedence_over_legacy_api_key_header(self) -> None:
+        bearer_key = self._api_key(
+            capabilities={MemoryCapability.WRITE},
+            tenant_id="tenant-a",
+            project_ids={"project-a"},
+        )
+        legacy_key = self._api_key(
+            capabilities={MemoryCapability.WRITE},
+            tenant_id="tenant-b",
+            project_ids={"project-b"},
+        )
+
+        response = self.client.post(
+            "/v1/append_transcript",
+            headers={
+                "Authorization": f"Bearer {bearer_key}",
+                "X-Vexic-Api-Key": legacy_key,
+                "X-Vexic-Project-Id": "project-a",
+                "X-Vexic-Session-Id": "session-a",
+            },
+            json=self._append_body("bearer wins cedar"),
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_hosted_write_strips_scope_headers_before_binding(self) -> None:
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH},
+            project_ids={"project-a"},
+            agent_ids={"agent-a"},
+        ).raw_key
+
+        append_response = self.client.post(
+            "/v1/append_transcript",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "X-Vexic-Project-Id": " project-a ",
+                "X-Vexic-Session-Id": " session-a ",
+                "X-Vexic-Agent-Id": " agent-a ",
+            },
+            json=self._append_body("trimmed header cedar"),
+        )
+        search_response = self.client.post(
+            "/v1/search_transcript",
+            headers=self._auth(api_key),
+            json=SearchTranscriptRequest(
+                scope=_scope(capabilities={MemoryCapability.SEARCH}).model_copy(
+                    update={"agent_id": "agent-a"}
+                ),
+                query="cedar",
+            ).model_dump(mode="json"),
+        )
+
+        self.assertEqual(append_response.status_code, 200)
+        self.assertEqual(
+            [hit["body"] for hit in search_response.json()["hits"]],
+            ["User: trimmed header cedar"],
+        )
+
+    def test_hosted_append_rejects_forbidden_values_without_persisting(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
+
+        append_response = self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key),
+            json=self._append_body("cedar-secret", forbidden_values=("cedar-secret",)),
+        )
+        search_response = self.client.post(
+            "/v1/search_transcript",
+            headers=self._auth(api_key),
+            json=SearchTranscriptRequest(
+                scope=_scope(capabilities={MemoryCapability.SEARCH}),
+                query="cedar-secret",
+            ).model_dump(mode="json"),
+        )
+
+        self.assertEqual(append_response.status_code, 400)
+        self.assertEqual(search_response.json()["hits"], [])
+
+    def test_hosted_append_rejects_polluted_rows_without_persisting(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
+        polluted = single_message_adapter.dump_json(
+            ModelResponse(parts=[ToolCallPart(tool_name="lookup", args={})])
+        ).decode()
+
+        append_response = self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key),
+            json={"messages_json": [polluted], "redaction": {"forbidden_values": []}},
+        )
+        search_response = self.client.post(
+            "/v1/search_transcript",
+            headers=self._auth(api_key),
+            json=SearchTranscriptRequest(
+                scope=_scope(capabilities={MemoryCapability.SEARCH}),
+                query="lookup",
+            ).model_dump(mode="json"),
+        )
+
+        self.assertEqual(append_response.status_code, 400)
+        self.assertEqual(search_response.json()["hits"], [])
+
+    def test_hosted_write_header_rejection_records_sanitized_telemetry(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE})
+
+        response = self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key) | {"X-Vexic-User-Id": "user-a"},
+            json=self._append_body("telemetry cedar"),
+        )
+        audit_events = self.catalog.audit_events("tenant-a")
+        usage_events = self.catalog.usage_events("tenant-a")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(audit_events[-1].operation, "append_transcript")
+        self.assertEqual(audit_events[-1].status, "error")
+        self.assertEqual(audit_events[-1].error_type, "ValueError")
+        self.assertEqual(usage_events[-1].operation, "append_transcript")
+        self.assertEqual(usage_events[-1].status, "error")
+        self.assertNotIn("telemetry cedar", repr(audit_events) + repr(usage_events))
+
+    def test_hosted_write_unexpected_auth_failure_returns_json_and_telemetry(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE})
+
+        def _boom(_: str) -> object:
+            raise RuntimeError("key store unavailable: cedar-secret")
+
+        self.service.api_keys.authenticate = _boom  # type: ignore[method-assign]
+
+        response = self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key),
+            json=self._append_body("preflight cedar"),
+        )
+        audit_events = self.catalog.audit_events(None)
+        usage_events = self.catalog.usage_events(None)
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.headers["content-type"], "application/json")
+        self.assertEqual(response.json()["error"]["code"], "internal_error")
+        self.assertNotIn("cedar-secret", response.text)
+        self.assertEqual(audit_events[-1].operation, "append_transcript")
+        self.assertEqual(audit_events[-1].status, "error")
+        self.assertEqual(audit_events[-1].error_type, "RuntimeError")
+        self.assertEqual(usage_events[-1].operation, "append_transcript")
+        self.assertEqual(usage_events[-1].status, "error")
+
+    def test_hosted_ingest_rejects_polluted_rows_per_row(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
+        polluted = single_message_adapter.dump_json(
+            ModelResponse(parts=[ToolCallPart(tool_name="lookup", args={})])
+        ).decode()
+
+        ingest_response = self.client.post(
+            "/v1/ingest_source_transcript",
+            headers=self._write_headers(api_key),
+            json={
+                "messages": [
+                    {
+                        "source_host": "claude-code",
+                        "source_session_id": "source-session-a",
+                        "source_message_id": "tool-call",
+                        "message_json": polluted,
+                    }
+                ],
+                "redaction": {"forbidden_values": []},
+            },
+        )
+        search_response = self.client.post(
+            "/v1/search_transcript",
+            headers=self._auth(api_key),
+            json=SearchTranscriptRequest(
+                scope=_scope(capabilities={MemoryCapability.SEARCH}),
+                query="lookup",
+            ).model_dump(mode="json"),
+        )
+
+        self.assertEqual(ingest_response.status_code, 200)
+        self.assertEqual(ingest_response.json()["items"][0]["status"], "rejected")
+        self.assertEqual(search_response.json()["hits"], [])
 
     def test_control_plane_routes_and_keys_are_tenant_isolated(self) -> None:
         client = TestClient(
@@ -624,20 +994,8 @@ class HostedHttpTests(unittest.TestCase):
             ):
                 client.post(
                     "/v1/append_transcript",
-                    headers=self._auth(raw_key),
-                    json=AppendTranscriptRequest(
-                        scope=_scope(
-                            tenant_id=tenant["tenantId"],
-                            project_id=project_id,
-                            capabilities={MemoryCapability.WRITE},
-                        ),
-                        messages_json=[
-                            single_message_adapter.dump_json(
-                                ModelRequest(parts=[UserPromptPart(content=text)])
-                            )
-                        ],
-                        redaction=RedactionContext(forbidden_values=()),
-                    ).model_dump(mode="json"),
+                    headers=self._write_headers(raw_key, project_id=project_id),
+                    json=self._append_body(text),
                 )
 
         for event in (
@@ -773,14 +1131,6 @@ class HostedHttpTests(unittest.TestCase):
             headers=self._control_auth(),
             json={"name": "Worker", "agentScope": "agent-a"},
         ).json()["rawKey"]
-        message_json = single_message_adapter.dump_json(
-            ModelRequest(parts=[UserPromptPart(content="agent cedar")])
-        )
-        allowed_scope = _scope(
-            tenant_id=tenant["tenantId"],
-            project_id=project["id"],
-            capabilities={MemoryCapability.WRITE},
-        ).model_copy(update={"agent_id": "agent-a"})
         denied_scope = _scope(
             tenant_id=tenant["tenantId"],
             project_id=project["id"],
@@ -789,12 +1139,8 @@ class HostedHttpTests(unittest.TestCase):
 
         allowed = client.post(
             "/v1/append_transcript",
-            headers=self._auth(raw_key),
-            json=AppendTranscriptRequest(
-                scope=allowed_scope,
-                messages_json=[message_json],
-                redaction=RedactionContext(forbidden_values=()),
-            ).model_dump(mode="json"),
+            headers=self._write_headers(raw_key, project_id=project["id"], agent_id="agent-a"),
+            json=self._append_body("agent cedar"),
         )
         denied = client.post(
             "/v1/search_transcript",
@@ -812,18 +1158,10 @@ class HostedHttpTests(unittest.TestCase):
         api_key = self._api_key(
             capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH}
         )
-        message_json = single_message_adapter.dump_json(
-            ModelRequest(parts=[UserPromptPart(content="hosted http cedar")])
-        )
-
         append_response = self.client.post(
             "/v1/append_transcript",
-            headers=self._auth(api_key),
-            json=AppendTranscriptRequest(
-                scope=_scope(capabilities={MemoryCapability.WRITE}),
-                messages_json=[message_json],
-                redaction=RedactionContext(forbidden_values=()),
-            ).model_dump(mode="json"),
+            headers=self._write_headers(api_key),
+            json=self._append_body("hosted http cedar"),
         )
         search_response = self.client.post(
             "/v1/search_transcript",
@@ -854,12 +1192,8 @@ class HostedHttpTests(unittest.TestCase):
         missing_auth = self.client.post("/v1/search_transcript", json=request)
         append_denied = self.client.post(
             "/v1/append_transcript",
-            headers=self._auth(api_key),
-            json=AppendTranscriptRequest(
-                scope=_scope(capabilities={MemoryCapability.WRITE}),
-                messages_json=[],
-                redaction=RedactionContext(forbidden_values=()),
-            ).model_dump(mode="json"),
+            headers=self._write_headers(api_key),
+            json={"messages_json": [], "redaction": {"forbidden_values": []}},
         )
 
         self.assertEqual(missing_auth.status_code, 401)
@@ -921,46 +1255,26 @@ class HostedHttpTests(unittest.TestCase):
         )
         first_response = self.client.post(
             "/v1/append_transcript",
-            headers=self._auth(api_key),
-            json=AppendTranscriptRequest(
-                scope=_scope(capabilities={MemoryCapability.WRITE}),
-                messages_json=[
-                    single_message_adapter.dump_json(
-                        ModelRequest(parts=[UserPromptPart(content="session alpha first")])
-                    )
-                ],
-                redaction=RedactionContext(forbidden_values=()),
-            ).model_dump(mode="json"),
-        )
-        beta_scope = _scope(capabilities={MemoryCapability.WRITE}).model_copy(
-            update={"session_id": "session-b"}
+            headers=self._write_headers(api_key),
+            json=self._append_body("session alpha first"),
         )
         self.client.post(
             "/v1/append_transcript",
-            headers=self._auth(api_key),
-            json=AppendTranscriptRequest(
-                scope=beta_scope,
-                messages_json=[
+            headers=self._write_headers(api_key, session_id="session-b"),
+            json={
+                "messages_json": [
                     single_message_adapter.dump_json(
                         ModelRequest(parts=[UserPromptPart(content=f"session beta {index}")])
-                    )
+                    ).decode()
                     for index in range(100)
                 ],
-                redaction=RedactionContext(forbidden_values=()),
-            ).model_dump(mode="json"),
+                "redaction": {"forbidden_values": []},
+            },
         )
         last_response = self.client.post(
             "/v1/append_transcript",
-            headers=self._auth(api_key),
-            json=AppendTranscriptRequest(
-                scope=_scope(capabilities={MemoryCapability.WRITE}),
-                messages_json=[
-                    single_message_adapter.dump_json(
-                        ModelRequest(parts=[UserPromptPart(content="session alpha last")])
-                    )
-                ],
-                redaction=RedactionContext(forbidden_values=()),
-            ).model_dump(mode="json"),
+            headers=self._write_headers(api_key),
+            json=self._append_body("session alpha last"),
         )
 
         response = self.client.post(
@@ -981,17 +1295,16 @@ class HostedHttpTests(unittest.TestCase):
 
         message_ids = self.client.post(
             "/v1/append_transcript",
-            headers=self._auth(api_key),
-            json=AppendTranscriptRequest(
-                scope=_scope(capabilities={MemoryCapability.WRITE}),
-                messages_json=[
+            headers=self._write_headers(api_key),
+            json={
+                "messages_json": [
                     single_message_adapter.dump_json(
                         ModelRequest(parts=[UserPromptPart(content=f"session alpha {index}")])
-                    )
+                    ).decode()
                     for index in range(99)
                 ],
-                redaction=RedactionContext(forbidden_values=()),
-            ).model_dump(mode="json"),
+                "redaction": {"forbidden_values": []},
+            },
         ).json()["message_ids"]
         response = self.client.post(
             "/v1/expand_history",

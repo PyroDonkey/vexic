@@ -13,7 +13,6 @@ from fastapi.responses import JSONResponse
 
 from vexic import CONTRACT_VERSION
 from vexic.contract import (
-    AppendTranscriptRequest,
     ExpandHistoryResult,
     ExpandHistoryRequest,
     MemoryCapability,
@@ -27,6 +26,7 @@ from vexic.hosted import (
     HostedMemoryService,
     HostedRateLimitExceeded,
     add_run_dream_phase_subcommand,
+    register_hosted_write_routes,
     run_dream_phase_command,
 )
 from vexic.mcp_http import register_mcp_routes
@@ -35,8 +35,6 @@ from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 
 
 MAX_BODY_BYTES = 1_000_000
-MAX_APPEND_MESSAGES = 100
-MAX_APPEND_CHARS = 250_000
 MAX_QUERY_CHARS = 1_000
 MAX_LIMIT = 20
 MAX_EXPAND_HISTORY_MESSAGES = 100
@@ -85,9 +83,13 @@ def create_app(
     async def health() -> dict[str, str]:
         return {"status": "ok", "contract_version": CONTRACT_VERSION}
 
-    @app.post("/v1/append_transcript")
-    async def append_transcript(request: Request, payload: AppendTranscriptRequest) -> JSONResponse:
-        return await _handle(request, payload, service.append_transcript)
+    register_hosted_write_routes(
+        app,
+        service,
+        api_key_from_request=_api_key,
+        handle_payload=_handle_payload,
+        error_response=_error_response,
+    )
 
     @app.post("/v1/search_transcript")
     async def search_transcript(request: Request, payload: SearchTranscriptRequest) -> JSONResponse:
@@ -132,6 +134,14 @@ async def _handle(
     api_key = _api_key(request)
     if api_key is None:
         return _error_response(401, "unauthorized", "Missing hosted API key.")
+    return await _handle_payload(api_key, payload, call)
+
+
+async def _handle_payload(
+    api_key: str,
+    payload: _RequestT,
+    call: Callable[[str, _RequestT], Awaitable[_ResultT]],
+) -> JSONResponse:
     cap_error = _cap_error(payload)
     if cap_error is not None:
         return cap_error
@@ -173,11 +183,6 @@ def _api_key(request: Request) -> str | None:
 
 
 def _cap_error(payload: MemoryRequest) -> JSONResponse | None:
-    if isinstance(payload, AppendTranscriptRequest):
-        if len(payload.messages_json) > MAX_APPEND_MESSAGES:
-            return _too_large("append_transcript message count is capped.")
-        if sum(len(message) for message in payload.messages_json) > MAX_APPEND_CHARS:
-            return _too_large("append_transcript payload is capped.")
     if isinstance(payload, (SearchTranscriptRequest, SearchLongTermRequest)):
         if len(payload.query) > MAX_QUERY_CHARS:
             return _too_large("query is capped.")

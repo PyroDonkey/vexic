@@ -58,6 +58,24 @@ def test_core_hosted_http_does_not_own_control_plane_adapter() -> None:
         assert forbidden not in text
 
 
+def test_core_hosted_http_does_not_own_hosted_write_adapter() -> None:
+    text = (ROOT / "src" / "vexic" / "hosted_http.py").read_text(encoding="utf-8")
+
+    for forbidden in (
+        '@app.post("/v1/append_transcript")',
+        '@app.post("/v1/ingest_source_transcript")',
+        "class HostedAppendTranscriptBody",
+        "class HostedIngestSourceTranscriptBody",
+        "def _handle_hosted_write",
+        "def _write_scope_from_headers",
+        "AppendTranscriptRequest",
+        "IngestSourceTranscriptRequest",
+        "MAX_APPEND_MESSAGES",
+        "service.api_keys.authenticate(api_key)",
+    ):
+        assert forbidden not in text
+
+
 def test_console_boundary_is_documented_as_outside_vexic_package() -> None:
     root_readme = (ROOT / "README.md").read_text(encoding="utf-8")
     console_readme = (ROOT / "console" / "README.md").read_text(encoding="utf-8")

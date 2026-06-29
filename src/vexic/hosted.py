@@ -17,6 +17,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Awaitable, Callable, Protocol, TypeVar
 
+from pydantic import BaseModel, ConfigDict
 from vexic.contract import (
     AppendTranscriptRequest,
     AppendTranscriptResult,
@@ -33,6 +34,7 @@ from vexic.contract import (
     RunDreamPhaseResult,
     MemoryCapability,
     MemoryRequest,
+    MemoryResult,
     MemoryScope,
     Principal,
     PrincipalType,
@@ -49,6 +51,7 @@ from vexic.contract import (
     SearchLongTermResult,
     SearchTranscriptRequest,
     SearchTranscriptResult,
+    SourceTranscriptMessage,
     TrustBoundary,
 )
 from vexic.ports import DreamPhasePorts, missing_host_port
@@ -60,6 +63,207 @@ from vexic.usage import UsageSummary
 
 
 _RequestT = TypeVar("_RequestT", bound=MemoryRequest)
+_ResultT = TypeVar("_ResultT", bound=MemoryResult)
+
+HOSTED_WRITE_MAX_MESSAGES = 100
+HOSTED_WRITE_MAX_CHARS = 250_000
+
+
+class HostedAppendTranscriptBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    messages_json: list[str]
+    redaction: RedactionContext
+
+
+class HostedIngestSourceTranscriptBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    messages: list[SourceTranscriptMessage]
+    redaction: RedactionContext
+
+
+def register_hosted_write_routes(
+    app: object,
+    service: HostedMemoryService,
+    *,
+    api_key_from_request: Callable[[object], str | None],
+    handle_payload: Callable[
+        [str, _RequestT, Callable[[str, _RequestT], Awaitable[_ResultT]]],
+        Awaitable[object],
+    ],
+    error_response: Callable[[int, str, str], object],
+) -> None:
+    from fastapi import Request
+
+    async def append_transcript(
+        request,
+        payload,
+    ) -> object:
+        return await _handle_hosted_write(
+            "append_transcript",
+            request,
+            service,
+            lambda scope: AppendTranscriptRequest(
+                scope=scope,
+                messages_json=payload.messages_json,
+                redaction=payload.redaction,
+            ),
+            service.append_transcript,
+            api_key_from_request=api_key_from_request,
+            handle_payload=handle_payload,
+            error_response=error_response,
+        )
+
+    async def ingest_source_transcript(
+        request,
+        payload,
+    ) -> object:
+        return await _handle_hosted_write(
+            "ingest_source_transcript",
+            request,
+            service,
+            lambda scope: IngestSourceTranscriptRequest(
+                scope=scope,
+                messages=payload.messages,
+                redaction=payload.redaction,
+            ),
+            service.ingest_source_transcript,
+            api_key_from_request=api_key_from_request,
+            handle_payload=handle_payload,
+            error_response=error_response,
+        )
+
+    append_transcript.__annotations__ = {
+        "request": Request,
+        "payload": HostedAppendTranscriptBody,
+        "return": object,
+    }
+    ingest_source_transcript.__annotations__ = {
+        "request": Request,
+        "payload": HostedIngestSourceTranscriptBody,
+        "return": object,
+    }
+    app.post("/v1/append_transcript")(append_transcript)
+    app.post("/v1/ingest_source_transcript")(ingest_source_transcript)
+
+
+def _hosted_write_cap_error(
+    payload: MemoryRequest,
+    error_response: Callable[[int, str, str], object],
+) -> object | None:
+    if isinstance(payload, AppendTranscriptRequest):
+        if len(payload.messages_json) > HOSTED_WRITE_MAX_MESSAGES:
+            return error_response(
+                400,
+                "request_too_large",
+                "append_transcript message count is capped.",
+            )
+        if sum(len(message) for message in payload.messages_json) > HOSTED_WRITE_MAX_CHARS:
+            return error_response(
+                400,
+                "request_too_large",
+                "append_transcript payload is capped.",
+            )
+    if isinstance(payload, IngestSourceTranscriptRequest):
+        if len(payload.messages) > HOSTED_WRITE_MAX_MESSAGES:
+            return error_response(
+                400,
+                "request_too_large",
+                "ingest_source_transcript message count is capped.",
+            )
+        if sum(len(message.message_json) for message in payload.messages) > HOSTED_WRITE_MAX_CHARS:
+            return error_response(
+                400,
+                "request_too_large",
+                "ingest_source_transcript payload is capped.",
+            )
+    return None
+
+
+async def _handle_hosted_write(
+    operation: str,
+    request: object,
+    service: HostedMemoryService,
+    build: Callable[[MemoryScope], _RequestT],
+    call: Callable[[str, _RequestT], Awaitable[_ResultT]],
+    *,
+    api_key_from_request: Callable[[object], str | None],
+    handle_payload: Callable[
+        [str, _RequestT, Callable[[str, _RequestT], Awaitable[_ResultT]]],
+        Awaitable[object],
+    ],
+    error_response: Callable[[int, str, str], object],
+) -> object:
+    api_key = api_key_from_request(request)
+    if api_key is None:
+        return error_response(401, "unauthorized", "Missing hosted API key.")
+    auth: HostedAuthContext | None = None
+    try:
+        auth = service.api_keys.authenticate(api_key)
+        scope = _write_scope_from_headers(request, auth)
+        payload = build(scope)
+    except PermissionError as exc:
+        service._record_request(
+            operation,
+            None,
+            status="error",
+            error_type=type(exc).__name__,
+            auth=auth,
+        )
+        if str(exc) == "Invalid hosted API key.":
+            return error_response(401, "unauthorized", "Invalid hosted API key.")
+        return error_response(403, "permission_denied", str(exc))
+    except ValueError as exc:
+        service._record_request(
+            operation,
+            None,
+            status="error",
+            error_type=type(exc).__name__,
+            auth=auth,
+        )
+        return error_response(400, "invalid_request", str(exc))
+    except Exception as exc:
+        service._record_request(
+            operation,
+            None,
+            status="error",
+            error_type=type(exc).__name__,
+            auth=auth,
+        )
+        return error_response(500, "internal_error", "Hosted memory request failed.")
+    cap_error = _hosted_write_cap_error(payload, error_response)
+    if cap_error is not None:
+        return cap_error
+    return await handle_payload(api_key, payload, call)
+
+
+def _write_scope_from_headers(request: object, auth: HostedAuthContext) -> MemoryScope:
+    headers = request.headers
+    if headers.get("x-vexic-user-id") is not None:
+        raise ValueError("X-Vexic-User-Id is not supported for hosted writes.")
+    if headers.get("x-vexic-correlation-id") is not None:
+        raise ValueError("X-Vexic-Correlation-Id is not supported for hosted writes.")
+    project_id = headers.get("x-vexic-project-id")
+    if project_id is None or not project_id.strip():
+        raise ValueError("X-Vexic-Project-Id header is required.")
+    project_id = project_id.strip()
+    session_id = headers.get("x-vexic-session-id")
+    if session_id is None or not session_id.strip():
+        raise ValueError("X-Vexic-Session-Id header is required.")
+    session_id = session_id.strip()
+    agent_id = headers.get("x-vexic-agent-id")
+    if agent_id is not None:
+        agent_id = agent_id.strip() or None
+    return MemoryScope(
+        tenant_id=auth.tenant_id,
+        project_id=project_id,
+        session_id=session_id,
+        agent_id=agent_id,
+        principal=auth.principal,
+        trust_boundary=TrustBoundary.NETWORKED,
+        capabilities={MemoryCapability.WRITE},
+    )
 
 
 @dataclass(frozen=True)
