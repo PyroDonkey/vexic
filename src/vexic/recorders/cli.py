@@ -11,6 +11,25 @@ from vexic.recorders.hosted_ingest import HostedIngestConfig, post_source_messag
 from vexic.recorders.status import RecorderStatus, write_status
 
 
+def _argv_status_path(argv: list[str]) -> Path | None:
+    for index, value in enumerate(argv):
+        if value == "--status-path" and index + 1 < len(argv):
+            return Path(argv[index + 1])
+        if value.startswith("--status-path="):
+            return Path(value.split("=", 1)[1])
+    return None
+
+
+def _try_write_status(path: Path | None, status: RecorderStatus) -> str | None:
+    if path is None:
+        return None
+    try:
+        write_status(path, status)
+    except Exception as exc:
+        return f"status write failed: {type(exc).__name__}"
+    return None
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="vexic recorder")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -83,8 +102,9 @@ def _ingest(args: argparse.Namespace) -> int:
         rejected=rejected,
         ignored=ignored,
     )
-    if args.status_path is not None:
-        write_status(args.status_path, status)
+    error = _try_write_status(args.status_path, status)
+    if error is not None:
+        raise RuntimeError(error)
     print(
         json.dumps(
             {
@@ -101,23 +121,39 @@ def _ingest(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    raw_argv = sys.argv[1:] if argv is None else argv
+    parser = _parser()
+    try:
+        args = parser.parse_args(raw_argv)
+    except SystemExit as exc:
+        if _argv_status_path(raw_argv) is not None:
+            _try_write_status(
+                _argv_status_path(raw_argv),
+                RecorderStatus(
+                    ok=False,
+                    operation="ingest",
+                    source_session_id=None,
+                    transcript_path=None,
+                    error="argument parsing failed",
+                ),
+            )
+        return exc.code if isinstance(exc.code, int) else 2
+
     try:
         if args.command == "ingest":
             return _ingest(args)
         raise ValueError(f"unknown command: {args.command}")
     except Exception as exc:
-        if getattr(args, "status_path", None) is not None:
-            write_status(
-                args.status_path,
-                RecorderStatus(
-                    ok=False,
-                    operation=args.command,
-                    source_session_id=None,
-                    transcript_path=None,
-                    error=str(exc),
-                ),
-            )
+        _try_write_status(
+            getattr(args, "status_path", None),
+            RecorderStatus(
+                ok=False,
+                operation=args.command,
+                source_session_id=None,
+                transcript_path=None,
+                error=str(exc),
+            ),
+        )
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
