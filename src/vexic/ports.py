@@ -35,8 +35,11 @@ class DreamPhasePorts:
     secrets: Mapping[str, str] | None = None
 
 
-def missing_host_port(name: str) -> HostPortNotConfigured:
-    return HostPortNotConfigured(
+def missing_host_port(name: str, hint: str | None = None) -> HostPortNotConfigured:
+    message = (
         f"{name} requires a host-supplied model port. "
         "Vexic core does not read provider secrets or build models directly."
     )
+    if hint:
+        message = f"{message} {hint}"
+    return HostPortNotConfigured(message)

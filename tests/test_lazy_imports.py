@@ -58,7 +58,7 @@ class VexicLazyImportTests(unittest.TestCase):
             patch("builtins.__import__", side_effect=blocked_import),
             self.assertRaisesRegex(
                 HostPortNotConfigured,
-                r"pip install vexic\[local-embed\]",
+                r"requires a host-supplied model port.*pip install vexic\[local-embed\]",
             ),
         ):
             embeddings.embed_texts(["compact reports"])

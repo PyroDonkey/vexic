@@ -1,7 +1,7 @@
 from threading import Lock
 from typing import Any
 
-from vexic.ports import HostPortNotConfigured
+from vexic.ports import missing_host_port
 
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 EMBEDDING_DIM = 384
@@ -28,9 +28,12 @@ def _embedding_model() -> Any:
                 try:
                     from fastembed import TextEmbedding
                 except ImportError as exc:
-                    raise HostPortNotConfigured(
-                        "Embeddings require the optional local-embed extra. "
-                        "Install it with `pip install vexic[local-embed]`."
+                    raise missing_host_port(
+                        "Embeddings",
+                        hint=(
+                            "Install the optional local adapter with "
+                            "`pip install vexic[local-embed]`."
+                        ),
                     ) from exc
                 _EMBEDDING_MODEL = TextEmbedding(model_name=EMBEDDING_MODEL_NAME)
     return _EMBEDDING_MODEL
