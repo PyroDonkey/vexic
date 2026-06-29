@@ -171,7 +171,8 @@ def _ingest(args: argparse.Namespace) -> int:
         timeout_seconds=args.timeout_seconds,
     )
     items = []
-    for batch in _iter_hosted_message_batches(messages):
+    batches = list(_iter_hosted_message_batches(messages))
+    for batch in batches:
         result = post_source_messages(
             config,
             messages=batch,

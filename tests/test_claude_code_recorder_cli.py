@@ -382,7 +382,7 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
             )
             self.assertEqual(status["inserted"], 3)
 
-    def test_ingest_rejects_single_message_over_payload_char_cap_before_posting(self) -> None:
+    def test_ingest_rejects_late_oversized_message_before_any_post(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             hook_payload = root / "hook.json"
@@ -396,17 +396,28 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
                 encoding="utf-8",
             )
             status_path = root / "status.json"
-            message = SourceTranscriptMessage(
-                source_host="claude-code",
-                source_session_id="claude-session",
-                source_message_id="uuid-oversize",
-                message_json="x" * (HOSTED_WRITE_MAX_CHARS + 1),
+            messages = [
+                SourceTranscriptMessage(
+                    source_host="claude-code",
+                    source_session_id="claude-session",
+                    source_message_id=f"uuid-{index}",
+                    message_json="x",
+                )
+                for index in range(101)
+            ]
+            messages.append(
+                SourceTranscriptMessage(
+                    source_host="claude-code",
+                    source_session_id="claude-session",
+                    source_message_id="uuid-oversize",
+                    message_json="x" * (HOSTED_WRITE_MAX_CHARS + 1),
+                )
             )
 
             with (
                 patch(
                     "vexic.recorders.cli.iter_claude_code_source_messages",
-                    return_value=iter([message]),
+                    return_value=iter(messages),
                 ),
                 patch("vexic.recorders.cli.post_source_messages") as post_source_messages_mock,
             ):
