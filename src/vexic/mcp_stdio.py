@@ -467,8 +467,19 @@ def main(
     argv: list[str] | None = None,
     *,
     service_factory: Callable[[McpServerConfig], McpMemoryService] | None = None,
+    stdin: TextIO = sys.stdin,
+    stdout: TextIO = sys.stdout,
+    stderr: TextIO = sys.stderr,
 ) -> int:
-    asyncio.run(run_stdio(_parse_args(argv, service_factory=service_factory)))
+    raw_argv = sys.argv[1:] if argv is None else argv
+    asyncio.run(
+        run_stdio(
+            _parse_args(raw_argv, service_factory=service_factory),
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    )
     return 0
 
 

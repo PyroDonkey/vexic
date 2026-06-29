@@ -226,9 +226,10 @@ the local setup guidance in
 treat Vexic as authoritative only for memory that reaches Vexic through the
 hosted HTTP append route, recorder, or importer path. Claude Code hosted
 auto-recording uses `vexic setup claude-code`; the command installs user-local
-Claude Code hook config and Vexic recorder config, then the recorder sends
-cleaned transcript rows to `/v1/ingest_source_transcript`. Claude Code reads
-hosted memory through the read-only MCP route. The Claude Code host transcript
+Claude Code hook config and Vexic recorder config, then scaffolds the project
+MCP entry that Claude Code asks the user to approve. The recorder sends cleaned
+transcript rows to `/v1/ingest_source_transcript`; approved MCP reads go
+through the read-only hosted `/mcp` route. The Claude Code host transcript
 recorder flow is documented in
 [README.md](../README.md#claude-code-transcript-import) and
 [ADR 0002](adr/0002-host-recorders-ingest-complete-cleaned-transcripts.md).
@@ -259,9 +260,11 @@ MCP tools.
 
 For hosted auto-recording, run `vexic setup claude-code` with the hosted base
 URL, raw key, project ID, and session ID. It installs user-local Claude Code
-hook config plus Vexic recorder config; the hook posts cleaned Claude Code
-transcript rows to `/v1/ingest_source_transcript`, and reads remain on the
-read-only MCP path.
+hook config plus Vexic recorder config, then scaffolds a project `.mcp.json`
+entry for Vexic. The hook posts cleaned Claude Code transcript rows to
+`/v1/ingest_source_transcript`; after the user approves the project MCP server
+in Claude Code, reads go through the scaffolded stdio proxy to hosted `/mcp`.
+The raw API key stays in the user-local recorder config, not `.mcp.json`.
 
 ## Railway Alpha Deploy
 

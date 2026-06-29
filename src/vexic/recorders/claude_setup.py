@@ -18,6 +18,7 @@ class ClaudeCodeSetupResult:
     config_path: Path
     status_path: Path
     command: str
+    mcp_config_path: Path | None = None
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -81,6 +82,63 @@ def _write_secret_json(path: Path, payload: dict[str, object]) -> None:
         raise
 
 
+def _recorder_config_arg(config_path: Path, home: Path) -> str:
+    try:
+        if home.resolve(strict=False) == Path.home().resolve(strict=False):
+            relative = config_path.resolve(strict=False).relative_to(
+                home.resolve(strict=False)
+            )
+            return f"~/{relative.as_posix()}"
+    except ValueError:
+        pass
+    return str(config_path)
+
+
+def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
+    text = json.dumps(payload, sort_keys=True)
+    temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp_path.write_text(text, encoding="utf-8")
+        os.replace(temp_path, path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def _write_mcp_config(project_root: Path, config_path: Path, home: Path) -> Path:
+    if not project_root.is_dir():
+        raise ValueError("project_root must be an existing directory")
+    mcp_path = project_root / ".mcp.json"
+    config = _load_json(mcp_path)
+    servers = config.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+        config["mcpServers"] = servers
+    servers["vexic"] = {
+        "command": "uv",
+        "args": [
+            "run",
+            "python",
+            "scripts/vexic-mcp-stdio.py",
+            "--recorder-config",
+            _recorder_config_arg(config_path, home),
+        ],
+    }
+    _write_json_atomic(mcp_path, config)
+    return mcp_path
+
+
+def _remove_mcp_config(project_root: Path) -> bool:
+    mcp_path = project_root / ".mcp.json"
+    config = _load_json(mcp_path)
+    servers = config.get("mcpServers")
+    if not isinstance(servers, dict) or "vexic" not in servers:
+        return False
+    del servers["vexic"]
+    _write_json_atomic(mcp_path, config)
+    return True
+
+
 def _without_vexic_hook(stop_groups: Any) -> tuple[list[dict[str, Any]], bool]:
     groups = stop_groups if isinstance(stop_groups, list) else []
     changed = False
@@ -116,6 +174,7 @@ def install_claude_code_setup(
     session_id: str,
     agent_id: str | None,
     command: str,
+    project_root: Path | None = None,
 ) -> ClaudeCodeSetupResult:
     base_url = _require_nonblank("base_url", base_url)
     api_key = _require_nonblank("api_key", api_key)
@@ -123,6 +182,9 @@ def install_claude_code_setup(
     session_id = _require_nonblank("session_id", session_id)
     settings_path, config_path, status_path = _paths(home)
     hook_command = f"{_bash_safe(command)} --config {shlex.quote(_bash_safe(str(config_path)))}"
+    mcp_config_path = (
+        _write_mcp_config(project_root, config_path, home) if project_root else None
+    )
 
     _write_secret_json(
         config_path,
@@ -164,18 +226,19 @@ def install_claude_code_setup(
         config_path=config_path,
         status_path=status_path,
         command=hook_command,
+        mcp_config_path=mcp_config_path,
     )
 
 
-def uninstall_claude_code_setup(*, home: Path) -> bool:
+def uninstall_claude_code_setup(*, home: Path, project_root: Path | None = None) -> bool:
     settings_path, _config_path, _status_path = _paths(home)
     settings = _load_json(settings_path)
     hooks = settings.get("hooks")
+    mcp_changed = _remove_mcp_config(project_root) if project_root else False
     if not isinstance(hooks, dict):
-        return False
+        return mcp_changed
     stop_groups, changed = _without_vexic_hook(hooks.get("Stop"))
-    if not changed:
-        return False
-    hooks["Stop"] = stop_groups
-    settings_path.write_text(json.dumps(settings, sort_keys=True), encoding="utf-8")
-    return True
+    if changed:
+        hooks["Stop"] = stop_groups
+        settings_path.write_text(json.dumps(settings, sort_keys=True), encoding="utf-8")
+    return changed or mcp_changed

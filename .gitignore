@@ -39,6 +39,7 @@ node_modules/
 
 # Local agent tooling
 .claude/launch.json
+.mcp.json
 .codex/
 
 # Local SQLite memory databases and sidecar files

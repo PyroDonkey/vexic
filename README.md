@@ -172,11 +172,18 @@ config:
 uv run --with-editable . python -m vexic.cli setup claude-code --base-url https://api.vexic.dev --api-key <raw-key> --project-id project-a --session-id session-a
 ```
 
-The setup command updates the user's Claude Code hook config and writes a Vexic
-recorder config outside the repository. On Claude Code stop events, the
-recorder reads the JSONL transcript, keeps visible user/assistant text, maps
-source keys as `claude-code`/`sessionId`/`uuid`, and posts cleaned rows to the
-hosted `/v1/ingest_source_transcript` route.
+The setup command updates the user's Claude Code hook config, writes a Vexic
+recorder config outside the repository, and scaffolds `.mcp.json` in the
+current project. The MCP entry launches `scripts/vexic-mcp-stdio.py` with
+`--recorder-config`, so `.mcp.json` does not contain the raw API key. Claude
+Code treats the project MCP server as pending until you approve/enable it in
+Claude Code.
+
+On Claude Code stop events, the recorder reads the JSONL transcript, keeps
+visible user/assistant text, maps source keys as
+`claude-code`/`sessionId`/`uuid`, and posts cleaned rows to the hosted
+`/v1/ingest_source_transcript` route. The enabled MCP entry reads the same
+recorder config and proxies read-only MCP requests to hosted `/mcp`.
 
 To replay a missed hosted hook manually, point the recorder at the setup config
 and a hook payload containing `session_id` and `transcript_path`:
@@ -265,8 +272,9 @@ include a `scopeTemplate` with the correct `tenant_id`, `project_id`,
 direct `/v1/search_*` calls instead of guessing a tenant id.
 
 Claude Code hosted auto-recording is installed with `vexic setup claude-code`.
-It writes cleaned transcript rows through `/v1/ingest_source_transcript`; the
-read-only hosted MCP server is still used for search.
+It writes cleaned transcript rows through `/v1/ingest_source_transcript` and
+scaffolds a project MCP entry that, once approved in Claude Code, proxies
+read-only search to hosted `/mcp`.
 
 Likewise, the hosted fresh-conversation context API and agent-side recap
 injection - assembling new hosted sessions from session summaries plus recent
