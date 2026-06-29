@@ -3,6 +3,8 @@ import io
 import json
 import os
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -665,13 +667,12 @@ class ClaudeCodeSetupTests(unittest.TestCase):
             self.assertEqual(config["agent_id"], "agent-a")
             mcp_config = json.loads((project_root / ".mcp.json").read_text(encoding="utf-8"))
             vexic_server = mcp_config["mcpServers"]["vexic"]
-            self.assertEqual(vexic_server["command"], "uv")
+            self.assertEqual(vexic_server["command"], sys.executable)
             self.assertEqual(
                 vexic_server["args"],
                 [
-                    "run",
-                    "python",
-                    "scripts/vexic-mcp-stdio.py",
+                    "-m",
+                    "vexic.hosted_mcp",
                     "--recorder-config",
                     str(result.config_path),
                 ],
@@ -701,6 +702,66 @@ class ClaudeCodeSetupTests(unittest.TestCase):
             self.assertEqual(args[-1], "~/.vexic/claude-code-recorder.json")
             self.assertNotIn(str(home), json.dumps(mcp_config))
             self.assertTrue(result.config_path.exists())
+
+    def test_setup_disables_project_mcp_entry_until_user_enables_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            project_root = home / "project"
+            project_root.mkdir()
+
+            result = install_claude_code_setup(
+                home=home,
+                base_url="https://api.example.test",
+                api_key="vx_secret",
+                project_id="project-a",
+                session_id="session-a",
+                agent_id=None,
+                command="python -m vexic.cli recorder ingest",
+                project_root=project_root,
+            )
+
+            mcp_config = json.loads((project_root / ".mcp.json").read_text(encoding="utf-8"))
+            settings = json.loads(result.settings_path.read_text(encoding="utf-8"))
+            self.assertIn("vexic", mcp_config["mcpServers"])
+            self.assertEqual(settings["disabledMcpjsonServers"], ["vexic"])
+            self.assertNotIn("vexic", settings.get("enabledMcpjsonServers", []))
+
+    def test_setup_writes_mcp_launcher_that_runs_outside_vexic_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            project_root = home / "customer-project"
+            project_root.mkdir()
+
+            install_claude_code_setup(
+                home=home,
+                base_url="https://api.example.test",
+                api_key="vx_secret",
+                project_id="project-a",
+                session_id="session-a",
+                agent_id=None,
+                command="python -m vexic.cli recorder ingest",
+                project_root=project_root,
+            )
+
+            repo_root = Path(__file__).resolve().parents[1]
+            env = os.environ.copy()
+            env["PYTHONPATH"] = os.pathsep.join(
+                [str(repo_root / "src"), env.get("PYTHONPATH", "")]
+            )
+            mcp_config = json.loads((project_root / ".mcp.json").read_text(encoding="utf-8"))
+            server = mcp_config["mcpServers"]["vexic"]
+            result = subprocess.run(
+                [server["command"], *server["args"]],
+                input="",
+                text=True,
+                cwd=project_root,
+                env=env,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_setup_writes_config_owner_only_when_supported(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -777,6 +838,32 @@ class ClaudeCodeSetupTests(unittest.TestCase):
                         command="python -m vexic.cli recorder ingest",
                     )
 
+            self.assertFalse((home / ".vexic" / "claude-code-recorder.json").exists())
+            self.assertFalse((home / ".claude" / "settings.json").exists())
+
+    def test_setup_secret_write_failure_does_not_leave_project_mcp_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            project_root = home / "project"
+            project_root.mkdir()
+
+            with patch("pathlib.Path.chmod", side_effect=OSError("chmod denied")):
+                with self.assertRaisesRegex(PermissionError, "owner-only permissions"):
+                    install_claude_code_setup(
+                        home=home,
+                        base_url="https://api.example.test",
+                        api_key="vx_secret",
+                        project_id="project-a",
+                        session_id="session-a",
+                        agent_id=None,
+                        command="python -m vexic.cli recorder ingest",
+                        project_root=project_root,
+                    )
+
+            mcp_path = project_root / ".mcp.json"
+            if mcp_path.exists():
+                mcp_config = json.loads(mcp_path.read_text(encoding="utf-8"))
+                self.assertNotIn("vexic", mcp_config.get("mcpServers", {}))
             self.assertFalse((home / ".vexic" / "claude-code-recorder.json").exists())
             self.assertFalse((home / ".claude" / "settings.json").exists())
 

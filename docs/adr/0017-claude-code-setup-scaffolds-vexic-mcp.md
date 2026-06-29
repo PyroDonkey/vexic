@@ -34,15 +34,16 @@ scaffolds a disabled / placeholder MCP entry that Claude Code will not use until
 the user performs one explicit enable step.
 
 - The scaffold targets a project-local `.mcp.json` entry. This aligns with
-  setup's per-project arguments (`--project-id`, `--session-id`) and uses Claude
-  Code's new-server approval prompt as the natural "disabled until the user
-  enables it" gate.
+  setup's per-project arguments (`--project-id`, `--session-id`). Setup also
+  writes `disabledMcpjsonServers: ["vexic"]` in `~/.claude/settings.json`, which
+  is Claude Code's supported rejection list for project `.mcp.json` servers.
+  The `.mcp.json` server object does not carry a made-up `disabled` flag.
 - The scaffolded server is a local stdio launcher
-  (`scripts/vexic-mcp-stdio.py`) configured to read its credentials from the
-  existing `~/.vexic/claude-code-recorder.json`. The launcher, not the Claude
-  config, holds the path to the secret. (There is no `vexic mcp` CLI subcommand
-  today; the follow-up issue may add one, but the supported launcher is the
-  script.)
+  (`python -m vexic.hosted_mcp --recorder-config ...`) configured to read its
+  credentials from the existing `~/.vexic/claude-code-recorder.json`. The
+  launcher, not the Claude config, holds the path to the secret. (There is no
+  `vexic mcp` CLI subcommand today; the follow-up issue may add one, but the
+  supported launcher is the installed Python module.)
 - The raw API key is never written into `.mcp.json` or `~/.claude.json`. The
   recorder config remains the single source of truth for the base URL and key.
 - No hosted MCP server changes are required. This is a setup/install-UX decision
@@ -58,6 +59,8 @@ follow-up issue, built test-first.
   atomic write); Claude config files never receive the raw key.
 - The scaffold is inert until the user enables it, so a stale credential cannot
   silently break a running agent through an auto-installed live entry.
+- The inert state is recorded as a Claude Code project-server choice in
+  `~/.claude/settings.json`, not as an ignored field inside `.mcp.json`.
 - The local stdio transport is local-trusted and carries no `Authorization`
   header to leak or go stale; the hosted-backed launcher reuses the single
   stored credential.
@@ -69,7 +72,8 @@ follow-up issue, built test-first.
 - Users get a one-step path to the read-only MCP search surface without
   hand-authoring launcher config or copying keys.
 - Vexic does not mutate Claude Code's large, app-managed `~/.claude.json`; the
-  scaffold lives in a project-local `.mcp.json` it owns.
+  server definition lives in a project-local `.mcp.json` it owns, while the
+  disabled choice lives in `~/.claude/settings.json`.
 - A follow-up implementation issue must build the scaffold install (and a
   matching uninstall mirroring the recorder's idempotent `vexicHookId` removal),
   with tests asserting the entry is written disabled and carries no raw key.
@@ -80,6 +84,5 @@ follow-up issue, built test-first.
 - A direct hosted-HTTP `.mcp.json` / `~/.claude.json` entry that embeds an
   `Authorization` header (rejected: duplicates the key and is brittle when the
   header goes stale).
-- User-level (`~/.claude.json`) scaffolding and the exact placeholder field
-  shape; the follow-up issue decides these implementation details.
+- User-level (`~/.claude.json`) scaffolding.
 - Cross-agent (Codex, OpenClaw, Hermes) MCP scaffolding.
