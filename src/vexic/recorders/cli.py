@@ -5,9 +5,10 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
-from vexic.hosted import HOSTED_WRITE_MAX_MESSAGES
+from vexic.contract import SourceTranscriptMessage
+from vexic.hosted import HOSTED_WRITE_MAX_CHARS, HOSTED_WRITE_MAX_MESSAGES
 from vexic.recorders.claude_code import iter_claude_code_source_messages
 from vexic.recorders.claude_setup import (
     install_claude_code_setup,
@@ -19,6 +20,35 @@ from vexic.recorders.status import RecorderStatus, write_status
 
 class MissingIngestOption(ValueError):
     pass
+
+
+def _iter_hosted_message_batches(
+    messages: list[SourceTranscriptMessage],
+) -> Iterator[list[SourceTranscriptMessage]]:
+    if not messages:
+        yield []
+        return
+
+    batch: list[SourceTranscriptMessage] = []
+    batch_chars = 0
+    for message in messages:
+        message_chars = len(message.message_json)
+        if message_chars > HOSTED_WRITE_MAX_CHARS:
+            raise ValueError(
+                f"source message {message.source_message_id} exceeds hosted ingest payload cap"
+            )
+        if batch and (
+            len(batch) >= HOSTED_WRITE_MAX_MESSAGES
+            or batch_chars + message_chars > HOSTED_WRITE_MAX_CHARS
+        ):
+            yield batch
+            batch = []
+            batch_chars = 0
+        batch.append(message)
+        batch_chars += message_chars
+
+    if batch:
+        yield batch
 
 
 def _argv_status_path(argv: list[str]) -> Path | None:
@@ -141,10 +171,10 @@ def _ingest(args: argparse.Namespace) -> int:
         timeout_seconds=args.timeout_seconds,
     )
     items = []
-    for start in range(0, max(len(messages), 1), HOSTED_WRITE_MAX_MESSAGES):
+    for batch in _iter_hosted_message_batches(messages):
         result = post_source_messages(
             config,
-            messages=messages[start : start + HOSTED_WRITE_MAX_MESSAGES],
+            messages=batch,
             forbidden_values=tuple(args.forbidden_value),
         )
         batch_items = result.get("items")

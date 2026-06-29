@@ -17,9 +17,10 @@ from vexic.contract import (
     Principal,
     PrincipalType,
     SearchTranscriptRequest,
+    SourceTranscriptMessage,
     TrustBoundary,
 )
-from vexic.hosted import HostedMemoryService
+from vexic.hosted import HOSTED_WRITE_MAX_CHARS, HostedMemoryService
 from vexic.hosted_http import create_app
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 from vexic.recorders.cli import main as recorder_main
@@ -303,6 +304,135 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
             self.assertEqual(status["skipped"], 99)
             self.assertEqual(status["rejected"], 1)
             self.assertEqual(status["ignored"], 1)
+
+    def test_ingest_batches_hosted_posts_before_payload_char_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            hook_payload = root / "hook.json"
+            hook_payload.write_text(
+                json.dumps(
+                    {
+                        "session_id": "claude-session",
+                        "transcript_path": str(root / "session.jsonl"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            status_path = root / "status.json"
+            messages = [
+                SourceTranscriptMessage(
+                    source_host="claude-code",
+                    source_session_id="claude-session",
+                    source_message_id="uuid-1",
+                    message_json="a" * (HOSTED_WRITE_MAX_CHARS - 10),
+                ),
+                SourceTranscriptMessage(
+                    source_host="claude-code",
+                    source_session_id="claude-session",
+                    source_message_id="uuid-2",
+                    message_json="b" * 20,
+                ),
+                SourceTranscriptMessage(
+                    source_host="claude-code",
+                    source_session_id="claude-session",
+                    source_message_id="uuid-3",
+                    message_json="c" * 10,
+                ),
+            ]
+            calls = []
+
+            def fake_post(config, *, messages, forbidden_values):
+                calls.append(messages)
+                return {"items": [{"status": "inserted"} for _ in messages]}
+
+            with (
+                patch(
+                    "vexic.recorders.cli.iter_claude_code_source_messages",
+                    return_value=iter(messages),
+                ),
+                patch("vexic.recorders.cli.post_source_messages", fake_post),
+            ):
+                code = recorder_main(
+                    [
+                        "ingest",
+                        "--hook-input",
+                        str(hook_payload),
+                        "--base-url",
+                        "https://api.example.test",
+                        "--api-key",
+                        "vx_secret",
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "vexic-session",
+                        "--status-path",
+                        str(status_path),
+                    ]
+                )
+
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual(code, 0)
+            self.assertEqual([len(batch) for batch in calls], [1, 2])
+            self.assertTrue(
+                all(
+                    sum(len(message.message_json) for message in batch)
+                    <= HOSTED_WRITE_MAX_CHARS
+                    for batch in calls
+                )
+            )
+            self.assertEqual(status["inserted"], 3)
+
+    def test_ingest_rejects_single_message_over_payload_char_cap_before_posting(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            hook_payload = root / "hook.json"
+            hook_payload.write_text(
+                json.dumps(
+                    {
+                        "session_id": "claude-session",
+                        "transcript_path": str(root / "session.jsonl"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            status_path = root / "status.json"
+            message = SourceTranscriptMessage(
+                source_host="claude-code",
+                source_session_id="claude-session",
+                source_message_id="uuid-oversize",
+                message_json="x" * (HOSTED_WRITE_MAX_CHARS + 1),
+            )
+
+            with (
+                patch(
+                    "vexic.recorders.cli.iter_claude_code_source_messages",
+                    return_value=iter([message]),
+                ),
+                patch("vexic.recorders.cli.post_source_messages") as post_source_messages_mock,
+            ):
+                code = recorder_main(
+                    [
+                        "ingest",
+                        "--hook-input",
+                        str(hook_payload),
+                        "--base-url",
+                        "https://api.example.test",
+                        "--api-key",
+                        "vx_secret",
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "vexic-session",
+                        "--status-path",
+                        str(status_path),
+                    ]
+                )
+
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual(code, 2)
+            self.assertFalse(status["ok"])
+            self.assertIn("exceeds hosted ingest payload cap", status["error"])
+            post_source_messages_mock.assert_not_called()
 
 
 class ClaudeCodeRecorderHostedRoundTripTests(unittest.TestCase):
