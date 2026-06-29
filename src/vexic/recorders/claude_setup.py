@@ -41,7 +41,7 @@ def _require_nonblank(name: str, value: str | None) -> str:
 
 def _without_vexic_hook(stop_groups: Any) -> tuple[list[dict[str, Any]], bool]:
     groups = stop_groups if isinstance(stop_groups, list) else []
-    changed = not isinstance(stop_groups, list)
+    changed = False
     kept_groups: list[dict[str, Any]] = []
     for group in groups:
         if not isinstance(group, dict):

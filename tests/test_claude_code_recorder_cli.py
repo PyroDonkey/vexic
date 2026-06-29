@@ -320,6 +320,28 @@ class ClaudeCodeSetupTests(unittest.TestCase):
             ]
             self.assertEqual(commands, ["echo keep"])
 
+    def test_uninstall_leaves_non_vexic_stop_data_unchanged(self) -> None:
+        cases = [
+            {"hooks": {}},
+            {"hooks": {"Stop": "malformed"}},
+            {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo keep"}]}]}},
+        ]
+        for initial_settings in cases:
+            with self.subTest(initial_settings=initial_settings):
+                with tempfile.TemporaryDirectory() as temp:
+                    home = Path(temp)
+                    settings_path = home / ".claude" / "settings.json"
+                    settings_path.parent.mkdir(parents=True)
+                    settings_path.write_text(json.dumps(initial_settings), encoding="utf-8")
+
+                    removed = uninstall_claude_code_setup(home=home)
+
+                    self.assertFalse(removed)
+                    self.assertEqual(
+                        json.loads(settings_path.read_text(encoding="utf-8")),
+                        initial_settings,
+                    )
+
     def test_top_level_setup_claude_code_dispatches(self) -> None:
         from vexic.cli import main as vexic_main
 
