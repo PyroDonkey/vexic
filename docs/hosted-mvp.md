@@ -124,11 +124,12 @@ uv run --with-editable . --extra hosted python -m vexic.hosted_http issue-key --
 The raw key is printed once. Store it in the caller secret store or Claude Code
 MCP environment, not in repository files.
 
-The HTTP API accepts `Authorization: Bearer <raw-key>` or `X-Vexic-Api-Key` and
-serves:
+The HTTP API accepts `Authorization: Bearer <raw-key>` or `X-Vexic-Api-Key` on
+`/v1/*`; use Bearer in new examples. It serves:
 
 - `GET /health`
 - `POST /v1/append_transcript`
+- `POST /v1/ingest_source_transcript`
 - `POST /v1/search_transcript`
 - `POST /v1/search_long_term`
 - `POST /v1/expand_history`
@@ -151,6 +152,34 @@ the `/v1/*` routes deliberately:
 Native HTTP MCP explicitly defers OAuth discovery/PKCE/audience handling,
 redirect/SSRF hardening, SSE/resumability, stateful sessions, write/admin
 tools, public marketplace distribution, and production customer-data readiness.
+
+Hosted transcript writes are separate from MCP and use scope-free bodies. The
+tenant comes from the Agent API key; `X-Vexic-Project-Id` and
+`X-Vexic-Session-Id` are required; `X-Vexic-Agent-Id` is optional. The adapter
+rejects body `scope`, `user_id`, and `correlation_id`, plus
+`X-Vexic-User-Id` and `X-Vexic-Correlation-Id`.
+
+Append a cleaned model-message row:
+
+```powershell
+curl.exe -s http://127.0.0.1:8000/v1/append_transcript `
+  -H "Authorization: Bearer <raw-key>" `
+  -H "X-Vexic-Project-Id: project-a" `
+  -H "X-Vexic-Session-Id: session-a" `
+  -H "Content-Type: application/json" `
+  -d "{\"messages_json\":[\"<clean-model-message-json>\"],\"redaction\":{\"forbidden_values\":[]}}"
+```
+
+Ingest cleaned source transcript rows:
+
+```powershell
+curl.exe -s http://127.0.0.1:8000/v1/ingest_source_transcript `
+  -H "Authorization: Bearer <raw-key>" `
+  -H "X-Vexic-Project-Id: project-a" `
+  -H "X-Vexic-Session-Id: session-a" `
+  -H "Content-Type: application/json" `
+  -d "{\"messages\":[{\"source_host\":\"claude-code\",\"source_session_id\":\"sessionId\",\"source_message_id\":\"uuid\",\"message_json\":\"<clean-model-message-json>\"}],\"redaction\":{\"forbidden_values\":[]}}"
+```
 
 Minimal client config shape for Claude Code, Codex, OpenClaw, and Hermes Agent:
 
@@ -197,8 +226,9 @@ uv run python scripts/vexic-mcp-stdio.py --api-base-url http://127.0.0.1:8000 --
 For the internal Railway alpha, use `https://api.vexic.dev` as the
 `--api-base-url` with a throwaway scoped API key.
 
-`append_transcript` is verified through the hosted HTTP API. Claude Code then
-searches the hosted memory through the stdio MCP tools.
+`append_transcript` or `ingest_source_transcript` is verified through the
+hosted HTTP API. Claude Code then searches the hosted memory through the stdio
+MCP tools.
 
 ## Railway Alpha Deploy
 

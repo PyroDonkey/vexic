@@ -209,6 +209,19 @@ hosted readiness gate
 ([COA-177](https://linear.app/ryan-boissonnault/issue/COA-177/define-hosted-security-privacy-backup-and-abuse-readiness-gate))
 in Linear.
 
+Hosted transcript writes use the same project/session/agent headers as hosted
+MCP reads. The write body does not include `scope` or `tenant_id`; the tenant is
+bound from the Agent API key.
+
+```powershell
+curl.exe -s https://api.vexic.dev/v1/append_transcript `
+  -H "Authorization: Bearer <raw-key>" `
+  -H "X-Vexic-Project-Id: project-a" `
+  -H "X-Vexic-Session-Id: session-a" `
+  -H "Content-Type: application/json" `
+  -d "{\"messages_json\":[\"<clean-model-message-json>\"],\"redaction\":{\"forbidden_values\":[]}}"
+```
+
 ## Native HTTP MCP
 
 The hosted FastAPI app also exposes `POST /mcp` as a stateless, read-only,

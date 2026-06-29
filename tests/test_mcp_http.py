@@ -7,12 +7,10 @@ from fastapi.testclient import TestClient
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 from vexic.contract import (
-    AppendTranscriptRequest,
     MemoryCapability,
     MemoryScope,
     Principal,
     PrincipalType,
-    RedactionContext,
     TrustBoundary,
 )
 from vexic.hosted import HostedInMemoryRateLimiter, HostedMemoryService, HostedRateLimitRule
@@ -85,19 +83,19 @@ class McpHttpTests(unittest.TestCase):
     def _append(self, api_key: str, *, session_id: str, text: str) -> None:
         response = self.client.post(
             "/v1/append_transcript",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json=AppendTranscriptRequest(
-                scope=self._scope(
-                    session_id=session_id,
-                    capabilities={MemoryCapability.WRITE},
-                ),
-                messages_json=[
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "X-Vexic-Project-Id": "project-a",
+                "X-Vexic-Session-Id": session_id,
+            },
+            json={
+                "messages_json": [
                     single_message_adapter.dump_json(
                         ModelRequest(parts=[UserPromptPart(content=text)])
-                    )
+                    ).decode()
                 ],
-                redaction=RedactionContext(forbidden_values=()),
-            ).model_dump(mode="json"),
+                "redaction": {"forbidden_values": []},
+            },
         )
         self.assertEqual(response.status_code, 200)
 
