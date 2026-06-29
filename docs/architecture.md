@@ -45,8 +45,9 @@ is a consumer, not a dependency.
   the opened SQLite context against it.
 - Agent isolation: `agent_id` is an optional `MemoryScope` refinement. `NULL`
   means shared memory inside the same parent scope, never a wildcard.
-- Host-neutral core: providers, embeddings, secrets, auth, and managed
-  operations live in adapters or hosts.
+- Host-neutral core: providers, secrets, auth, and managed operations live in
+  adapters or hosts. Embeddings may come from a host port or the optional lazy
+  local adapter described in ADR 0016.
 
 ## Non-goals
 
@@ -109,15 +110,16 @@ never as durable memory.
 ## Dream Pipeline
 
 The memory pipeline has three named phases. The phase functions exist in the
-package, but model-backed work requires host-supplied agents through ports.
+package, but model-backed agent work requires host-supplied agents through
+ports. Embedding can use a host port or the optional local adapter.
 
 ### Light
 
 `vexic.pipeline.run_light_phase` reads transcript rows since the last
 watermark, renders stable message ids, asks a host-supplied extraction agent for
 structured `FactCandidate` output, validates source ids, embeds fact text
-through a host-supplied embedding port, and commits candidate inserts/merges
-with a `dream_runs` audit row.
+through the supplied embedding port or optional local adapter, and commits
+candidate inserts/merges with a `dream_runs` audit row.
 
 Dream watermarks are scoped by compatible memory scope including `agent_id`.
 Existing `NULL` dream-run rows are shared agent-scope progress rows.
@@ -130,9 +132,12 @@ host-supplied clustering/boost agent for bounded boost values. REM writes
 
 ### Deep
 
-`vexic.deep.run_deep_phase` scores candidates, promotes selected candidates to
-Tier 3, and performs contradiction/supersession checks through a host-supplied
-judge agent. Promotion is idempotent and non-destructive.
+`vexic.deep.run_deep_phase` scores candidates and promotes selected candidates
+to Tier 3. When a contradiction judge is supplied, Deep performs the existing
+supersession checks and retires losing facts or candidates. When contradiction
+is deferred, selected candidates promote without judging; Tier 3 may
+temporarily contain contradictory active facts until a later audit runs.
+Promotion is idempotent and non-destructive.
 
 ## Retrieval
 
@@ -151,7 +156,7 @@ Long-term search uses hybrid retrieval:
 1. Optional query rewrite through a host-supplied agent when available.
 2. FTS5 keyword search over `long_term_memory_fts`.
 3. sqlite-vec KNN over `long_term_memory_embeddings` using host-supplied query
-   embeddings.
+   embeddings or the optional local embedding adapter.
 4. Reciprocal Rank Fusion.
 5. Top facts returned with provenance.
 6. One `retrieval_events` row per surfaced fact plus `retrieved_count`
@@ -179,8 +184,10 @@ The v0.1 local core uses SQLite:
 - sqlite-vec backs candidate and long-term vector search.
 - `embedding_metadata` guards embedding model, dimension, and distance metric
   compatibility.
-- Vexic core stores and validates vectors but does not load embedding models.
-  Missing embedding adapters fail with `HostPortNotConfigured`.
+- Vexic core stores and validates vectors. Embedding models are host-supplied
+  by default, with one optional lazy local adapter available through
+  `vexic[local-embed]`; missing local adapter dependencies fail with an
+  actionable install error.
 
 Current local isolation is one opened SQLite database per memory context, with
 `LocalMemoryService` validating `MemoryScope.tenant_id` against the service's
@@ -206,11 +213,12 @@ rather than source of truth.
 `LocalMemoryService` implements the local read/write core for transcript ingest,
 source-ledger transcript ingest, long-term search, retrieval telemetry, fact
 retirement, export, replay, rebuild, and scope tombstones. Dream phase
-orchestration is deliberately host-port backed: the local adapter authorizes and
+orchestration is deliberately port-backed: the local adapter authorizes and
 checks lifecycle state, executes Light, REM, or Deep only when explicit dream
 phase ports are supplied, and fails closed with `HostPortNotConfigured` when no
-host execution adapter is supplied. This is not an invitation to import private
-host runtime code.
+host execution adapter is supplied. Within those ports, embedding may fall back
+to the optional local adapter and Deep contradiction may be deferred. This is
+not an invitation to import private host runtime code.
 
 ## Data Flow
 

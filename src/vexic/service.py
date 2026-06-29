@@ -710,6 +710,7 @@ async def _run_dream_phase_with_usage(
             agent_id=request.scope.agent_id,
             secrets=ports.secrets,
             contradiction_agent_factory=ports.contradiction_agent_factory,
+            defer_contradiction=ports.defer_contradiction,
             forbidden_secret_values=service._redaction_values(request.redaction),
         )
 

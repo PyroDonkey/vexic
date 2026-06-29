@@ -29,7 +29,7 @@ class ToolConfigurationTests(unittest.IsolatedAsyncioTestCase):
 
             result = await search_long_term(ctx, "compact reports")
 
-        self.assertIn("Embeddings requires a host-supplied model port", result)
+        self.assertIn("pip install vexic[local-embed]", result)
 
 
 class ToolAgentScopeTests(unittest.TestCase):

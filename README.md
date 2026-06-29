@@ -75,9 +75,10 @@ omit it to bind the server to the explicit shared agent scope.
 
 By default, the MVP exposes `search_transcript` and `search_long_term` only.
 Transcript writes, export, delete, rebuild, and admin tools are intentionally
-not registered. Long-term vector search requires a host-supplied embedding
-adapter; without one, `search_long_term` returns a configuration error instead
-of loading a model from Vexic core.
+not registered. Long-term vector search uses a host-supplied embedding adapter
+when one is configured, otherwise it uses the optional local embedding adapter
+from `vexic[local-embed]`. Without that extra, `search_long_term` returns an
+actionable configuration error.
 
 Privileged verbatim history egress is disabled by default. For a local,
 session-bound agent that explicitly needs it, pass `--enable-expand-history` to
@@ -226,7 +227,8 @@ calling providers. The host-owned OpenRouter adapter reads `OPENROUTER_API_KEY`
 from the process environment and supplies `build_extraction_agent`,
 `build_rem_agent`, `build_contradiction_agent`, and `embed_texts`; Vexic core
 does not read provider secrets. The adapter lives under repo-local `adapters/`
-by design because it is host-owned provider wiring, not package core.
+by design because it is host-owned provider wiring, not package core. Embedding
+can alternatively use the optional local `vexic[local-embed]` adapter.
 
 Fixture rows are JSONL objects with `id`, `transcript`, `question`, and
 `expected_fact`. `transcript` may be a list of strings or `{ "role": "user" |

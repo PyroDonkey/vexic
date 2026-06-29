@@ -171,20 +171,21 @@ async def run_deep_phase(
     neighbor_k: int = DEFAULT_NEIGHBOR_K,
     now: datetime | None = None,
     contradiction_agent_factory: AgentFactory | None = None,
+    defer_contradiction: bool = True,
     forbidden_secret_values: tuple[str, ...] = (),
 ) -> UsageSummary:
-    """Score eligible Tier 2 candidates, promote the top-N to Tier 3, and
-    retire any pre-existing Tier 3 fact a promotion contradicts.
+    """Score eligible Tier 2 candidates and promote the top-N to Tier 3.
 
-    Contradictions are judged pairwise (new fact vs each Tier 3 neighbor).
-    Every high-confidence contradiction is checked before deciding whether the
-    candidate beats existing memory; this avoids letting nearest-neighbor order
-    hide a later, higher-confidence contradiction. Like the Light phase, a
+    When a contradiction agent is supplied, contradictions are judged pairwise
+    (new fact vs each Tier 3 neighbor). Every high-confidence contradiction is
+    checked before deciding whether the candidate beats existing memory; this
+    avoids letting nearest-neighbor order hide a later, higher-confidence
+    contradiction. When contradiction is deferred, selected candidates promote
+    without retiring facts or pending candidates. Like the Light phase, a
     failure records an error dream_run and re-raises, leaving Tier 3 untouched.
     """
     started_at = utc_now_iso()
     forbidden = _forbidden_secret_values(secrets, forbidden_secret_values)
-    agent_factory = contradiction_agent_factory or build_contradiction_agent
     try:
         init_vector_memory(db_path)
         when = now or datetime.now(timezone.utc)
@@ -204,104 +205,115 @@ async def run_deep_phase(
             print("Deep phase: no eligible candidates. No-op.")
             return UsageSummary()
 
-        agent = agent_factory(model_group, secrets=secrets)
-        decisions: list[PromotionDecision | CandidateRetirementDecision] = []
-        pending_promotions: list[_PendingPromotion] = []
         usage = UsageSummary()
-        for candidate in selected:
-            neighbors = nearest_long_term_facts(
-                db_path,
-                candidate.embedding,
-                k=neighbor_k,
-                agent_id=agent_id,
-            )
-            contradicted_neighbors: list[LongTermNeighbor] = []
-            candidate_retired = False
-            for neighbor in neighbors:
-                prompt = _judge_prompt(candidate, neighbor)
-                assert_no_forbidden_secret_values(forbidden, prompt)
-                contradicts, judge_usage = await _high_confidence_contradiction(
-                    agent,
-                    prompt,
-                )
-                usage = usage.plus(judge_usage)
-                if contradicts:
-                    contradicted_neighbors.append(neighbor)
-            blocking_neighbors = [
-                neighbor
-                for neighbor in contradicted_neighbors
-                if neighbor.confidence >= candidate.confidence
-            ]
-            if blocking_neighbors:
-                winning_neighbor = max(
-                    blocking_neighbors,
-                    key=lambda neighbor: (neighbor.confidence, neighbor.similarity),
-                )
-                decisions.append(
-                    CandidateRetirementDecision(
-                        candidate_id=candidate.candidate_id,
-                        retired_by_fact_id=winning_neighbor.fact_id,
-                    )
-                )
-                candidate_retired = True
-            if candidate_retired:
-                continue
-            retired_fact_id = (
-                contradicted_neighbors[0].fact_id if contradicted_neighbors else None
-            )
-
-            retired_candidate_ids: list[int] = []
-            surviving_pending: list[_PendingPromotion] = []
-            for index, pending in enumerate(pending_promotions):
-                prompt = _candidate_judge_prompt(candidate, pending.candidate)
-                assert_no_forbidden_secret_values(forbidden, prompt)
-                contradicts, judge_usage = await _high_confidence_contradiction(
-                    agent,
-                    prompt,
-                )
-                usage = usage.plus(judge_usage)
-                if not contradicts:
-                    surviving_pending.append(pending)
-                    continue
-                if candidate.confidence > pending.candidate.confidence:
-                    retired_candidate_ids.append(pending.candidate.candidate_id)
-                    retired_candidate_ids.extend(pending.retired_candidate_ids)
-                    continue
-                surviving_pending.append(
-                    _PendingPromotion(
-                        candidate=pending.candidate,
-                        retired_fact_id=pending.retired_fact_id,
-                        retired_candidate_ids=(
-                            *pending.retired_candidate_ids,
-                            candidate.candidate_id,
-                        ),
-                    )
-                )
-                surviving_pending.extend(pending_promotions[index + 1 :])
-                candidate_retired = True
-                break
-
-            if candidate_retired:
-                pending_promotions = surviving_pending
-                continue
-            pending_promotions = [
-                *surviving_pending,
-                _PendingPromotion(
-                    candidate=candidate,
-                    retired_fact_id=retired_fact_id,
-                    retired_candidate_ids=tuple(sorted(set(retired_candidate_ids))),
-                ),
-            ]
-
-        for pending in pending_promotions:
-            decisions.append(
+        decisions: list[PromotionDecision | CandidateRetirementDecision]
+        if contradiction_agent_factory is None and defer_contradiction:
+            decisions = [
                 PromotionDecision(
-                    candidate_id=pending.candidate.candidate_id,
-                    embedding=pending.candidate.embedding,
-                    retired_fact_id=pending.retired_fact_id,
-                    retired_candidate_ids=pending.retired_candidate_ids,
+                    candidate_id=candidate.candidate_id,
+                    embedding=candidate.embedding,
                 )
-            )
+                for candidate in selected
+            ]
+        else:
+            agent_factory = contradiction_agent_factory or build_contradiction_agent
+            agent = agent_factory(model_group, secrets=secrets)
+            decisions = []
+            pending_promotions: list[_PendingPromotion] = []
+            for candidate in selected:
+                neighbors = nearest_long_term_facts(
+                    db_path,
+                    candidate.embedding,
+                    k=neighbor_k,
+                    agent_id=agent_id,
+                )
+                contradicted_neighbors: list[LongTermNeighbor] = []
+                candidate_retired = False
+                for neighbor in neighbors:
+                    prompt = _judge_prompt(candidate, neighbor)
+                    assert_no_forbidden_secret_values(forbidden, prompt)
+                    contradicts, judge_usage = await _high_confidence_contradiction(
+                        agent,
+                        prompt,
+                    )
+                    usage = usage.plus(judge_usage)
+                    if contradicts:
+                        contradicted_neighbors.append(neighbor)
+                blocking_neighbors = [
+                    neighbor
+                    for neighbor in contradicted_neighbors
+                    if neighbor.confidence >= candidate.confidence
+                ]
+                if blocking_neighbors:
+                    winning_neighbor = max(
+                        blocking_neighbors,
+                        key=lambda neighbor: (neighbor.confidence, neighbor.similarity),
+                    )
+                    decisions.append(
+                        CandidateRetirementDecision(
+                            candidate_id=candidate.candidate_id,
+                            retired_by_fact_id=winning_neighbor.fact_id,
+                        )
+                    )
+                    candidate_retired = True
+                if candidate_retired:
+                    continue
+                retired_fact_id = (
+                    contradicted_neighbors[0].fact_id if contradicted_neighbors else None
+                )
+
+                retired_candidate_ids: list[int] = []
+                surviving_pending: list[_PendingPromotion] = []
+                for index, pending in enumerate(pending_promotions):
+                    prompt = _candidate_judge_prompt(candidate, pending.candidate)
+                    assert_no_forbidden_secret_values(forbidden, prompt)
+                    contradicts, judge_usage = await _high_confidence_contradiction(
+                        agent,
+                        prompt,
+                    )
+                    usage = usage.plus(judge_usage)
+                    if not contradicts:
+                        surviving_pending.append(pending)
+                        continue
+                    if candidate.confidence > pending.candidate.confidence:
+                        retired_candidate_ids.append(pending.candidate.candidate_id)
+                        retired_candidate_ids.extend(pending.retired_candidate_ids)
+                        continue
+                    surviving_pending.append(
+                        _PendingPromotion(
+                            candidate=pending.candidate,
+                            retired_fact_id=pending.retired_fact_id,
+                            retired_candidate_ids=(
+                                *pending.retired_candidate_ids,
+                                candidate.candidate_id,
+                            ),
+                        )
+                    )
+                    surviving_pending.extend(pending_promotions[index + 1 :])
+                    candidate_retired = True
+                    break
+
+                if candidate_retired:
+                    pending_promotions = surviving_pending
+                    continue
+                pending_promotions = [
+                    *surviving_pending,
+                    _PendingPromotion(
+                        candidate=candidate,
+                        retired_fact_id=retired_fact_id,
+                        retired_candidate_ids=tuple(sorted(set(retired_candidate_ids))),
+                    ),
+                ]
+
+            for pending in pending_promotions:
+                decisions.append(
+                    PromotionDecision(
+                        candidate_id=pending.candidate.candidate_id,
+                        embedding=pending.candidate.embedding,
+                        retired_fact_id=pending.retired_fact_id,
+                        retired_candidate_ids=pending.retired_candidate_ids,
+                    )
+                )
 
         stats = commit_deep_cycle(
             db_path,

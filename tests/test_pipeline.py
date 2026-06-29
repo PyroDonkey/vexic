@@ -5,7 +5,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-from contextlib import closing, redirect_stderr
+from contextlib import closing, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,7 +17,6 @@ from vexic.embeddings import EMBEDDING_DIM
 from vexic.deep import run_deep_phase
 from vexic.models import ContradictionJudgment, FactCandidate, RemBoost, RemBoostPlan
 from vexic.pipeline import _main, run_light_phase
-from vexic.ports import HostPortNotConfigured
 from vexic.rem import run_rem_phase
 from vexic.storage import (
     CandidateRetirementDecision,
@@ -118,7 +117,7 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-    async def test_light_phase_requires_explicit_embedding_port_before_agent(self) -> None:
+    async def test_light_phase_uses_default_embedding_port(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = str(Path(temp_dir) / "memory.db")
             init_db(db_path)
@@ -127,20 +126,48 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                 [ModelRequest(parts=[UserPromptPart(content="I prefer compact reports.")])],
             )
             agent_factory_called = False
+            embedded_texts: list[str] = []
+
+            class ExtractionAgent:
+                async def run(self, transcript: str) -> object:
+                    return SimpleNamespace(
+                        output=[
+                            FactCandidate(
+                                fact_text="Ryan prefers compact reports.",
+                                subject="Ryan",
+                                category="preference",
+                                importance=7,
+                                confidence=0.9,
+                                source_message_ids=[1],
+                            )
+                        ]
+                    )
 
             def agent_factory(model_group: str, secrets: object = None) -> object:
                 nonlocal agent_factory_called
                 agent_factory_called = True
-                return SimpleNamespace()
+                return ExtractionAgent()
 
-            with self.assertRaisesRegex(HostPortNotConfigured, "Embeddings"):
+            def default_embed(texts: list[str]) -> list[list[float]]:
+                embedded_texts.extend(texts)
+                return [_unit_vector(1.0) for _ in texts]
+
+            with patch("vexic.pipeline.embed_texts", side_effect=default_embed, create=True):
                 await run_light_phase(
                     db_path,
                     "glm",
                     extraction_agent_factory=agent_factory,
                 )
 
-            self.assertFalse(agent_factory_called)
+            with closing(sqlite3.connect(db_path)) as conn:
+                _load_vec_extension(conn)
+                embedded_count = conn.execute(
+                    "SELECT COUNT(*) FROM memory_candidate_embeddings"
+                ).fetchone()[0]
+
+            self.assertTrue(agent_factory_called)
+            self.assertEqual(embedded_texts, ["Ryan prefers compact reports."])
+            self.assertEqual(embedded_count, 1)
 
     async def test_light_phase_redaction_failure_does_not_call_embedder(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -217,7 +244,7 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                 conn.execute("DELETE FROM memory_candidate_embeddings")
                 conn.commit()
 
-            def embed(texts: list[str]) -> list[list[float]]:
+            def default_embed(texts: list[str]) -> list[list[float]]:
                 return [_unit_vector(1.0) for _ in texts]
 
             def repaired_state() -> list[tuple[str | None, int]]:
@@ -233,14 +260,16 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                         """
                     ).fetchall()
 
-            await run_light_phase(db_path, "glm", agent_id="agent-a", embed=embed)
+            with patch("vexic.pipeline.embed_texts", side_effect=default_embed, create=True):
+                await run_light_phase(db_path, "glm", agent_id="agent-a")
 
             self.assertEqual(
                 repaired_state(),
                 [("agent-a", 1), ("agent-b", 0), (None, 0)],
             )
 
-            await run_light_phase(db_path, "glm", agent_id=None, embed=embed)
+            with patch("vexic.pipeline.embed_texts", side_effect=default_embed, create=True):
+                await run_light_phase(db_path, "glm", agent_id=None)
 
             self.assertEqual(
                 repaired_state(),
@@ -458,6 +487,70 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(facts, [("agent-a", "Ryan agent a cedar fact.")])
         self.assertEqual(candidates, [("agent-a", 1), ("agent-b", 0)])
         self.assertEqual(deep_runs, [("agent-a", 1)])
+
+    async def test_deep_phase_defers_contradiction_without_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            for fact_text, confidence, message_id in (
+                ("Ryan lives in Seattle.", 0.7, 1),
+                ("Ryan lives in Austin.", 0.9, 2),
+            ):
+                commit_dream_cycle(
+                    db_path,
+                    [
+                        FactCandidate(
+                            fact_text=fact_text,
+                            subject="Ryan",
+                            category="fact",
+                            importance=6,
+                            confidence=confidence,
+                            source_message_ids=[message_id],
+                        )
+                    ],
+                    candidate_embeddings=[_unit_vector(1.0)],
+                    agent_id=None,
+                    status="ok",
+                    started_at="2026-01-01T00:00:00Z",
+                    finished_at="2026-01-01T00:00:01Z",
+                    messages_processed=1,
+                    last_processed_message_id=message_id,
+                )
+                if message_id == 1:
+                    commit_deep_cycle(
+                        db_path,
+                        [PromotionDecision(candidate_id=1, embedding=_unit_vector(1.0))],
+                        status="ok",
+                        started_at="2026-01-01T00:01:00Z",
+                        finished_at="2026-01-01T00:01:01Z",
+                    )
+
+            with patch(
+                "vexic.deep.build_contradiction_agent",
+                side_effect=AssertionError("contradiction judge should be deferred"),
+            ):
+                await run_deep_phase(db_path, "glm")
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                facts = conn.execute(
+                    """
+                    SELECT fact_text, retired, retired_by_fact_id
+                    FROM long_term_memory
+                    ORDER BY id
+                    """
+                ).fetchall()
+                candidates = conn.execute(
+                    "SELECT id, promoted, retired FROM memory_candidates ORDER BY id"
+                ).fetchall()
+
+        self.assertEqual(
+            facts,
+            [
+                ("Ryan lives in Seattle.", 0, None),
+                ("Ryan lives in Austin.", 0, None),
+            ],
+        )
+        self.assertEqual(candidates, [(1, 1, 0), (2, 1, 0)])
 
     async def test_deep_phase_redaction_failure_does_not_call_model(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -722,21 +815,19 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PipelineCliTests(unittest.TestCase):
-    def test_cli_without_embedding_adapter_exits_with_configuration_message(self) -> None:
+    def test_cli_empty_database_noops_without_embedding_adapter(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = str(Path(temp_dir) / "memory.db")
-            stderr = StringIO()
+            stdout = StringIO()
             argv = ["vexic.pipeline", "--db", db_path, "--model-group", "glm"]
 
             with (
                 patch.object(sys, "argv", argv),
-                redirect_stderr(stderr),
-                self.assertRaises(SystemExit) as caught,
+                redirect_stdout(stdout),
             ):
                 _main()
 
-        self.assertEqual(caught.exception.code, 2)
-        self.assertIn("Embeddings requires a host-supplied model port", stderr.getvalue())
+        self.assertIn("Light phase: no new messages. No-op.", stdout.getvalue())
 
 
 if __name__ == "__main__":

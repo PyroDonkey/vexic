@@ -11,6 +11,7 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
+from vexic.embeddings import embed_texts
 from vexic.models import FactCandidate
 from vexic.ports import AgentFactory, EmbedTexts, HostPortNotConfigured, missing_host_port
 from vexic.redaction import assert_no_forbidden_secret_values
@@ -105,9 +106,7 @@ async def run_light_phase(
     watermark = 0
     forbidden = _forbidden_secret_values(secrets, forbidden_secret_values)
     agent_factory = extraction_agent_factory or build_extraction_agent
-    if embed is None:
-        raise missing_host_port("Embeddings")
-    embedder = embed
+    embedder = embed or embed_texts
 
     try:
         init_db(db_path)
