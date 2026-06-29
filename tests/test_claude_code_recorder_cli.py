@@ -681,6 +681,25 @@ class ClaudeCodeSetupTests(unittest.TestCase):
 
             self.assertEqual(stat.S_IMODE(result.config_path.stat().st_mode), 0o600)
 
+    def test_setup_fails_if_config_permissions_cannot_be_hardened(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+
+            with patch("pathlib.Path.chmod", side_effect=OSError("chmod denied")):
+                with self.assertRaisesRegex(PermissionError, "owner-only permissions"):
+                    install_claude_code_setup(
+                        home=home,
+                        base_url="https://api.example.test",
+                        api_key="vx_secret",
+                        project_id="project-a",
+                        session_id="session-a",
+                        agent_id=None,
+                        command="python -m vexic.cli recorder ingest",
+                    )
+
+            self.assertFalse((home / ".vexic" / "claude-code-recorder.json").exists())
+            self.assertFalse((home / ".claude" / "settings.json").exists())
+
     def test_setup_quotes_config_path_with_spaces_in_hook(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vexic home ") as temp:
             home = Path(temp)

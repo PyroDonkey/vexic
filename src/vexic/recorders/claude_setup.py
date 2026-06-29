@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import subprocess
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -40,11 +43,38 @@ def _require_nonblank(name: str, value: str | None) -> str:
     return value
 
 
-def _chmod_owner_only(path: Path) -> None:
+def _ensure_owner_only(path: Path) -> None:
+    if os.name != "nt" and stat.S_IMODE(path.stat().st_mode) != 0o600:
+        raise PermissionError("recorder config must have owner-only permissions")
+
+
+def _write_secret_json(path: Path, payload: dict[str, object]) -> None:
+    text = json.dumps(payload, sort_keys=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    replaced = False
     try:
+        fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as config:
+            config.write(text)
+        temp_path.chmod(0o600)
+        _ensure_owner_only(temp_path)
+        os.replace(temp_path, path)
+        replaced = True
         path.chmod(0o600)
-    except OSError:
-        pass
+        _ensure_owner_only(path)
+    except OSError as exc:
+        temp_path.unlink(missing_ok=True)
+        if replaced:
+            path.unlink(missing_ok=True)
+        raise PermissionError(
+            "recorder config owner-only permissions could not be enforced"
+        ) from exc
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        if replaced:
+            path.unlink(missing_ok=True)
+        raise
 
 
 def _without_vexic_hook(stop_groups: Any) -> tuple[list[dict[str, Any]], bool]:
@@ -89,24 +119,17 @@ def install_claude_code_setup(
     settings_path, config_path, status_path = _paths(home)
     hook_command = f"{command} --config {subprocess.list2cmdline([str(config_path)])}"
 
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.touch(mode=0o600, exist_ok=True)
-    _chmod_owner_only(config_path)
-    config_path.write_text(
-        json.dumps(
-            {
-                "base_url": base_url,
-                "api_key": api_key,
-                "project_id": project_id,
-                "session_id": session_id,
-                "agent_id": agent_id,
-                "status_path": str(status_path),
-            },
-            sort_keys=True,
-        ),
-        encoding="utf-8",
+    _write_secret_json(
+        config_path,
+        {
+            "base_url": base_url,
+            "api_key": api_key,
+            "project_id": project_id,
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "status_path": str(status_path),
+        },
     )
-    _chmod_owner_only(config_path)
 
     settings = _load_json(settings_path)
     hooks = settings.get("hooks")
