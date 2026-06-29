@@ -112,8 +112,17 @@ def _parser() -> argparse.ArgumentParser:
     ingest.add_argument("--forbidden-value", action="append", default=[])
     ingest.add_argument("--status-path", type=Path)
 
-    setup = subparsers.add_parser("setup-claude-code")
+    setup = subparsers.add_parser(
+        "setup-claude-code",
+        description="Install Claude Code recording and scaffold the project Vexic MCP entry.",
+    )
     setup.add_argument("--home", type=Path, default=Path.home())
+    setup.add_argument(
+        "--project-root",
+        type=Path,
+        default=Path.cwd(),
+        help="Project directory where .mcp.json should be written.",
+    )
     setup.add_argument("--base-url", required=True)
     setup.add_argument("--api-key", required=True)
     setup.add_argument("--project-id", required=True)
@@ -127,8 +136,17 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
 
-    uninstall = subparsers.add_parser("uninstall-claude-code")
+    uninstall = subparsers.add_parser(
+        "uninstall-claude-code",
+        description="Remove Claude Code recording and the project Vexic MCP entry.",
+    )
     uninstall.add_argument("--home", type=Path, default=Path.home())
+    uninstall.add_argument(
+        "--project-root",
+        type=Path,
+        default=Path.cwd(),
+        help="Project directory containing .mcp.json.",
+    )
     return parser
 
 
@@ -246,6 +264,7 @@ def _setup_claude_code(args: argparse.Namespace) -> int:
         session_id=args.session_id,
         agent_id=args.agent_id,
         command=args.hook_command,
+        project_root=args.project_root,
     )
     print(
         json.dumps(
@@ -254,6 +273,7 @@ def _setup_claude_code(args: argparse.Namespace) -> int:
                 "settings_path": str(result.settings_path),
                 "config_path": str(result.config_path),
                 "status_path": str(result.status_path),
+                "mcp_config_path": str(result.mcp_config_path) if result.mcp_config_path else None,
                 "hook_command": result.command,
             },
             sort_keys=True,
@@ -263,7 +283,7 @@ def _setup_claude_code(args: argparse.Namespace) -> int:
 
 
 def _uninstall_claude_code(args: argparse.Namespace) -> int:
-    removed = uninstall_claude_code_setup(home=args.home)
+    removed = uninstall_claude_code_setup(home=args.home, project_root=args.project_root)
     print(json.dumps({"ok": True, "removed": removed}, sort_keys=True))
     return 0
 

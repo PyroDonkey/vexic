@@ -5,7 +5,8 @@ import json
 import os
 import urllib.error
 import urllib.request
-from typing import TypeVar
+from pathlib import Path
+from typing import Any, TextIO, TypeVar
 
 from vexic.contract import (
     ExpandHistoryResult,
@@ -18,6 +19,54 @@ from vexic.contract import (
 from vexic.mcp_stdio import McpServerConfig
 
 _ResultT = TypeVar("_ResultT")
+
+
+def _required_config_string(config: dict[str, Any], name: str) -> str:
+    value = config.get(name)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"recorder config {name} must be a non-empty string.")
+    return value.strip()
+
+
+def run_recorder_config_proxy(
+    path: Path,
+    *,
+    stdin: TextIO,
+    stdout: TextIO,
+    stderr: TextIO,
+) -> int:
+    raw_config = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw_config, dict):
+        raise ValueError("recorder config must be a JSON object.")
+    base_url = _required_config_string(raw_config, "base_url").rstrip("/")
+    api_key = _required_config_string(raw_config, "api_key")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+        "X-Vexic-Project-Id": _required_config_string(raw_config, "project_id"),
+        "X-Vexic-Session-Id": _required_config_string(raw_config, "session_id"),
+    }
+    agent_id = raw_config.get("agent_id")
+    if isinstance(agent_id, str) and agent_id.strip():
+        headers["X-Vexic-Agent-Id"] = agent_id.strip()
+
+    for line in stdin:
+        if not line.strip():
+            continue
+        request = urllib.request.Request(
+            f"{base_url}/mcp",
+            data=line.encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            if response.status == 202:
+                continue
+            stdout.write(response.read().decode("utf-8") + "\n")
+            stdout.flush()
+        stderr.flush()
+    return 0
 
 
 def create_hosted_http_memory_service(

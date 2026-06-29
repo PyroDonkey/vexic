@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import os
 import tempfile
@@ -19,7 +20,7 @@ from vexic.mcp_stdio import (
     handle_jsonrpc_message,
 )
 from vexic.storage import save_messages
-from vexic.hosted_mcp import create_hosted_http_memory_service
+from vexic.hosted_mcp import create_hosted_http_memory_service, run_recorder_config_proxy
 
 
 class _HostedApiHandler(BaseHTTPRequestHandler):
@@ -32,6 +33,9 @@ class _HostedApiHandler(BaseHTTPRequestHandler):
         type(self).captured = {
             "path": self.path,
             "authorization": self.headers.get("Authorization"),
+            "x-vexic-project-id": self.headers.get("X-Vexic-Project-Id"),
+            "x-vexic-session-id": self.headers.get("X-Vexic-Session-Id"),
+            "x-vexic-agent-id": self.headers.get("X-Vexic-Agent-Id"),
             "body": json.loads(body),
         }
         payload = json.dumps(type(self).response_payload).encode("utf-8")
@@ -167,6 +171,56 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(config.api_base_url, "https://vexic.example")
         self.assertEqual(config.api_key_env, "CUSTOM_VEXIC_KEY")
+
+    def test_recorder_config_proxy_posts_to_hosted_mcp_without_printing_secret(self) -> None:
+        _HostedApiHandler.response_payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": []},
+        }
+        server = HTTPServer(("127.0.0.1", 0), _HostedApiHandler)
+        thread = Thread(target=server.handle_request)
+        thread.start()
+        try:
+            config_path = Path(self.temp_dir.name) / "claude-code-recorder.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": f"http://127.0.0.1:{server.server_port}",
+                        "api_key": "vx_test_key",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                        "agent_id": "agent-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stdin = io.StringIO('{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n')
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            code = run_recorder_config_proxy(
+                config_path,
+                stdin=stdin,
+                stdout=stdout,
+                stderr=stderr,
+            )
+        finally:
+            server.server_close()
+            thread.join(timeout=1)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), _HostedApiHandler.response_payload)
+        self.assertEqual(stderr.getvalue(), "")
+        captured = _HostedApiHandler.captured
+        self.assertEqual(captured["path"], "/mcp")
+        self.assertEqual(captured["authorization"], "Bearer vx_test_key")
+        self.assertEqual(captured["x-vexic-project-id"], "project-a")
+        self.assertEqual(captured["x-vexic-session-id"], "session-a")
+        self.assertEqual(captured["x-vexic-agent-id"], "agent-a")
+        self.assertEqual(captured["body"]["method"], "tools/list")
+        self.assertNotIn("vx_test_key", stdout.getvalue())
+        self.assertNotIn("vx_test_key", stderr.getvalue())
 
     async def test_hosted_api_backed_search_uses_bearer_api_key(self) -> None:
         _HostedApiHandler.response_payload = SearchTranscriptResult(

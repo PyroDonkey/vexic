@@ -18,6 +18,7 @@ class ClaudeCodeSetupResult:
     config_path: Path
     status_path: Path
     command: str
+    mcp_config_path: Path | None = None
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -81,6 +82,38 @@ def _write_secret_json(path: Path, payload: dict[str, object]) -> None:
         raise
 
 
+def _write_mcp_config(project_root: Path, config_path: Path) -> Path:
+    mcp_path = project_root / ".mcp.json"
+    config = _load_json(mcp_path)
+    servers = config.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+        config["mcpServers"] = servers
+    servers["vexic"] = {
+        "command": "uv",
+        "args": [
+            "run",
+            "python",
+            "scripts/vexic-mcp-stdio.py",
+            "--recorder-config",
+            str(config_path),
+        ],
+    }
+    mcp_path.write_text(json.dumps(config, sort_keys=True), encoding="utf-8")
+    return mcp_path
+
+
+def _remove_mcp_config(project_root: Path) -> bool:
+    mcp_path = project_root / ".mcp.json"
+    config = _load_json(mcp_path)
+    servers = config.get("mcpServers")
+    if not isinstance(servers, dict) or "vexic" not in servers:
+        return False
+    del servers["vexic"]
+    mcp_path.write_text(json.dumps(config, sort_keys=True), encoding="utf-8")
+    return True
+
+
 def _without_vexic_hook(stop_groups: Any) -> tuple[list[dict[str, Any]], bool]:
     groups = stop_groups if isinstance(stop_groups, list) else []
     changed = False
@@ -116,6 +149,7 @@ def install_claude_code_setup(
     session_id: str,
     agent_id: str | None,
     command: str,
+    project_root: Path | None = None,
 ) -> ClaudeCodeSetupResult:
     base_url = _require_nonblank("base_url", base_url)
     api_key = _require_nonblank("api_key", api_key)
@@ -158,24 +192,26 @@ def install_claude_code_setup(
     hooks["Stop"] = stop_groups
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings_path.write_text(json.dumps(settings, sort_keys=True), encoding="utf-8")
+    mcp_config_path = _write_mcp_config(project_root, config_path) if project_root else None
 
     return ClaudeCodeSetupResult(
         settings_path=settings_path,
         config_path=config_path,
         status_path=status_path,
         command=hook_command,
+        mcp_config_path=mcp_config_path,
     )
 
 
-def uninstall_claude_code_setup(*, home: Path) -> bool:
+def uninstall_claude_code_setup(*, home: Path, project_root: Path | None = None) -> bool:
     settings_path, _config_path, _status_path = _paths(home)
     settings = _load_json(settings_path)
     hooks = settings.get("hooks")
+    mcp_changed = _remove_mcp_config(project_root) if project_root else False
     if not isinstance(hooks, dict):
-        return False
+        return mcp_changed
     stop_groups, changed = _without_vexic_hook(hooks.get("Stop"))
-    if not changed:
-        return False
-    hooks["Stop"] = stop_groups
-    settings_path.write_text(json.dumps(settings, sort_keys=True), encoding="utf-8")
-    return True
+    if changed:
+        hooks["Stop"] = stop_groups
+        settings_path.write_text(json.dumps(settings, sort_keys=True), encoding="utf-8")
+    return changed or mcp_changed
