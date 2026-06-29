@@ -7,6 +7,7 @@ from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 from vexic.contract import SourceTranscriptMessage
+from vexic.redaction import assert_no_forbidden_secret_values_in_payload
 
 
 @dataclass(frozen=True)
@@ -25,8 +26,13 @@ def post_source_messages(
     messages: list[SourceTranscriptMessage],
     forbidden_values: tuple[str, ...],
 ) -> dict[str, object]:
+    messages_payload = [message.model_dump(mode="json") for message in messages]
+    assert_no_forbidden_secret_values_in_payload(
+        forbidden_values,
+        {"messages": messages_payload},
+    )
     payload = {
-        "messages": [message.model_dump(mode="json") for message in messages],
+        "messages": messages_payload,
         "redaction": {"forbidden_values": list(forbidden_values)},
     }
     headers = {

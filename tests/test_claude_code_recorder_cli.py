@@ -123,6 +123,31 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "hosted ingest failed: HTTP 403"):
                 post_source_messages(config, messages=[], forbidden_values=())
 
+    def test_post_source_messages_rejects_forbidden_value_before_egress(self) -> None:
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+        message = SourceTranscriptMessage(
+            source_host="claude-code",
+            source_session_id="claude-session",
+            source_message_id="uuid-1",
+            message_json="User: cedar-secret",
+        )
+
+        with patch("vexic.recorders.hosted_ingest.urlopen") as urlopen_mock:
+            with self.assertRaisesRegex(ValueError, "forbidden secret value"):
+                post_source_messages(
+                    config,
+                    messages=[message],
+                    forbidden_values=("cedar-secret",),
+                )
+
+        urlopen_mock.assert_not_called()
+
     def test_write_status_does_not_leak_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             status_path = Path(temp) / "status.json"
