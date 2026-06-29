@@ -116,6 +116,8 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
   }
 
   useEffect(() => {
+    setRawKey("");
+    setCreatedKey(null);
     void loadProject();
     void loadKeys();
     void loadUsage();
