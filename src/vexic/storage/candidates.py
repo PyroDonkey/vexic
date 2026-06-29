@@ -21,7 +21,7 @@ from vexic.storage.schema import (
     init_vector_memory,
 )
 
-# Tier 2 candidate-fallback retrieval (upstream ADR-0010, COA-95): the eligibility
+# Tier 2 candidate-fallback retrieval from the hosted MCP design: the eligibility
 # predicate shared with Deep/REM — active, unpromoted candidates only. Kept as
 # one constant so the fallback retrievers cannot drift from load_*_candidates.
 _ACTIVE_CANDIDATE_PREDICATE = (
@@ -72,7 +72,7 @@ class PromotionCandidate:
 
 @dataclass(frozen=True)
 class CandidateNote:
-    # A Tier 2 candidate surfaced by candidate-fallback retrieval (upstream ADR-0010),
+    # A Tier 2 candidate surfaced by candidate-fallback retrieval,
     # carrying only what the unverified-note surface shows: text, category, and
     # glass-box provenance. The candidate's LLM confidence is deliberately left
     # out — it is misleadingly high for unvetted material, replaced by words in
@@ -554,7 +554,7 @@ def keyword_candidate_ids(
 ) -> list[int]:
     """BM25-ranked active candidate ids for a free-text query, best first.
 
-    The keyword half of the candidate-fallback hybrid retriever (upstream ADR-0010).
+    The keyword half of the candidate-fallback hybrid retriever.
     Filters to the active-candidate predicate so promoted/retired/stale/review
     candidates never surface as unverified notes.
     """
@@ -595,8 +595,8 @@ def record_candidate_retrieval(
     """Reinforcement observation: these candidates were surfaced by fallback.
 
     Writes one candidate_retrieval_events row per candidate and increments
-    retrieved_count in the same transaction (upstream ADR-0010), mirroring
-    record_long_term_retrieval so the counter stays derivable and rebuild-safe.
+    retrieved_count in the same transaction, mirroring record_long_term_retrieval
+    so the counter stays derivable and rebuild-safe.
     The `used` verdict is deferred — rows stay used = NULL. Returns the new
     event ids in candidate_ids order.
     """
@@ -701,7 +701,7 @@ def nearest_candidate_ids(
 ) -> list[int]:
     """sqlite-vec KNN over active candidate embeddings, nearest first.
 
-    The vector half of the candidate-fallback hybrid retriever (upstream ADR-0010).
+    The vector half of the candidate-fallback hybrid retriever.
     sqlite-vec applies its KNN before the eligibility join, so over-fetch then
     keep the k nearest active candidates — same shape as nearest_long_term_facts.
     """

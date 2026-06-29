@@ -218,6 +218,12 @@ Claude Code conversations into Vexic. Hosted writes currently happen through
 the hosted HTTP append/ingest routes or host-owned recorder/importer paths;
 the automatic hosted Claude Code recorder is tracked separately in COA-253.
 
+Likewise, the hosted fresh-conversation context API and agent-side recap
+injection - assembling new hosted sessions from session summaries plus recent
+messages - are not built yet. The local `vexic.storage` summary, active-context,
+and recap helpers exist, but that hosted product slice is tracked separately in
+[COA-254](https://linear.app/ryan-boissonnault/issue/COA-254/expose-hosted-fresh-conversation-context-from-summaries-plus-recent).
+
 ```powershell
 curl.exe -s https://api.vexic.dev/v1/append_transcript `
   -H "Authorization: Bearer <raw-key>" `

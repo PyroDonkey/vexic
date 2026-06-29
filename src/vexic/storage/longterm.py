@@ -156,7 +156,7 @@ def record_long_term_retrieval(
     """Reinforcement observation: these facts were surfaced by retrieval.
 
     Writes one retrieval_events row per fact and increments retrieved_count in
-    the same transaction (upstream ADR-0008) so counters and events cannot disagree.
+    the same transaction so counters and events cannot disagree.
     Recorded at the moment of retrieval, never recomputed. Returns the new
     event ids in fact_ids order so the use judge can target these exact rows.
     """
@@ -231,8 +231,8 @@ def record_fact_use_verdict(
     used_event_ids: list[int],
     unused_event_ids: list[int],
 ) -> None:
-    """Land a use-judge verdict (upstream ADR-0008): mark this turn's retrieval events
-    judged and increment used_count for the used facts, in one transaction.
+    """Land a use-judge verdict: mark this turn's retrieval events judged and
+    increment used_count for the used facts, in one transaction.
     Events not in either list stay used = NULL — judge never ran on them.
     """
     if not used_event_ids and not unused_event_ids:
@@ -278,8 +278,8 @@ def record_long_term_use(db_path: str, fact_ids: list[int]) -> None:
 
     The wired production path is `record_fact_use_verdict`, which lands the
     use judge's verdict on retrieval_events and increments used_count in one
-    transaction (upstream ADR-0008). This primitive remains for callers that have fact
-    ids but no event rows (manual corrections, backfills).
+    transaction. This primitive remains for callers that have fact ids but no
+    event rows (manual corrections, backfills).
     """
     _increment_counter(db_path, "used_count", fact_ids)
 

@@ -290,7 +290,7 @@ Verified internal-alpha evidence through 2026-06-25:
 - API-key auth rejects missing and invalid keys. A throwaway tester key proved
   hosted HTTP append/search, then hosted-API-backed stdio MCP search. An
   agent-B scoped MCP search did not see the agent-A marker.
-- COA-227 verified hosted Light/REM/Deep promotion/search against the alpha
+- A hosted alpha smoke verified Light/REM/Deep promotion/search against the alpha
   deployment with a host-owned OpenRouter adapter and temporary provider key:
   Light extracted one candidate, REM boosted it, Deep promoted it, tenant A
   `search_long_term` returned the promoted marker fact, tenant B search did
@@ -305,7 +305,7 @@ One-off key issuance can run against the same volume:
 uv run --no-sync python -m vexic.hosted_http issue-key --root /data/vexic --tenant-id tenant-a --project-id project-a --principal-id claude-code --capability memory:write --capability memory:search --capability memory:admin:rebuild
 ```
 
-Run one hosted dream phase through a private host-owned adapter:
+Run one hosted dream phase through a host-owned adapter:
 
 ```powershell
 $env:VEXIC_API_KEY = "<raw-key>"
@@ -395,11 +395,10 @@ reliability, and product planning within the 400-day retention window.
 
 ### Incident Response And Security Review
 
-The COA-203 hosted incident response and pre-beta security review runbook lives
-at `docs/runbooks/hosted-incident-response.md`. The first synthetic tabletop
-artifact lives at
-`docs/runbooks/incident-tabletops/2026-06-26-coa-203-scoped-key-routing.md`.
-These artifacts satisfy COA-203 documentation/tabletop evidence only; they do
+The hosted incident response and pre-beta security review runbook lives
+at `docs/runbooks/hosted-incident-response.md`. The first synthetic scoped-key
+tabletop artifact lives under `docs/runbooks/incident-tabletops/`.
+These artifacts satisfy documentation/tabletop evidence only; they do
 not close the hosted readiness gate or make hosted Vexic external/customer-data
 ready.
 
@@ -411,8 +410,8 @@ Not production/customer-data ready yet:
 - no customer-readiness restore drill, incident tabletop/security-review
   signoff, network hardening, distributed rate limiting, or implemented
   support-access workflow; the Railway-volume alpha restore drill passed with
-  caveats in
-  `docs/runbooks/restore-drills/2026-06-26-coa-232-railway-alpha-volume.md`,
+  caveats in the 2026-06-26 Railway alpha volume restore-drill artifact under
+  `docs/runbooks/restore-drills/`,
   but Turso PITR, Neon control-plane recovery, and S3 Object Lock export
   restore remain blocked;
 - no Cloudflare/WAF configuration, origin lock-down, auth-failure throttling,

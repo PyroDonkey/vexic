@@ -1,4 +1,4 @@
-"""Tier 3 hybrid retrieval (COA-18, MEMORY_ARCHITECTURE.md §Retrieval).
+"""Tier 3 hybrid retrieval.
 
 Deterministic Python orders the steps; one optional model call fills the
 query-rewrite box. The requesting agent sees only the returned facts — BM25
@@ -182,7 +182,7 @@ async def retrieve_candidate_fallback(
     return_k: int = RETURN_K,
     embed: EmbedTexts | None = None,
 ) -> list[CandidateNote]:
-    """Tier 2 candidate-fallback retrieval (upstream ADR-0010, COA-95).
+    """Tier 2 candidate-fallback retrieval from the hosted MCP design.
 
     The zero-Tier-3-hit rescue: hybrid FTS + sqlite-vec KNN over active
     unpromoted candidates, fused via RRF (same shape as Tier 3, no query

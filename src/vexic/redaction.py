@@ -1,7 +1,7 @@
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from typing import Any
 
-# Public persistence secret guard (design D5 / COA-69). This is a dependency-free
+# Public persistence secret guard. This is a dependency-free
 # leaf: Vexic storage and host adapters can scrub text against loaded secret
 # values without reaching into host runtime modules.
 

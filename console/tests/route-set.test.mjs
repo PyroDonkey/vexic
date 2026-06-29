@@ -18,13 +18,13 @@ const routes = [
   ["support", "app/console/support/page.tsx"]
 ];
 
-test("COA-230 route set exists", () => {
+test("required console routes exist", () => {
   for (const [name, file] of routes) {
     assert.ok(existsSync(path.join(root, file)), `${name} route missing: ${file}`);
   }
 });
 
-test("COA-249 console does not expose self-serve sign-up", () => {
+test("console does not expose self-serve sign-up", () => {
   const appFiles = filesUnder(appRoot);
   const signUpRouteFiles = appFiles.filter((file) => isRouteFile(file) && hasPathSegment(file, "sign-up"));
   const signUpLinks = appFiles
