@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -5,6 +7,19 @@ from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
 
+from fastapi.testclient import TestClient
+
+from vexic.contract import (
+    MemoryCapability,
+    MemoryScope,
+    Principal,
+    PrincipalType,
+    SearchTranscriptRequest,
+    TrustBoundary,
+)
+from vexic.hosted import HostedMemoryService
+from vexic.hosted_http import create_app
+from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 from vexic.recorders.cli import main as recorder_main
 from vexic.recorders.claude_setup import (
     install_claude_code_setup,
@@ -213,6 +228,130 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
             self.assertTrue(status["ok"])
             self.assertEqual(status["inserted"], 1)
             self.assertEqual(status["ignored"], 1)
+
+
+class ClaudeCodeRecorderHostedRoundTripTests(unittest.TestCase):
+    def test_ingest_cli_posts_to_hosted_http_and_search_finds_cleaned_row(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            catalog = HostedTenantCatalog(root)
+            keys = HostedApiKeyStore(root)
+            catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+            api_key = keys.create_key(
+                tenant_id="tenant-a",
+                principal_id="agent-a",
+                capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH},
+                project_ids={"project-a"},
+            ).raw_key
+            client = TestClient(create_app(HostedMemoryService(catalog, keys, telemetry=catalog)))
+            transcript = root / "claude-session.jsonl"
+            transcript.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "user",
+                                "sessionId": "claude-source-session",
+                                "uuid": "source-message-1",
+                                "message": {
+                                    "role": "user",
+                                    "content": "remember hosted-orchid",
+                                },
+                            }
+                        ),
+                        json.dumps({"type": "summary", "summary": "ignore hosted-orchid"}),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "hook.json"
+            hook_payload.write_text(
+                json.dumps(
+                    {
+                        "session_id": "claude-source-session",
+                        "transcript_path": str(transcript),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            status_path = root / "status.json"
+
+            class _Response:
+                def __init__(self, content: bytes):
+                    self._content = content
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc):
+                    return False
+
+                def read(self) -> bytes:
+                    return self._content
+
+            def fake_urlopen(request, timeout):
+                response = client.post(
+                    "/v1/ingest_source_transcript",
+                    headers=dict(request.header_items()),
+                    content=request.data,
+                )
+                return _Response(response.content)
+
+            stdout = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    [
+                        "ingest",
+                        "--hook-input",
+                        str(hook_payload),
+                        "--base-url",
+                        "http://testserver",
+                        "--api-key",
+                        api_key,
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "session-a",
+                        "--status-path",
+                        str(status_path),
+                    ]
+                )
+
+            search_response = client.post(
+                "/v1/search_transcript",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json=SearchTranscriptRequest(
+                    scope=MemoryScope(
+                        tenant_id="tenant-a",
+                        project_id="project-a",
+                        session_id="session-a",
+                        principal=Principal(
+                            principal_id="caller-supplied",
+                            principal_type=PrincipalType.HUMAN,
+                        ),
+                        trust_boundary=TrustBoundary.LOCAL_TRUSTED,
+                        capabilities={MemoryCapability.SEARCH},
+                    ),
+                    query="hosted-orchid",
+                ).model_dump(mode="json"),
+            )
+
+            self.assertEqual(code, 0)
+            output = json.loads(stdout.getvalue())
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual(output["inserted"], 1)
+            self.assertEqual(output["ignored"], 1)
+            self.assertTrue(status["ok"])
+            self.assertEqual(status["inserted"], 1)
+            self.assertEqual(status["ignored"], 1)
+            self.assertEqual(search_response.status_code, 200)
+            self.assertEqual(
+                [hit["body"] for hit in search_response.json()["hits"]],
+                ["User: remember hosted-orchid"],
+            )
 
 
 class ClaudeCodeSetupTests(unittest.TestCase):

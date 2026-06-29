@@ -141,7 +141,28 @@ For the host transcript recorder flow, see
 
 ## Claude Code Transcript Import
 
-Import cleaned Claude Code JSONL transcript rows into a local Vexic database:
+For hosted Claude Code recording, install the user-local hook and recorder
+config:
+
+```powershell
+uv run python -m vexic.cli setup claude-code --base-url https://api.vexic.dev --api-key <raw-key> --project-id project-a --session-id session-a
+```
+
+The setup command updates the user's Claude Code hook config and writes a Vexic
+recorder config outside the repository. On Claude Code stop events, the
+recorder reads the JSONL transcript, keeps visible user/assistant text, maps
+source keys as `claude-code`/`sessionId`/`uuid`, and posts cleaned rows to the
+hosted `/v1/ingest_source_transcript` route.
+
+To replay a missed hosted hook manually, point the recorder at the setup config
+and a hook payload containing `session_id` and `transcript_path`:
+
+```powershell
+uv run python -m vexic.cli recorder ingest --config "$env:USERPROFILE\.vexic\claude-code-recorder.json" --hook-input .\claude-hook-replay.json
+```
+
+For local recovery/import, import cleaned Claude Code JSONL transcript rows into
+a local Vexic database:
 
 ```powershell
 uv run python scripts\import-claude-code-jsonl.py --db-path .\memory.db --tenant-id local --session-id default <path-to-session.jsonl>
@@ -213,10 +234,9 @@ Hosted transcript writes use the same project/session/agent headers as hosted
 MCP reads. The write body does not include `scope` or `tenant_id`; the tenant is
 bound from the Agent API key.
 
-Configuring the read-only hosted MCP server does not automatically record
-Claude Code conversations into Vexic. Hosted writes currently happen through
-the hosted HTTP append/ingest routes or host-owned recorder/importer paths;
-the automatic hosted Claude Code recorder is tracked separately in COA-253.
+Claude Code hosted auto-recording is installed with `vexic setup claude-code`.
+It writes cleaned transcript rows through `/v1/ingest_source_transcript`; the
+read-only hosted MCP server is still used for search.
 
 Likewise, the hosted fresh-conversation context API and agent-side recap
 injection - assembling new hosted sessions from session summaries plus recent
