@@ -247,14 +247,19 @@ def _write_scope_from_headers(request: object, auth: HostedAuthContext) -> Memor
     project_id = headers.get("x-vexic-project-id")
     if project_id is None or not project_id.strip():
         raise ValueError("X-Vexic-Project-Id header is required.")
+    project_id = project_id.strip()
     session_id = headers.get("x-vexic-session-id")
     if session_id is None or not session_id.strip():
         raise ValueError("X-Vexic-Session-Id header is required.")
+    session_id = session_id.strip()
+    agent_id = headers.get("x-vexic-agent-id")
+    if agent_id is not None:
+        agent_id = agent_id.strip() or None
     return MemoryScope(
         tenant_id=auth.tenant_id,
         project_id=project_id,
         session_id=session_id,
-        agent_id=headers.get("x-vexic-agent-id"),
+        agent_id=agent_id,
         principal=auth.principal,
         trust_boundary=TrustBoundary.NETWORKED,
         capabilities={MemoryCapability.WRITE},

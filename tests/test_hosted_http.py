@@ -750,6 +750,43 @@ class HostedHttpTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
 
+    def test_hosted_write_strips_scope_headers_before_binding(self) -> None:
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH},
+            project_ids={"project-a"},
+            agent_ids={"agent-a"},
+        ).raw_key
+
+        append_response = self.client.post(
+            "/v1/append_transcript",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "X-Vexic-Project-Id": " project-a ",
+                "X-Vexic-Session-Id": " session-a ",
+                "X-Vexic-Agent-Id": " agent-a ",
+            },
+            json=self._append_body("trimmed header cedar"),
+        )
+        search_response = self.client.post(
+            "/v1/search_transcript",
+            headers=self._auth(api_key),
+            json=SearchTranscriptRequest(
+                scope=_scope(capabilities={MemoryCapability.SEARCH}).model_copy(
+                    update={"agent_id": "agent-a"}
+                ),
+                query="cedar",
+            ).model_dump(mode="json"),
+        )
+
+        self.assertEqual(append_response.status_code, 200)
+        self.assertEqual(
+            [hit["body"] for hit in search_response.json()["hits"]],
+            ["User: trimmed header cedar"],
+        )
+
     def test_hosted_append_rejects_forbidden_values_without_persisting(self) -> None:
         api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
 
