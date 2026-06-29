@@ -45,6 +45,9 @@ this boundary without changing the memory contract.
 - `vexic.mcp_http` exposes a native read-only Streamable HTTP MCP `/mcp`
   route on the hosted FastAPI app. It is stateless, JSON-only, Bearer-auth
   only, and exposes `search_transcript` and `search_long_term`.
+- Session summary and active-context helpers exist in the local core. The
+  hosted fresh-conversation context API and agent-side recap injection are not
+  built yet.
 
 ## Local Staging
 
@@ -230,6 +233,11 @@ For the internal Railway alpha, use `https://api.vexic.dev` as the
 hosted HTTP API. Claude Code then searches the hosted memory through the stdio
 MCP tools.
 
+Configuring Claude Code with hosted MCP does not automatically write the
+conversation into Vexic. Automatic hosted Claude Code recording remains a
+separate backlog item; until then, cleaned transcript writes must come through
+the hosted HTTP append/ingest routes or a host-owned recorder/importer.
+
 ## Railway Alpha Deploy
 
 Use the committed `Dockerfile`; do not rely on Railway Nixpacks for this slice.
@@ -267,13 +275,15 @@ GitHub Actions deploy trigger:
   successful deployment and using Railway's rollback action. Railway restores
   that deployment's Docker image and custom variables, subject to retention.
 
-Current internal-alpha state as of 2026-06-25:
+Verified internal-alpha evidence through 2026-06-25:
 
 - Railway project `Vexic` runs service `vexic` in the `production`
   environment at `https://api.vexic.dev`.
-- The verified deployment is
+- Deployment
   `83a04e5a-199c-4671-bd15-7d01e3a3181b` at commit
-  `f8b22637ab6ad31ac055b469b568243869627b90`.
+  `f8b22637ab6ad31ac055b469b568243869627b90` was verified during the
+  2026-06-25 alpha smoke. Do not treat this historical deployment id as the
+  current live deploy without a fresh Railway check.
 - `/health` returns `200` with contract version `0.1.0`.
 - `vexic-volume` is mounted at `/data/vexic`; append/search persistence
   survived a redeploy.

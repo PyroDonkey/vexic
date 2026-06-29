@@ -213,6 +213,11 @@ Hosted transcript writes use the same project/session/agent headers as hosted
 MCP reads. The write body does not include `scope` or `tenant_id`; the tenant is
 bound from the Agent API key.
 
+Configuring the read-only hosted MCP server does not automatically record
+Claude Code conversations into Vexic. Hosted writes currently happen through
+the hosted HTTP append/ingest routes or host-owned recorder/importer paths;
+the automatic hosted Claude Code recorder is tracked separately in COA-253.
+
 ```powershell
 curl.exe -s https://api.vexic.dev/v1/append_transcript `
   -H "Authorization: Bearer <raw-key>" `
