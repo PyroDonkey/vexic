@@ -153,6 +153,40 @@ class OperatorMigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([fact.fact_text for fact in long_term.facts], ["cedar migration durable fact"])
         self.assertEqual(duplicate_ingest[0].status, "skipped")
 
+    async def test_canonical_migration_import_uses_schema_column_order_for_values(self) -> None:
+        from vexic.migration import (
+            export_canonical_migration,
+            import_canonical_migration,
+        )
+        from vexic.service import LocalMemoryService
+
+        self._seed_source()
+        export_canonical_migration(
+            str(self.source_db),
+            self.artifact,
+            tenant_id="tenant-a",
+            project_id="project-a",
+        )
+        payload = json.loads(self.artifact.read_text())
+        payload["tables"]["messages"] = [
+            dict(reversed(list(row.items()))) for row in payload["tables"]["messages"]
+        ]
+        self.artifact.write_text(json.dumps(payload))
+
+        import_canonical_migration(
+            self.artifact,
+            str(self.target_db),
+            tenant_id="tenant-a",
+            project_id="project-a",
+        )
+
+        service = LocalMemoryService(db_path=str(self.target_db), tenant_id="tenant-a")
+        transcript = await service.search_transcript(
+            SearchTranscriptRequest(scope=_scope(), query="cedar")
+        )
+
+        self.assertEqual([hit.body for hit in transcript.hits], ["User: cedar migration transcript"])
+
     def test_canonical_migration_export_does_not_create_vector_projection_tables(self) -> None:
         from vexic.migration import export_canonical_migration
 
