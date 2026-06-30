@@ -203,8 +203,18 @@ def _apply_ingest_config(args: argparse.Namespace) -> None:
         raise MissingIngestOption(f"missing required ingest option: {missing[0]}")
 
 
+def _read_hook_input_bytes(path: Path | None) -> bytes:
+    # Read raw UTF-8 bytes and let pydantic-core decode them. Reading via
+    # sys.stdin.read() decodes with the locale codec (cp1252 + surrogateescape
+    # on Windows), which turns any byte the codec cannot map into a lone
+    # surrogate and makes model_validate_json fail with string_unicode.
+    if path is not None:
+        return path.read_bytes()
+    return sys.stdin.buffer.read()
+
+
 def _read_hook_payload(path: Path | None) -> _ClaudeHookPayload:
-    raw = path.read_text(encoding="utf-8") if path is not None else sys.stdin.read()
+    raw = _read_hook_input_bytes(path)
     try:
         return _ClaudeHookPayload.model_validate_json(raw)
     except ValidationError as exc:
@@ -212,7 +222,7 @@ def _read_hook_payload(path: Path | None) -> _ClaudeHookPayload:
 
 
 def _read_session_start_payload(path: Path | None) -> _ClaudeSessionStartHookPayload:
-    raw = path.read_text(encoding="utf-8") if path is not None else sys.stdin.read()
+    raw = _read_hook_input_bytes(path)
     try:
         return _ClaudeSessionStartHookPayload.model_validate_json(raw)
     except ValidationError as exc:

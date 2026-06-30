@@ -44,10 +44,6 @@ class QueryRewrite(BaseModel):
     search_terms: str
 
 
-class UseJudgment(BaseModel):
-    used_fact_ids: list[int] = Field(default_factory=list)
-
-
 class RetrievedFact(BaseModel):
     model_config = ConfigDict(frozen=True)
 
