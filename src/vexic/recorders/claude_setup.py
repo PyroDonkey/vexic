@@ -3,9 +3,9 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shutil
 import shlex
 import stat
-import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +48,31 @@ def _require_nonblank(name: str, value: str | None) -> str:
 
 def _bash_safe(value: str) -> str:
     return value.replace("\\", "/")
+
+
+def _repo_root() -> Path:
+    root = Path(__file__).resolve().parents[3]
+    if not (root / "scripts" / "vexic-mcp-stdio.py").is_file():
+        raise RuntimeError("Claude Code setup must run from a Vexic source checkout")
+    return root
+
+
+def _uv_executable() -> str:
+    executable = shutil.which("uv")
+    if executable is None:
+        raise FileNotFoundError("uv executable was not found on PATH")
+    return executable
+
+
+def _uv_run_editable_args(*tail: str, uv_executable: str | None = None) -> list[str]:
+    return [uv_executable or _uv_executable(), "run", "--with-editable", str(_repo_root()), *tail]
+
+
+def default_recorder_hook_command() -> str:
+    return shlex.join(
+        _bash_safe(part)
+        for part in _uv_run_editable_args("python", "-m", "vexic.cli", "recorder", "ingest")
+    )
 
 
 def _ensure_owner_only(path: Path) -> None:
@@ -127,6 +152,7 @@ def _write_mcp_config(
     project_root: Path,
     config_path: Path,
     home: Path,
+    uv_executable: str,
     config: dict[str, Any] | None = None,
 ) -> Path:
     if not project_root.is_dir():
@@ -140,8 +166,12 @@ def _write_mcp_config(
         servers = dict(servers)
     next_config["mcpServers"] = servers
     servers["vexic"] = {
-        "command": sys.executable,
+        "command": uv_executable,
         "args": [
+            "run",
+            "--with-editable",
+            str(_repo_root()),
+            "python",
             str(_mcp_stdio_launcher()),
             "--recorder-config",
             _recorder_config_arg(config_path, home),
@@ -238,6 +268,7 @@ def install_claude_code_setup(
     settings_path, config_path, status_path = _paths(home)
     hook_command = _hook_command(command, config_path)
     prime_hook_command = _hook_command(prime_command or _prime_command(command), config_path)
+    uv_executable = _uv_executable() if project_root else ""
     if project_root and not project_root.is_dir():
         raise ValueError("project_root must be an existing directory")
     if project_root and not os.access(project_root, os.W_OK):
@@ -299,7 +330,7 @@ def install_claude_code_setup(
             },
         )
         mcp_config_path = (
-            _write_mcp_config(project_root, config_path, home, mcp_config)
+            _write_mcp_config(project_root, config_path, home, uv_executable, mcp_config)
             if project_root
             else None
         )
