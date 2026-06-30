@@ -285,6 +285,55 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
         message = captured["message"]
         self.assertEqual(message["params"]["arguments"]["query"], query)
 
+    def test_main_writes_stdout_as_utf8_not_locale(self) -> None:
+        save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="cedar café ၁ 中")])],
+            session_id="session-a",
+        )
+        request = (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "search_transcript",
+                        "arguments": {"query": "cedar"},
+                    },
+                }
+            )
+            + "\n"
+        )
+
+        class _BufferedStream:
+            def __init__(self, data: bytes = b"") -> None:
+                self.buffer = io.BytesIO(data)
+
+        stdout = _BufferedStream()
+
+        with (
+            patch("vexic.mcp_stdio.sys.stdin", _BufferedStream(request.encode("utf-8"))),
+            patch("vexic.mcp_stdio.sys.stdout", stdout),
+            patch("vexic.mcp_stdio.sys.stderr", _BufferedStream()),
+        ):
+            code = main(
+                [
+                    "--db-path",
+                    self.db_path,
+                    "--tenant-id",
+                    "tenant-a",
+                    "--session-id",
+                    "session-a",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        output = stdout.buffer.getvalue()
+        self.assertIn("café ၁ 中".encode("utf-8"), output)
+        response = json.loads(output.decode("utf-8"))
+        self.assertFalse(response["result"]["isError"])
+
     def test_recorder_config_proxy_forwards_hosted_mcp_http_error_body(self) -> None:
         _HostedApiHandler.response_status = 401
         _HostedApiHandler.response_payload = {

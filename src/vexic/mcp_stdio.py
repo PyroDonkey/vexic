@@ -478,20 +478,28 @@ def main(
     # non-ASCII JSON-RPC payloads on read and can fail to encode non-ASCII
     # responses on write. Resolve at call time so the streams stay injectable
     # for tests.
+    stdio_wrappers = []
     if stdin is None:
         stdin = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8", newline="")
+        stdio_wrappers.append(stdin)
     if stdout is None:
         stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", newline="")
+        stdio_wrappers.append(stdout)
     if stderr is None:
         stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", newline="")
-    asyncio.run(
-        run_stdio(
-            _parse_args(raw_argv, service_factory=service_factory),
-            stdin=stdin,
-            stdout=stdout,
-            stderr=stderr,
+        stdio_wrappers.append(stderr)
+    try:
+        asyncio.run(
+            run_stdio(
+                _parse_args(raw_argv, service_factory=service_factory),
+                stdin=stdin,
+                stdout=stdout,
+                stderr=stderr,
+            )
         )
-    )
+    finally:
+        for stream in stdio_wrappers:
+            stream.detach()
     return 0
 
 
