@@ -30,6 +30,7 @@ missing from this index (and the reverse).
 | 0015 | Claude Code setup recorder is hook-triggered                   | accepted |
 | 0016 | Local embedding and deferrable contradiction lower the LLM floor | accepted |
 | 0017 | Claude Code setup scaffolds a disabled Vexic MCP entry           | accepted |
+| 0018 | Claude Code read path splits SessionStart priming and MCP on-demand pull | accepted |
 
 Notes:
 
@@ -60,6 +61,10 @@ Notes:
   config, and requires no hosted MCP server changes. It builds on the COA-250 /
   COA-253 evidence and affirms ADR 0010 and ADR 0015. A follow-up implementation
   issue owns the scaffold install/uninstall, built test-first.
+- 0018 settles COA-262: the default Claude Code read path is SessionStart
+  priming from the existing recorder config plus an opt-in MCP on-demand pull
+  leg. UserPromptSubmit relevance injection and a dedicated no-query priming
+  endpoint stay deferred.
 - These numbers are the Vexic `docs/adr/` series. Some source comments under
   `src/vexic` cite an `upstream ADR-00NN` label from the extraction source
   (for example `upstream ADR-0010` for candidate-fallback retrieval); those

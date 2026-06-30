@@ -5,11 +5,12 @@ import json
 import os
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from vexic import CONTRACT_VERSION
 from vexic.contract import (
@@ -22,6 +23,7 @@ from vexic.contract import (
     SearchTranscriptRequest,
 )
 from vexic.hosted import (
+    HostedAuthContext,
     HostedInMemoryRateLimiter,
     HostedMemoryService,
     HostedRateLimitExceeded,
@@ -30,6 +32,7 @@ from vexic.hosted import (
     run_dream_phase_command,
 )
 from vexic.mcp_http import register_mcp_routes
+from vexic.mcp_http import _scope_from_headers as _read_scope_from_headers
 from vexic.ports import HostPortNotConfigured
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 
@@ -42,6 +45,14 @@ MAX_EXPAND_HISTORY_CHARS = 20_000
 
 _RequestT = TypeVar("_RequestT", bound=MemoryRequest)
 _ResultT = TypeVar("_ResultT", bound=MemoryResult)
+_SearchRequestT = TypeVar("_SearchRequestT", SearchTranscriptRequest, SearchLongTermRequest)
+
+
+class _HeaderBoundSearchBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    query: str
+    limit: int = 5
 
 
 def create_app(
@@ -92,12 +103,24 @@ def create_app(
     )
 
     @app.post("/v1/search_transcript")
-    async def search_transcript(request: Request, payload: SearchTranscriptRequest) -> JSONResponse:
-        return await _handle(request, payload, service.search_transcript)
+    async def search_transcript(request: Request, payload: dict[str, Any]) -> JSONResponse:
+        return await _handle_search(
+            request,
+            payload,
+            service,
+            SearchTranscriptRequest,
+            service.search_transcript,
+        )
 
     @app.post("/v1/search_long_term")
-    async def search_long_term(request: Request, payload: SearchLongTermRequest) -> JSONResponse:
-        return await _handle(request, payload, service.search_long_term)
+    async def search_long_term(request: Request, payload: dict[str, Any]) -> JSONResponse:
+        return await _handle_search(
+            request,
+            payload,
+            service,
+            SearchLongTermRequest,
+            service.search_long_term,
+        )
 
     @app.post("/v1/expand_history")
     async def expand_history(request: Request, payload: ExpandHistoryRequest) -> JSONResponse:
@@ -135,6 +158,52 @@ async def _handle(
     if api_key is None:
         return _error_response(401, "unauthorized", "Missing hosted API key.")
     return await _handle_payload(api_key, payload, call)
+
+
+async def _handle_search(
+    request: Request,
+    body: dict[str, Any],
+    service: HostedMemoryService,
+    request_type: type[_SearchRequestT],
+    call: Callable[[str, _SearchRequestT], Awaitable[_ResultT]],
+) -> JSONResponse:
+    api_key = _api_key(request)
+    if api_key is None:
+        return _error_response(401, "unauthorized", "Missing hosted API key.")
+    try:
+        if "scope" in body:
+            payload = request_type.model_validate(body)
+        else:
+            auth = _authenticate_for_header_scope(service, api_key)
+            search = _HeaderBoundSearchBody.model_validate(body)
+            payload = request_type(
+                scope=_read_scope_from_headers(request, auth),
+                query=search.query,
+                limit=search.limit,
+            )
+    except ValidationError:
+        return _error_response(
+            422,
+            "invalid_request",
+            "Request body does not match the Vexic contract.",
+        )
+    except PermissionError as exc:
+        if str(exc) == "Invalid hosted API key.":
+            return _error_response(401, "unauthorized", "Invalid hosted API key.")
+        return _error_response(403, "permission_denied", str(exc))
+    except ValueError as exc:
+        return _error_response(400, "invalid_request", str(exc))
+    except Exception:
+        return _error_response(500, "internal_error", "Hosted memory request failed.")
+    return await _handle_payload(api_key, payload, call)
+
+
+def _authenticate_for_header_scope(
+    service: HostedMemoryService,
+    api_key: str,
+) -> HostedAuthContext:
+    authenticate = service.api_keys.authenticate
+    return authenticate(api_key)
 
 
 async def _handle_payload(

@@ -904,6 +904,27 @@ class HostedHttpTests(unittest.TestCase):
             ["User: trimmed header cedar"],
         )
 
+    def test_hosted_search_transcript_accepts_header_bound_scope(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
+        append_response = self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key),
+            json=self._append_body("header scoped cedar"),
+        )
+
+        search_response = self.client.post(
+            "/v1/search_transcript",
+            headers=self._write_headers(api_key),
+            json={"query": "cedar", "limit": 5},
+        )
+
+        self.assertEqual(append_response.status_code, 200)
+        self.assertEqual(search_response.status_code, 200)
+        self.assertEqual(
+            [hit["body"] for hit in search_response.json()["hits"]],
+            ["User: header scoped cedar"],
+        )
+
     def test_hosted_append_rejects_forbidden_values_without_persisting(self) -> None:
         api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
 

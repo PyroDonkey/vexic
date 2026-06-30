@@ -15,6 +15,11 @@ from vexic.recorders.claude_setup import (
     install_claude_code_setup,
     uninstall_claude_code_setup,
 )
+from vexic.recorders.hosted_prime import (
+    DEFAULT_PRIME_MAX_CHARS,
+    HostedPrimeConfig,
+    fetch_prime_context,
+)
 from vexic.recorders.hosted_ingest import HostedIngestConfig, post_source_messages
 from vexic.recorders.status import RecorderStatus, write_status
 
@@ -46,6 +51,12 @@ class _ClaudeHookPayload(BaseModel):
         if not value.strip():
             raise ValueError("hook input transcript_path must be a nonblank string")
         return value
+
+
+class _ClaudeSessionStartHookPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    source: str | None = None
 
 
 def _iter_hosted_message_batches(
@@ -112,6 +123,18 @@ def _parser() -> argparse.ArgumentParser:
     ingest.add_argument("--forbidden-value", action="append", default=[])
     ingest.add_argument("--status-path", type=Path)
 
+    prime = subparsers.add_parser("prime")
+    prime.add_argument("--hook-input", type=Path)
+    prime.add_argument("--config", type=Path, required=True)
+    prime.add_argument("--base-url")
+    prime.add_argument("--api-key")
+    prime.add_argument("--project-id")
+    prime.add_argument("--session-id")
+    prime.add_argument("--agent-id")
+    prime.add_argument("--timeout-seconds", type=float, default=5.0)
+    prime.add_argument("--max-chars", type=int, default=DEFAULT_PRIME_MAX_CHARS)
+    prime.add_argument("--status-path", type=Path)
+
     setup = subparsers.add_parser(
         "setup-claude-code",
         description="Install Claude Code recording and scaffold the project Vexic MCP entry.",
@@ -135,6 +158,7 @@ def _parser() -> argparse.ArgumentParser:
             [sys.executable, "-m", "vexic.cli", "recorder", "ingest"]
         ),
     )
+    setup.add_argument("--prime-hook-command")
 
     uninstall = subparsers.add_parser(
         "uninstall-claude-code",
@@ -185,6 +209,14 @@ def _read_hook_payload(path: Path | None) -> _ClaudeHookPayload:
     raw = path.read_text(encoding="utf-8") if path is not None else sys.stdin.read()
     try:
         return _ClaudeHookPayload.model_validate_json(raw)
+    except ValidationError as exc:
+        raise ValueError(f"invalid hook input: {exc}") from exc
+
+
+def _read_session_start_payload(path: Path | None) -> _ClaudeSessionStartHookPayload:
+    raw = path.read_text(encoding="utf-8") if path is not None else sys.stdin.read()
+    try:
+        return _ClaudeSessionStartHookPayload.model_validate_json(raw)
     except ValidationError as exc:
         raise ValueError(f"invalid hook input: {exc}") from exc
 
@@ -255,6 +287,43 @@ def _ingest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _prime(args: argparse.Namespace) -> int:
+    payload = _read_session_start_payload(args.hook_input)
+    if payload.source not in {"startup", "clear"}:
+        return 0
+    try:
+        context = fetch_prime_context(
+            HostedPrimeConfig(
+                base_url=args.base_url,
+                api_key=args.api_key,
+                project_id=args.project_id,
+                session_id=args.session_id,
+                agent_id=args.agent_id,
+                timeout_seconds=args.timeout_seconds,
+            ),
+            max_chars=args.max_chars,
+        )
+    except RuntimeError as exc:
+        # SessionStart priming is fail-open: stderr is the operator signal,
+        # stdout stays empty so Claude Code receives no unsafe context.
+        print(f"warning: {exc}", file=sys.stderr)
+        return 0
+    if not context:
+        return 0
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": context,
+                }
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def _setup_claude_code(args: argparse.Namespace) -> int:
     result = install_claude_code_setup(
         home=args.home,
@@ -264,6 +333,7 @@ def _setup_claude_code(args: argparse.Namespace) -> int:
         session_id=args.session_id,
         agent_id=args.agent_id,
         command=args.hook_command,
+        prime_command=args.prime_hook_command,
         project_root=args.project_root,
     )
     print(
@@ -311,6 +381,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "ingest":
             _apply_ingest_config(args)
             return _ingest(args)
+        if args.command == "prime":
+            _apply_ingest_config(args)
+            return _prime(args)
         if args.command == "setup-claude-code":
             return _setup_claude_code(args)
         if args.command == "uninstall-claude-code":

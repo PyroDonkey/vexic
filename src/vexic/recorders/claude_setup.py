@@ -96,6 +96,18 @@ def _recorder_config_arg(config_path: Path, home: Path) -> str:
     return str(config_path)
 
 
+def _hook_command(command: str, config_path: Path) -> str:
+    return f"{_bash_safe(command)} --config {shlex.quote(_bash_safe(str(config_path)))}"
+
+
+def _prime_command(command: str) -> str:
+    command = command.rstrip()
+    suffix = " recorder ingest"
+    if command.endswith(suffix):
+        return command[: -len(suffix)] + " recorder prime"
+    raise ValueError("prime_command is required when command does not end with recorder ingest")
+
+
 def _mcp_stdio_launcher() -> Path:
     return Path(__file__).resolve().parents[3] / "scripts" / "vexic-mcp-stdio.py"
 
@@ -216,6 +228,7 @@ def install_claude_code_setup(
     session_id: str,
     agent_id: str | None,
     command: str,
+    prime_command: str | None = None,
     project_root: Path | None = None,
 ) -> ClaudeCodeSetupResult:
     base_url = _require_nonblank("base_url", base_url)
@@ -223,7 +236,8 @@ def install_claude_code_setup(
     project_id = _require_nonblank("project_id", project_id)
     session_id = _require_nonblank("session_id", session_id)
     settings_path, config_path, status_path = _paths(home)
-    hook_command = f"{_bash_safe(command)} --config {shlex.quote(_bash_safe(str(config_path)))}"
+    hook_command = _hook_command(command, config_path)
+    prime_hook_command = _hook_command(prime_command or _prime_command(command), config_path)
     if project_root and not project_root.is_dir():
         raise ValueError("project_root must be an existing directory")
     if project_root and not os.access(project_root, os.W_OK):
@@ -249,6 +263,21 @@ def install_claude_code_setup(
         }
     )
     hooks["Stop"] = stop_groups
+    session_start_groups, _changed = _without_vexic_hook(hooks.get("SessionStart"))
+    session_start_groups.append(
+        {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": prime_hook_command,
+                    "async": False,
+                    "timeout": 30,
+                    "vexicHookId": VEXIC_HOOK_ID,
+                }
+            ]
+        }
+    )
+    hooks["SessionStart"] = session_start_groups
     if project_root:
         _set_mcpjson_disabled(settings, "vexic")
     mcp_path = project_root / ".mcp.json" if project_root else None
@@ -303,10 +332,14 @@ def uninstall_claude_code_setup(*, home: Path, project_root: Path | None = None)
     choice_changed = _remove_mcpjson_choice(settings, "vexic") if project_root else False
     if not isinstance(hooks, dict):
         if choice_changed:
-            settings_path.write_text(json.dumps(settings, sort_keys=True), encoding="utf-8")
+            _write_json_atomic(settings_path, settings)
         return mcp_changed or choice_changed
-    stop_groups, changed = _without_vexic_hook(hooks.get("Stop"))
-    if changed or choice_changed:
-        hooks["Stop"] = stop_groups
-        settings_path.write_text(json.dumps(settings, sort_keys=True), encoding="utf-8")
-    return changed or mcp_changed or choice_changed
+    changed = choice_changed
+    for name in ("Stop", "SessionStart"):
+        groups, hook_changed = _without_vexic_hook(hooks.get(name))
+        if hook_changed:
+            hooks[name] = groups
+            changed = True
+    if changed:
+        _write_json_atomic(settings_path, settings)
+    return changed or mcp_changed
