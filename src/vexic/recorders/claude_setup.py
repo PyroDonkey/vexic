@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shlex
 import stat
+import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -94,6 +96,10 @@ def _recorder_config_arg(config_path: Path, home: Path) -> str:
     return str(config_path)
 
 
+def _mcp_stdio_launcher() -> Path:
+    return Path(__file__).resolve().parents[3] / "scripts" / "vexic-mcp-stdio.py"
+
+
 def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
     text = json.dumps(payload, sort_keys=True)
     temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -105,26 +111,31 @@ def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
         raise
 
 
-def _write_mcp_config(project_root: Path, config_path: Path, home: Path) -> Path:
+def _write_mcp_config(
+    project_root: Path,
+    config_path: Path,
+    home: Path,
+    config: dict[str, Any] | None = None,
+) -> Path:
     if not project_root.is_dir():
         raise ValueError("project_root must be an existing directory")
     mcp_path = project_root / ".mcp.json"
-    config = _load_json(mcp_path)
-    servers = config.get("mcpServers")
+    next_config = dict(_load_json(mcp_path) if config is None else config)
+    servers = next_config.get("mcpServers")
     if not isinstance(servers, dict):
         servers = {}
-        config["mcpServers"] = servers
+    else:
+        servers = dict(servers)
+    next_config["mcpServers"] = servers
     servers["vexic"] = {
-        "command": "uv",
+        "command": sys.executable,
         "args": [
-            "run",
-            "python",
-            "scripts/vexic-mcp-stdio.py",
+            str(_mcp_stdio_launcher()),
             "--recorder-config",
             _recorder_config_arg(config_path, home),
         ],
     }
-    _write_json_atomic(mcp_path, config)
+    _write_json_atomic(mcp_path, next_config)
     return mcp_path
 
 
@@ -137,6 +148,28 @@ def _remove_mcp_config(project_root: Path) -> bool:
     del servers["vexic"]
     _write_json_atomic(mcp_path, config)
     return True
+
+
+def _set_mcpjson_disabled(settings: dict[str, Any], name: str) -> None:
+    disabled = settings.get("disabledMcpjsonServers")
+    disabled_names = disabled if isinstance(disabled, list) else []
+    settings["disabledMcpjsonServers"] = [
+        item for item in disabled_names if item != name
+    ] + [name]
+
+    enabled = settings.get("enabledMcpjsonServers")
+    if isinstance(enabled, list):
+        settings["enabledMcpjsonServers"] = [item for item in enabled if item != name]
+
+
+def _remove_mcpjson_choice(settings: dict[str, Any], name: str) -> bool:
+    changed = False
+    for key in ("disabledMcpjsonServers", "enabledMcpjsonServers"):
+        values = settings.get(key)
+        if isinstance(values, list) and name in values:
+            settings[key] = [item for item in values if item != name]
+            changed = True
+    return changed
 
 
 def _without_vexic_hook(stop_groups: Any) -> tuple[list[dict[str, Any]], bool]:
@@ -165,6 +198,15 @@ def _without_vexic_hook(stop_groups: Any) -> tuple[list[dict[str, Any]], bool]:
     return kept_groups, changed
 
 
+def _restore_secret_config(path: Path, previous: bytes | None) -> None:
+    if previous is None:
+        path.unlink(missing_ok=True)
+        return
+    path.write_bytes(previous)
+    path.chmod(0o600)
+    _ensure_owner_only(path)
+
+
 def install_claude_code_setup(
     *,
     home: Path,
@@ -182,21 +224,10 @@ def install_claude_code_setup(
     session_id = _require_nonblank("session_id", session_id)
     settings_path, config_path, status_path = _paths(home)
     hook_command = f"{_bash_safe(command)} --config {shlex.quote(_bash_safe(str(config_path)))}"
-    mcp_config_path = (
-        _write_mcp_config(project_root, config_path, home) if project_root else None
-    )
-
-    _write_secret_json(
-        config_path,
-        {
-            "base_url": base_url,
-            "api_key": api_key,
-            "project_id": project_id,
-            "session_id": session_id,
-            "agent_id": agent_id,
-            "status_path": str(status_path),
-        },
-    )
+    if project_root and not project_root.is_dir():
+        raise ValueError("project_root must be an existing directory")
+    if project_root and not os.access(project_root, os.W_OK):
+        raise PermissionError("project_root must be writable")
 
     settings = _load_json(settings_path)
     hooks = settings.get("hooks")
@@ -218,8 +249,42 @@ def install_claude_code_setup(
         }
     )
     hooks["Stop"] = stop_groups
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
-    settings_path.write_text(json.dumps(settings, sort_keys=True), encoding="utf-8")
+    if project_root:
+        _set_mcpjson_disabled(settings, "vexic")
+    mcp_path = project_root / ".mcp.json" if project_root else None
+    mcp_config = _load_json(mcp_path) if mcp_path else None
+
+    previous_config = config_path.read_bytes() if config_path.exists() else None
+    previous_mcp = mcp_path.read_bytes() if mcp_path and mcp_path.exists() else None
+    mcp_config_path = None
+    try:
+        _write_secret_json(
+            config_path,
+            {
+                "base_url": base_url,
+                "api_key": api_key,
+                "project_id": project_id,
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "status_path": str(status_path),
+            },
+        )
+        mcp_config_path = (
+            _write_mcp_config(project_root, config_path, home, mcp_config)
+            if project_root
+            else None
+        )
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(settings_path, settings)
+    except Exception:
+        if mcp_config_path is not None:
+            with contextlib.suppress(Exception):
+                if previous_mcp is None:
+                    mcp_config_path.unlink(missing_ok=True)
+                else:
+                    mcp_config_path.write_bytes(previous_mcp)
+        _restore_secret_config(config_path, previous_config)
+        raise
 
     return ClaudeCodeSetupResult(
         settings_path=settings_path,
@@ -235,10 +300,13 @@ def uninstall_claude_code_setup(*, home: Path, project_root: Path | None = None)
     settings = _load_json(settings_path)
     hooks = settings.get("hooks")
     mcp_changed = _remove_mcp_config(project_root) if project_root else False
+    choice_changed = _remove_mcpjson_choice(settings, "vexic") if project_root else False
     if not isinstance(hooks, dict):
-        return mcp_changed
+        if choice_changed:
+            settings_path.write_text(json.dumps(settings, sort_keys=True), encoding="utf-8")
+        return mcp_changed or choice_changed
     stop_groups, changed = _without_vexic_hook(hooks.get("Stop"))
-    if changed:
+    if changed or choice_changed:
         hooks["Stop"] = stop_groups
         settings_path.write_text(json.dumps(settings, sort_keys=True), encoding="utf-8")
-    return changed or mcp_changed
+    return changed or mcp_changed or choice_changed
