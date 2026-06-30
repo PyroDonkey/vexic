@@ -9,10 +9,11 @@ transcript recorder: it writes user-local recorder config
 (`~/.vexic/claude-code-recorder.json`, owner-only) and a Stop hook in
 `~/.claude/settings.json`. The hook command never embeds the API key.
 
-ADR 0010 and ADR 0001 keep the Vexic MCP read-only and thin. Two MCP transports
-exist: a local stdio server (`scripts/vexic-mcp-stdio.py`, local-trusted, no
-auth) and a hosted Streamable HTTP server (`POST /mcp`) that requires
-`Authorization: Bearer <api-key>`.
+ADR 0010 and ADR 0001 keep the Vexic MCP read-only and thin. ADR 0018 splits
+the Claude Code read path into default SessionStart priming and MCP on-demand
+pull. Two MCP transports exist: a local stdio server
+(`scripts/vexic-mcp-stdio.py`, local-trusted, no auth) and a hosted Streamable
+HTTP server (`POST /mcp`) that requires `Authorization: Bearer <api-key>`.
 
 COA-250 and COA-253 end-to-end testing confirmed the recorder hook writes hosted
 transcript memory, but Claude Code still reports no visible Vexic MCP. The
@@ -30,21 +31,21 @@ secret-duplication and a brittleness risk.
 ## Decision
 
 `vexic setup claude-code` does not auto-register a live Vexic MCP server. It
-scaffolds a disabled / placeholder MCP entry that Claude Code will not use until
-the user performs one explicit enable step.
+scaffolds a disabled / placeholder MCP entry for the on-demand pull leg that
+Claude Code will not use until the user performs one explicit enable step.
 
 - The scaffold targets a project-local `.mcp.json` entry. This aligns with
   setup's per-project arguments (`--project-id`, `--session-id`). Setup also
   writes `disabledMcpjsonServers: ["vexic"]` in `~/.claude/settings.json`, which
   is Claude Code's supported rejection list for project `.mcp.json` servers.
   The `.mcp.json` server object does not carry a made-up `disabled` flag.
-- The scaffolded server is a local stdio launcher
-  (`scripts/vexic-mcp-stdio.py --recorder-config ...`) configured to read its
-  credentials from the existing `~/.vexic/claude-code-recorder.json`. Setup
-  writes the script path as an absolute path so it works from a user project
-  directory. The launcher, not the Claude config, holds the path to the secret.
-  (There is no `vexic mcp` CLI subcommand today; the follow-up issue may add
-  one, but the supported launcher is the script.)
+- The scaffolded server is a local stdio launcher run by the setup-time Python
+  interpreter: `.mcp.json` writes `command` as `sys.executable` and `args` as
+  `[<absolute scripts/vexic-mcp-stdio.py>, "--recorder-config",
+  <recorder-config path>]`. The script path is absolute so the launcher works
+  from a user project directory, and the recorder config path points at the
+  existing `~/.vexic/claude-code-recorder.json` secret store. The launcher, not
+  the Claude config, holds the path to the secret.
 - The raw API key is never written into `.mcp.json` or `~/.claude.json`. The
   recorder config remains the single source of truth for the base URL and key.
 - No hosted MCP server changes are required. This is a setup/install-UX decision
@@ -68,8 +69,9 @@ follow-up issue, built test-first.
 
 ## Consequences
 
-- Setup keeps a clean separation: the recorder hook write path is unchanged, and
-  MCP search becomes an opt-in the user explicitly enables.
+- Setup keeps a clean separation: the recorder hook write path is unchanged,
+  SessionStart priming owns default readback, and MCP search becomes an opt-in
+  on-demand pull surface the user explicitly enables.
 - Users get a one-step path to the read-only MCP search surface without
   hand-authoring launcher config or copying keys.
 - Vexic does not mutate Claude Code's large, app-managed `~/.claude.json`; the

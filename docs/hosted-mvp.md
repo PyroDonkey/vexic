@@ -45,9 +45,12 @@ this boundary without changing the memory contract.
 - `vexic.mcp_http` exposes a native read-only Streamable HTTP MCP `/mcp`
   route on the hosted FastAPI app. It is stateless, JSON-only, Bearer-auth
   only, and exposes `search_transcript` and `search_long_term`.
-- Session summary and active-context helpers exist in the local core. The
-  hosted fresh-conversation context API and agent-side recap injection are not
-  built yet.
+- `vexic setup claude-code` installs a SessionStart primer that reuses the
+  recorder config and hosted read endpoints to inject capped memory context on
+  new/cleared Claude Code sessions.
+- Session summary and active-context helpers exist in the local core. A
+  dedicated hosted fresh-conversation context API and agent-side recap
+  injection are not built yet.
 
 ## Local Staging
 
@@ -228,8 +231,10 @@ hosted HTTP append route, recorder, or importer path. Claude Code hosted
 auto-recording uses `vexic setup claude-code`; the command installs user-local
 Claude Code hook config and Vexic recorder config, then scaffolds the project
 MCP entry that Claude Code asks the user to approve. The recorder sends cleaned
-transcript rows to `/v1/ingest_source_transcript`; approved MCP reads go
-through the read-only hosted `/mcp` route. The Claude Code host transcript
+transcript rows to `/v1/ingest_source_transcript`; the SessionStart primer
+injects capped hosted memory context on `startup` and `clear`; approved MCP
+reads go through the read-only hosted `/mcp` route for targeted on-demand
+search. The Claude Code host transcript
 recorder flow is documented in
 [README.md](../README.md#claude-code-transcript-import) and
 [ADR 0002](adr/0002-host-recorders-ingest-complete-cleaned-transcripts.md).
@@ -261,10 +266,12 @@ MCP tools.
 For hosted auto-recording, run `vexic setup claude-code` with the hosted base
 URL, raw key, project ID, and session ID. It installs user-local Claude Code
 hook config plus Vexic recorder config, then scaffolds a project `.mcp.json`
-entry for Vexic. The hook posts cleaned Claude Code transcript rows to
-`/v1/ingest_source_transcript`; after the user approves the project MCP server
-in Claude Code, reads go through the scaffolded stdio proxy to hosted `/mcp`.
-The raw API key stays in the user-local recorder config, not `.mcp.json`.
+entry for Vexic. The Stop hook posts cleaned Claude Code transcript rows to
+`/v1/ingest_source_transcript`; the SessionStart hook primes new/cleared
+sessions through hosted read endpoints using the same recorder config; after
+the user approves the project MCP server in Claude Code, targeted reads go
+through the scaffolded stdio proxy to hosted `/mcp`. The raw API key stays in
+the user-local recorder config, not `.mcp.json` or Claude settings.
 
 ## Railway Alpha Deploy
 

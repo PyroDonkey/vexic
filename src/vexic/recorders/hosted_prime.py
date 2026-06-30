@@ -1,0 +1,148 @@
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from urllib.error import HTTPError, URLError
+from urllib.parse import urljoin
+from urllib.request import Request, urlopen
+
+from vexic.redaction import assert_no_forbidden_secret_values
+
+LONG_TERM_PRIME_QUERY = "preference fact goal decision project context remember"
+TRANSCRIPT_PRIME_QUERY = "remember"
+DEFAULT_PRIME_MAX_CHARS = 6_000
+
+
+@dataclass(frozen=True)
+class HostedPrimeConfig:
+    base_url: str
+    api_key: str
+    project_id: str
+    session_id: str
+    agent_id: str | None
+    timeout_seconds: float = 5.0
+
+
+def fetch_prime_context(
+    config: HostedPrimeConfig,
+    *,
+    max_chars: int = DEFAULT_PRIME_MAX_CHARS,
+    long_term_limit: int = 5,
+    transcript_limit: int = 5,
+) -> str:
+    long_term = _safe_post_search(
+        config,
+        "search_long_term",
+        {"query": LONG_TERM_PRIME_QUERY, "limit": long_term_limit},
+    )
+    transcript = _safe_post_search(
+        config,
+        "search_transcript",
+        {"query": TRANSCRIPT_PRIME_QUERY, "limit": transcript_limit},
+    )
+    context = build_prime_context(long_term, transcript, max_chars=max_chars)
+    try:
+        assert_no_forbidden_secret_values((config.api_key,), context)
+    except ValueError:
+        raise RuntimeError("hosted prime failed: forbidden secret in response") from None
+    return context
+
+
+def _safe_post_search(
+    config: HostedPrimeConfig,
+    operation: str,
+    payload: dict[str, object],
+) -> dict[str, object]:
+    try:
+        return _post_search(config, operation, payload)
+    except RuntimeError:
+        return {}
+
+
+def _post_search(
+    config: HostedPrimeConfig,
+    operation: str,
+    payload: dict[str, object],
+) -> dict[str, object]:
+    headers = {
+        "Authorization": f"Bearer {config.api_key}",
+        "Content-Type": "application/json",
+        "X-Vexic-Project-Id": config.project_id,
+        "X-Vexic-Session-Id": config.session_id,
+    }
+    if config.agent_id is not None:
+        headers["X-Vexic-Agent-Id"] = config.agent_id
+    request = Request(
+        urljoin(config.base_url.rstrip("/") + "/", f"v1/{operation}"),
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=config.timeout_seconds) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        raise RuntimeError(f"hosted prime failed: HTTP {exc.code}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"hosted prime failed: {type(exc.reason).__name__}") from exc
+    if not isinstance(body, dict):
+        raise RuntimeError("hosted prime failed: invalid response")
+    return body
+
+
+def build_prime_context(
+    long_term: dict[str, object],
+    transcript: dict[str, object],
+    *,
+    max_chars: int,
+) -> str:
+    lines: list[str] = ["Vexic memory priming:"]
+    facts = _items(long_term.get("facts"))
+    notes = _items(long_term.get("candidate_notes"))
+    hits = _items(transcript.get("hits"))
+
+    if facts or notes:
+        lines.append("Long-term memory:")
+        for fact in facts:
+            text = _str(fact.get("fact_text"))
+            if text:
+                lines.append(f"- {text}")
+        for note in notes:
+            text = _str(note.get("fact_text"))
+            if text:
+                lines.append(f"- tentative: {text}")
+
+    if hits:
+        lines.append("Recent transcript memory:")
+        for hit in hits:
+            body = _str(hit.get("body"))
+            if body:
+                lines.append(f"- {body}")
+
+    if len(lines) == 1:
+        return ""
+    return _cap("\n".join(lines), max_chars)
+
+
+def _items(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _str(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _cap(text: str, max_chars: int) -> str:
+    if max_chars < 1:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    suffix = "\n[truncated]"
+    if max_chars <= len(suffix):
+        return text[:max_chars]
+    return text[: max_chars - len(suffix)].rstrip() + suffix
