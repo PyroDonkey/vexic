@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -19,7 +18,7 @@ from vexic.contract import (
     SearchTranscriptResult,
     SearchTranscriptRequest,
 )
-from vexic.mcp_stdio import McpServerConfig, main as mcp_stdio_main
+from vexic.mcp_stdio import McpServerConfig
 
 _ResultT = TypeVar("_ResultT")
 
@@ -222,31 +221,3 @@ def _hosted_http_error(exc: urllib.error.HTTPError) -> str:
         if isinstance(error, dict) and isinstance(error.get("message"), str):
             return error["message"]
     return f"Hosted Vexic API returned HTTP {exc.code}."
-
-
-def main(
-    argv: list[str] | None = None,
-    *,
-    stdin: TextIO = sys.stdin,
-    stdout: TextIO = sys.stdout,
-    stderr: TextIO = sys.stderr,
-) -> int:
-    args = sys.argv[1:] if argv is None else argv
-    if args[:1] == ["--recorder-config"] and len(args) == 2:
-        return run_recorder_config_proxy(
-            Path(args[1]),
-            stdin=stdin,
-            stdout=stdout,
-            stderr=stderr,
-        )
-    return mcp_stdio_main(
-        args,
-        service_factory=create_hosted_http_memory_service,
-        stdin=stdin,
-        stdout=stdout,
-        stderr=stderr,
-    )
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

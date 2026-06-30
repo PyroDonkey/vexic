@@ -39,11 +39,12 @@ the user performs one explicit enable step.
   is Claude Code's supported rejection list for project `.mcp.json` servers.
   The `.mcp.json` server object does not carry a made-up `disabled` flag.
 - The scaffolded server is a local stdio launcher
-  (`python -m vexic.hosted_mcp --recorder-config ...`) configured to read its
-  credentials from the existing `~/.vexic/claude-code-recorder.json`. The
-  launcher, not the Claude config, holds the path to the secret. (There is no
-  `vexic mcp` CLI subcommand today; the follow-up issue may add one, but the
-  supported launcher is the installed Python module.)
+  (`scripts/vexic-mcp-stdio.py --recorder-config ...`) configured to read its
+  credentials from the existing `~/.vexic/claude-code-recorder.json`. Setup
+  writes the script path as an absolute path so it works from a user project
+  directory. The launcher, not the Claude config, holds the path to the secret.
+  (There is no `vexic mcp` CLI subcommand today; the follow-up issue may add
+  one, but the supported launcher is the script.)
 - The raw API key is never written into `.mcp.json` or `~/.claude.json`. The
   recorder config remains the single source of truth for the base URL and key.
 - No hosted MCP server changes are required. This is a setup/install-UX decision

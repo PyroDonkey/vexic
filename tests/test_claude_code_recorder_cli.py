@@ -667,12 +667,12 @@ class ClaudeCodeSetupTests(unittest.TestCase):
             self.assertEqual(config["agent_id"], "agent-a")
             mcp_config = json.loads((project_root / ".mcp.json").read_text(encoding="utf-8"))
             vexic_server = mcp_config["mcpServers"]["vexic"]
+            launcher = Path(__file__).resolve().parents[1] / "scripts" / "vexic-mcp-stdio.py"
             self.assertEqual(vexic_server["command"], sys.executable)
             self.assertEqual(
                 vexic_server["args"],
                 [
-                    "-m",
-                    "vexic.hosted_mcp",
+                    str(launcher),
                     "--recorder-config",
                     str(result.config_path),
                 ],

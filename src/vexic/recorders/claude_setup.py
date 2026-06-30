@@ -95,6 +95,10 @@ def _recorder_config_arg(config_path: Path, home: Path) -> str:
     return str(config_path)
 
 
+def _mcp_stdio_launcher() -> Path:
+    return Path(__file__).resolve().parents[3] / "scripts" / "vexic-mcp-stdio.py"
+
+
 def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
     text = json.dumps(payload, sort_keys=True)
     temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -118,8 +122,7 @@ def _write_mcp_config(project_root: Path, config_path: Path, home: Path) -> Path
     servers["vexic"] = {
         "command": sys.executable,
         "args": [
-            "-m",
-            "vexic.hosted_mcp",
+            str(_mcp_stdio_launcher()),
             "--recorder-config",
             _recorder_config_arg(config_path, home),
         ],
