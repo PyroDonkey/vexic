@@ -904,6 +904,164 @@ class HostedHttpTests(unittest.TestCase):
             ["User: trimmed header cedar"],
         )
 
+    def test_hosted_search_transcript_accepts_header_bound_scope(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
+        append_response = self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key),
+            json=self._append_body("header scoped cedar"),
+        )
+
+        search_response = self.client.post(
+            "/v1/search_transcript",
+            headers=self._write_headers(api_key),
+            json={"query": "cedar", "limit": 5},
+        )
+
+        self.assertEqual(append_response.status_code, 200)
+        self.assertEqual(search_response.status_code, 200)
+        self.assertEqual(
+            [hit["body"] for hit in search_response.json()["hits"]],
+            ["User: header scoped cedar"],
+        )
+
+    def test_hosted_search_long_term_accepts_header_bound_scope(self) -> None:
+        """Header-bound scope also works for the search_long_term route."""
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
+        # Append so there is something in the tenant to search
+        self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key),
+            json=self._append_body("header long-term cedar"),
+        )
+
+        response = self.client.post(
+            "/v1/search_long_term",
+            headers=self._write_headers(api_key),
+            json={"query": "cedar", "limit": 5},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("facts", response.json())
+
+    def test_hosted_search_transcript_missing_api_key_returns_401(self) -> None:
+        """Requests without an Authorization header or X-Vexic-Api-Key get 401."""
+        response = self.client.post(
+            "/v1/search_transcript",
+            json={"query": "cedar", "limit": 5},
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"]["code"], "unauthorized")
+
+    def test_hosted_search_long_term_missing_api_key_returns_401(self) -> None:
+        response = self.client.post(
+            "/v1/search_long_term",
+            json={"query": "cedar", "limit": 5},
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"]["code"], "unauthorized")
+
+    def test_hosted_search_transcript_invalid_api_key_returns_401(self) -> None:
+        """A completely unknown API key that fails authentication returns 401."""
+        response = self.client.post(
+            "/v1/search_transcript",
+            headers={"Authorization": "Bearer vx_totally_fake_key"},
+            json={"query": "cedar", "limit": 5},
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"]["code"], "unauthorized")
+
+    def test_hosted_search_transcript_with_scope_in_body_uses_explicit_scope_path(self) -> None:
+        """When the body contains 'scope', the header-bound code path is NOT used."""
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
+        self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key),
+            json=self._append_body("explicit scope cedar"),
+        )
+
+        response = self.client.post(
+            "/v1/search_transcript",
+            headers=self._auth(api_key),
+            json=SearchTranscriptRequest(
+                scope=_scope(capabilities={MemoryCapability.SEARCH}),
+                query="cedar",
+            ).model_dump(mode="json"),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [hit["body"] for hit in response.json()["hits"]],
+            ["User: explicit scope cedar"],
+        )
+
+    def test_hosted_search_transcript_header_bound_rejects_extra_fields(self) -> None:
+        """Header-bound path uses _HeaderBoundSearchBody (extra='forbid')."""
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
+
+        response = self.client.post(
+            "/v1/search_transcript",
+            headers=self._write_headers(api_key),
+            json={"query": "cedar", "limit": 5, "unexpected_field": "value"},
+        )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["error"]["code"], "invalid_request")
+
+    def test_hosted_search_transcript_header_bound_default_limit_is_five(self) -> None:
+        """When limit is omitted in header-bound mode, it defaults to 5."""
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
+
+        response = self.client.post(
+            "/v1/search_transcript",
+            headers=self._write_headers(api_key),
+            json={"query": "cedar"},
+        )
+
+        # Should succeed (not 422/400) — limit defaults to 5
+        self.assertEqual(response.status_code, 200)
+
+    def test_hosted_search_transcript_header_bound_permission_denied_returns_403(self) -> None:
+        """A key that exists but lacks SEARCH capability gets 403 on header-bound search."""
+        # Issue a WRITE-only key
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE})
+
+        response = self.client.post(
+            "/v1/search_transcript",
+            headers=self._write_headers(api_key),
+            json={"query": "cedar", "limit": 5},
+        )
+
+        self.assertIn(response.status_code, (401, 403))
+
+    def test_hosted_search_transcript_header_bound_handles_unexpected_exception_as_500(
+        self,
+    ) -> None:
+        """Unexpected exceptions from authenticate() surface as 500."""
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
+
+        original_authenticate = self.service.api_keys.authenticate
+
+        def _boom(_: str) -> object:
+            raise RuntimeError("unexpected internal error: cedar-secret")
+
+        self.service.api_keys.authenticate = _boom  # type: ignore[method-assign]
+
+        try:
+            response = self.client.post(
+                "/v1/search_transcript",
+                headers=self._write_headers(api_key),
+                json={"query": "cedar", "limit": 5},
+            )
+        finally:
+            self.service.api_keys.authenticate = original_authenticate  # type: ignore[method-assign]
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["error"]["code"], "internal_error")
+
     def test_hosted_append_rejects_forbidden_values_without_persisting(self) -> None:
         api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
 

@@ -977,6 +977,49 @@ class ClaudeCodeSetupTests(unittest.TestCase):
             mcp_config = json.loads((project_root / ".mcp.json").read_text(encoding="utf-8"))
             self.assertEqual(list(mcp_config["mcpServers"]), ["vexic"])
 
+    def test_setup_installs_session_start_prime_hook_idempotently(self) -> None:
+        from vexic.cli import main as vexic_main
+
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            project_root = home / "project"
+            project_root.mkdir()
+
+            for _ in range(2):
+                code = vexic_main(
+                    [
+                        "setup",
+                        "claude-code",
+                        "--home",
+                        str(home),
+                        "--project-root",
+                        str(project_root),
+                        "--base-url",
+                        "https://api.example.test",
+                        "--api-key",
+                        "vx_secret",
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "session-a",
+                    ]
+                )
+                self.assertEqual(code, 0)
+
+            settings = json.loads((home / ".claude" / "settings.json").read_text(encoding="utf-8"))
+            prime_hooks = [
+                hook
+                for group in settings["hooks"]["SessionStart"]
+                for hook in group["hooks"]
+                if hook.get("vexicHookId") == "vexic-claude-code-recorder"
+            ]
+
+            self.assertEqual(len(prime_hooks), 1)
+            self.assertEqual(prime_hooks[0]["type"], "command")
+            self.assertIn("recorder prime", prime_hooks[0]["command"])
+            self.assertIn("--config", prime_hooks[0]["command"])
+            self.assertNotIn("vx_secret", prime_hooks[0]["command"])
+
     def test_uninstall_removes_only_vexic_hook(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
@@ -1001,6 +1044,9 @@ class ClaudeCodeSetupTests(unittest.TestCase):
             settings["hooks"]["Stop"].append(
                 {"hooks": [{"type": "command", "command": "echo keep"}]}
             )
+            settings["hooks"]["SessionStart"].append(
+                {"hooks": [{"type": "command", "command": "echo keep session"}]}
+            )
             settings_path.write_text(json.dumps(settings), encoding="utf-8")
 
             removed = uninstall_claude_code_setup(home=home, project_root=project_root)
@@ -1013,6 +1059,12 @@ class ClaudeCodeSetupTests(unittest.TestCase):
                 for hook in group["hooks"]
             ]
             self.assertEqual(commands, ["echo keep"])
+            session_start_commands = [
+                hook["command"]
+                for group in settings["hooks"]["SessionStart"]
+                for hook in group["hooks"]
+            ]
+            self.assertEqual(session_start_commands, ["echo keep session"])
             mcp_config = json.loads(mcp_path.read_text(encoding="utf-8"))
             self.assertEqual(mcp_config["mcpServers"], {"other": {"command": "echo", "args": ["keep"]}})
 
@@ -1066,6 +1118,42 @@ class ClaudeCodeSetupTests(unittest.TestCase):
 
             self.assertEqual(code, 0)
             self.assertTrue((project_root / ".mcp.json").exists())
+
+    def test_setup_rejects_non_derivable_hook_command_cleanly(self) -> None:
+        from vexic.cli import main as vexic_main
+
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            project_root = home / "project"
+            project_root.mkdir()
+            stderr = io.StringIO()
+
+            with contextlib.redirect_stderr(stderr):
+                code = vexic_main(
+                    [
+                        "setup",
+                        "claude-code",
+                        "--home",
+                        str(home),
+                        "--project-root",
+                        str(project_root),
+                        "--base-url",
+                        "https://api.example.test",
+                        "--api-key",
+                        "vx_secret",
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "session-a",
+                        "--hook-command",
+                        "custom-recorder",
+                    ]
+                )
+
+            self.assertEqual(code, 2)
+            self.assertIn("prime_command is required", stderr.getvalue())
+            self.assertNotIn("Traceback", stderr.getvalue())
+            self.assertFalse((home / ".claude" / "settings.json").exists())
 
     def test_ingest_uses_config_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1389,3 +1477,763 @@ class ClaudeCodeRecorderIngestCommandMoreTests(unittest.TestCase):
                 )
 
             self.assertEqual(code, 0)
+
+
+class ClaudeCodeRecorderPrimeCommandTests(unittest.TestCase):
+    def test_prime_resume_skips_injection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                        "agent_id": "agent-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "resume"}), encoding="utf-8")
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout.getvalue(), "")
+
+    def test_prime_startup_emits_capped_context_from_hosted_search(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                        "agent_id": "agent-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            calls = []
+
+            class _Response:
+                def __init__(self, payload: dict[str, object]) -> None:
+                    self._payload = payload
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc):
+                    return False
+
+                def read(self) -> bytes:
+                    return json.dumps(self._payload).encode("utf-8")
+
+            def fake_urlopen(request, timeout):
+                calls.append((request, timeout))
+                if request.full_url.endswith("/v1/search_long_term"):
+                    return _Response(
+                        {
+                            "facts": [
+                                {
+                                    "fact_id": 1,
+                                    "fact_text": "Durable cedar preference",
+                                    "subject": "user",
+                                    "category": "preference",
+                                    "importance": 5,
+                                    "confidence": 0.9,
+                                    "source_message_ids": [7],
+                                    "editable": True,
+                                    "created_at": "2026-06-29T00:00:00Z",
+                                }
+                            ],
+                            "candidate_notes": [],
+                        }
+                    )
+                return _Response(
+                    {
+                        "hits": [
+                            {
+                                "message_id": 3,
+                                "session_id": "session-a",
+                                "timestamp": "2026-06-29T00:00:01Z",
+                                "body": "User: recent cedar note",
+                            }
+                        ]
+                    }
+                )
+
+            stdout = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--max-chars",
+                        "160",
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            output = json.loads(stdout.getvalue())
+            context = output["hookSpecificOutput"]["additionalContext"]
+            self.assertEqual(output["hookSpecificOutput"]["hookEventName"], "SessionStart")
+            self.assertLessEqual(len(context), 160)
+            self.assertIn("Durable cedar preference", context)
+            self.assertIn("recent cedar note", context)
+            self.assertNotIn("vx_secret", stdout.getvalue())
+            self.assertEqual(
+                [urlsplit(call[0].full_url).path for call in calls],
+                ["/v1/search_long_term", "/v1/search_transcript"],
+            )
+            for request, timeout in calls:
+                self.assertEqual(timeout, 5.0)
+                self.assertEqual(request.get_header("Authorization"), "Bearer vx_secret")
+                self.assertEqual(request.get_header("X-vexic-project-id"), "project-a")
+                self.assertEqual(request.get_header("X-vexic-session-id"), "session-a")
+                self.assertEqual(request.get_header("X-vexic-agent-id"), "agent-a")
+
+    def test_prime_uses_transcript_when_long_term_search_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "clear"}), encoding="utf-8")
+
+            class _Response:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc):
+                    return False
+
+                def read(self) -> bytes:
+                    return json.dumps(
+                        {
+                            "hits": [
+                                {
+                                    "message_id": 1,
+                                    "session_id": "session-a",
+                                    "body": "User: remember fallback cedar",
+                                }
+                            ]
+                        }
+                    ).encode("utf-8")
+
+            def fake_urlopen(request, timeout):
+                if request.full_url.endswith("/v1/search_long_term"):
+                    raise HTTPError(request.full_url, 500, "boom", hdrs={}, fp=None)
+                return _Response()
+
+            stdout = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            output = json.loads(stdout.getvalue())
+            self.assertIn(
+                "remember fallback cedar",
+                output["hookSpecificOutput"]["additionalContext"],
+            )
+
+    def test_prime_secret_response_warns_without_injection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+
+            class _Response:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc):
+                    return False
+
+                def read(self) -> bytes:
+                    return json.dumps(
+                        {
+                            "hits": [
+                                {
+                                    "message_id": 1,
+                                    "session_id": "session-a",
+                                    "body": "User: vx_secret",
+                                }
+                            ]
+                        }
+                    ).encode("utf-8")
+
+            def fake_urlopen(request, timeout):
+                if request.full_url.endswith("/v1/search_long_term"):
+                    return _Response()
+                return _Response()
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("forbidden secret", stderr.getvalue())
+            self.assertNotIn("vx_secret", stderr.getvalue())
+
+    def test_prime_compact_source_skips_injection(self) -> None:
+        """source='compact' is not eligible — prime should exit silently."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "compact"}), encoding="utf-8")
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout.getvalue(), "")
+
+    def test_prime_unknown_source_skips_injection(self) -> None:
+        """Unknown source values are not eligible."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "some_future_source"}), encoding="utf-8")
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout.getvalue(), "")
+
+    def test_prime_null_source_skips_injection(self) -> None:
+        """Explicit null source is not eligible."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": None}), encoding="utf-8")
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout.getvalue(), "")
+
+    def test_prime_missing_source_field_skips_injection(self) -> None:
+        """Hook payload with no 'source' key is not eligible."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({}), encoding="utf-8")
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout.getvalue(), "")
+
+    def test_prime_both_searches_fail_produces_no_output(self) -> None:
+        """When both searches fail, context is empty and no output is emitted."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+
+            def fake_urlopen(request, timeout):
+                raise HTTPError(request.full_url, 503, "Service Unavailable", hdrs={}, fp=None)
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout.getvalue(), "")
+
+    def test_prime_emits_no_injection_when_context_is_empty(self) -> None:
+        """When both searches return no usable items, stdout is empty."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+
+            class _Response:
+                def __enter__(self): return self
+                def __exit__(self, *_): return False
+                def read(self): return json.dumps({}).encode("utf-8")
+
+            def fake_urlopen(request, timeout):
+                return _Response()
+
+            stdout = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout.getvalue(), "")
+
+    def test_prime_clear_source_also_emits_context(self) -> None:
+        """source='clear' should trigger priming just like 'startup'."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "clear"}), encoding="utf-8")
+
+            class _Response:
+                def __enter__(self): return self
+                def __exit__(self, *_): return False
+                def read(self):
+                    return json.dumps(
+                        {"facts": [{"fact_text": "Clear event fact"}], "candidate_notes": []}
+                    ).encode("utf-8")
+
+            def fake_urlopen(request, timeout):
+                if "long_term" in request.full_url:
+                    return _Response()
+                return type("R", (), {
+                    "__enter__": lambda s: s,
+                    "__exit__": lambda s, *a: False,
+                    "read": lambda s: json.dumps({}).encode("utf-8"),
+                })()
+
+            stdout = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            output = json.loads(stdout.getvalue())
+            self.assertIn("Clear event fact", output["hookSpecificOutput"]["additionalContext"])
+
+    def test_prime_cli_timeout_seconds_passed_to_fetch(self) -> None:
+        """--timeout-seconds flag is forwarded to urlopen calls."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            timeouts: list[float] = []
+
+            class _Response:
+                def __enter__(self): return self
+                def __exit__(self, *_): return False
+                def read(self): return json.dumps({}).encode("utf-8")
+
+            def fake_urlopen(request, timeout):
+                timeouts.append(timeout)
+                return _Response()
+
+            with patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen):
+                recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--timeout-seconds",
+                        "12.5",
+                    ]
+                )
+
+            for t in timeouts:
+                self.assertEqual(t, 12.5)
+
+
+class ClaudeSetupHookCommandTests(unittest.TestCase):
+    """Tests for _hook_command() and _prime_command() helpers in claude_setup."""
+
+    def test_hook_command_constructs_command_with_config_path(self) -> None:
+        from vexic.recorders.claude_setup import _hook_command
+        from pathlib import Path
+
+        path = Path("/home/user/.vexic/claude-code-recorder.json")
+        result = _hook_command("python -m vexic.cli recorder ingest", path)
+        self.assertIn("--config", result)
+        self.assertIn("claude-code-recorder.json", result)
+        self.assertIn("python -m vexic.cli recorder ingest", result)
+
+    def test_hook_command_replaces_backslashes_with_forward_slashes(self) -> None:
+        from vexic.recorders.claude_setup import _hook_command
+        from pathlib import Path
+
+        path = Path(r"C:\Users\user\.vexic\recorder.json")
+        result = _hook_command(r"C:\Python\python.exe -m vexic.cli recorder ingest", path)
+        self.assertNotIn("\\", result.split("--config")[0])
+
+    def test_prime_command_derives_from_ingest_command(self) -> None:
+        from vexic.recorders.claude_setup import _prime_command
+
+        result = _prime_command("python -m vexic.cli recorder ingest")
+        self.assertEqual(result, "python -m vexic.cli recorder prime")
+
+    def test_prime_command_strips_trailing_whitespace_before_comparison(self) -> None:
+        from vexic.recorders.claude_setup import _prime_command
+
+        result = _prime_command("python -m vexic.cli recorder ingest   ")
+        self.assertEqual(result, "python -m vexic.cli recorder prime")
+
+    def test_prime_command_raises_when_command_does_not_end_with_recorder_ingest(self) -> None:
+        from vexic.recorders.claude_setup import _prime_command
+
+        with self.assertRaises(ValueError) as ctx:
+            _prime_command("custom-recorder-tool")
+
+        self.assertIn("prime_command is required", str(ctx.exception))
+
+    def test_prime_command_raises_for_partial_suffix(self) -> None:
+        from vexic.recorders.claude_setup import _prime_command
+
+        with self.assertRaises(ValueError):
+            _prime_command("python -m vexic.cli recorder")  # missing "ingest"
+
+    def test_install_writes_session_start_hook_with_prime_command(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            project_root = home / "proj"
+            project_root.mkdir()
+
+            result = install_claude_code_setup(
+                home=home,
+                base_url="https://api.example.test",
+                api_key="key123",
+                project_id="proj-a",
+                session_id="sess-a",
+                agent_id=None,
+                command="python -m vexic.cli recorder ingest",
+            )
+
+            settings = json.loads(result.settings_path.read_text(encoding="utf-8"))
+            session_start_hooks = [
+                hook
+                for group in settings["hooks"]["SessionStart"]
+                for hook in group["hooks"]
+            ]
+            self.assertEqual(len(session_start_hooks), 1)
+            cmd = session_start_hooks[0]["command"]
+            self.assertIn("recorder prime", cmd)
+            self.assertIn("--config", cmd)
+            self.assertNotIn("key123", cmd)
+
+    def test_install_uses_explicit_prime_command_when_provided(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+
+            result = install_claude_code_setup(
+                home=home,
+                base_url="https://api.example.test",
+                api_key="key123",
+                project_id="proj-a",
+                session_id="sess-a",
+                agent_id=None,
+                command="python -m vexic.cli recorder ingest",
+                prime_command="my-custom-prime-tool",
+            )
+
+            settings = json.loads(result.settings_path.read_text(encoding="utf-8"))
+            prime_hooks = [
+                hook
+                for group in settings["hooks"]["SessionStart"]
+                for hook in group["hooks"]
+            ]
+            self.assertEqual(len(prime_hooks), 1)
+            self.assertIn("my-custom-prime-tool", prime_hooks[0]["command"])
+
+    def test_install_raises_valueerror_for_non_derivable_command_without_explicit_prime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+
+            with self.assertRaises(ValueError) as ctx:
+                install_claude_code_setup(
+                    home=home,
+                    base_url="https://api.example.test",
+                    api_key="key123",
+                    project_id="proj-a",
+                    session_id="sess-a",
+                    agent_id=None,
+                    command="my-custom-recorder",
+                )
+
+            self.assertIn("prime_command is required", str(ctx.exception))
+
+    def test_uninstall_removes_session_start_hook(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+
+            install_claude_code_setup(
+                home=home,
+                base_url="https://api.example.test",
+                api_key="key123",
+                project_id="proj-a",
+                session_id="sess-a",
+                agent_id=None,
+                command="python -m vexic.cli recorder ingest",
+            )
+
+            removed = uninstall_claude_code_setup(home=home)
+
+            settings_path = home / ".claude" / "settings.json"
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            self.assertTrue(removed)
+            # SessionStart hooks list should be empty after removal
+            session_start = settings.get("hooks", {}).get("SessionStart", [])
+            remaining = [
+                hook
+                for group in session_start
+                for hook in group.get("hooks", [])
+                if hook.get("vexicHookId") == "vexic-claude-code-recorder"
+            ]
+            self.assertEqual(remaining, [])
+
+    def test_uninstall_preserves_non_vexic_session_start_hooks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+
+            install_claude_code_setup(
+                home=home,
+                base_url="https://api.example.test",
+                api_key="key123",
+                project_id="proj-a",
+                session_id="sess-a",
+                agent_id=None,
+                command="python -m vexic.cli recorder ingest",
+            )
+
+            # Inject a third-party SessionStart hook
+            settings_path = home / ".claude" / "settings.json"
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            settings["hooks"]["SessionStart"].append(
+                {"hooks": [{"type": "command", "command": "echo third-party-session"}]}
+            )
+            settings_path.write_text(json.dumps(settings), encoding="utf-8")
+
+            uninstall_claude_code_setup(home=home)
+
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            all_session_cmds = [
+                hook["command"]
+                for group in settings["hooks"]["SessionStart"]
+                for hook in group.get("hooks", [])
+            ]
+            self.assertIn("echo third-party-session", all_session_cmds)
+
+    def test_session_start_hook_timeout_is_30_seconds(self) -> None:
+        """SessionStart hook should use a shorter timeout than Stop (30 vs 120)."""
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+
+            result = install_claude_code_setup(
+                home=home,
+                base_url="https://api.example.test",
+                api_key="key123",
+                project_id="proj-a",
+                session_id="sess-a",
+                agent_id=None,
+                command="python -m vexic.cli recorder ingest",
+            )
+
+            settings = json.loads(result.settings_path.read_text(encoding="utf-8"))
+            prime_hooks = [
+                hook
+                for group in settings["hooks"]["SessionStart"]
+                for hook in group["hooks"]
+                if hook.get("vexicHookId") == "vexic-claude-code-recorder"
+            ]
+            self.assertEqual(len(prime_hooks), 1)
+            self.assertEqual(prime_hooks[0]["timeout"], 30)
+
+    def test_stop_hook_timeout_is_120_seconds(self) -> None:
+        """Stop hook should keep its 120 second timeout."""
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+
+            result = install_claude_code_setup(
+                home=home,
+                base_url="https://api.example.test",
+                api_key="key123",
+                project_id="proj-a",
+                session_id="sess-a",
+                agent_id=None,
+                command="python -m vexic.cli recorder ingest",
+            )
+
+            settings = json.loads(result.settings_path.read_text(encoding="utf-8"))
+            stop_hooks = [
+                hook
+                for group in settings["hooks"]["Stop"]
+                for hook in group["hooks"]
+                if hook.get("vexicHookId") == "vexic-claude-code-recorder"
+            ]
+            self.assertEqual(len(stop_hooks), 1)
+            self.assertEqual(stop_hooks[0]["timeout"], 120)
