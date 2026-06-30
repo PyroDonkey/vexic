@@ -31,6 +31,7 @@ missing from this index (and the reverse).
 | 0016 | Local embedding and deferrable contradiction lower the LLM floor | accepted |
 | 0017 | Claude Code setup scaffolds a disabled Vexic MCP entry           | accepted |
 | 0018 | Claude Code read path splits SessionStart priming and MCP on-demand pull | accepted |
+| 0019 | Hosted storage cutover starts Turso-only, Neon deferred         | proposed |
 
 Notes:
 
@@ -41,7 +42,10 @@ Notes:
   dream-phase concurrency lock, spend caps, edge throttles, alerting, abuse
   response) are tracked by COA-263. The 0005/0008 Turso/Neon production cutover
   (the hosted alpha currently runs SQLite on a Railway volume) is tracked by
-  COA-264.
+  COA-264, and ADR 0019 records how that cutover starts: Turso-only as a
+  bootstrap posture (customer memory and the control-plane catalog both on
+  managed libSQL), with the Neon Postgres control plane deferred to a later
+  promotion before external-customer memory.
 - 0007 corresponds to the multi-agent scoping work. The repo, not a tracking
   view, defines the accepted scope semantics.
 - 0011 corresponds to the local/self-host to hosted migration-path decision for
