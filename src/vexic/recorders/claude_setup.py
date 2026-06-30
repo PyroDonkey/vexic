@@ -5,7 +5,6 @@ import json
 import os
 import shlex
 import stat
-import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +47,21 @@ def _require_nonblank(name: str, value: str | None) -> str:
 
 def _bash_safe(value: str) -> str:
     return value.replace("\\", "/")
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+def _uv_run_editable_args(*tail: str) -> list[str]:
+    return ["uv", "run", "--with-editable", str(_repo_root()), *tail]
+
+
+def default_recorder_hook_command() -> str:
+    return shlex.join(
+        _bash_safe(part)
+        for part in _uv_run_editable_args("python", "-m", "vexic.cli", "recorder", "ingest")
+    )
 
 
 def _ensure_owner_only(path: Path) -> None:
@@ -140,8 +154,12 @@ def _write_mcp_config(
         servers = dict(servers)
     next_config["mcpServers"] = servers
     servers["vexic"] = {
-        "command": sys.executable,
+        "command": "uv",
         "args": [
+            "run",
+            "--with-editable",
+            str(_repo_root()),
+            "python",
             str(_mcp_stdio_launcher()),
             "--recorder-config",
             _recorder_config_arg(config_path, home),

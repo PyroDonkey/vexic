@@ -4,7 +4,6 @@ import json
 import os
 import stat
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -683,11 +682,16 @@ class ClaudeCodeSetupTests(unittest.TestCase):
             self.assertEqual(config["agent_id"], "agent-a")
             mcp_config = json.loads((project_root / ".mcp.json").read_text(encoding="utf-8"))
             vexic_server = mcp_config["mcpServers"]["vexic"]
+            repo_root = Path(__file__).resolve().parents[1]
             launcher = Path(__file__).resolve().parents[1] / "scripts" / "vexic-mcp-stdio.py"
-            self.assertEqual(vexic_server["command"], sys.executable)
+            self.assertEqual(vexic_server["command"], "uv")
             self.assertEqual(
                 vexic_server["args"],
                 [
+                    "run",
+                    "--with-editable",
+                    str(repo_root),
+                    "python",
                     str(launcher),
                     "--recorder-config",
                     str(result.config_path),
@@ -773,7 +777,7 @@ class ClaudeCodeSetupTests(unittest.TestCase):
                 cwd=project_root,
                 env=env,
                 capture_output=True,
-                timeout=10,
+                timeout=60,
                 check=False,
             )
 
@@ -1134,6 +1138,50 @@ class ClaudeCodeSetupTests(unittest.TestCase):
 
             self.assertEqual(code, 0)
             self.assertTrue((project_root / ".mcp.json").exists())
+
+    def test_top_level_setup_uses_stable_uv_launcher_not_setup_python(self) -> None:
+        from vexic.cli import main as vexic_main
+
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            project_root = home / "project"
+            project_root.mkdir()
+            setup_python = home / "uv-cache" / ".tmpdead" / "Scripts" / "python.exe"
+
+            with patch("sys.executable", str(setup_python)):
+                code = vexic_main(
+                    [
+                        "setup",
+                        "claude-code",
+                        "--home",
+                        str(home),
+                        "--project-root",
+                        str(project_root),
+                        "--base-url",
+                        "https://api.example.test",
+                        "--api-key",
+                        "vx_secret",
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "session-a",
+                    ]
+                )
+
+            settings = json.loads((home / ".claude" / "settings.json").read_text(encoding="utf-8"))
+            hook_command = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+            mcp_config = json.loads((project_root / ".mcp.json").read_text(encoding="utf-8"))
+            server = mcp_config["mcpServers"]["vexic"]
+            repo_root = str(Path(__file__).resolve().parents[1])
+
+            self.assertEqual(code, 0)
+            self.assertNotIn(str(setup_python).replace("\\", "/"), hook_command)
+            self.assertIn("uv run --with-editable", hook_command)
+            self.assertIn(repo_root.replace("\\", "/"), hook_command)
+            self.assertEqual(server["command"], "uv")
+            self.assertIn("--with-editable", server["args"])
+            self.assertIn(repo_root, server["args"])
+            self.assertNotIn(str(setup_python), json.dumps(mcp_config))
 
     def test_setup_rejects_non_derivable_hook_command_cleanly(self) -> None:
         from vexic.cli import main as vexic_main

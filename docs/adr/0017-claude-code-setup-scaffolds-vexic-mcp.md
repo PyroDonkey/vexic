@@ -39,9 +39,10 @@ Claude Code will not use until the user performs one explicit enable step.
   writes `disabledMcpjsonServers: ["vexic"]` in `~/.claude/settings.json`, which
   is Claude Code's supported rejection list for project `.mcp.json` servers.
   The `.mcp.json` server object does not carry a made-up `disabled` flag.
-- The scaffolded server is a local stdio launcher run by the setup-time Python
-  interpreter: `.mcp.json` writes `command` as `sys.executable` and `args` as
-  `[<absolute scripts/vexic-mcp-stdio.py>, "--recorder-config",
+- The scaffolded server is a local stdio launcher run through a stable
+  repo-local uv invocation: `.mcp.json` writes `command` as `uv` and `args` as
+  `["run", "--with-editable", <repo-root>, "python",
+  <absolute scripts/vexic-mcp-stdio.py>, "--recorder-config",
   <recorder-config path>]`. The script path is absolute so the launcher works
   from a user project directory, and the recorder config path points at the
   existing `~/.vexic/claude-code-recorder.json` secret store. The launcher, not
