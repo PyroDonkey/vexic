@@ -904,6 +904,27 @@ class HostedHttpTests(unittest.TestCase):
             ["User: trimmed header cedar"],
         )
 
+    def test_hosted_search_transcript_accepts_header_bound_scope(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
+        append_response = self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key),
+            json=self._append_body("header scoped cedar"),
+        )
+
+        search_response = self.client.post(
+            "/v1/search_transcript",
+            headers=self._write_headers(api_key),
+            json={"query": "cedar", "limit": 5},
+        )
+
+        self.assertEqual(append_response.status_code, 200)
+        self.assertEqual(search_response.status_code, 200)
+        self.assertEqual(
+            [hit["body"] for hit in search_response.json()["hits"]],
+            ["User: header scoped cedar"],
+        )
+
     def test_hosted_append_rejects_forbidden_values_without_persisting(self) -> None:
         api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
 
@@ -1594,6 +1615,232 @@ class HostedHttpTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 2)
         self.assertIn("requires a host-supplied model port", stderr.getvalue())
+
+
+class HostedSearchHandlerTests(unittest.TestCase):
+    """Tests for the _handle_search path added in this PR.
+
+    Covers: header-bound scope (no ``scope`` in body), explicit scope in body,
+    missing API key, invalid body, and permission errors for both
+    /v1/search_transcript and /v1/search_long_term.
+    """
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        root = Path(self.temp_dir.name)
+        self.catalog = HostedTenantCatalog(root)
+        self.keys = HostedApiKeyStore(root)
+        self.service = HostedMemoryService(self.catalog, self.keys, telemetry=self.catalog)
+        self.client = TestClient(create_app(self.service))
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _api_key(
+        self,
+        *,
+        capabilities: set[MemoryCapability],
+        tenant_id: str = "tenant-a",
+        project_ids: set[str] | None = None,
+    ) -> str:
+        project_ids = project_ids or {"project-a"}
+        self.catalog.provision_tenant(tenant_id, project_ids=project_ids)
+        return self.keys.create_key(
+            tenant_id=tenant_id,
+            principal_id="agent-a",
+            capabilities=capabilities,
+            project_ids=project_ids,
+        ).raw_key
+
+    def _write_headers(
+        self,
+        api_key: str,
+        *,
+        project_id: str = "project-a",
+        session_id: str = "session-a",
+        agent_id: str | None = None,
+    ) -> dict[str, str]:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "X-Vexic-Project-Id": project_id,
+            "X-Vexic-Session-Id": session_id,
+        }
+        if agent_id is not None:
+            headers["X-Vexic-Agent-Id"] = agent_id
+        return headers
+
+    def _append_body(self, text: str) -> dict[str, object]:
+        from vexic.storage import single_message_adapter
+        from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+        message_json = single_message_adapter.dump_json(
+            ModelRequest(parts=[UserPromptPart(content=text)])
+        ).decode()
+        return {"messages_json": [message_json], "redaction": {"forbidden_values": []}}
+
+    # -- search_transcript ----------------------------------------------------
+
+    def test_search_transcript_without_api_key_returns_401(self) -> None:
+        response = self.client.post(
+            "/v1/search_transcript",
+            json={"query": "test", "limit": 5},
+        )
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"]["code"], "unauthorized")
+
+    def test_search_transcript_with_header_bound_scope_returns_results(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
+        self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key),
+            json=self._append_body("header scope search test value"),
+        )
+
+        response = self.client.post(
+            "/v1/search_transcript",
+            headers=self._write_headers(api_key),
+            json={"query": "header scope search test", "limit": 5},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        hits = response.json()["hits"]
+        self.assertTrue(any("header scope search test value" in h["body"] for h in hits))
+
+    def test_search_transcript_with_scope_in_body_uses_explicit_scope(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
+        self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key),
+            json=self._append_body("explicit scope body value"),
+        )
+
+        # Provide an explicit scope in the body; no X-Vexic-* headers needed for scope
+        response = self.client.post(
+            "/v1/search_transcript",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "scope": {
+                    "tenant_id": "tenant-a",
+                    "project_id": "project-a",
+                    "session_id": "session-a",
+                    "principal": {
+                        "principal_id": "agent-a",
+                        "principal_type": "human",
+                    },
+                    "trust_boundary": "local_trusted",
+                    "capabilities": ["search"],
+                },
+                "query": "explicit scope body",
+                "limit": 5,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_search_transcript_with_extra_fields_in_header_bound_body_returns_422(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
+
+        response = self.client.post(
+            "/v1/search_transcript",
+            headers=self._write_headers(api_key),
+            json={"query": "test", "limit": 5, "unexpected_field": "value"},
+        )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["error"]["code"], "invalid_request")
+
+    def test_search_transcript_with_invalid_api_key_returns_401(self) -> None:
+        # provision tenant so catalog exists, then use wrong key
+        self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
+
+        response = self.client.post(
+            "/v1/search_transcript",
+            headers=self._write_headers("not_a_real_api_key"),
+            json={"query": "test", "limit": 5},
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"]["code"], "unauthorized")
+
+    # -- search_long_term -----------------------------------------------------
+
+    def test_search_long_term_without_api_key_returns_401(self) -> None:
+        response = self.client.post(
+            "/v1/search_long_term",
+            json={"query": "test", "limit": 5},
+        )
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"]["code"], "unauthorized")
+
+    def test_search_long_term_with_header_bound_scope_returns_200(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
+
+        response = self.client.post(
+            "/v1/search_long_term",
+            headers=self._write_headers(api_key),
+            json={"query": "preferences", "limit": 5},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("facts", response.json())
+
+    def test_search_long_term_with_extra_fields_in_header_bound_body_returns_422(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
+
+        response = self.client.post(
+            "/v1/search_long_term",
+            headers=self._write_headers(api_key),
+            json={"query": "test", "limit": 5, "unknown_extra": True},
+        )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["error"]["code"], "invalid_request")
+
+    def test_search_long_term_with_invalid_api_key_returns_401(self) -> None:
+        self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
+
+        response = self.client.post(
+            "/v1/search_long_term",
+            headers=self._write_headers("bad_key_value"),
+            json={"query": "test", "limit": 5},
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"]["code"], "unauthorized")
+
+    def test_search_transcript_default_limit_is_used_when_omitted(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
+
+        response = self.client.post(
+            "/v1/search_transcript",
+            headers=self._write_headers(api_key),
+            json={"query": "test"},
+        )
+
+        # Should succeed with default limit=5 from _HeaderBoundSearchBody
+        self.assertEqual(response.status_code, 200)
+
+    def test_search_transcript_missing_query_returns_422(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
+
+        response = self.client.post(
+            "/v1/search_transcript",
+            headers=self._write_headers(api_key),
+            json={"limit": 5},
+        )
+
+        self.assertEqual(response.status_code, 422)
+
+    def test_search_long_term_missing_query_returns_422(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
+
+        response = self.client.post(
+            "/v1/search_long_term",
+            headers=self._write_headers(api_key),
+            json={"limit": 5},
+        )
+
+        self.assertEqual(response.status_code, 422)
 
 
 def _main_result(argv: list[str]) -> int:

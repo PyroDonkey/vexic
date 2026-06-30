@@ -977,6 +977,49 @@ class ClaudeCodeSetupTests(unittest.TestCase):
             mcp_config = json.loads((project_root / ".mcp.json").read_text(encoding="utf-8"))
             self.assertEqual(list(mcp_config["mcpServers"]), ["vexic"])
 
+    def test_setup_installs_session_start_prime_hook_idempotently(self) -> None:
+        from vexic.cli import main as vexic_main
+
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            project_root = home / "project"
+            project_root.mkdir()
+
+            for _ in range(2):
+                code = vexic_main(
+                    [
+                        "setup",
+                        "claude-code",
+                        "--home",
+                        str(home),
+                        "--project-root",
+                        str(project_root),
+                        "--base-url",
+                        "https://api.example.test",
+                        "--api-key",
+                        "vx_secret",
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "session-a",
+                    ]
+                )
+                self.assertEqual(code, 0)
+
+            settings = json.loads((home / ".claude" / "settings.json").read_text(encoding="utf-8"))
+            prime_hooks = [
+                hook
+                for group in settings["hooks"]["SessionStart"]
+                for hook in group["hooks"]
+                if hook.get("vexicHookId") == "vexic-claude-code-recorder"
+            ]
+
+            self.assertEqual(len(prime_hooks), 1)
+            self.assertEqual(prime_hooks[0]["type"], "command")
+            self.assertIn("recorder prime", prime_hooks[0]["command"])
+            self.assertIn("--config", prime_hooks[0]["command"])
+            self.assertNotIn("vx_secret", prime_hooks[0]["command"])
+
     def test_uninstall_removes_only_vexic_hook(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
@@ -1001,6 +1044,9 @@ class ClaudeCodeSetupTests(unittest.TestCase):
             settings["hooks"]["Stop"].append(
                 {"hooks": [{"type": "command", "command": "echo keep"}]}
             )
+            settings["hooks"]["SessionStart"].append(
+                {"hooks": [{"type": "command", "command": "echo keep session"}]}
+            )
             settings_path.write_text(json.dumps(settings), encoding="utf-8")
 
             removed = uninstall_claude_code_setup(home=home, project_root=project_root)
@@ -1013,6 +1059,12 @@ class ClaudeCodeSetupTests(unittest.TestCase):
                 for hook in group["hooks"]
             ]
             self.assertEqual(commands, ["echo keep"])
+            session_start_commands = [
+                hook["command"]
+                for group in settings["hooks"]["SessionStart"]
+                for hook in group["hooks"]
+            ]
+            self.assertEqual(session_start_commands, ["echo keep session"])
             mcp_config = json.loads(mcp_path.read_text(encoding="utf-8"))
             self.assertEqual(mcp_config["mcpServers"], {"other": {"command": "echo", "args": ["keep"]}})
 
@@ -1066,6 +1118,42 @@ class ClaudeCodeSetupTests(unittest.TestCase):
 
             self.assertEqual(code, 0)
             self.assertTrue((project_root / ".mcp.json").exists())
+
+    def test_setup_rejects_non_derivable_hook_command_cleanly(self) -> None:
+        from vexic.cli import main as vexic_main
+
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            project_root = home / "project"
+            project_root.mkdir()
+            stderr = io.StringIO()
+
+            with contextlib.redirect_stderr(stderr):
+                code = vexic_main(
+                    [
+                        "setup",
+                        "claude-code",
+                        "--home",
+                        str(home),
+                        "--project-root",
+                        str(project_root),
+                        "--base-url",
+                        "https://api.example.test",
+                        "--api-key",
+                        "vx_secret",
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "session-a",
+                        "--hook-command",
+                        "custom-recorder",
+                    ]
+                )
+
+            self.assertEqual(code, 2)
+            self.assertIn("prime_command is required", stderr.getvalue())
+            self.assertNotIn("Traceback", stderr.getvalue())
+            self.assertFalse((home / ".claude" / "settings.json").exists())
 
     def test_ingest_uses_config_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1389,3 +1477,1019 @@ class ClaudeCodeRecorderIngestCommandMoreTests(unittest.TestCase):
                 )
 
             self.assertEqual(code, 0)
+
+
+class ClaudeCodeRecorderPrimeCommandTests(unittest.TestCase):
+    def test_prime_resume_skips_injection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                        "agent_id": "agent-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "resume"}), encoding="utf-8")
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout.getvalue(), "")
+
+    def test_prime_startup_emits_capped_context_from_hosted_search(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                        "agent_id": "agent-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            calls = []
+
+            class _Response:
+                def __init__(self, payload: dict[str, object]) -> None:
+                    self._payload = payload
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc):
+                    return False
+
+                def read(self) -> bytes:
+                    return json.dumps(self._payload).encode("utf-8")
+
+            def fake_urlopen(request, timeout):
+                calls.append((request, timeout))
+                if request.full_url.endswith("/v1/search_long_term"):
+                    return _Response(
+                        {
+                            "facts": [
+                                {
+                                    "fact_id": 1,
+                                    "fact_text": "Durable cedar preference",
+                                    "subject": "user",
+                                    "category": "preference",
+                                    "importance": 5,
+                                    "confidence": 0.9,
+                                    "source_message_ids": [7],
+                                    "editable": True,
+                                    "created_at": "2026-06-29T00:00:00Z",
+                                }
+                            ],
+                            "candidate_notes": [],
+                        }
+                    )
+                return _Response(
+                    {
+                        "hits": [
+                            {
+                                "message_id": 3,
+                                "session_id": "session-a",
+                                "timestamp": "2026-06-29T00:00:01Z",
+                                "body": "User: recent cedar note",
+                            }
+                        ]
+                    }
+                )
+
+            stdout = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--max-chars",
+                        "160",
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            output = json.loads(stdout.getvalue())
+            context = output["hookSpecificOutput"]["additionalContext"]
+            self.assertEqual(output["hookSpecificOutput"]["hookEventName"], "SessionStart")
+            self.assertLessEqual(len(context), 160)
+            self.assertIn("Durable cedar preference", context)
+            self.assertIn("recent cedar note", context)
+            self.assertNotIn("vx_secret", stdout.getvalue())
+            self.assertEqual(
+                [urlsplit(call[0].full_url).path for call in calls],
+                ["/v1/search_long_term", "/v1/search_transcript"],
+            )
+            for request, timeout in calls:
+                self.assertEqual(timeout, 5.0)
+                self.assertEqual(request.get_header("Authorization"), "Bearer vx_secret")
+                self.assertEqual(request.get_header("X-vexic-project-id"), "project-a")
+                self.assertEqual(request.get_header("X-vexic-session-id"), "session-a")
+                self.assertEqual(request.get_header("X-vexic-agent-id"), "agent-a")
+
+    def test_prime_uses_transcript_when_long_term_search_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "clear"}), encoding="utf-8")
+
+            class _Response:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc):
+                    return False
+
+                def read(self) -> bytes:
+                    return json.dumps(
+                        {
+                            "hits": [
+                                {
+                                    "message_id": 1,
+                                    "session_id": "session-a",
+                                    "body": "User: remember fallback cedar",
+                                }
+                            ]
+                        }
+                    ).encode("utf-8")
+
+            def fake_urlopen(request, timeout):
+                if request.full_url.endswith("/v1/search_long_term"):
+                    raise HTTPError(request.full_url, 500, "boom", hdrs={}, fp=None)
+                return _Response()
+
+            stdout = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            output = json.loads(stdout.getvalue())
+            self.assertIn(
+                "remember fallback cedar",
+                output["hookSpecificOutput"]["additionalContext"],
+            )
+
+    def test_prime_secret_response_warns_without_injection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+
+            class _Response:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc):
+                    return False
+
+                def read(self) -> bytes:
+                    return json.dumps(
+                        {
+                            "hits": [
+                                {
+                                    "message_id": 1,
+                                    "session_id": "session-a",
+                                    "body": "User: vx_secret",
+                                }
+                            ]
+                        }
+                    ).encode("utf-8")
+
+            def fake_urlopen(request, timeout):
+                if request.full_url.endswith("/v1/search_long_term"):
+                    return _Response()
+                return _Response()
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("forbidden secret", stderr.getvalue())
+            self.assertNotIn("vx_secret", stderr.getvalue())
+
+    def test_prime_compact_source_skips_injection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "compact"}), encoding="utf-8")
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout.getvalue(), "")
+
+    def test_prime_null_source_skips_injection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": None}), encoding="utf-8")
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout.getvalue(), "")
+
+    def test_prime_missing_source_field_skips_injection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({}), encoding="utf-8")
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout.getvalue(), "")
+
+    def test_prime_unknown_source_skips_injection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "some_future_source"}), encoding="utf-8")
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout.getvalue(), "")
+
+    def test_prime_emits_nothing_when_context_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+
+            class _EmptyResponse:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc):
+                    return False
+
+                def read(self) -> bytes:
+                    return json.dumps({"facts": [], "candidate_notes": [], "hits": []}).encode("utf-8")
+
+            def fake_urlopen(request, timeout):
+                return _EmptyResponse()
+
+            stdout = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout.getvalue(), "")
+
+    def test_prime_missing_config_option_exits_with_code_2(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            # Config is missing api_key
+            config_path.write_text(
+                json.dumps({"base_url": "https://api.example.test", "project_id": "p", "session_id": "s"}),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 2)
+            self.assertIn("missing required ingest option", stderr.getvalue())
+
+    def test_prime_both_searches_fail_returns_empty_context(self) -> None:
+        from urllib.error import URLError
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+
+            def fake_urlopen(request, timeout):
+                raise URLError("connection refused")
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            # Both searches fail → no context → no output, but returns 0 (fail-open)
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout.getvalue(), "")
+
+    def test_prime_no_agent_id_omits_agent_header(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                        # no agent_id
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "clear"}), encoding="utf-8")
+            calls = []
+
+            class _Response:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc):
+                    return False
+
+                def read(self) -> bytes:
+                    return json.dumps({"facts": [], "candidate_notes": [], "hits": []}).encode("utf-8")
+
+            def fake_urlopen(request, timeout):
+                calls.append(request)
+                return _Response()
+
+            with patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen):
+                recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertTrue(len(calls) > 0)
+            for request in calls:
+                self.assertIsNone(request.get_header("X-vexic-agent-id"))
+
+
+class HostedPrimeUnitTests(unittest.TestCase):
+    """Unit tests for hosted_prime.py helper functions."""
+
+    def test_build_prime_context_empty_both_returns_empty_string(self) -> None:
+        from vexic.recorders.hosted_prime import build_prime_context
+
+        result = build_prime_context({}, {}, max_chars=1000)
+        self.assertEqual(result, "")
+
+    def test_build_prime_context_only_facts(self) -> None:
+        from vexic.recorders.hosted_prime import build_prime_context
+
+        result = build_prime_context(
+            {"facts": [{"fact_text": "User prefers dark mode"}], "candidate_notes": []},
+            {},
+            max_chars=1000,
+        )
+        self.assertIn("User prefers dark mode", result)
+        self.assertIn("Long-term memory:", result)
+        self.assertNotIn("Recent transcript memory:", result)
+
+    def test_build_prime_context_only_transcript_hits(self) -> None:
+        from vexic.recorders.hosted_prime import build_prime_context
+
+        result = build_prime_context(
+            {},
+            {"hits": [{"body": "User asked about authentication"}]},
+            max_chars=1000,
+        )
+        self.assertIn("User asked about authentication", result)
+        self.assertIn("Recent transcript memory:", result)
+        self.assertNotIn("Long-term memory:", result)
+
+    def test_build_prime_context_includes_candidate_notes(self) -> None:
+        from vexic.recorders.hosted_prime import build_prime_context
+
+        result = build_prime_context(
+            {
+                "facts": [],
+                "candidate_notes": [{"fact_text": "Possible preference noted"}],
+            },
+            {},
+            max_chars=1000,
+        )
+        self.assertIn("tentative:", result)
+        self.assertIn("Possible preference noted", result)
+
+    def test_build_prime_context_skips_facts_with_missing_fact_text(self) -> None:
+        from vexic.recorders.hosted_prime import build_prime_context
+
+        result = build_prime_context(
+            {
+                "facts": [
+                    {"fact_text": "Valid fact"},
+                    {"other_key": "no fact_text here"},
+                    {"fact_text": ""},
+                    {"fact_text": "   "},
+                ],
+                "candidate_notes": [],
+            },
+            {},
+            max_chars=1000,
+        )
+        self.assertIn("Valid fact", result)
+        self.assertNotIn("no fact_text here", result)
+
+    def test_build_prime_context_truncates_at_max_chars(self) -> None:
+        from vexic.recorders.hosted_prime import build_prime_context
+
+        long_fact = "x" * 500
+        result = build_prime_context(
+            {"facts": [{"fact_text": long_fact}], "candidate_notes": []},
+            {},
+            max_chars=50,
+        )
+        self.assertLessEqual(len(result), 50)
+        self.assertIn("[truncated]", result)
+
+    def test_build_prime_context_max_chars_zero_returns_empty(self) -> None:
+        from vexic.recorders.hosted_prime import build_prime_context
+
+        result = build_prime_context(
+            {"facts": [{"fact_text": "some fact"}], "candidate_notes": []},
+            {},
+            max_chars=0,
+        )
+        self.assertEqual(result, "")
+
+    def test_build_prime_context_at_exact_limit_no_truncation(self) -> None:
+        from vexic.recorders.hosted_prime import build_prime_context
+
+        # Build context with known content then check it at its exact length
+        full_result = build_prime_context(
+            {"facts": [{"fact_text": "short"}], "candidate_notes": []},
+            {},
+            max_chars=10000,
+        )
+        at_limit = build_prime_context(
+            {"facts": [{"fact_text": "short"}], "candidate_notes": []},
+            {},
+            max_chars=len(full_result),
+        )
+        self.assertEqual(full_result, at_limit)
+        self.assertNotIn("[truncated]", at_limit)
+
+    def test_cap_truncation_adds_truncated_suffix(self) -> None:
+        from vexic.recorders.hosted_prime import _cap
+
+        text = "a" * 100
+        result = _cap(text, 30)
+        self.assertLessEqual(len(result), 30)
+        self.assertTrue(result.endswith("[truncated]"))
+
+    def test_cap_at_or_under_limit_returns_full_text(self) -> None:
+        from vexic.recorders.hosted_prime import _cap
+
+        text = "hello world"
+        self.assertEqual(_cap(text, len(text)), text)
+        self.assertEqual(_cap(text, len(text) + 10), text)
+
+    def test_cap_very_small_limit_returns_raw_slice(self) -> None:
+        from vexic.recorders.hosted_prime import _cap
+
+        # When max_chars <= len("\n[truncated]") = 12, falls back to raw slice
+        text = "abcdefghijklmnopqrstuvwxyz"
+        result = _cap(text, 5)
+        self.assertEqual(len(result), 5)
+        self.assertEqual(result, text[:5])
+
+    def test_items_with_non_list_returns_empty(self) -> None:
+        from vexic.recorders.hosted_prime import _items
+
+        self.assertEqual(_items(None), [])
+        self.assertEqual(_items("string"), [])
+        self.assertEqual(_items(42), [])
+        self.assertEqual(_items({}), [])
+
+    def test_items_filters_non_dict_elements(self) -> None:
+        from vexic.recorders.hosted_prime import _items
+
+        result = _items([{"a": 1}, "string", None, 42, {"b": 2}])
+        self.assertEqual(result, [{"a": 1}, {"b": 2}])
+
+    def test_items_with_empty_list_returns_empty(self) -> None:
+        from vexic.recorders.hosted_prime import _items
+
+        self.assertEqual(_items([]), [])
+
+    def test_str_helper_with_none_returns_none(self) -> None:
+        from vexic.recorders.hosted_prime import _str
+
+        self.assertIsNone(_str(None))
+
+    def test_str_helper_with_empty_string_returns_none(self) -> None:
+        from vexic.recorders.hosted_prime import _str
+
+        self.assertIsNone(_str(""))
+
+    def test_str_helper_with_whitespace_only_returns_none(self) -> None:
+        from vexic.recorders.hosted_prime import _str
+
+        self.assertIsNone(_str("   "))
+        self.assertIsNone(_str("\t\n"))
+
+    def test_str_helper_with_non_string_returns_none(self) -> None:
+        from vexic.recorders.hosted_prime import _str
+
+        self.assertIsNone(_str(42))
+        self.assertIsNone(_str(["list"]))
+
+    def test_str_helper_strips_whitespace(self) -> None:
+        from vexic.recorders.hosted_prime import _str
+
+        self.assertEqual(_str("  hello  "), "hello")
+
+    def test_post_search_url_error_raises_runtime_error(self) -> None:
+        from urllib.error import URLError
+        from vexic.recorders.hosted_prime import HostedPrimeConfig, _post_search
+
+        config = HostedPrimeConfig(
+            base_url="https://api.example.test/",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        def fake_urlopen(request, timeout):
+            raise URLError("name resolution failed")
+
+        with patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen):
+            with self.assertRaises(RuntimeError) as ctx:
+                _post_search(config, "search_transcript", {"query": "test", "limit": 5})
+
+        self.assertIn("hosted prime failed", str(ctx.exception))
+
+    def test_post_search_non_dict_response_raises_runtime_error(self) -> None:
+        from vexic.recorders.hosted_prime import HostedPrimeConfig, _post_search
+
+        config = HostedPrimeConfig(
+            base_url="https://api.example.test/",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        class _ListResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self) -> bytes:
+                return json.dumps(["not", "a", "dict"]).encode("utf-8")
+
+        def fake_urlopen(request, timeout):
+            return _ListResponse()
+
+        with patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen):
+            with self.assertRaises(RuntimeError) as ctx:
+                _post_search(config, "search_transcript", {"query": "test", "limit": 5})
+
+        self.assertIn("hosted prime failed", str(ctx.exception))
+
+    def test_post_search_http_error_raises_runtime_error(self) -> None:
+        from vexic.recorders.hosted_prime import HostedPrimeConfig, _post_search
+
+        config = HostedPrimeConfig(
+            base_url="https://api.example.test/",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        def fake_urlopen(request, timeout):
+            raise HTTPError(request.full_url, 403, "Forbidden", hdrs={}, fp=None)
+
+        with patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen):
+            with self.assertRaises(RuntimeError) as ctx:
+                _post_search(config, "search_long_term", {"query": "test", "limit": 5})
+
+        self.assertIn("403", str(ctx.exception))
+
+    def test_post_search_includes_agent_id_header_when_set(self) -> None:
+        from vexic.recorders.hosted_prime import HostedPrimeConfig, _post_search
+
+        config = HostedPrimeConfig(
+            base_url="https://api.example.test/",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id="agent-x",
+        )
+        captured_requests = []
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self) -> bytes:
+                return json.dumps({}).encode("utf-8")
+
+        def fake_urlopen(request, timeout):
+            captured_requests.append(request)
+            return _Response()
+
+        with patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen):
+            _post_search(config, "search_transcript", {"query": "test", "limit": 5})
+
+        self.assertEqual(len(captured_requests), 1)
+        self.assertEqual(captured_requests[0].get_header("X-vexic-agent-id"), "agent-x")
+
+    def test_post_search_omits_agent_id_header_when_none(self) -> None:
+        from vexic.recorders.hosted_prime import HostedPrimeConfig, _post_search
+
+        config = HostedPrimeConfig(
+            base_url="https://api.example.test/",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+        captured_requests = []
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self) -> bytes:
+                return json.dumps({}).encode("utf-8")
+
+        def fake_urlopen(request, timeout):
+            captured_requests.append(request)
+            return _Response()
+
+        with patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen):
+            _post_search(config, "search_transcript", {"query": "test", "limit": 5})
+
+        self.assertEqual(len(captured_requests), 1)
+        self.assertIsNone(captured_requests[0].get_header("X-vexic-agent-id"))
+
+    def test_post_search_url_constructed_correctly(self) -> None:
+        from vexic.recorders.hosted_prime import HostedPrimeConfig, _post_search
+
+        config = HostedPrimeConfig(
+            base_url="https://api.example.test/",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+        captured_requests = []
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self) -> bytes:
+                return json.dumps({}).encode("utf-8")
+
+        def fake_urlopen(request, timeout):
+            captured_requests.append(request)
+            return _Response()
+
+        with patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen):
+            _post_search(config, "search_transcript", {"query": "test", "limit": 5})
+
+        self.assertEqual(len(captured_requests), 1)
+        self.assertIn("/v1/search_transcript", captured_requests[0].full_url)
+
+    def test_fetch_prime_context_returns_empty_when_no_memory(self) -> None:
+        from vexic.recorders.hosted_prime import HostedPrimeConfig, fetch_prime_context
+
+        config = HostedPrimeConfig(
+            base_url="https://api.example.test/",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self) -> bytes:
+                return json.dumps({"facts": [], "candidate_notes": [], "hits": []}).encode("utf-8")
+
+        def fake_urlopen(request, timeout):
+            return _Response()
+
+        with patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen):
+            result = fetch_prime_context(config, max_chars=1000)
+
+        self.assertEqual(result, "")
+
+    def test_fetch_prime_context_raises_runtime_error_for_secret_in_response(self) -> None:
+        from vexic.recorders.hosted_prime import HostedPrimeConfig, fetch_prime_context
+
+        config = HostedPrimeConfig(
+            base_url="https://api.example.test/",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self) -> bytes:
+                return json.dumps(
+                    {"hits": [{"body": "context containing vx_secret value"}]}
+                ).encode("utf-8")
+
+        def fake_urlopen(request, timeout):
+            return _Response()
+
+        with patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen):
+            with self.assertRaises(RuntimeError) as ctx:
+                fetch_prime_context(config, max_chars=1000)
+
+        self.assertIn("forbidden secret", str(ctx.exception))
+
+
+class HookCommandUnitTests(unittest.TestCase):
+    """Unit tests for _hook_command and _prime_command from claude_setup.py."""
+
+    def test_hook_command_replaces_backslashes_with_forward_slashes(self) -> None:
+        from vexic.recorders.claude_setup import _hook_command
+
+        config_path = Path("C:\\Users\\user\\.vexic\\claude-code-recorder.json")
+        result = _hook_command("C:\\Python\\python.exe -m vexic.cli recorder ingest", config_path)
+
+        self.assertNotIn("\\", result)
+        self.assertIn("--config", result)
+
+    def test_hook_command_quotes_config_path_with_spaces(self) -> None:
+        from vexic.recorders.claude_setup import _hook_command
+
+        config_path = Path("/home/user name/.vexic/claude-code-recorder.json")
+        result = _hook_command("python -m vexic.cli recorder ingest", config_path)
+
+        # Path with spaces should be quoted
+        self.assertIn("--config", result)
+        # The config path should appear quoted (shlex.quote wraps in single quotes if needed)
+        self.assertIn(".vexic", result)
+
+    def test_hook_command_includes_base_command(self) -> None:
+        from vexic.recorders.claude_setup import _hook_command
+
+        config_path = Path("/home/user/.vexic/config.json")
+        result = _hook_command("python -m vexic.cli recorder ingest", config_path)
+
+        self.assertTrue(result.startswith("python -m vexic.cli recorder ingest"))
+        self.assertIn("--config", result)
+
+    def test_prime_command_derives_from_ingest_command(self) -> None:
+        from vexic.recorders.claude_setup import _prime_command
+
+        ingest_cmd = "python -m vexic.cli recorder ingest"
+        result = _prime_command(ingest_cmd)
+
+        self.assertEqual(result, "python -m vexic.cli recorder prime")
+
+    def test_prime_command_strips_trailing_whitespace_before_matching(self) -> None:
+        from vexic.recorders.claude_setup import _prime_command
+
+        ingest_cmd = "python -m vexic.cli recorder ingest   "
+        result = _prime_command(ingest_cmd)
+
+        self.assertEqual(result, "python -m vexic.cli recorder prime")
+
+    def test_prime_command_raises_for_non_ingest_command(self) -> None:
+        from vexic.recorders.claude_setup import _prime_command
+
+        with self.assertRaises(ValueError) as ctx:
+            _prime_command("custom-recorder-tool")
+
+        self.assertIn("prime_command is required", str(ctx.exception))
+
+    def test_prime_command_raises_for_partial_match(self) -> None:
+        from vexic.recorders.claude_setup import _prime_command
+
+        # Has "ingest" but not " recorder ingest" suffix
+        with self.assertRaises(ValueError):
+            _prime_command("python -m vexic.cli recorder ingest_extended")
+
+    def test_setup_with_explicit_prime_command_overrides_derivation(self) -> None:
+        from vexic.cli import main as vexic_main
+
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            project_root = home / "project"
+            project_root.mkdir()
+
+            code = vexic_main(
+                [
+                    "setup",
+                    "claude-code",
+                    "--home",
+                    str(home),
+                    "--project-root",
+                    str(project_root),
+                    "--base-url",
+                    "https://api.example.test",
+                    "--api-key",
+                    "vx_secret",
+                    "--project-id",
+                    "project-a",
+                    "--session-id",
+                    "session-a",
+                    "--hook-command",
+                    "custom-recorder recorder ingest",
+                    "--prime-hook-command",
+                    "custom-recorder recorder prime",
+                ]
+            )
+
+            self.assertEqual(code, 0)
+            settings = json.loads(
+                (home / ".claude" / "settings.json").read_text(encoding="utf-8")
+            )
+            prime_hooks = [
+                hook
+                for group in settings["hooks"]["SessionStart"]
+                for hook in group["hooks"]
+                if hook.get("vexicHookId") == "vexic-claude-code-recorder"
+            ]
+            self.assertEqual(len(prime_hooks), 1)
+            self.assertIn("custom-recorder recorder prime", prime_hooks[0]["command"])
