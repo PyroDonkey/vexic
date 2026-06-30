@@ -20,6 +20,7 @@ from vexic.mcp_stdio import (
     McpServerConfig,
     _parse_args,
     handle_jsonrpc_message,
+    main,
 )
 from vexic.storage import save_messages
 from vexic.hosted_mcp import create_hosted_http_memory_service, run_recorder_config_proxy
@@ -227,6 +228,62 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["body"]["method"], "tools/list")
         self.assertNotIn("vx_test_key", stdout.getvalue())
         self.assertNotIn("vx_test_key", stderr.getvalue())
+
+    def test_main_decodes_stdin_as_utf8_not_locale(self) -> None:
+        # Regression: on Windows under `uv run`, sys.stdin decodes as cp1252,
+        # so non-ASCII JSON-RPC payloads are silently mojibake'd before
+        # json.loads ever sees them. The stdio entry point must decode stdin as
+        # UTF-8 regardless of the platform locale.
+        query = "café ၁ 中"
+        request = (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "search_transcript",
+                        "arguments": {"query": query},
+                    },
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+        request_bytes = request.encode("utf-8")
+
+        class _WindowsLikeStream:
+            def __init__(self, data: bytes) -> None:
+                self.buffer = io.BytesIO(data)
+                # Mirror real uv-run Windows std-stream text decoding.
+                self._text = data.decode("cp1252", "surrogateescape")
+
+            def __iter__(self):
+                return iter(self._text.splitlines(keepends=True))
+
+            def write(self, _s: str) -> int:
+                return 0
+
+            def flush(self) -> None:
+                return None
+
+        captured: dict[str, object] = {}
+
+        async def fake_handle(message, config):
+            captured["message"] = message
+            return None
+
+        with (
+            patch("vexic.mcp_stdio.sys.stdin", _WindowsLikeStream(request_bytes)),
+            patch("vexic.mcp_stdio.sys.stdout", _WindowsLikeStream(b"")),
+            patch("vexic.mcp_stdio.sys.stderr", _WindowsLikeStream(b"")),
+            patch("vexic.mcp_stdio.handle_jsonrpc_message", fake_handle),
+        ):
+            code = main(["--db-path", self.db_path, "--tenant-id", "tenant-a"])
+
+        self.assertEqual(code, 0)
+        message = captured["message"]
+        self.assertEqual(message["params"]["arguments"]["query"], query)
 
     def test_recorder_config_proxy_forwards_hosted_mcp_http_error_body(self) -> None:
         _HostedApiHandler.response_status = 401

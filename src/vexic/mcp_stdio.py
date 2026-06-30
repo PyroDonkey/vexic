@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
 import sys
 from collections.abc import Callable
@@ -467,11 +468,22 @@ def main(
     argv: list[str] | None = None,
     *,
     service_factory: Callable[[McpServerConfig], McpMemoryService] | None = None,
-    stdin: TextIO = sys.stdin,
-    stdout: TextIO = sys.stdout,
-    stderr: TextIO = sys.stderr,
+    stdin: TextIO | None = None,
+    stdout: TextIO | None = None,
+    stderr: TextIO | None = None,
 ) -> int:
     raw_argv = sys.argv[1:] if argv is None else argv
+    # Decode/encode stdio as UTF-8 regardless of the platform locale. On Windows
+    # the default sys.std* streams use cp1252, which silently mojibakes
+    # non-ASCII JSON-RPC payloads on read and can fail to encode non-ASCII
+    # responses on write. Resolve at call time so the streams stay injectable
+    # for tests.
+    if stdin is None:
+        stdin = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8", newline="")
+    if stdout is None:
+        stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", newline="")
+    if stderr is None:
+        stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", newline="")
     asyncio.run(
         run_stdio(
             _parse_args(raw_argv, service_factory=service_factory),
