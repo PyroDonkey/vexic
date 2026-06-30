@@ -2,6 +2,8 @@ import asyncio
 import io
 import json
 import os
+import runpy
+import sys
 import tempfile
 import unittest
 import urllib.error
@@ -333,6 +335,54 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("café ၁ 中".encode("utf-8"), output)
         response = json.loads(output.decode("utf-8"))
         self.assertFalse(response["result"]["isError"])
+
+    def test_recorder_config_launcher_decodes_stdin_as_utf8_not_locale(self) -> None:
+        query = "café ၁ 中"
+        request = (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": "search_transcript", "arguments": {"query": query}},
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+        request_bytes = request.encode("utf-8")
+        captured: dict[str, object] = {}
+
+        class _WindowsLikeStdin:
+            def __init__(self, data: bytes) -> None:
+                self.buffer = io.BytesIO(data)
+                self._text = data.decode("cp1252", "surrogateescape")
+
+            def __iter__(self):
+                return iter(self._text.splitlines(keepends=True))
+
+        class _BufferedStream:
+            def __init__(self) -> None:
+                self.buffer = io.BytesIO()
+
+        def fake_proxy(path, *, stdin, stdout, stderr):
+            captured["line"] = next(iter(stdin))
+            return 0
+
+        launcher = Path(__file__).resolve().parents[1] / "scripts" / "vexic-mcp-stdio.py"
+        with (
+            patch("vexic.hosted_mcp.run_recorder_config_proxy", fake_proxy),
+            patch.object(sys, "argv", [str(launcher), "--recorder-config", "config.json"]),
+            patch.object(sys, "stdin", _WindowsLikeStdin(request_bytes)),
+            patch.object(sys, "stdout", _BufferedStream()),
+            patch.object(sys, "stderr", _BufferedStream()),
+        ):
+            with self.assertRaises(SystemExit) as exc:
+                runpy.run_path(str(launcher), run_name="__main__")
+
+        self.assertEqual(exc.exception.code, 0)
+        payload = json.loads(captured["line"])
+        self.assertEqual(payload["params"]["arguments"]["query"], query)
 
     def test_recorder_config_proxy_forwards_hosted_mcp_http_error_body(self) -> None:
         _HostedApiHandler.response_status = 401
