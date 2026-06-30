@@ -22,8 +22,9 @@ RUN PYTHONPATH="/app/src${PYTHONPATH:+:$PYTHONPATH}" uv run --no-sync python -c 
 
 EXPOSE 8000
 
-USER vexic
+# nosemgrep: root startup repairs the Railway volume, then hosted_entrypoint drops to vexic.
+USER root
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD python -c "import os, urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.environ.get(\"PORT\", \"8000\")}/health', timeout=3).read()"
 
-CMD PYTHONPATH="/app/src${PYTHONPATH:+:$PYTHONPATH}" uv run --no-sync python -m uvicorn vexic.hosted_control_plane_http:create_app --factory --host 0.0.0.0 --port ${PORT}
+CMD ["/app/.venv/bin/python", "-m", "vexic.hosted_entrypoint"]
