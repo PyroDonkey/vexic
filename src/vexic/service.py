@@ -64,6 +64,7 @@ from vexic.storage.longterm import record_fact_use_verdict, record_long_term_ret
 from vexic.storage.operators import repair_memory_projections
 from vexic.subagents.retrieval import retrieve_candidate_fallback, retrieve_long_term_facts
 from vexic.usage import UsageSummary
+from vexic.storage.connection import connect
 
 def _iter_payload_strings(value: object) -> Iterator[str]:
     """Yield every raw string (mapping keys and values) in a JSON-able payload.
@@ -143,7 +144,7 @@ class LocalMemoryService(MemoryService):
 
     def _assert_not_tombstoned(self, scope: MemoryScope, operation: str) -> None:
         column_name = _TOMBSTONE_FLAG_COLUMNS[operation]
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(connect(self.db_path)) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 f"""
@@ -182,7 +183,7 @@ class LocalMemoryService(MemoryService):
 
     def _replay_hits(self, scope: MemoryScope) -> list[TranscriptHit]:
         scoped = self._with_default_session(scope)
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(connect(self.db_path)) as conn:
             rows = conn.execute(
                 """
                 SELECT id, timestamp, message_json
@@ -218,7 +219,7 @@ class LocalMemoryService(MemoryService):
 
     def _export_payload(self, scope: MemoryScope) -> dict[str, object]:
         scoped = self._with_default_session(scope)
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(connect(self.db_path)) as conn:
             conn.row_factory = sqlite3.Row
             return {
                 "scope": {
@@ -507,7 +508,7 @@ class LocalMemoryService(MemoryService):
             self._with_default_session(request.scope),
             "rebuild",
         )
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(connect(self.db_path)) as conn:
             with conn:
                 if request.superseded_by_fact_id is not None:
                     row = conn.execute(
@@ -625,7 +626,7 @@ class LocalMemoryService(MemoryService):
             self._redaction_values(request.redaction),
             request.reason,
         )
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(connect(self.db_path)) as conn:
             with conn:
                 cursor = conn.execute(
                     """

@@ -22,6 +22,7 @@ from vexic.storage.schema import (
     _ensure_vector_memory_schema,
     init_db,
 )
+from vexic.storage.connection import connect
 
 # Cross-tier promotion. The single module allowed to span Tier 2 and Tier 3: it
 # reads a candidate, claims it, writes the durable fact, and retires a
@@ -273,7 +274,7 @@ def commit_deep_cycle(
         raise ValueError("Error deep cycles must not include promotions.")
     assert_no_forbidden_secret_values(forbidden_secret_values, error_detail or "")
 
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         with conn:
             promotions = 0
             retirements = 0

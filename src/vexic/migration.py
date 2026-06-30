@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage import init_db, init_vector_memory
 from vexic.storage.operators import MemoryProjectionRepairReport, repair_memory_projections
+from vexic.storage.connection import connect
 
 ARTIFACT_VERSION = "vexic.canonical-migration.v1"
 MIGRATION_METADATA_TABLE = "canonical_migration_imports"
@@ -188,7 +189,7 @@ def export_canonical_migration(
     if target.exists() and not overwrite:
         raise FileExistsError(f"Refusing to overwrite migration artifact: {target}")
 
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         _assert_no_host_owned_tables(conn)
         payload = {
             "artifact_version": ARTIFACT_VERSION,
@@ -280,7 +281,7 @@ def _record_import_metadata(
     tenant_id: str,
     project_id: str | None,
 ) -> None:
-    with closing(sqlite3.connect(target_db_path)) as conn:
+    with closing(connect(target_db_path)) as conn:
         with conn:
             conn.execute(
                 f"""
@@ -335,11 +336,11 @@ def import_canonical_migration(
 
     target = Path(target_db_path)
     if target.exists():
-        with closing(sqlite3.connect(target)) as conn:
+        with closing(connect(target)) as conn:
             _assert_no_host_owned_tables(conn)
     init_vector_memory(target_db_path)
     rows_imported = 0
-    with closing(sqlite3.connect(target_db_path)) as conn:
+    with closing(connect(target_db_path)) as conn:
         with conn:
             for table_name in CANONICAL_TABLES:
                 rows_imported += _insert_rows(conn, table_name, artifact.tables[table_name])

@@ -20,6 +20,7 @@ from pydantic_ai.messages import (
 
 from vexic.storage.schema import _assert_no_forbidden_secret_values, _fts_match_query
 from vexic.text_utils import estimate_tokens
+from vexic.storage.connection import connect
 
 # Tier 1 — the append-only transcript. Owns message (de)serialization, the
 # messages_fts shadow that init_db builds, and the read/write/search surface.
@@ -153,7 +154,7 @@ def _rebuild_messages_fts(conn: sqlite3.Connection) -> None:
 
 
 def rebuild_messages_fts(db_path: str) -> None:
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         with conn:
             _rebuild_messages_fts(conn)
 
@@ -165,7 +166,7 @@ def load_messages(
     session_id: str = "default",
     agent_id: str | None = None,
 ) -> list[ModelMessage]:
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         if limit is None:
             rows = conn.execute(
                 """
@@ -220,7 +221,7 @@ def load_messages_by_token_budget(
 
     selected: list[ModelMessage] = []
     total = 0
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         rows = conn.execute(
             """
             SELECT message_json
@@ -255,7 +256,7 @@ def save_messages(
     timestamp: str | None = None,
 ) -> list[int]:
     message_ids: list[int] = []
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         with conn:
             for msg in messages:
                 reason = _polluted_transcript_reason(msg)
@@ -390,7 +391,7 @@ def ingest_source_messages(
 ) -> list[SourceTranscriptIngestResult]:
     results: list[SourceTranscriptIngestResult] = []
     forbidden_values = tuple(forbidden_secret_values)
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         conn.execute("PRAGMA foreign_keys=ON")
         with conn:
             for item in inputs:
@@ -575,7 +576,7 @@ def search_messages(
     if safe_query is None:
         return []
 
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         try:
             rows = conn.execute(
                 """
@@ -613,7 +614,7 @@ def load_messages_in_id_range(
     agent_id: str | None = None,
     max_rows: int | None = None,
 ) -> list[TranscriptHit]:
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         params: list[object] = [session_id, agent_id, first_message_id, last_message_id]
         limit_clause = ""
         if max_rows is not None:
@@ -661,7 +662,7 @@ def load_messages_since(
     agent_id: str | None = None,
     exclude_session_prefixes: tuple[str, ...] = (),
 ) -> list[tuple[int, ModelMessage]]:
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         filters = ["id > ?", "agent_id IS ?"]
         params: list[object] = [after_id, agent_id]
         for prefix in exclude_session_prefixes:
@@ -697,7 +698,7 @@ def load_messages_since(
 
 
 def get_watermark(db_path: str, *, agent_id: str | None) -> int:
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         row = conn.execute(
             """
             SELECT MAX(last_processed_message_id)
