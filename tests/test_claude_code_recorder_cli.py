@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -684,7 +685,7 @@ class ClaudeCodeSetupTests(unittest.TestCase):
             vexic_server = mcp_config["mcpServers"]["vexic"]
             repo_root = Path(__file__).resolve().parents[1]
             launcher = Path(__file__).resolve().parents[1] / "scripts" / "vexic-mcp-stdio.py"
-            self.assertEqual(vexic_server["command"], "uv")
+            self.assertEqual(vexic_server["command"], shutil.which("uv"))
             self.assertEqual(
                 vexic_server["args"],
                 [
@@ -1147,8 +1148,12 @@ class ClaudeCodeSetupTests(unittest.TestCase):
             project_root = home / "project"
             project_root.mkdir()
             setup_python = home / "uv-cache" / ".tmpdead" / "Scripts" / "python.exe"
+            uv_path = home / "bin" / "uv.exe"
 
-            with patch("sys.executable", str(setup_python)):
+            with (
+                patch("sys.executable", str(setup_python)),
+                patch("shutil.which", return_value=str(uv_path)),
+            ):
                 code = vexic_main(
                     [
                         "setup",
@@ -1176,12 +1181,51 @@ class ClaudeCodeSetupTests(unittest.TestCase):
 
             self.assertEqual(code, 0)
             self.assertNotIn(str(setup_python).replace("\\", "/"), hook_command)
-            self.assertIn("uv run --with-editable", hook_command)
+            self.assertIn(str(uv_path).replace("\\", "/"), hook_command)
+            self.assertIn("run --with-editable", hook_command)
             self.assertIn(repo_root.replace("\\", "/"), hook_command)
-            self.assertEqual(server["command"], "uv")
+            self.assertEqual(server["command"], str(uv_path))
             self.assertIn("--with-editable", server["args"])
             self.assertIn(repo_root, server["args"])
             self.assertNotIn(str(setup_python), json.dumps(mcp_config))
+
+    def test_top_level_setup_rejects_missing_uv_before_writing_setup_files(self) -> None:
+        from vexic.cli import main as vexic_main
+
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            project_root = home / "project"
+            project_root.mkdir()
+            stderr = io.StringIO()
+
+            with (
+                patch("shutil.which", return_value=None),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = vexic_main(
+                    [
+                        "setup",
+                        "claude-code",
+                        "--home",
+                        str(home),
+                        "--project-root",
+                        str(project_root),
+                        "--base-url",
+                        "https://api.example.test",
+                        "--api-key",
+                        "vx_secret",
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "session-a",
+                    ]
+                )
+
+            self.assertEqual(code, 2)
+            self.assertIn("uv executable was not found", stderr.getvalue())
+            self.assertFalse((home / ".claude" / "settings.json").exists())
+            self.assertFalse((home / ".vexic" / "claude-code-recorder.json").exists())
+            self.assertFalse((project_root / ".mcp.json").exists())
 
     def test_setup_rejects_non_derivable_hook_command_cleanly(self) -> None:
         from vexic.cli import main as vexic_main

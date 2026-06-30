@@ -154,7 +154,7 @@ def _parser() -> argparse.ArgumentParser:
     setup.add_argument(
         "--hook-command",
         dest="hook_command",
-        default=default_recorder_hook_command(),
+        default=None,
     )
     setup.add_argument("--prime-hook-command")
 
@@ -331,7 +331,7 @@ def _setup_claude_code(args: argparse.Namespace) -> int:
         project_id=args.project_id,
         session_id=args.session_id,
         agent_id=args.agent_id,
-        command=args.hook_command,
+        command=args.hook_command or default_recorder_hook_command(),
         prime_command=args.prime_hook_command,
         project_root=args.project_root,
     )
