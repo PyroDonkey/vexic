@@ -7,6 +7,7 @@ from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 from vexic.redaction import assert_no_forbidden_secret_values
+from vexic.url_policy import require_http_url
 
 LONG_TERM_PRIME_QUERY = "preference fact goal decision project context remember"
 TRANSCRIPT_PRIME_QUERY = "remember"
@@ -72,8 +73,9 @@ def _post_search(
     }
     if config.agent_id is not None:
         headers["X-Vexic-Agent-Id"] = config.agent_id
+    base_url = require_http_url("base_url", config.base_url)
     request = Request(
-        urljoin(config.base_url.rstrip("/") + "/", f"v1/{operation}"),
+        urljoin(base_url + "/", f"v1/{operation}"),
         data=json.dumps(payload).encode("utf-8"),
         headers=headers,
         method="POST",

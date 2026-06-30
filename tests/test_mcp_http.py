@@ -368,6 +368,32 @@ class McpHttpTests(unittest.TestCase):
         self.assertTrue(result["isError"])
         self.assertIn("unexpected argument", result["content"][0]["text"])
 
+    def test_search_transcript_hostile_query_stays_scoped(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
+        self._append(api_key, session_id="session-a", text="cedar OR 1 1 visible")
+        self._append(api_key, session_id="session-b", text="cedar OR 1 1 hidden")
+
+        response = self.client.post(
+            "/mcp",
+            headers=self._mcp_headers(api_key, session_id="session-a"),
+            json={
+                "jsonrpc": "2.0",
+                "id": 17,
+                "method": "tools/call",
+                "params": {
+                    "name": "search_transcript",
+                    "arguments": {"query": "cedar') OR 1=1 --"},
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        result = response.json()["result"]
+        self.assertFalse(result.get("isError", False))
+        text = result["content"][0]["text"]
+        self.assertIn("visible", text)
+        self.assertNotIn("hidden", text)
+
     def test_write_admin_and_expand_tools_are_unreachable(self) -> None:
         api_key = self._api_key()
 

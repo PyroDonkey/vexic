@@ -13,12 +13,16 @@ COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src ./src
 
 RUN uv sync --frozen --no-dev --extra hosted
-RUN mkdir -p /data/vexic
+RUN useradd --uid 10001 --create-home --user-group --shell /usr/sbin/nologin vexic \
+    && mkdir -p /data/vexic \
+    && chown -R vexic:vexic /data/vexic
 
 ENV PYTHONPATH=/app/src
 RUN PYTHONPATH="/app/src${PYTHONPATH:+:$PYTHONPATH}" uv run --no-sync python -c "from uvicorn.importer import import_from_string; import_from_string('vexic.hosted_control_plane_http:create_app')"
 
 EXPOSE 8000
+
+USER vexic
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD python -c "import os, urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.environ.get(\"PORT\", \"8000\")}/health', timeout=3).read()"
 
