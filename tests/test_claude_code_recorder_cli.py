@@ -1480,6 +1480,73 @@ class ClaudeCodeRecorderIngestCommandMoreTests(unittest.TestCase):
 
 
 class ClaudeCodeRecorderPrimeCommandTests(unittest.TestCase):
+    def test_prime_malformed_session_start_payload_warns_without_injection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": 123}), encoding="utf-8")
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("invalid hook input", stderr.getvalue())
+
+    def test_prime_invalid_config_warns_without_injection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                        "unexpected": "value",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch("vexic.recorders.cli.fetch_prime_context") as fetch_prime_context_mock,
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("invalid recorder config", stderr.getvalue())
+            fetch_prime_context_mock.assert_not_called()
+
     def test_prime_resume_skips_injection(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

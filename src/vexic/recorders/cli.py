@@ -288,10 +288,11 @@ def _ingest(args: argparse.Namespace) -> int:
 
 
 def _prime(args: argparse.Namespace) -> int:
-    payload = _read_session_start_payload(args.hook_input)
-    if payload.source not in {"startup", "clear"}:
-        return 0
     try:
+        payload = _read_session_start_payload(args.hook_input)
+        if payload.source not in {"startup", "clear"}:
+            return 0
+        _apply_ingest_config(args)
         context = fetch_prime_context(
             HostedPrimeConfig(
                 base_url=args.base_url,
@@ -303,7 +304,7 @@ def _prime(args: argparse.Namespace) -> int:
             ),
             max_chars=args.max_chars,
         )
-    except RuntimeError as exc:
+    except Exception as exc:
         # SessionStart priming is fail-open: stderr is the operator signal,
         # stdout stays empty so Claude Code receives no unsafe context.
         print(f"warning: {exc}", file=sys.stderr)
@@ -382,7 +383,6 @@ def main(argv: list[str] | None = None) -> int:
             _apply_ingest_config(args)
             return _ingest(args)
         if args.command == "prime":
-            _apply_ingest_config(args)
             return _prime(args)
         if args.command == "setup-claude-code":
             return _setup_claude_code(args)
