@@ -1,9 +1,23 @@
 import json
+import tomllib
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 CONSOLE = ROOT / "console"
+
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    # ponytail: stable numeric pins only; use packaging.version if prereleases matter.
+    return tuple(int(part) for part in version.split("."))
+
+
+def _direct_pin(dependencies: list[str], package: str) -> str:
+    prefix = f"{package}=="
+    for dependency in dependencies:
+        if dependency.startswith(prefix):
+            return dependency.removeprefix(prefix)
+    raise AssertionError(f"{package} is not directly pinned")
 
 
 def test_root_remains_uv_managed() -> None:
@@ -45,6 +59,32 @@ def test_console_node_engine_pins_node_22_lts_for_vercel() -> None:
     expected_node_engine = ">=22.0.0 <23"
     assert package["engines"]["node"] == expected_node_engine
     assert package_lock["packages"][""]["engines"]["node"] == expected_node_engine
+
+
+def test_locked_dependencies_clear_known_supply_chain_advisories() -> None:
+    root_project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    root_lock = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
+    console_package = json.loads((CONSOLE / "package.json").read_text(encoding="utf-8"))
+    console_lock = json.loads((CONSOLE / "package-lock.json").read_text(encoding="utf-8"))
+
+    assert _version_tuple(_direct_pin(root_project["project"]["dependencies"], "pydantic-ai")) >= (
+        1,
+        102,
+        0,
+    )
+
+    python_packages = {package["name"]: package["version"] for package in root_lock["package"]}
+    assert _version_tuple(python_packages["pydantic-ai"]) >= (1, 102, 0)
+    assert _version_tuple(python_packages["pydantic-ai-slim"]) >= (1, 102, 0)
+
+    assert _version_tuple(console_package["overrides"]["next"]["postcss"]) >= (8, 5, 10)
+    postcss_packages = {
+        name: package["version"]
+        for name, package in console_lock["packages"].items()
+        if name.endswith("node_modules/postcss")
+    }
+    assert postcss_packages
+    assert all(_version_tuple(version) >= (8, 5, 10) for version in postcss_packages.values())
 
 
 def test_readmes_scope_console_npm_flows_away_from_core_runtime() -> None:
