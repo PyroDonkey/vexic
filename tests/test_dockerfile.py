@@ -16,6 +16,10 @@ def test_hosted_docker_runtime_exposes_src_package(tmp_path: Path) -> None:
     assert re.search(r"(?m)^ENV\s+PYTHONPATH=([\"']?)/app/src\1\s*$", dockerfile)
     assert "COPY adapters ./adapters" not in dockerfile
     assert "vexic.hosted_control_plane_http:create_app" in dockerfile
+    users = re.findall(r"(?m)^USER\s+(.+)$", dockerfile)
+    assert users
+    assert users[-1].strip() not in {"0", "root"}
+    assert re.search(r"(?m)chown\s+-R\s+\S+:\S+\s+/data/vexic\b", dockerfile)
 
     pythonpath_export = (
         r"PYTHONPATH\s*=\s*([\"'])/app/src\$\{PYTHONPATH:\+:\$PYTHONPATH\}\1"

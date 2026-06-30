@@ -8,6 +8,7 @@ from urllib.request import Request, urlopen
 
 from vexic.contract import SourceTranscriptMessage
 from vexic.redaction import assert_no_forbidden_secret_values_in_payload
+from vexic.url_policy import require_http_url
 
 
 @dataclass(frozen=True)
@@ -44,8 +45,9 @@ def post_source_messages(
     if config.agent_id is not None:
         headers["X-Vexic-Agent-Id"] = config.agent_id
 
+    base_url = require_http_url("base_url", config.base_url)
     request = Request(
-        urljoin(config.base_url.rstrip("/") + "/", "v1/ingest_source_transcript"),
+        urljoin(base_url + "/", "v1/ingest_source_transcript"),
         data=json.dumps(payload).encode("utf-8"),
         headers=headers,
         method="POST",

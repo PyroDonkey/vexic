@@ -32,6 +32,7 @@ from vexic.recorders.claude_setup import (
     uninstall_claude_code_setup,
 )
 from vexic.recorders.hosted_ingest import HostedIngestConfig, post_source_messages
+from vexic.recorders.hosted_prime import HostedPrimeConfig, fetch_prime_context
 from vexic.recorders.status import RecorderStatus, write_status
 
 
@@ -148,6 +149,21 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
                     messages=[message],
                     forbidden_values=("cedar-secret",),
                 )
+
+        urlopen_mock.assert_not_called()
+
+    def test_post_source_messages_rejects_non_http_base_url(self) -> None:
+        config = HostedIngestConfig(
+            base_url="file:///tmp/vexic",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        with patch("vexic.recorders.hosted_ingest.urlopen") as urlopen_mock:
+            with self.assertRaisesRegex(ValueError, "base_url.*http"):
+                post_source_messages(config, messages=[], forbidden_values=())
 
         urlopen_mock.assert_not_called()
 
@@ -1795,3 +1811,18 @@ class ClaudeCodeRecorderPrimeCommandTests(unittest.TestCase):
             self.assertEqual(stdout.getvalue(), "")
             self.assertIn("forbidden secret", stderr.getvalue())
             self.assertNotIn("vx_secret", stderr.getvalue())
+
+    def test_prime_rejects_non_http_base_url(self) -> None:
+        config = HostedPrimeConfig(
+            base_url="file:///tmp/vexic",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        with patch("vexic.recorders.hosted_prime.urlopen") as urlopen_mock:
+            with self.assertRaisesRegex(ValueError, "base_url.*http"):
+                fetch_prime_context(config)
+
+        urlopen_mock.assert_not_called()

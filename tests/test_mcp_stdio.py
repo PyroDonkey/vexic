@@ -299,6 +299,31 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("upstream", payload["error"]["message"])
         self.assertNotIn("vx_test_key", stdout.getvalue())
 
+    def test_recorder_config_proxy_rejects_non_http_base_url(self) -> None:
+        config_path = Path(self.temp_dir.name) / "claude-code-recorder.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "base_url": "file:///tmp/vexic",
+                    "api_key": "vx_test_key",
+                    "project_id": "project-a",
+                    "session_id": "session-a",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch("vexic.hosted_mcp.urllib.request.urlopen") as urlopen_mock:
+            with self.assertRaisesRegex(ValueError, "base_url.*http"):
+                run_recorder_config_proxy(
+                    config_path,
+                    stdin=io.StringIO('{"jsonrpc":"2.0","id":7,"method":"tools/list"}\n'),
+                    stdout=io.StringIO(),
+                    stderr=io.StringIO(),
+                )
+
+        urlopen_mock.assert_not_called()
+
     def test_recorder_config_proxy_expands_home_relative_config_path(self) -> None:
         _HostedApiHandler.response_payload = {
             "jsonrpc": "2.0",
@@ -411,6 +436,17 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["authorization"], "Bearer vx_test_key")
         self.assertEqual(captured["body"]["scope"]["tenant_id"], "tenant-a")
         self.assertEqual(captured["body"]["scope"]["trust_boundary"], "networked")
+
+    def test_hosted_http_client_rejects_non_http_api_base_url(self) -> None:
+        with patch.dict(os.environ, {"VEXIC_API_KEY": "vx_test_key"}):
+            config = McpServerConfig(
+                api_base_url="file:///tmp/vexic",
+                tenant_id="tenant-a",
+                service_factory=create_hosted_http_memory_service,
+            )
+
+            with self.assertRaisesRegex(ValueError, "api_base_url.*http"):
+                config.service()
 
     async def test_search_transcript_uses_configured_session_scope(self) -> None:
         save_messages(

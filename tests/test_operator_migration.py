@@ -271,6 +271,31 @@ class OperatorMigrationTests(unittest.IsolatedAsyncioTestCase):
                 project_id="project-a",
             )
 
+    def test_canonical_migration_import_rejects_extra_artifact_columns(self) -> None:
+        from vexic.migration import (
+            export_canonical_migration,
+            import_canonical_migration,
+        )
+
+        self._seed_source()
+        export_canonical_migration(
+            str(self.source_db),
+            self.artifact,
+            tenant_id="tenant-a",
+            project_id="project-a",
+        )
+        payload = json.loads(self.artifact.read_text())
+        payload["tables"]["messages"][0]['id" FROM messages WHERE id = ? --'] = 1
+        self.artifact.write_text(json.dumps(payload))
+
+        with self.assertRaisesRegex(ValueError, "columns"):
+            import_canonical_migration(
+                self.artifact,
+                str(self.target_db),
+                tenant_id="tenant-a",
+                project_id="project-a",
+            )
+
     def test_canonical_migration_export_fails_closed_on_host_owned_extension_tables(self) -> None:
         from vexic.migration import export_canonical_migration
 

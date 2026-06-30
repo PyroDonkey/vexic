@@ -147,6 +147,10 @@ def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     return row is not None
 
 
+def _target_columns(conn: sqlite3.Connection, table_name: str) -> list[str]:
+    return [str(row[1]) for row in conn.execute(f'PRAGMA table_info("{table_name}")')]
+
+
 def _assert_no_host_owned_tables(conn: sqlite3.Connection) -> None:
     known_tables = (
         frozenset(CANONICAL_TABLES)
@@ -224,7 +228,11 @@ def _insert_rows(
     if not rows:
         _assert_no_extra_rows(conn, table_name, set())
         return 0
-    columns = list(rows[0])
+    columns = _target_columns(conn, table_name)
+    expected = set(columns)
+    for row in rows:
+        if set(row) != expected:
+            raise ValueError(f"canonical migration artifact row in {table_name} has invalid columns.")
     column_sql = ", ".join(f'"{column}"' for column in columns)
     placeholders = ", ".join("?" for _ in columns)
     imported = 0

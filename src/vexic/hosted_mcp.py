@@ -19,6 +19,7 @@ from vexic.contract import (
     SearchTranscriptRequest,
 )
 from vexic.mcp_stdio import McpServerConfig
+from vexic.url_policy import require_http_url
 
 _ResultT = TypeVar("_ResultT")
 
@@ -39,6 +40,11 @@ class _RecorderProxyConfig(BaseModel):
         if not isinstance(value, str) or not value.strip():
             raise ValueError("must be a non-empty string")
         return value.strip()
+
+    @field_validator("base_url")
+    @classmethod
+    def _base_url_is_http(cls, value: str) -> str:
+        return require_http_url("base_url", value)
 
     @field_validator("agent_id", mode="before")
     @classmethod
@@ -105,7 +111,7 @@ def run_recorder_config_proxy(
 ) -> int:
     path = Path(os.path.expandvars(str(path))).expanduser()
     config = _load_recorder_proxy_config(path)
-    base_url = config.base_url.rstrip("/")
+    base_url = config.base_url
     headers = {
         "Authorization": f"Bearer {config.api_key}",
         "Accept": "application/json, text/event-stream",
@@ -153,7 +159,7 @@ def create_hosted_http_memory_service(
 
 class HostedHttpMemoryServiceClient:
     def __init__(self, base_url: str, api_key: str) -> None:
-        self.base_url = base_url.rstrip("/")
+        self.base_url = require_http_url("api_base_url", base_url)
         self.api_key = api_key
 
     async def search_transcript(

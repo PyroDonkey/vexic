@@ -396,6 +396,59 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             ).fetchall()
         self.assertEqual(sorted(event_agents, key=lambda row: "" if row[0] is None else row[0]), [(None, 1), ("agent-a", 1), ("agent-b", 1)])
 
+    async def test_search_long_term_hostile_query_stays_agent_scoped(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(
+            db_path=self.db_path,
+            tenant_id="tenant-a",
+            embed=lambda texts: [_unit_vector(1.0) for _ in texts],
+        )
+        service.init_schema()
+        for message_id, agent_id, fact_text in (
+            (1, "agent-a", "Ryan agent a cedar fact."),
+            (2, "agent-b", "Ryan agent b cedar fact."),
+        ):
+            commit_dream_cycle(
+                self.db_path,
+                [
+                    FactCandidate(
+                        fact_text=fact_text,
+                        subject="Ryan",
+                        category="fact",
+                        importance=6,
+                        confidence=0.8,
+                        source_message_ids=[message_id],
+                    )
+                ],
+                candidate_embeddings=[_unit_vector(1.0)],
+                agent_id=agent_id,
+                status="ok",
+                started_at="2026-06-01T00:00:00+00:00",
+                finished_at="2026-06-01T00:00:01+00:00",
+                messages_processed=1,
+                last_processed_message_id=message_id,
+            )
+            commit_deep_cycle(
+                self.db_path,
+                [PromotionDecision(candidate_id=message_id, embedding=_unit_vector(1.0))],
+                agent_id=agent_id,
+                started_at="2026-06-01T00:01:00+00:00",
+                finished_at="2026-06-01T00:01:01+00:00",
+            )
+
+        result = await service.search_long_term(
+            SearchLongTermRequest(
+                scope=_scope(agent_id="agent-a"),
+                query="cedar') OR 1=1 --",
+            )
+        )
+
+        self.assertEqual(
+            [fact.fact_text for fact in result.facts],
+            ["Ryan agent a cedar fact."],
+        )
+
     async def test_search_long_term_uses_exact_agent_scope_for_candidate_fallback(self) -> None:
         from vexic.service import LocalMemoryService
 
