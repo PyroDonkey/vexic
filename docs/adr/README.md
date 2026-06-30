@@ -37,6 +37,11 @@ Notes:
 - 0005, 0006, and 0008 record hosted decisions (storage, abuse protection,
   encryption/backup). They are the source of truth for those hosted topics; a
   downstream "SaaS Stack Plan" or similar planning doc must not contradict them.
+  The remaining pre-launch abuse gates named in 0006 (durable distributed quota,
+  dream-phase concurrency lock, spend caps, edge throttles, alerting, abuse
+  response) are tracked by COA-263. The 0005/0008 Turso/Neon production cutover
+  (the hosted alpha currently runs SQLite on a Railway volume) is tracked by
+  COA-264.
 - 0007 corresponds to the multi-agent scoping work. The repo, not a tracking
   view, defines the accepted scope semantics.
 - 0011 corresponds to the local/self-host to hosted migration-path decision for
@@ -65,7 +70,7 @@ Notes:
   priming from the existing recorder config plus an opt-in MCP on-demand pull
   leg. UserPromptSubmit relevance injection and a dedicated no-query priming
   endpoint stay deferred.
-- These numbers are the Vexic `docs/adr/` series. Some source comments under
-  `src/vexic` cite an `upstream ADR-00NN` label from the extraction source
-  (for example `upstream ADR-0010` for candidate-fallback retrieval); those
-  labels are deliberately namespaced and do not map to the files here.
+- These numbers are the Vexic `docs/adr/` series and are self-contained.
+  `src/vexic` source no longer carries any `upstream ADR-00NN` extraction-source
+  labels (they were removed when the COA boundary policy was clarified), so there
+  is no cross-series namespace to disambiguate.

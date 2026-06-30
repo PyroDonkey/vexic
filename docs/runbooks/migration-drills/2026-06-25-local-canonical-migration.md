@@ -39,7 +39,9 @@ Fresh command for this drill:
 uv run pytest tests/test_operator_migration.py
 ```
 
-Recorded result after adversarial review fixes: `13 passed`.
+Recorded result after adversarial review fixes (point-in-time, 2026-06-25):
+`13 passed`. The suite has since grown; re-run the command above for the current
+count rather than relying on this historical figure.
 
 ## Sanitization
 
