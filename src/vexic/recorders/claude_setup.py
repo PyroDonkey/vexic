@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shlex
@@ -110,15 +111,22 @@ def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
         raise
 
 
-def _write_mcp_config(project_root: Path, config_path: Path, home: Path) -> Path:
+def _write_mcp_config(
+    project_root: Path,
+    config_path: Path,
+    home: Path,
+    config: dict[str, Any] | None = None,
+) -> Path:
     if not project_root.is_dir():
         raise ValueError("project_root must be an existing directory")
     mcp_path = project_root / ".mcp.json"
-    config = _load_json(mcp_path)
-    servers = config.get("mcpServers")
+    next_config = dict(_load_json(mcp_path) if config is None else config)
+    servers = next_config.get("mcpServers")
     if not isinstance(servers, dict):
         servers = {}
-        config["mcpServers"] = servers
+    else:
+        servers = dict(servers)
+    next_config["mcpServers"] = servers
     servers["vexic"] = {
         "command": sys.executable,
         "args": [
@@ -127,7 +135,7 @@ def _write_mcp_config(project_root: Path, config_path: Path, home: Path) -> Path
             _recorder_config_arg(config_path, home),
         ],
     }
-    _write_json_atomic(mcp_path, config)
+    _write_json_atomic(mcp_path, next_config)
     return mcp_path
 
 
@@ -190,6 +198,15 @@ def _without_vexic_hook(stop_groups: Any) -> tuple[list[dict[str, Any]], bool]:
     return kept_groups, changed
 
 
+def _restore_secret_config(path: Path, previous: bytes | None) -> None:
+    if previous is None:
+        path.unlink(missing_ok=True)
+        return
+    path.write_bytes(previous)
+    path.chmod(0o600)
+    _ensure_owner_only(path)
+
+
 def install_claude_code_setup(
     *,
     home: Path,
@@ -209,21 +226,8 @@ def install_claude_code_setup(
     hook_command = f"{_bash_safe(command)} --config {shlex.quote(_bash_safe(str(config_path)))}"
     if project_root and not project_root.is_dir():
         raise ValueError("project_root must be an existing directory")
-
-    _write_secret_json(
-        config_path,
-        {
-            "base_url": base_url,
-            "api_key": api_key,
-            "project_id": project_id,
-            "session_id": session_id,
-            "agent_id": agent_id,
-            "status_path": str(status_path),
-        },
-    )
-    mcp_config_path = (
-        _write_mcp_config(project_root, config_path, home) if project_root else None
-    )
+    if project_root and not os.access(project_root, os.W_OK):
+        raise PermissionError("project_root must be writable")
 
     settings = _load_json(settings_path)
     hooks = settings.get("hooks")
@@ -247,8 +251,40 @@ def install_claude_code_setup(
     hooks["Stop"] = stop_groups
     if project_root:
         _set_mcpjson_disabled(settings, "vexic")
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
-    settings_path.write_text(json.dumps(settings, sort_keys=True), encoding="utf-8")
+    mcp_path = project_root / ".mcp.json" if project_root else None
+    mcp_config = _load_json(mcp_path) if mcp_path else None
+
+    previous_config = config_path.read_bytes() if config_path.exists() else None
+    previous_mcp = mcp_path.read_bytes() if mcp_path and mcp_path.exists() else None
+    mcp_config_path = None
+    try:
+        _write_secret_json(
+            config_path,
+            {
+                "base_url": base_url,
+                "api_key": api_key,
+                "project_id": project_id,
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "status_path": str(status_path),
+            },
+        )
+        mcp_config_path = (
+            _write_mcp_config(project_root, config_path, home, mcp_config)
+            if project_root
+            else None
+        )
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(settings_path, settings)
+    except Exception:
+        if mcp_config_path is not None:
+            with contextlib.suppress(Exception):
+                if previous_mcp is None:
+                    mcp_config_path.unlink(missing_ok=True)
+                else:
+                    mcp_config_path.write_bytes(previous_mcp)
+        _restore_secret_config(config_path, previous_config)
+        raise
 
     return ClaudeCodeSetupResult(
         settings_path=settings_path,

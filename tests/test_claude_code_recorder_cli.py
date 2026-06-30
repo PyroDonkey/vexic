@@ -867,6 +867,28 @@ class ClaudeCodeSetupTests(unittest.TestCase):
             self.assertFalse((home / ".vexic" / "claude-code-recorder.json").exists())
             self.assertFalse((home / ".claude" / "settings.json").exists())
 
+    def test_setup_mcp_parse_failure_does_not_leave_secret_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            project_root = home / "project"
+            project_root.mkdir()
+            (project_root / ".mcp.json").write_text("{", encoding="utf-8")
+
+            with self.assertRaises(json.JSONDecodeError):
+                install_claude_code_setup(
+                    home=home,
+                    base_url="https://api.example.test",
+                    api_key="vx_secret",
+                    project_id="project-a",
+                    session_id="session-a",
+                    agent_id=None,
+                    command="python -m vexic.cli recorder ingest",
+                    project_root=project_root,
+                )
+
+            self.assertFalse((home / ".vexic" / "claude-code-recorder.json").exists())
+            self.assertFalse((home / ".claude" / "settings.json").exists())
+
     def test_setup_quotes_config_path_with_spaces_in_hook(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vexic home ") as temp:
             home = Path(temp)
