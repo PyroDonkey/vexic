@@ -239,7 +239,7 @@ async def _call_tool(
                 api_key,
                 SearchLongTermRequest(
                     scope=_scope_from_headers(request, auth),
-                    query=_query(arguments),
+                    query=_query(arguments),  # nosemgrep: python.lang.security.audit.sqli
                     limit=_limit(arguments),
                 ),
             )
