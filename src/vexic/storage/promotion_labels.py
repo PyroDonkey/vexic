@@ -1,10 +1,10 @@
-import sqlite3
 from collections.abc import Iterable
 from contextlib import closing
 from typing import Literal
 
 from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage.schema import init_db
+from vexic.storage.connection import connect
 
 # Promotion labels: human promote/reject judgments over Tier 2 candidates,
 # accumulating toward the ~100-pair eval corpus that will tune Deep scoring
@@ -34,7 +34,7 @@ def record_promotion_label(
     if label not in _VALID_LABELS:
         raise ValueError(f"Label must be one of {_VALID_LABELS}, got {label!r}.")
     init_db(db_path)
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         with conn:
             row = conn.execute(
                 "SELECT fact_text FROM memory_candidates WHERE id = ?",
@@ -61,5 +61,5 @@ def record_promotion_label(
 def count_promotion_labels(db_path: str) -> int:
     """Progress toward the ~100-pair eval threshold."""
     init_db(db_path)
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         return int(conn.execute("SELECT COUNT(*) FROM promotion_labels").fetchone()[0])

@@ -9,6 +9,7 @@ from vexic.embeddings import EMBEDDING_DIM, EMBEDDING_MODEL_NAME
 # Back-compat re-export: storage-internal callers keep importing the persistence
 # secret guard from here under the old private name.
 from vexic.redaction import assert_no_forbidden_secret_values as _assert_no_forbidden_secret_values
+from vexic.storage.connection import connect
 
 # Shared spine for the three memory tiers. Owns the connection seam (WAL,
 # schema creation, vec-extension load), the embedding-blob math reused across
@@ -635,7 +636,7 @@ def init_db(db_path: str) -> None:
     # reached here only at call time, once both modules are fully initialized.
     from vexic.storage.transcript import _ensure_messages_fts
 
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         # WAL is a persistent database property: once set it applies to every
         # later connection. It lets readers run alongside a single writer, so a
         # scheduled cron brief and a live chat turn don't contend on memory.db.
@@ -758,6 +759,6 @@ def init_db(db_path: str) -> None:
 
 def init_vector_memory(db_path: str) -> None:
     init_db(db_path)
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         with conn:
             _ensure_vector_memory_schema(conn)

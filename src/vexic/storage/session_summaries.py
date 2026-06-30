@@ -22,6 +22,7 @@ from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.text_utils import estimate_tokens
 from vexic.text_utils import TAU_SOFT
 from vexic.usage import UsageSummary
+from vexic.storage.connection import connect
 
 SessionSummaryKind = Literal["leaf", "condensed"]
 
@@ -91,7 +92,7 @@ def record_session_summary(
     assert_no_forbidden_secret_values(forbidden_secret_values, summary_text)
     token_estimate = estimate_tokens(summary_text)
     replaces_json = json.dumps(list(replaces_summary_ids))
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         with conn:
             cursor = conn.execute(
                 """
@@ -127,7 +128,7 @@ def fetch_session_summary_frontier(
     session_id: str,
     agent_id: str | None = None,
 ) -> list[SessionSummary]:
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         rows = conn.execute(
             """
             SELECT id, session_id, kind, first_message_id, last_message_id,
@@ -166,7 +167,7 @@ def _message_rows(
     session_id: str,
     agent_id: str | None = None,
 ) -> list[tuple[int, datetime | None]]:
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         rows = conn.execute(
             """
             SELECT id, timestamp
@@ -186,7 +187,7 @@ def _first_message_id(
     session_id: str,
     agent_id: str | None = None,
 ) -> int | None:
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         row = conn.execute(
             """
             SELECT id
@@ -318,7 +319,7 @@ def _estimate_session_tokens_from_id(
         where_clause = "session_id = ? AND agent_id IS ? AND id >= ?"
         params = (session_id, agent_id, first_message_id)
 
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         rows = conn.execute(
             f"""
             SELECT message_json
@@ -408,7 +409,7 @@ def list_compactable_session_ids(
     *,
     agent_id: str | None = None,
 ) -> list[str]:
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         rows = conn.execute(
             """
             SELECT DISTINCT session_id
@@ -461,7 +462,7 @@ def _load_active_context_rows_by_token_budget(
         where_clause = "session_id = ? AND agent_id IS ? AND id > ?"
         params = (session_id, agent_id, after_id)
 
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         rows = conn.execute(
             f"""
             SELECT id, timestamp, message_json

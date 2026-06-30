@@ -14,6 +14,7 @@ from vexic.storage.schema import (
     init_db,
 )
 from vexic.storage.transcript import _rebuild_messages_fts
+from vexic.storage.connection import connect
 
 
 @dataclass(frozen=True)
@@ -222,7 +223,7 @@ def repair_memory_projections(
 ) -> MemoryProjectionRepairReport:
     """Repair rebuildable memory projections without mutating the Transcript."""
     init_db(db_path)
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         with conn:
             candidate_embeddings = candidate_embeddings or {}
             long_term_embeddings = long_term_embeddings or {}
@@ -377,7 +378,7 @@ def export_memory_review(
     if target.exists() and not overwrite:
         raise FileExistsError(f"Refusing to overwrite existing memory export: {target}")
 
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         rendered, rows_exported = _render_memory_review_markdown(conn)
 
     assert_no_forbidden_secret_values(forbidden_secret_values, rendered)
@@ -409,7 +410,7 @@ def create_memory_rebuild_copy(
         raise FileExistsError(f"Refusing to overwrite existing rebuild copy: {target}")
 
     forbidden_values = tuple(forbidden_secret_values)
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         _guard_database_text_for_file_copy(conn, forbidden_values)
         try:
             conn.execute("VACUUM INTO ?", (str(target),))
