@@ -64,7 +64,7 @@ from vexic.storage.longterm import record_fact_use_verdict, record_long_term_ret
 from vexic.storage.operators import repair_memory_projections
 from vexic.subagents.retrieval import retrieve_candidate_fallback, retrieve_long_term_facts
 from vexic.usage import UsageSummary
-from vexic.storage.connection import connect
+from vexic.storage.connection import connect, rows_as_dicts
 
 def _iter_payload_strings(value: object) -> Iterator[str]:
     """Yield every raw string (mapping keys and values) in a JSON-able payload.
@@ -126,7 +126,7 @@ class LocalMemoryService(MemoryService):
             return scope
         return scope.model_copy(update={"session_id": "default"})
 
-    def _scope_matches_tombstone(self, scope: MemoryScope, row: sqlite3.Row) -> bool:
+    def _scope_matches_tombstone(self, scope: MemoryScope, row: Mapping[str, object]) -> bool:
         for field_name, column_name in (
             ("project_id", "target_project_id"),
             ("user_id", "target_user_id"),
@@ -145,15 +145,14 @@ class LocalMemoryService(MemoryService):
     def _assert_not_tombstoned(self, scope: MemoryScope, operation: str) -> None:
         column_name = _TOMBSTONE_FLAG_COLUMNS[operation]
         with closing(connect(self.db_path)) as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
+            rows = rows_as_dicts(conn.execute(
                 f"""
                 SELECT target_project_id, target_user_id, target_session_id, target_agent_id
                 FROM scope_tombstones
                 WHERE target_tenant_id = ? AND {column_name} = 1
                 """,
                 (scope.tenant_id,),
-            ).fetchall()
+            ))
         if any(self._scope_matches_tombstone(scope, row) for row in rows):
             raise PermissionError(f"Memory scope is tombstoned for {operation}.")
 
@@ -215,12 +214,11 @@ class LocalMemoryService(MemoryService):
         query: str,
         params: tuple[object, ...],
     ) -> list[dict[str, object]]:
-        return [dict(row) for row in conn.execute(query, params).fetchall()]
+        return rows_as_dicts(conn.execute(query, params))
 
     def _export_payload(self, scope: MemoryScope) -> dict[str, object]:
         scoped = self._with_default_session(scope)
         with closing(connect(self.db_path)) as conn:
-            conn.row_factory = sqlite3.Row
             return {
                 "scope": {
                     "tenant_id": scoped.tenant_id,

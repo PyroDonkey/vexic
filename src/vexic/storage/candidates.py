@@ -16,11 +16,11 @@ from vexic.storage.schema import (
     _fts_match_query,
     _normalize_embedding,
     _serialize_float32,
-    _similarity_from_distance,
     init_db,
     init_vector_memory,
 )
 from vexic.storage.connection import connect
+from vexic.storage.vectors import select_vector_backend
 
 # Tier 2 candidate-fallback retrieval from the hosted MCP design: the eligibility
 # predicate shared with Deep/REM — active, unpromoted candidates only. Kept as
@@ -44,7 +44,6 @@ DEDUP_NEIGHBOR_COUNT = 10
 @dataclass(frozen=True)
 class DedupMatch:
     candidate_id: int
-    distance: float
     similarity: float
 
 
@@ -106,21 +105,24 @@ def _nearest_candidate(
     *,
     agent_id: str | None,
 ) -> DedupMatch | None:
+    backend = select_vector_backend(conn)
+    knn = backend.knn_subquery(
+        table="memory_candidate_embeddings", id_column="candidate_id"
+    )
     rows = conn.execute(
-        """
-        SELECT e.candidate_id, e.distance
-        FROM memory_candidate_embeddings AS e
+        f"""
+        SELECT e._id, e._distance
+        FROM ({knn}) AS e
         JOIN memory_candidates AS c
-            ON c.id = e.candidate_id
-        WHERE e.embedding MATCH ? AND k = ?
-            AND c.subject = ?
+            ON c.id = e._id
+        WHERE c.subject = ?
             AND c.category = ?
             AND c.promoted = 0
             AND c.retired = 0
             AND c.stale = 0
             AND c.needs_review = 0
             AND c.agent_id IS ?
-        ORDER BY distance
+        ORDER BY e._distance
         """,
         (
             _serialize_float32(embedding),
@@ -135,11 +137,9 @@ def _nearest_candidate(
         return None
 
     row = rows[0]
-    distance = float(row[1])
     return DedupMatch(
         candidate_id=int(row[0]),
-        distance=distance,
-        similarity=_similarity_from_distance(distance),
+        similarity=backend.similarity(float(row[1])),
     )
 
 
@@ -714,15 +714,18 @@ def nearest_candidate_ids(
     init_vector_memory(db_path)
     with closing(connect(db_path)) as conn:
         _ensure_vector_memory_schema(conn)
+        backend = select_vector_backend(conn)
+        knn = backend.knn_subquery(
+            table="memory_candidate_embeddings", id_column="candidate_id"
+        )
         rows = conn.execute(
             f"""
-            SELECT e.candidate_id
-            FROM memory_candidate_embeddings AS e
-            JOIN memory_candidates AS c ON c.id = e.candidate_id
-            WHERE e.embedding MATCH ? AND k = ?
-                AND {_ACTIVE_CANDIDATE_PREDICATE}
+            SELECT e._id
+            FROM ({knn}) AS e
+            JOIN memory_candidates AS c ON c.id = e._id
+            WHERE {_ACTIVE_CANDIDATE_PREDICATE}
                 AND c.agent_id IS ?
-            ORDER BY distance
+            ORDER BY e._distance
             LIMIT ?
             """,
             (_serialize_float32(normalized), fetch_k, agent_id, k),

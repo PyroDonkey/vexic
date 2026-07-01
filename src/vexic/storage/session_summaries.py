@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from collections.abc import Sequence
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone, tzinfo
@@ -58,7 +59,7 @@ def _parse_replaces_summary_ids(raw: str) -> tuple[int, ...]:
     return tuple(int(value) for value in values)
 
 
-def _summary_from_row(row: sqlite3.Row | tuple[object, ...]) -> SessionSummary:
+def _summary_from_row(row: Sequence[object]) -> SessionSummary:
     return SessionSummary(
         id=int(row[0]),
         session_id=str(row[1]),

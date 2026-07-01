@@ -14,7 +14,7 @@ from vexic.storage.schema import (
     init_db,
 )
 from vexic.storage.transcript import _rebuild_messages_fts
-from vexic.storage.connection import connect
+from vexic.storage.connection import connect, rows_as_dicts
 
 
 @dataclass(frozen=True)
@@ -270,11 +270,10 @@ def repair_memory_projections(
 
 
 def _render_memory_review_markdown(conn: sqlite3.Connection) -> tuple[str, int]:
-    conn.row_factory = sqlite3.Row
     lines = ["# Memory Review Export", "", "## Candidates"]
     rows_exported = 0
 
-    candidate_rows = conn.execute(
+    candidate_rows = rows_as_dicts(conn.execute(
         """
         SELECT c.id, c.fact_text, c.subject, c.category, c.importance,
                c.confidence, c.source_message_ids, c.hit_count,
@@ -292,7 +291,7 @@ def _render_memory_review_markdown(conn: sqlite3.Connection) -> tuple[str, int]:
         ) AS e ON e.candidate_id = c.id
         ORDER BY c.id
         """
-    ).fetchall()
+    ))
     for row in candidate_rows:
         rows_exported += 1
         if row["promotion_label"] is not None:
@@ -327,7 +326,7 @@ def _render_memory_review_markdown(conn: sqlite3.Connection) -> tuple[str, int]:
             ])
 
     lines.extend(["", "## Long-term Facts"])
-    fact_rows = conn.execute(
+    fact_rows = rows_as_dicts(conn.execute(
         """
         SELECT id, fact_text, subject, category, importance, confidence,
                source_message_ids, promoted_from_candidate_id, retrieved_count,
@@ -341,7 +340,7 @@ def _render_memory_review_markdown(conn: sqlite3.Connection) -> tuple[str, int]:
         ) AS e ON e.fact_id = f.id
         ORDER BY f.id
         """
-    ).fetchall()
+    ))
     for row in fact_rows:
         rows_exported += 1
         lines.extend([

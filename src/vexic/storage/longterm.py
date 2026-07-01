@@ -11,11 +11,11 @@ from vexic.storage.schema import (
     _fts_match_query,
     _normalize_embedding,
     _serialize_float32,
-    _similarity_from_distance,
     init_db,
     init_vector_memory,
 )
 from vexic.storage.connection import connect
+from vexic.storage.vectors import select_vector_backend
 
 # Tier 3 — durable, vector-indexed facts. Owns nearest-neighbor retrieval and
 # the conn-scoped insert/retire primitives the promotion module calls inside its
@@ -304,15 +304,18 @@ def nearest_long_term_facts(
     init_vector_memory(db_path)
     with closing(connect(db_path)) as conn:
         _ensure_vector_memory_schema(conn)
+        backend = select_vector_backend(conn)
+        knn = backend.knn_subquery(
+            table="long_term_memory_embeddings", id_column="fact_id"
+        )
         rows = conn.execute(
-            """
-            SELECT e.fact_id, l.fact_text, e.distance, l.confidence
-            FROM long_term_memory_embeddings AS e
-            JOIN long_term_memory AS l ON l.id = e.fact_id
-            WHERE e.embedding MATCH ? AND k = ?
-                AND l.retired = 0
+            f"""
+            SELECT e._id, l.fact_text, e._distance, l.confidence
+            FROM ({knn}) AS e
+            JOIN long_term_memory AS l ON l.id = e._id
+            WHERE l.retired = 0
                 AND l.agent_id IS ?
-            ORDER BY distance
+            ORDER BY e._distance
             LIMIT ?
             """,
             (_serialize_float32(normalized), fetch_k, agent_id, k),
@@ -322,7 +325,7 @@ def nearest_long_term_facts(
         LongTermNeighbor(
             fact_id=int(row[0]),
             fact_text=str(row[1]),
-            similarity=_similarity_from_distance(float(row[2])),
+            similarity=backend.similarity(float(row[2])),
             confidence=float(row[3]),
         )
         for row in rows
