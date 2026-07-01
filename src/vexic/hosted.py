@@ -272,6 +272,14 @@ class HostedTenant:
     tenant_id: str
     db_path: str | StorageTarget
     project_ids: frozenset[str]
+    # Catalog data model only (COA-273 Task 11): `customer_target` is the DSN
+    # string for the tenant's customer-memory database, or `None` to use the
+    # local `db_path` (unchanged behavior). NEVER a token here -- resolving
+    # this into a connectable, token-bearing `StorageTarget` is P4 work.
+    # `generation` is a repoint counter bumped by Task 12; both fields default
+    # so existing `HostedTenant(...)` construction keeps working.
+    customer_target: str | None = None
+    generation: int = 1
 
 
 @dataclass(frozen=True)

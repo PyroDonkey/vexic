@@ -143,6 +143,50 @@ def test_api_key_store_create_authenticate_revoke_against_fake_libsql(monkeypatc
         keys.authenticate(provisioned.raw_key)
 
 
+def test_provision_tenant_stores_and_returns_customer_target(tmp_path):
+    catalog = HostedTenantCatalog(tmp_path)
+
+    catalog.provision_tenant(
+        "tenant-a",
+        project_ids={"project-a"},
+        customer_target="libsql://x",
+    )
+    tenant = catalog.get_tenant("tenant-a")
+
+    assert tenant.customer_target == "libsql://x"
+    assert tenant.generation == 1
+
+
+def test_provision_tenant_without_customer_target_defaults_to_local_path(tmp_path):
+    catalog = HostedTenantCatalog(tmp_path)
+
+    catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+    tenant = catalog.get_tenant("tenant-a")
+
+    assert tenant.customer_target is None
+    assert tenant.generation == 1
+    assert tenant.db_path == tmp_path / tenant.db_path.name
+    assert tenant.db_path.parent == tmp_path
+
+
+def test_control_plane_on_fake_libsql_supports_customer_target_columns(monkeypatch, tmp_path):
+    fake_conn = FakeLibsqlConn()
+    _patch_connect_to_fake(monkeypatch, fake_conn)
+    _forbid_local_permission_ops(monkeypatch)
+    target = StorageTarget("libsql://fake-control-plane", auth_token="s3cr3t-token")
+
+    catalog = HostedTenantCatalog(tmp_path, control_target=target)
+    catalog.provision_tenant(
+        "tenant-a",
+        project_ids={"project-a"},
+        customer_target="libsql://customer-a",
+    )
+    tenant = catalog.get_tenant("tenant-a")
+
+    assert tenant.customer_target == "libsql://customer-a"
+    assert tenant.generation == 1
+
+
 def test_catalog_telemetry_insert_and_read_against_fake_libsql(monkeypatch, tmp_path):
     fake_conn = FakeLibsqlConn()
     _patch_connect_to_fake(monkeypatch, fake_conn)

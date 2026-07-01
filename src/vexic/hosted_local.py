@@ -42,7 +42,9 @@ _CONTROL_PLANE_SCHEMA_STATEMENTS: tuple[str, ...] = (
         tenant_id TEXT PRIMARY KEY,
         db_filename TEXT NOT NULL UNIQUE,
         active INTEGER NOT NULL DEFAULT 1,
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        customer_target TEXT,
+        generation INTEGER NOT NULL DEFAULT 1
     )
     """,
     """
@@ -202,6 +204,7 @@ class HostedTenantCatalog:
         tenant_id: str,
         *,
         project_ids: set[str] | frozenset[str] = frozenset(),
+        customer_target: str | None = None,
     ) -> HostedTenant:
         if not tenant_id.strip():
             raise ValueError("tenant_id must not be blank.")
@@ -222,10 +225,10 @@ class HostedTenantCatalog:
                 db_filename = self._allocate_db_filename(conn)
                 conn.execute(
                     """
-                    INSERT INTO tenants (tenant_id, db_filename, active)
-                    VALUES (?, ?, 0)
+                    INSERT INTO tenants (tenant_id, db_filename, active, customer_target)
+                    VALUES (?, ?, 0, ?)
                     """,
-                    (tenant_id, db_filename),
+                    (tenant_id, db_filename, customer_target),
                 )
                 conn.commit()
                 needs_customer_init = True
@@ -243,6 +246,15 @@ class HostedTenantCatalog:
                 """,
                 (tenant_id,),
             )
+            if customer_target is not None:
+                conn.execute(
+                    """
+                    UPDATE tenants
+                    SET customer_target = ?
+                    WHERE tenant_id = ?
+                    """,
+                    (customer_target, tenant_id),
+                )
             self._insert_projects(conn, tenant_id, project_ids)
             conn.commit()
             return self._tenant_from_filename(conn, tenant_id, db_filename)
@@ -711,6 +723,16 @@ class HostedTenantCatalog:
             }
             if "project_id" not in columns:
                 conn.execute("ALTER TABLE hosted_usage_events ADD COLUMN project_id TEXT")
+            tenant_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(tenants)").fetchall()
+            }
+            if "customer_target" not in tenant_columns:
+                conn.execute("ALTER TABLE tenants ADD COLUMN customer_target TEXT")
+            if "generation" not in tenant_columns:
+                conn.execute(
+                    "ALTER TABLE tenants ADD COLUMN generation INTEGER NOT NULL DEFAULT 1"
+                )
             conn.commit()
 
     def _allocate_db_filename(self, conn: sqlite3.Connection) -> str:
@@ -792,10 +814,22 @@ class HostedTenantCatalog:
             """,
             (tenant_id,),
         ).fetchall()
+        catalog_row = conn.execute(
+            """
+            SELECT customer_target, generation
+            FROM tenants
+            WHERE tenant_id = ?
+            """,
+            (tenant_id,),
+        ).fetchone()
+        customer_target = None if catalog_row is None else catalog_row[0]
+        generation = 1 if catalog_row is None else int(catalog_row[1])
         return HostedTenant(
             tenant_id=tenant_id,
             db_path=self.root_path / db_filename,
             project_ids=frozenset(row[0] for row in project_rows),
+            customer_target=customer_target,
+            generation=generation,
         )
 
 class HostedApiKeyStore:
