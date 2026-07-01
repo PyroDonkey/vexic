@@ -818,3 +818,21 @@ directly-constructed exceptions.
 
 **Task 10 update:** the control-plane's `IntegrityError`/`OperationalError`
 catches MUST adopt these helpers so control-plane persistence works on libSQL.
+
+## Amendment 2a — 2026-07-01 (operator: expand T9b to the full cross-cutting fix)
+
+Per operator instruction, Task 9b is expanded from "helper + ingest refactor" to
+the complete cross-backend exception concern: `src/vexic/storage/errors.py` with
+`is_unique_violation`, `is_operational_error`, and `is_retryable_operational_error`
+(classifying both `sqlite3.*` typed exceptions and the libSQL bare `ValueError`
+with its Hrana/`code:` message). Adopted at ALL affected sites —
+`hosted_control_plane_http.py` (`:343`/`:346` catches + `_is_retryable_sqlite_operational_error`
+`:409`), `storage/candidates.py:582`, `storage/longterm.py:80`,
+`storage/operators.py:187`/`:209`, and `storage/transcript.py` (ingest +
+`search_messages`) — each keeping a broad catch then re-raising when the
+classifier returns False (never swallowing arbitrary `ValueError`). The
+`StorageConnection` Protocol docstring is corrected re SAVEPOINT/explicit-`BEGIN`
+semantics. Turso-gated conformance tests prove constraint-violation detection and
+explicit-`BEGIN` SAVEPOINT parity on both backends. This subsumes background task
+`task_c531447d` (retired). Task 10 therefore no longer adopts the helpers itself —
+T9b already covers the control-plane catches.
