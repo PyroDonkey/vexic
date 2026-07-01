@@ -187,7 +187,7 @@ def record_long_term_retrieval(
                         AND agent_id IS ?
                     """,
                     [*fact_ids, agent_id],
-                )
+                ).fetchall()
             }
             scoped_fact_ids = [fact_id for fact_id in fact_ids if fact_id in scoped_ids]
             if not scoped_fact_ids:

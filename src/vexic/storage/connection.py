@@ -7,6 +7,7 @@ from typing import Any, Protocol
 # Hosted libSQL/Turso targets (ADR 0019) arrive as URLs; a filesystem path or
 # ":memory:" is the local SQLite backend. ``str.startswith`` accepts the tuple.
 _LIBSQL_SCHEMES = ("libsql://", "https://", "http://", "wss://", "ws://")
+_PLAINTEXT_LIBSQL_SCHEMES = ("http://", "ws://")
 
 
 class StorageConnection(Protocol):
@@ -61,6 +62,8 @@ def connect(
         # ``target`` is trusted configuration -- a resolved DSN handed in by the
         # adapters/ layer -- never user input, so scheme-based routing here is
         # not an outbound-request boundary.
+        if auth_token is not None and target.startswith(_PLAINTEXT_LIBSQL_SCHEMES):
+            raise ValueError("Refusing to send a libSQL auth token over plaintext.")
         try:
             import libsql  # lazy: optional ``hosted`` extra, remote targets only
         except ImportError as exc:  # pragma: no cover - only when the extra is absent

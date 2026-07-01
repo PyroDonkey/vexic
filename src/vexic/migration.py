@@ -145,7 +145,7 @@ def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
 
 
 def _target_columns(conn: sqlite3.Connection, table_name: str) -> list[str]:
-    return [str(row[1]) for row in conn.execute(f'PRAGMA table_info("{table_name}")')]
+    return [str(row[1]) for row in conn.execute(f'PRAGMA table_info("{table_name}")').fetchall()]
 
 
 def _assert_no_host_owned_tables(conn: sqlite3.Connection) -> None:
@@ -261,7 +261,7 @@ def _assert_no_extra_rows(
         return
     target_ids = {
         int(row[0])
-        for row in conn.execute(f'SELECT id FROM "{table_name}"')
+        for row in conn.execute(f'SELECT id FROM "{table_name}"').fetchall()
     }
     extra_ids = sorted(target_ids - artifact_ids)
     if extra_ids:

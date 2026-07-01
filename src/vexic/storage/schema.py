@@ -562,7 +562,7 @@ def _create_source_transcript_ledger(conn: sqlite3.Connection) -> None:
 
 
 def _source_transcript_ledger_has_legacy_unique(conn: sqlite3.Connection) -> bool:
-    for row in conn.execute("PRAGMA index_list(source_transcript_ledger)"):
+    for row in conn.execute("PRAGMA index_list(source_transcript_ledger)").fetchall():
         if not row[2] or (len(row) > 4 and row[4]):
             continue
         columns = [
@@ -570,7 +570,7 @@ def _source_transcript_ledger_has_legacy_unique(conn: sqlite3.Connection) -> boo
             for column in conn.execute(
                 "SELECT name FROM pragma_index_info(?) ORDER BY seqno",
                 (row[1],),
-            )
+            ).fetchall()
         ]
         if columns == ["source_host", "source_session_id", "source_message_id"]:
             return True

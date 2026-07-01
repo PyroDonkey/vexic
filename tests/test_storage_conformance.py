@@ -9,6 +9,7 @@ import pytest
 
 from vexic.embeddings import EMBEDDING_DIM
 from vexic.storage.connection import connect, rows_as_dicts
+from vexic.storage import schema as storage_schema
 from vexic.storage.schema import _normalize_embedding, _serialize_float32
 from vexic.storage.vectors import select_vector_backend
 
@@ -179,3 +180,35 @@ def test_transaction_rolls_back_on_exception(conformance_conn: Any) -> None:
 
     remaining = conn.execute(f"SELECT count(*) FROM {_CONF_BASE}").fetchone()[0]
     assert remaining == 0
+
+
+def test_local_libsql_initializes_full_storage_schema(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    libsql = pytest.importorskip("libsql")
+    db_path = tmp_path / "local-libsql-schema.db"
+
+    def connect_local_libsql(_target: str) -> Any:
+        return libsql.connect(str(db_path))
+
+    monkeypatch.setattr(storage_schema, "connect", connect_local_libsql)
+
+    storage_schema.init_db("libsql://local-test")
+    storage_schema.init_vector_memory("libsql://local-test")
+
+    conn = libsql.connect(str(db_path))
+    try:
+        tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+
+    assert "messages" in tables
+    assert "memory_candidates" in tables
+    assert "memory_candidate_embeddings" in tables
+    assert "long_term_memory_embeddings" in tables

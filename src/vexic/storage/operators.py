@@ -125,7 +125,7 @@ def _guard_rebuildable_projection_text(
         ("memory_candidates", "fact_text"),
         ("long_term_memory", "fact_text"),
     ):
-        for row in conn.execute(f"SELECT {column_name} FROM {table_name}"):
+        for row in conn.execute(f"SELECT {column_name} FROM {table_name}").fetchall():
             assert_no_forbidden_secret_values(forbidden_secret_values, str(row[0]))
 
 

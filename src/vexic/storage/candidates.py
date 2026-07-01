@@ -621,7 +621,7 @@ def record_candidate_retrieval(
                         AND agent_id IS ?
                     """,
                     [*candidate_ids, agent_id],
-                )
+                ).fetchall()
             }
             scoped_candidate_ids = [
                 candidate_id for candidate_id in candidate_ids if candidate_id in scoped_ids

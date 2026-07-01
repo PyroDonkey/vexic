@@ -24,6 +24,12 @@ class ConnectSeamTests(unittest.TestCase):
             with closing(connect(db_path, isolation_level=None)) as conn:
                 self.assertIsNone(conn.isolation_level)
 
+    def test_connect_rejects_plaintext_libsql_auth_token(self) -> None:
+        for target in ("http://example.test/db", "ws://example.test/db"):
+            with self.subTest(target=target):
+                with self.assertRaises(ValueError):
+                    connect(target, auth_token="secret")
+
 
 class SeamGateTests(unittest.TestCase):
     """Vexic runtime must open SQLite only through the connect() seam.
@@ -56,6 +62,34 @@ class SeamGateTests(unittest.TestCase):
             offenders,
             [],
             f"sqlite3.connect must go through vexic.storage.connection.connect: {offenders}",
+        )
+
+    def test_storage_code_does_not_iterate_execute_cursors_directly(self) -> None:
+        package_root = Path(__file__).resolve().parent.parent / "src" / "vexic"
+        offenders: list[str] = []
+
+        def is_execute_call(node: ast.AST) -> bool:
+            return (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "execute"
+            )
+
+        for module_path in package_root.rglob("*.py"):
+            tree = ast.parse(module_path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.For) and is_execute_call(node.iter):
+                    rel = module_path.relative_to(package_root)
+                    offenders.append(f"{rel}:{node.lineno}")
+                elif isinstance(node, ast.comprehension) and is_execute_call(node.iter):
+                    rel = module_path.relative_to(package_root)
+                    offenders.append(f"{rel}:{getattr(node, 'lineno', '?')}")
+
+        self.assertEqual(
+            offenders,
+            [],
+            "libSQL cursors are not iterable; call .fetchall()/.fetchone() before iterating: "
+            f"{offenders}",
         )
 
 
