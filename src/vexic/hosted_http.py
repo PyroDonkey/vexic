@@ -165,33 +165,37 @@ def create_service_from_env(
 
     Default (``local``, unset) preserves the exact prior behavior: a
     filesystem-rooted ``HostedTenantCatalog``/``HostedApiKeyStore`` under
-    ``VEXIC_HOSTED_ROOT``. ``VEXIC_STORAGE_BACKEND=turso`` resolves the
-    control-plane and customer-memory ``StorageTarget``s via
-    ``turso_target_resolver`` (defaulting to ``adapters.turso_adapter``, the
-    only place secrets are read) rather than the filesystem root; this seam
-    exists so tests can inject a fake resolver with no real credentials.
-    Turso-backed catalog/key-store construction lands with per-tenant
-    provisioning (a later task) -- this function resolves the targets now so
-    that seam is exercised end-to-end as soon as it is wired.
+    ``VEXIC_HOSTED_ROOT``. ``VEXIC_STORAGE_BACKEND=turso`` selects the
+    P2 dogfood customer-memory override (superseded/removed by Task 11's
+    catalog per-tenant target model): the control-plane
+    (``HostedTenantCatalog``/``HostedApiKeyStore``, i.e. auth + tenant
+    lookup) STAYS LOCAL/filesystem-rooted exactly as in the ``local``
+    branch, but the customer-memory ``StorageTarget`` is resolved via
+    ``turso_target_resolver`` (defaulting to ``adapters.turso_adapter``,
+    the only place secrets are read) and injected into
+    ``HostedMemoryService`` as ``customer_memory_target_override``. This
+    seam exists so tests can inject a fake resolver with no real
+    credentials. Turso-backed catalog/key-store construction (moving the
+    control-plane itself off the filesystem) lands with per-tenant
+    provisioning (Task 10/11).
     """
     backend = resolve_storage_backend(os.environ)
-    if backend == "turso":
-        resolver = turso_target_resolver or _TursoTargetResolver()
-        resolver.control_plane_target(os.environ)
-        resolver.customer_memory_target(os.environ)
-        raise NotImplementedError(
-            "VEXIC_STORAGE_BACKEND=turso is not yet wired to a Turso-backed "
-            "HostedTenantCatalog/HostedApiKeyStore; that lands with per-tenant "
-            "provisioning."
-        )
     root = Path(os.environ.get("VEXIC_HOSTED_ROOT", ".hosted-memory"))
     catalog = HostedTenantCatalog(root)
     keys = HostedApiKeyStore(root)
+    customer_memory_target_override = None
+    if backend == "turso":
+        resolver = turso_target_resolver or _TursoTargetResolver()
+        # Resolved for parity/validation with Task 7's seam even though the
+        # control-plane itself stays local until Task 10/11.
+        resolver.control_plane_target(os.environ)
+        customer_memory_target_override = resolver.customer_memory_target(os.environ)
     return HostedMemoryService(
         catalog,
         keys,
         telemetry=catalog,
         rate_limiter=HostedInMemoryRateLimiter(),
+        customer_memory_target_override=customer_memory_target_override,
     )
 
 
