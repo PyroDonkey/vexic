@@ -38,3 +38,6 @@ dev = [
 
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]
+markers = [
+    "turso: live tests that require TURSO_DATABASE_URL + TURSO_AUTH_TOKEN and the libsql extra",
+]
