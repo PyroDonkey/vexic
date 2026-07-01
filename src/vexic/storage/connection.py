@@ -33,9 +33,19 @@ class StorageConnection(Protocol):
 
     The libSQL connection (ADR 0019 verification spike) supports this DB-API
     subset -- ``execute``/``executemany``/``cursor``/``commit``/``rollback``/
-    ``close`` and the ``with conn:`` transaction context (rollback on exception,
-    verified equivalent to ``sqlite3``) -- but NOT a settable ``row_factory``
-    (use :func:`rows_as_dicts`), named/dict params, or ``enable_load_extension``.
+    ``close`` and the ``with conn:`` transaction context (rollback on
+    exception) -- but NOT a settable ``row_factory`` (use :func:`rows_as_dicts`),
+    named/dict params, or ``enable_load_extension``.
+
+    Transaction caveat (verified live against Turso, ADR 0019): the ``with conn:``
+    context rolls back on exception on both backends, but on managed libSQL it
+    does NOT open an implicit transaction the way ``sqlite3`` does -- each
+    ``execute`` auto-commits its own micro-transaction. So a ``SAVEPOINT`` /
+    ``ROLLBACK TO SAVEPOINT`` / ``RELEASE SAVEPOINT`` sequence does NOT persist
+    across ``execute`` calls under a bare ``with conn:`` on libSQL (the savepoint
+    is gone by the next call, "no such savepoint"). Nested savepoint logic must
+    issue an explicit ``BEGIN`` first so it has a real open transaction to nest
+    inside (see ``transcript.ingest_source_messages``).
     """
 
     def execute(self, sql: str, parameters: Any = ..., /) -> Any: ...

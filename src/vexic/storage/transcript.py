@@ -18,6 +18,7 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
+from vexic.storage.errors import is_operational_error, is_unique_violation
 from vexic.storage.schema import _assert_no_forbidden_secret_values, _fts_match_query
 from vexic.text_utils import estimate_tokens
 from vexic.storage.connection import connect
@@ -381,24 +382,6 @@ def _polluted_transcript_reason(msg: ModelMessage) -> str | None:
     return None
 
 
-def _is_unique_constraint_violation(exc: Exception) -> bool:
-    """True when ``exc`` is a UNIQUE/PRIMARY KEY constraint violation.
-
-    ``sqlite3`` raises ``sqlite3.IntegrityError`` for this; the hosted
-    libSQL/Hrana driver (ADR 0019) has no equivalent typed exception and
-    raises a bare ``ValueError`` for every server-side SQL error instead, so
-    this call site must fall back to sniffing the message for the
-    SQLite-native ``SQLITE_CONSTRAINT``/``UNIQUE constraint failed`` text
-    rather than only catching a type unavailable on that backend.
-    """
-    if isinstance(exc, sqlite3.IntegrityError):
-        return True
-    if isinstance(exc, ValueError):
-        message = str(exc)
-        return "SQLITE_CONSTRAINT" in message or "UNIQUE constraint failed" in message
-    return False
-
-
 def ingest_source_messages(
     db_path: str,
     inputs: list[SourceTranscriptInput],
@@ -529,7 +512,7 @@ def ingest_source_messages(
                         (source_host, source_session_id, source_message_id, agent_id, message_id),
                     )
                 except (sqlite3.IntegrityError, ValueError) as exc:
-                    if not _is_unique_constraint_violation(exc):
+                    if not is_unique_violation(exc):
                         raise
                     conn.execute("ROLLBACK TO SAVEPOINT source_ingest_row")
                     conn.execute("RELEASE SAVEPOINT source_ingest_row")
@@ -626,7 +609,12 @@ def search_messages(
                 """,
                 (safe_query, session_id, agent_id, agent_id, limit),
             ).fetchall()
-        except sqlite3.OperationalError:
+        except (sqlite3.OperationalError, ValueError) as exc:
+            # A malformed FTS MATCH surfaces as sqlite3.OperationalError locally
+            # and as a bare ValueError on hosted libSQL (ADR 0019); both mean
+            # "no hits for this query". Unrelated ValueErrors re-raise.
+            if not is_operational_error(exc):
+                raise
             return []
 
         return [

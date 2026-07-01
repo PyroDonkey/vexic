@@ -10,6 +10,7 @@ import pytest
 from vexic.embeddings import EMBEDDING_DIM
 from vexic.storage.connection import StorageTarget, connect, rows_as_dicts
 from vexic.storage import schema as storage_schema
+from vexic.storage.errors import is_unique_violation
 from vexic.storage.schema import _normalize_embedding, _serialize_float32
 from vexic.storage.vectors import select_vector_backend
 
@@ -212,6 +213,58 @@ def test_local_libsql_initializes_full_storage_schema(
     assert "memory_candidates" in tables
     assert "memory_candidate_embeddings" in tables
     assert "long_term_memory_embeddings" in tables
+
+
+def test_is_unique_violation_detected_on_backend(conformance_conn: Any) -> None:
+    # Constraint-violation detection parity (Task 9b): the shared classifier must
+    # recognize a UNIQUE conflict on BOTH backends -- sqlite3 raises
+    # sqlite3.IntegrityError, hosted libSQL raises a bare ValueError carrying the
+    # Hrana/SQLITE_CONSTRAINT payload. The classifier normalizes both.
+    conn = conformance_conn
+    conn.execute(f"CREATE TABLE IF NOT EXISTS {_CONF_BASE} (id INTEGER PRIMARY KEY, uid TEXT UNIQUE)")
+    conn.execute(f"INSERT INTO {_CONF_BASE} (id, uid) VALUES (1, 'dup')")
+    conn.commit()
+
+    raised: Exception | None = None
+    try:
+        conn.execute(f"INSERT INTO {_CONF_BASE} (id, uid) VALUES (2, 'dup')")
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001 -- backends raise different types
+        raised = exc
+    finally:
+        conn.rollback()
+
+    assert raised is not None, "duplicate UNIQUE insert should raise on this backend"
+    assert is_unique_violation(raised) is True
+
+
+def test_explicit_begin_savepoint_parity(conformance_conn: Any) -> None:
+    # Explicit-BEGIN SAVEPOINT parity (Task 9b): under an explicit BEGIN, a
+    # SAVEPOINT / insert / ROLLBACK TO / RELEASE sequence must behave identically
+    # on both backends -- the rolled-back row is absent, the kept row present.
+    # libSQL's `with conn:` does NOT open an implicit transaction, so the ingest
+    # path relies on the explicit BEGIN exercised here.
+    conn = conformance_conn
+    conn.execute(f"CREATE TABLE IF NOT EXISTS {_CONF_BASE} (id INTEGER PRIMARY KEY)")
+    conn.commit()
+
+    conn.execute("BEGIN")
+    try:
+        # Kept row, no savepoint.
+        conn.execute(f"INSERT INTO {_CONF_BASE} (id) VALUES (1)")
+
+        # Rolled-back row, inside a savepoint.
+        conn.execute("SAVEPOINT conf_sp")
+        conn.execute(f"INSERT INTO {_CONF_BASE} (id) VALUES (2)")
+        conn.execute("ROLLBACK TO SAVEPOINT conf_sp")
+        conn.execute("RELEASE SAVEPOINT conf_sp")
+    except BaseException:
+        conn.rollback()
+        raise
+    conn.commit()
+
+    ids = {int(row[0]) for row in conn.execute(f"SELECT id FROM {_CONF_BASE}").fetchall()}
+    assert ids == {1}, "kept row present, rolled-back savepoint row absent"
 
 
 def test_storage_target_is_exported() -> None:
