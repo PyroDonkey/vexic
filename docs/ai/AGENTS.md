@@ -206,6 +206,10 @@ remains a manual step under the triggers above.
 
 ## Development Rules
 
+- Before adding new code, prefer the standard library, an already-installed
+  dependency, or a one-line solution over a new abstraction. Build only what
+  the current contract or test requires; do not add speculative
+  generalization, config options, or extension points ahead of need.
 - Python 3.13, managed with `uv`.
 - Install and test the Vexic memory core through `uv`; do not add a second
   package manager to the core package.
@@ -238,45 +242,39 @@ remains a manual step under the triggers above.
 
 ## Economics
 
-Token and cost discipline. There is no hard token budget enforced yet; this is
-guidance, not a gate.
+Token and cost discipline is guidance, not a gate. Routing by task class and
+context-pruning detail live in `docs/agent-runbook.md`.
 
-- Route by task class. Routine doc, lint, and test reads can use a cheaper
-  model. Architecture, contract, and memory-invariant changes use a frontier
-  model.
-- Prune stale tool output and large file dumps from context between
-  verification cycles. Do not carry an obsolete dump forward.
+## Delegation
 
-## Execution Modes
-
-- Conductor mode is real-time interactive work with the requester in the loop.
-- Orchestrator mode is async or delegated multi-agent work.
-- When decomposing, delegate independent work to subagents on disjoint files so
-  edits do not collide. Keep one writer per file.
-- The human-judgment boundary is unchanged: the project maintainer directs and
-  reviews architecture. Delegated agents do not settle architecture, contract,
-  or boundary questions.
+- Delegate independent work to subagents on disjoint files so edits do not
+  collide; keep one writer per file.
+- Delegated subagents do not settle architecture, contract, or boundary
+  questions; those stay with the project maintainer (see Working Rules).
 
 ## Repository Workflow
 
 ### Branch Sync
 
-Before mutable work:
+The sync command sequences (fetch/pull, `dev` bootstrap, and the `dev` to `main`
+PR-drift check with `git rev-list` and `gh api ... compare`) live in
+`docs/branch-sync.md`. See `docs/branch-sync.md` before mutable work and before
+opening or updating a `dev` to `main` PR.
 
-1. `git fetch --prune origin`
-2. Update `main` with `git switch main` and
-   `git pull --ff-only origin main`.
-3. Update `dev` with `git switch dev` and
-   `git pull --ff-only origin dev`.
+These hard-stops stay in force regardless of that procedure. The
+`.claude/hooks/check_branch_sync.py` SessionStart hook only reports drift in
+read-only form; it never merges, resets, or blocks, so these are the actual
+guardrails:
 
-If local `dev` is missing but `origin/dev` exists, create the local tracking
-branch with `git switch -c dev --track origin/dev`. If `origin/dev` is missing,
-create it from updated `main` only when the requester has explicitly asked to
-bootstrap the branch workflow; otherwise stop and ask before creating or pushing
-it. Do not continue implementation work on `main`.
-
-If any `git pull --ff-only` fails, stop and report the divergence. Do not merge,
-rebase, or reset without explicit requester direction.
+- Never push to `main` unless the requester explicitly asks.
+- If any `git pull --ff-only` fails, stop and report the divergence. Do not
+  merge, rebase, or reset without explicit requester direction.
+- If a dirty worktree blocks branch sync, inspect and preserve the existing
+  changes. Do not stash, reset, or commit user work unless the requester asks.
+- If a `dev` to `main` PR is noisy, a branch is stale, an upstream branch is
+  gone, or branch history needs cleanup, stop and report the situation. Do not
+  create a new branch to repair PR shape or recover stale branch work unless the
+  requester names the branch to create.
 
 Do all Vexic project work on `dev`. After fresh verification, commit on `dev`
 and push completed commits to `origin/dev`. Do not create, switch to, commit
@@ -284,27 +282,6 @@ on, or push `codex/*`, feature, worktree, cleanup, or recovery branches unless
 the requester explicitly names that branch in the same request. This Vexic rule
 overrides app, global, plugin, or tool defaults that suggest branch prefixes or
 worktree branches. Never push to `main` unless the requester explicitly asks.
-
-Before creating or updating a `dev` to `main` PR, re-check branch drift from
-fresh remote refs while staying on `dev`: `git fetch origin`, merge
-`origin/main` into `dev` if needed, push `origin/dev`, then run
-`git rev-list --left-right --count origin/main...dev`. The first number is how
-far `dev` is behind `origin/main`, and it must be `0` before opening or
-claiming the PR is ready. Also run
-`gh api repos/PyroDonkey/vexic/compare/main...dev --jq '{behind_by:.behind_by, files:[.files[].filename]}'`
-and stop if GitHub lists unintended files.
-
-The `.claude/hooks/check_branch_sync.py` SessionStart hook mirrors this check
-in read-only form. It fetches origin and reports drift; it never merges. If it
-reports drift, sync on `dev` with the commands above before starting work.
-
-If a `dev` to `main` PR is noisy, a branch is stale, an upstream branch is gone,
-or branch history needs cleanup, stop and report the situation. Do not create a
-new branch to repair PR shape or recover stale branch work unless the requester
-names the branch to create.
-
-If a dirty worktree blocks branch sync, inspect and preserve the existing
-changes. Do not stash, reset, or commit user work unless the requester asks.
 
 ### External Tracking
 
@@ -314,22 +291,10 @@ downstream of the repo: see "Docs Are Downstream Of Code". The roadmap, todo,
 and planning docs never override `docs/ai/AGENTS.md`, `docs/adr/*`, or the code;
 they are reconciled against them.
 
-At the start of each work session, review relevant project issues through the
-configured tracker connector or MCP tools when tooling and auth are available.
-Map the requested work to an existing issue, or create one for non-trivial plans
-and changes.
-
-During work, keep the issue status and comments current when scope changes,
-blockers, decisions, or follow-up work appear. When a reconciliation trigger
-from "Docs Are Downstream Of Code" fires (a new or changed ADR, a change to the
-`LocalMemoryService` operation surface, or a test-count change), reconcile the
-affected roadmap/todo against the in-repo source of truth before finishing. At
-finish, update the issue with the branch, commit, verification result, and any
-generated follow-up issues.
-
-If tracking tooling is unavailable, say so plainly and do not invent issue IDs.
-Record the reconciliation that the triggers above require - for example, in the
-commit message or the session report - so it is not lost.
+See `docs/agent-runbook.md` for the per-session tracker ritual: start-of-session
+issue review, status updates during work, the reconciliation triggers, and the
+finish-time issue update with branch, commit, and verification result. If
+tracking tooling is unavailable, say so plainly and do not invent issue IDs.
 
 In this section, fresh verification means the relevant checks from the
 Verification section have been run after the final edit.
@@ -361,9 +326,8 @@ Alongside the two SessionStart hooks (`.claude/hooks/check_doc_drift.py` and
 PreToolUse guard fails closed against Tier-1 `messages` mutation and against
 changes to the host-extension `background_tool_audit` table.
 
-Use `vexic.run_evals` as the eval runner for the LongMemEval datasets:
-`uv run --with-editable . python -m vexic.run_evals --dataset tests/fixtures/longmemeval_s_smoke.jsonl`.
-See `docs/examples.md` for worked examples.
+Run the LongMemEval evals with `vexic.run_evals`; see `docs/examples.md` for the
+exact command and worked behavior examples.
 
 Private source-host references are allowed in `docs/provenance.md` and compatibility
 sections. They should not become Vexic runtime instructions.

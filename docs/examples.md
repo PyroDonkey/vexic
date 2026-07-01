@@ -112,3 +112,15 @@ from the environment. Do not replace host ports with ambient environment reads,
 provider SDK wiring, process globals, or private host runtime imports. Implement
 a scoped Vexic dream-phase adapter slice only when the project maintainer starts
 that work.
+
+## Example 4: Running The LongMemEval Evals
+
+`docs/ai/AGENTS.md` names `vexic.run_evals` as the eval runner for the
+LongMemEval datasets. Run the smoke dataset with:
+
+```powershell
+uv run --with-editable . python -m vexic.run_evals --dataset tests/fixtures/longmemeval_s_smoke.jsonl
+```
+
+This is the eval entry point referenced by the Verification section. It does not
+replace `uv run pytest` for conformance and reliability checks.
