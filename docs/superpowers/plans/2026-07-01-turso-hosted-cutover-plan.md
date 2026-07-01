@@ -771,3 +771,25 @@ Run: `uv run pytest -q` (green without creds), then `set -a && . ./.env.turso &&
 - **Placeholder scan:** near-term tasks (1–8) carry full test + implementation code; the wide/again-mechanical refactors (10–18) specify exact files, interfaces, red→green→commit steps, and representative code rather than restating dozens of near-identical call-site edits — no `TBD`/`add error handling` placeholders.
 - **Type consistency:** `StorageTarget(target, auth_token)`, `as_connect_args()`, `_memo_key`/`_reset_init_memo`, `resolve_storage_backend`, `control_plane_target`/`customer_memory_target`, `TursoProvisioningPort.{create_database,mint_token,destroy_database}`, `generation` used consistently across tasks.
 - **Secret handling:** tokens only in `adapters/`, redacted in `StorageTarget`, never persisted raw — enforced by Tasks 2, 6, 10, 15.
+
+## Amendment — 2026-07-01 (fuse checkpoint, pre-P3)
+
+Implementation of Task 7 revealed that the `turso` factory branch must raise
+`NotImplementedError` because the catalog/keystore are filesystem-only until P3,
+so Task 8's live round-trip could not run. A deep fuse pass (GPT/Gemini/Composer
+unanimous) chose the minimal customer-memory override over deferral. Inserted:
+
+**Task 7b — customer-memory Turso override (before Task 8).** `HostedMemoryService`
+gains an optional `customer_memory_target_override: StorageTarget | None`;
+`_local_service` uses it as the customer-memory `db_path` instead of
+`tenant.db_path` when set. `create_service_from_env` (in `hosted_http.py`, the
+real factory — the P2 tasks' "factory in hosted.py" reference was inaccurate), on
+`VEXIC_STORAGE_BACKEND=turso`, builds the LOCAL catalog + keystore as today,
+resolves the Turso customer-memory target via the injected `adapters/` resolver,
+and passes it as the override — removing the `NotImplementedError` for the
+customer-memory path. Control-plane stays local until P3. A runtime fail-fast
+guard raises if a second distinct tenant is served while the override is active
+(dogfood single-tenant only). Committed unit tests cover the factory injection +
+`_local_service` override + the guard; the Task 8 live e2e stays creds-gated.
+This override is explicitly superseded and removed by Task 11 (catalog per-tenant
+target model). Replacement/reconcile filesystem ops stay local-only until P3.
