@@ -413,6 +413,12 @@ def _provision_control_tenant(service: HostedMemoryService, clerk_org_id: str) -
     try:
         return service.catalog.provision_customer_account(clerk_org_id)
     except ValueError as exc:
+        # On the hosted libSQL/Turso backend a genuine constraint/operational
+        # SQL failure surfaces as a bare `ValueError` (ADR 0019). Let it
+        # propagate to the storage boundary for 409/503/500 classification
+        # instead of mis-wrapping it as an HTTP 400 domain-validation error.
+        if is_unique_violation(exc) or is_operational_error(exc):
+            raise
         raise _ControlPlaneBadRequest(str(exc)) from exc
 
 

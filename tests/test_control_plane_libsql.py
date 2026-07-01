@@ -4,6 +4,7 @@ import os
 from contextlib import closing
 
 import pytest
+from fastapi.responses import JSONResponse
 
 from tests.fakes.libsql import FakeLibsqlConn
 from vexic.contract import MemoryCapability
@@ -523,3 +524,215 @@ def test_activate_replacement_database_rejects_dsn_tenant_mismatch(monkeypatch, 
     tenant = catalog.get_tenant("tenant-a")
     assert tenant.customer_target is None
     assert tenant.generation == 1
+
+
+# ---------------------------------------------------------------------------
+# FIX I-1 (COA-273 final review): `_provision_control_tenant` wraps every
+# `ValueError` from `provision_customer_account` as an HTTP 400
+# `_ControlPlaneBadRequest`. Once the control plane runs on Turso, a genuine
+# constraint/operational SQL failure arrives as a BARE `ValueError` carrying a
+# Hrana `code:` payload -- it must reach the storage boundary's 409/503/500
+# classification, NOT be mis-wrapped as a 400 domain-validation error. A
+# genuine domain `ValueError` (non-storage message) must still become a 400.
+
+
+class _StubProvisionService:
+    """Minimal stand-in whose `catalog.provision_customer_account` raises a
+    preset exception, so `_provision_control_tenant` can be exercised without a
+    real catalog or Turso connection."""
+
+    def __init__(self, exc: Exception) -> None:
+        self.catalog = self
+        self._exc = exc
+
+    def provision_customer_account(self, clerk_org_id: str) -> str:
+        raise self._exc
+
+
+def _run_boundary(exc: Exception) -> object:
+    """Run `_provision_control_tenant` through `_control_plane_storage_boundary`
+    and return the boundary's decision: either the `JSONResponse` it produced
+    for a classified storage error, or the exception that propagated out."""
+    import asyncio
+
+    from vexic import hosted_control_plane_http as cp
+
+    @cp._control_plane_storage_boundary
+    async def handler() -> object:
+        return cp._provision_control_tenant(_StubProvisionService(exc), "org_123")
+
+    try:
+        return asyncio.run(handler())
+    except Exception as propagated:  # noqa: BLE001 -- assert on it in the test
+        return propagated
+
+
+def test_provision_control_tenant_libsql_unique_violation_propagates_unwrapped():
+    """A libSQL UNIQUE-constraint `ValueError` must propagate UNTOUCHED out of
+    `_provision_control_tenant` (so the storage boundary classifies it as 409),
+    NOT be wrapped as a 400 `_ControlPlaneBadRequest`."""
+    from vexic import hosted_control_plane_http as cp
+
+    libsql_unique = ValueError(
+        'Hrana: `stream error: `Error { message: "SQLite error: UNIQUE '
+        'constraint failed: customer_account_mappings.clerk_org_id", '
+        'code: "SQLITE_CONSTRAINT" }``'
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        cp._provision_control_tenant(_StubProvisionService(libsql_unique), "org_123")
+
+    assert not isinstance(excinfo.value, cp._ControlPlaneBadRequest)
+    assert excinfo.value is libsql_unique
+
+    # End-to-end: the storage boundary turns that propagated error into a 409.
+    result = _run_boundary(libsql_unique)
+    assert isinstance(result, JSONResponse)
+    assert result.status_code == 409
+
+
+def test_provision_control_tenant_libsql_operational_error_propagates_unwrapped():
+    """A libSQL operational `ValueError` (missing table / bad SQL) must
+    propagate untouched so the boundary classifies it as 5xx, not 400."""
+    from vexic import hosted_control_plane_http as cp
+
+    libsql_operational = ValueError(
+        'Hrana: `stream error: `Error { message: "SQLite error: no such '
+        'table: tenants", code: "SQLITE_ERROR" }``'
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        cp._provision_control_tenant(
+            _StubProvisionService(libsql_operational), "org_123"
+        )
+
+    assert not isinstance(excinfo.value, cp._ControlPlaneBadRequest)
+    assert excinfo.value is libsql_operational
+
+    result = _run_boundary(libsql_operational)
+    assert isinstance(result, JSONResponse)
+    assert result.status_code in (500, 503)
+
+
+def test_provision_control_tenant_domain_valueerror_still_becomes_bad_request():
+    """A genuine domain `ValueError` (no storage markers) must still be wrapped
+    as `_ControlPlaneBadRequest` (HTTP 400)."""
+    from vexic import hosted_control_plane_http as cp
+
+    domain_error = ValueError("clerk_org_id must not be blank.")
+
+    with pytest.raises(cp._ControlPlaneBadRequest) as excinfo:
+        cp._provision_control_tenant(_StubProvisionService(domain_error), "org_123")
+
+    assert "clerk_org_id" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# FIX I-2 (COA-273 final review): `_replacement_migration_scope` catches only
+# `sqlite3.DatabaseError` when reading `canonical_migration_imports`. For a
+# Turso-DSN replacement whose replacement db lacks that table, the libSQL
+# driver raises a BARE `ValueError` ("no such table"), which slips past the
+# catch and propagates as an unhandled 500 instead of the intended `None`
+# (which yields the clean "no migration metadata" `PermissionError` upstream).
+# An unrelated `ValueError` must still propagate.
+
+
+class _RaisingOnMigrationReadConn:
+    """Wraps a `FakeLibsqlConn` but raises a preset exception whenever
+    `canonical_migration_imports` is read -- everything else delegates
+    through, so control-plane bookkeeping still works."""
+
+    def __init__(self, fake_conn: FakeLibsqlConn, read_exc: Exception) -> None:
+        self._fake_conn = fake_conn
+        self._read_exc = read_exc
+
+    def execute(self, sql, parameters=(), /):
+        if "canonical_migration_imports" in sql:
+            raise self._read_exc
+        return self._fake_conn.execute(sql, parameters)
+
+    def executemany(self, sql, parameters, /):
+        return self._fake_conn.executemany(sql, parameters)
+
+    def cursor(self):
+        return self._fake_conn.cursor()
+
+    def commit(self):
+        self._fake_conn.commit()
+
+    def rollback(self):
+        self._fake_conn.rollback()
+
+    def close(self):
+        pass
+
+    def __enter__(self):
+        self._fake_conn.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._fake_conn.__exit__(*exc)
+
+
+def _patch_connect_with_raising_replacement(
+    monkeypatch, fake_conn: FakeLibsqlConn, read_exc: Exception
+) -> None:
+    """Route the control-plane `StorageTarget` at the plain shared fake, but
+    the replacement DSN `str` at a connection whose migration-metadata read
+    raises `read_exc` -- reproducing a libSQL replacement db that lacks
+    `canonical_migration_imports`."""
+    import vexic.hosted_local as hosted_local
+    import vexic.storage.schema as storage_schema
+
+    raising_handle = _RaisingOnMigrationReadConn(fake_conn, read_exc)
+
+    def _fake_connect(target, *, auth_token=None, **kwargs):
+        if isinstance(target, StorageTarget):
+            assert target.auth_token == "s3cr3t-token"
+            return _NonClosingFakeConnHandle(fake_conn)
+        assert isinstance(target, str), f"unexpected connect() target: {target!r}"
+        return raising_handle
+
+    monkeypatch.setattr(hosted_local, "connect", _fake_connect)
+    monkeypatch.setattr(storage_schema, "connect", _fake_connect)
+
+
+def test_replacement_scope_libsql_missing_table_yields_permission_error(
+    monkeypatch, tmp_path
+):
+    fake_conn = FakeLibsqlConn()
+    libsql_missing_table = ValueError(
+        'Hrana: `stream error: `Error { message: "SQLite error: no such '
+        'table: canonical_migration_imports", code: "SQLITE_ERROR" }``'
+    )
+    _patch_connect_with_raising_replacement(monkeypatch, fake_conn, libsql_missing_table)
+    control_target = StorageTarget("libsql://fake-control-plane", auth_token="s3cr3t-token")
+
+    catalog = HostedTenantCatalog(tmp_path, control_target=control_target)
+    catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+
+    # Missing table -> _replacement_migration_scope returns None -> the clean
+    # "no migration metadata" PermissionError, NOT a raw ValueError propagation.
+    with pytest.raises(PermissionError, match="migration metadata"):
+        catalog.activate_replacement_database(
+            "tenant-a", "libsql://replacement-customer-db"
+        )
+
+    tenant = catalog.get_tenant("tenant-a")
+    assert tenant.customer_target is None
+    assert tenant.generation == 1
+
+
+def test_replacement_scope_unrelated_valueerror_still_propagates(monkeypatch, tmp_path):
+    fake_conn = FakeLibsqlConn()
+    unrelated = ValueError("totally unrelated failure with no SQL markers")
+    _patch_connect_with_raising_replacement(monkeypatch, fake_conn, unrelated)
+    control_target = StorageTarget("libsql://fake-control-plane", auth_token="s3cr3t-token")
+
+    catalog = HostedTenantCatalog(tmp_path, control_target=control_target)
+    catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+
+    with pytest.raises(ValueError, match="unrelated failure"):
+        catalog.activate_replacement_database(
+            "tenant-a", "libsql://replacement-customer-db"
+        )

@@ -22,6 +22,7 @@ from vexic.hosted import (
 )
 from vexic.service import LocalMemoryService
 from vexic.storage.connection import StorageTarget, _is_libsql_target, connect
+from vexic.storage.errors import is_operational_error
 
 
 _CONTROL_DB_MODE = 0o600
@@ -616,8 +617,18 @@ class HostedTenantCatalog:
                     WHERE id = 1
                     """
                 ).fetchone()
-        except sqlite3.DatabaseError:
-            return None
+        except (sqlite3.DatabaseError, ValueError) as exc:
+            # A missing `canonical_migration_imports` table (or otherwise
+            # unreadable replacement db) is a "no migration metadata" signal:
+            # local sqlite raises a typed `sqlite3.DatabaseError` (preserved
+            # here at its original blanket reach); the hosted libSQL backend
+            # raises a bare `ValueError` ("no such table") (ADR 0019), gated
+            # through `is_operational_error` so an unrelated `ValueError`
+            # re-raises rather than being silently swallowed. Both signals ->
+            # return None (yields a clean PermissionError upstream).
+            if isinstance(exc, sqlite3.DatabaseError) or is_operational_error(exc):
+                return None
+            raise
         if row is None:
             return None
         return str(row[0]), None if row[1] is None else str(row[1])
