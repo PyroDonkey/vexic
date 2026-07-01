@@ -1,9 +1,17 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+import json
+import urllib.error
+import urllib.request
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from urllib.parse import urlencode
 
 from vexic.storage.connection import StorageTarget
+
+PLATFORM_API_BASE = "https://api.turso.tech"
+
+HttpCall = Callable[[str, str, Mapping[str, str], bytes | None], tuple[int, dict]]
 
 
 def _require(env: Mapping[str, str], name: str) -> str:
@@ -95,3 +103,159 @@ def reconcile_tenant_databases(
         orphan_databases=orphan_databases,
         dangling_targets=dangling_targets,
     )
+
+
+def _default_http_call(
+    method: str, url: str, headers: Mapping[str, str], body: bytes | None
+) -> tuple[int, dict]:
+    """Stdlib ``urllib.request``-based transport (no new dependency).
+
+    Returns ``(status, json_dict)``. Non-JSON or empty bodies decode to
+    ``{}``. Non-2xx responses are NOT raised here -- ``urllib`` raises
+    ``HTTPError`` on those, which this function catches and converts back
+    into a normal ``(status, json_dict)`` tuple so callers handle status
+    codes uniformly regardless of transport.
+    """
+    request = urllib.request.Request(url, data=body, headers=dict(headers), method=method)
+    try:
+        with urllib.request.urlopen(request) as response:  # noqa: S310 - fixed https host
+            status = response.status
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        raw = exc.read()
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        parsed = {}
+    return status, parsed
+
+
+def _looks_like_conflict(status: int, payload: dict) -> bool:
+    if status == 409:
+        return True
+    message = str(payload.get("error", "")).lower()
+    return "already exists" in message
+
+
+class TursoProvisioningPort:
+    """Creates/mints/destroys per-tenant Turso databases via the Turso
+    Platform API (COA-273 P4).
+
+    Secrets (the platform API token) are read only in ``adapters/`` --
+    ``src/vexic`` never sees them. The HTTP transport is injectable so unit
+    tests never touch the network; ``_default_http_call`` (stdlib
+    ``urllib.request``) is used when no transport is supplied.
+
+    Never logs or prints the platform token or a minted jwt. Non-2xx error
+    messages never include the token.
+    """
+
+    def __init__(
+        self,
+        org: str,
+        group: str,
+        *,
+        http_call: HttpCall | None = None,
+        platform_token: str,
+    ) -> None:
+        self.org = org
+        self.group = group
+        self._http_call: HttpCall = http_call if http_call is not None else _default_http_call
+        self._platform_token = platform_token
+
+    @classmethod
+    def from_env(cls, env: Mapping[str, str]) -> TursoProvisioningPort:
+        return cls(
+            _require(env, "TURSO_ORG"),
+            _require(env, "TURSO_GROUP"),
+            platform_token=_require(env, "TURSO_PLATFORM_API_TOKEN"),
+        )
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self._platform_token}",
+            "Content-Type": "application/json",
+        }
+
+    def _url(self, path: str, query: Mapping[str, str] | None = None) -> str:
+        base = f"{PLATFORM_API_BASE}/v1/organizations/{self.org}{path}"
+        if query:
+            return f"{base}?{urlencode(query)}"
+        return base
+
+    def _call(
+        self,
+        method: str,
+        path: str,
+        *,
+        query: Mapping[str, str] | None = None,
+        body: dict | None = None,
+    ) -> tuple[int, dict]:
+        payload = json.dumps(body).encode("utf-8") if body is not None else None
+        return self._http_call(method, self._url(path, query), self._headers(), payload)
+
+    def _dsn_from_database_body(self, payload: dict) -> str:
+        hostname = payload["database"]["Hostname"]
+        return f"libsql://{hostname}"
+
+    def create_database(self, name: str) -> str:
+        """Idempotent create: on conflict (409 or an error body containing
+        "already exists"), resolves the existing database's DSN via GET
+        instead of raising.
+        """
+        status, payload = self._call(
+            "POST", "/databases", body={"name": name, "group": self.group}
+        )
+        if 200 <= status < 300:
+            return self._dsn_from_database_body(payload)
+        if _looks_like_conflict(status, payload):
+            get_status, get_payload = self._call("GET", f"/databases/{name}")
+            if 200 <= get_status < 300:
+                return self._dsn_from_database_body(get_payload)
+            raise RuntimeError(
+                f"Turso create_database({name!r}) conflicted, then GET failed with "
+                f"status {get_status}."
+            )
+        raise RuntimeError(
+            f"Turso create_database({name!r}) failed with status {status}."
+        )
+
+    def mint_token(
+        self, db_name: str, *, expiration: str = "5m", read_only: bool = True
+    ) -> str:
+        """Returns the raw jwt. Never logged."""
+        authorization = "read-only" if read_only else "full-access"
+        status, payload = self._call(
+            "POST",
+            f"/databases/{db_name}/auth/tokens",
+            query={"expiration": expiration, "authorization": authorization},
+        )
+        if not (200 <= status < 300):
+            raise RuntimeError(
+                f"Turso mint_token({db_name!r}) failed with status {status}."
+            )
+        return payload["jwt"]
+
+    def destroy_database(self, name: str) -> None:
+        status, payload = self._call("DELETE", f"/databases/{name}")
+        if not (200 <= status < 300):
+            raise RuntimeError(
+                f"Turso destroy_database({name!r}) failed with status {status}."
+            )
+
+    def provision(
+        self, name: str, *, expiration: str = "5m", read_only: bool = True
+    ) -> tuple[str, str]:
+        """Composes create_database + mint_token. If mint_token fails after
+        a successful create_database, performs a COMPENSATING
+        destroy_database and re-raises -- no half-provisioned DB is left
+        behind.
+        """
+        dsn = self.create_database(name)
+        try:
+            token = self.mint_token(name, expiration=expiration, read_only=read_only)
+        except Exception:
+            self.destroy_database(name)
+            raise
+        return dsn, token
