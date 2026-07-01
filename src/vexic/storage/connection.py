@@ -75,6 +75,11 @@ def connect(
     from the environment (ADR 0019). The ``libsql`` client is an optional
     ``hosted`` extra, imported lazily so the local path needs no extra dependency.
     """
+    if isinstance(target, StorageTarget):
+        if auth_token is not None:
+            raise ValueError("Pass auth_token via StorageTarget or the kwarg, not both.")
+        target, auth_token = target.as_connect_args()
+
     if _is_libsql_target(target):
         # ``target`` is trusted configuration -- a resolved DSN handed in by the
         # adapters/ layer -- never user input, so scheme-based routing here is
