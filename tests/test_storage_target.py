@@ -27,3 +27,19 @@ def test_connect_accepts_storage_target_local(tmp_path):
 def test_connect_rejects_double_token():
     with pytest.raises(ValueError):
         connect(StorageTarget("libsql://db", "a"), auth_token="b")
+
+def test_init_db_runs_ddl_once(tmp_path, monkeypatch):
+    import vexic.storage.schema as schema
+    schema._reset_init_memo()  # test hook
+    calls = {"n": 0}
+    real_connect = schema.connect
+    def counting_connect(target, **kw):
+        calls["n"] += 1
+        return real_connect(target, **kw)
+    monkeypatch.setattr(schema, "connect", counting_connect)
+    p = str(tmp_path / "m.db")
+    schema.init_db(p); first = calls["n"]
+    schema.init_db(p); schema.init_db(p)
+    assert first >= 1 and calls["n"] == first  # no reconnect/DDL after first
+    schema.init_db(p, force=True)
+    assert calls["n"] == first + 1
