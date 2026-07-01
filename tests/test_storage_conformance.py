@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import os
 import uuid
 from typing import Any
@@ -22,7 +23,8 @@ from vexic.storage.vectors import select_vector_backend
 
 _TURSO_URL = os.environ.get("TURSO_DATABASE_URL")
 _TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
-_HAS_TURSO = bool(_TURSO_URL and _TURSO_TOKEN)
+_LIBSQL_INSTALLED = importlib.util.find_spec("libsql") is not None
+_HAS_TURSO = bool(_TURSO_URL and _TURSO_TOKEN and _LIBSQL_INSTALLED)
 
 # Per-process suffix so concurrent test runs never collide on the shared Turso
 # dev database (the tables live in one remote DB).
@@ -54,7 +56,7 @@ def _drop_conformance_tables(conn: Any) -> None:
             "libsql",
             marks=pytest.mark.skipif(
                 not _HAS_TURSO,
-                reason="TURSO_DATABASE_URL / TURSO_AUTH_TOKEN not in environment",
+                reason="Turso creds not in environment, or libsql (vexic[hosted]) not installed",
             ),
         ),
     ]

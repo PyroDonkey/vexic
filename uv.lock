@@ -1293,6 +1293,19 @@ wheels = [
 ]
 
 [[package]]
+name = "libsql"
+version = "0.1.11"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/ff/a2/804e533104102770b42aa0698fee944dd13654652ceb3d27e08a83404bbd/libsql-0.1.11.tar.gz", hash = "sha256:101b6e60f5333434b3e6107bfe2cf24cd5d1317286ad262cb6489941abde77d4", size = 33353, upload-time = "2025-09-02T10:13:38.63Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7c/e3/254d777f73a6ef985db2b030592a7eda45b2a2ac5042d9325937c90df9af/libsql-0.1.11-cp313-cp313-macosx_10_12_x86_64.whl", hash = "sha256:0b41c9fa8fa7bfe44f4a80a99939c5c87d11d88fdb1bad8d6f0c0ac96b5f9432", size = 4768039, upload-time = "2025-09-02T10:13:22.674Z" },
+    { url = "https://files.pythonhosted.org/packages/64/a5/de5dd7950bdc199b142a82b55fbc0049da0c7eb1639bb81a79a774f1654c/libsql-0.1.11-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:8682d519c62daafba13df521b117a08a43af516f6d3c81337299275c66fda051", size = 4527338, upload-time = "2025-09-02T10:13:24.211Z" },
+    { url = "https://files.pythonhosted.org/packages/76/09/a36482f773943c45a6659bcb58be11ec7c1157876b908ea9eccf16c7a553/libsql-0.1.11-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:9c9ac431078a4eb82257541c764befa84782d8c5fbd1d1147e77f2906c28c444", size = 5110482, upload-time = "2025-09-02T10:13:25.669Z" },
+    { url = "https://files.pythonhosted.org/packages/a6/7e/8496944f42f5b91a0e0938205297fc11896f6003f92caa5c53eaa2b8440f/libsql-0.1.11-cp313-cp313-win_amd64.whl", hash = "sha256:c61f6c4a73d799e4bedc49eb9b18bc8b6574267046195963684688f6a184632b", size = 4056117, upload-time = "2025-09-02T10:13:28.806Z" },
+    { url = "https://files.pythonhosted.org/packages/d8/ad/cb4e9ac36693a9f3f3f9b03f2b1f0d14cf5b1b449c66be6f9ce7845cbf02/libsql-0.1.11-cp314-cp314-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:9c7b39b90228637a4b26293af44833633c36c091276fc8b58f216dea38742f23", size = 5110968, upload-time = "2025-09-02T10:13:30.228Z" },
+]
+
+[[package]]
 name = "logfire"
 version = "4.37.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3006,6 +3019,7 @@ dependencies = [
 [package.optional-dependencies]
 hosted = [
     { name = "fastapi" },
+    { name = "libsql" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 local-embed = [
@@ -3016,6 +3030,7 @@ local-embed = [
 dev = [
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "libsql" },
     { name = "pytest" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -3024,6 +3039,7 @@ dev = [
 requires-dist = [
     { name = "fastapi", marker = "extra == 'hosted'", specifier = ">=0.138.0" },
     { name = "fastembed", marker = "extra == 'local-embed'", specifier = ">=0.7.0" },
+    { name = "libsql", marker = "extra == 'hosted'", specifier = ">=0.1.0" },
     { name = "pydantic-ai", specifier = "==1.102.0" },
     { name = "sqlite-vec", specifier = ">=0.1.9" },
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'hosted'", specifier = ">=0.49.0" },
@@ -3034,6 +3050,7 @@ provides-extras = ["local-embed", "hosted"]
 dev = [
     { name = "fastapi", specifier = ">=0.138.0" },
     { name = "httpx", specifier = ">=0.28.1" },
+    { name = "libsql", specifier = ">=0.1.0" },
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.49.0" },
 ]
