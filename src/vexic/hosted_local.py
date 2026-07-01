@@ -20,7 +20,7 @@ from vexic.hosted import (
     HostedUsageEvent,
 )
 from vexic.service import LocalMemoryService
-from vexic.storage.connection import connect
+from vexic.storage.connection import StorageTarget, connect
 
 
 _CONTROL_DB_MODE = 0o600
@@ -30,6 +30,109 @@ _CONTROL_PLANE_AGENT_CAPABILITIES = frozenset(
         MemoryCapability.SEARCH,
         MemoryCapability.EXPAND_HISTORY,
     }
+)
+
+# Split into individual DDL statements (rather than one `executescript()`
+# blob) so schema init runs identically over a local `sqlite3.Connection` or
+# a hosted libSQL/Turso connection through the `connect()` seam -- neither
+# the real libSQL driver nor `FakeLibsqlConn` implements `executescript`.
+_CONTROL_PLANE_SCHEMA_STATEMENTS: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS tenants (
+        tenant_id TEXT PRIMARY KEY,
+        db_filename TEXT NOT NULL UNIQUE,
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS tenant_projects (
+        tenant_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        PRIMARY KEY (tenant_id, project_id),
+        FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS customer_account_mappings (
+        clerk_org_id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS hosted_projects (
+        project_id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        environment TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS hosted_audit_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        operation TEXT NOT NULL,
+        tenant_id TEXT,
+        principal_id TEXT,
+        status TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        error_type TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS hosted_usage_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        tenant_id TEXT,
+        principal_id TEXT,
+        status TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        model_requests INTEGER NOT NULL DEFAULT 0,
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        total_tokens INTEGER NOT NULL DEFAULT 0,
+        estimated_cost_micros INTEGER NOT NULL DEFAULT 0,
+        error_type TEXT,
+        project_id TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS hosted_job_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        tenant_id TEXT NOT NULL,
+        principal_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        phase TEXT,
+        error_type TEXT
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_hosted_audit_events_tenant_id
+        ON hosted_audit_events(tenant_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_hosted_usage_events_tenant_id
+        ON hosted_usage_events(tenant_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_hosted_usage_events_tenant_project_recorded_at
+        ON hosted_usage_events(tenant_id, project_id, recorded_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_hosted_usage_events_tenant_project_recorded_at_jd
+        ON hosted_usage_events(tenant_id, project_id, julianday(recorded_at))
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_hosted_job_events_tenant_id
+        ON hosted_job_events(tenant_id)
+    """,
 )
 
 
@@ -79,10 +182,19 @@ class _HostedApiKey:
 
 
 class HostedTenantCatalog:
-    def __init__(self, root_path: str | Path) -> None:
+    def __init__(
+        self,
+        root_path: str | Path,
+        *,
+        control_target: StorageTarget | None = None,
+    ) -> None:
         self.root_path = Path(root_path)
         self.root_path.mkdir(parents=True, exist_ok=True)
-        self._control_db_path = self.root_path / "control-plane.db"
+        self._control_target: str | Path | StorageTarget = (
+            control_target
+            if control_target is not None
+            else self.root_path / "control-plane.db"
+        )
         self._init_control_plane_schema()
 
     def provision_tenant(
@@ -583,93 +695,16 @@ class HostedTenantCatalog:
         ]
 
     def _connect_control(self) -> sqlite3.Connection:
-        return _connect_control_db(self._control_db_path)
+        return _connect_control_db(self._control_target)
 
     def _init_control_plane_schema(self) -> None:
+        # Individual `execute()` calls, not `executescript()`: the latter is a
+        # `sqlite3`-only API not part of the libSQL-compatible
+        # `StorageConnection` protocol (see `vexic.storage.schema.init_db` for
+        # the same pattern on the customer-memory schema).
         with closing(self._connect_control()) as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS tenants (
-                    tenant_id TEXT PRIMARY KEY,
-                    db_filename TEXT NOT NULL UNIQUE,
-                    active INTEGER NOT NULL DEFAULT 1,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                );
-
-                CREATE TABLE IF NOT EXISTS tenant_projects (
-                    tenant_id TEXT NOT NULL,
-                    project_id TEXT NOT NULL,
-                    PRIMARY KEY (tenant_id, project_id),
-                    FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS customer_account_mappings (
-                    clerk_org_id TEXT PRIMARY KEY,
-                    tenant_id TEXT NOT NULL UNIQUE,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS hosted_projects (
-                    project_id TEXT PRIMARY KEY,
-                    tenant_id TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    environment TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS hosted_audit_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    operation TEXT NOT NULL,
-                    tenant_id TEXT,
-                    principal_id TEXT,
-                    status TEXT NOT NULL,
-                    recorded_at TEXT NOT NULL,
-                    error_type TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS hosted_usage_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    kind TEXT NOT NULL,
-                    operation TEXT NOT NULL,
-                    tenant_id TEXT,
-                    principal_id TEXT,
-                    status TEXT NOT NULL,
-                    recorded_at TEXT NOT NULL,
-                    model_requests INTEGER NOT NULL DEFAULT 0,
-                    input_tokens INTEGER NOT NULL DEFAULT 0,
-                    output_tokens INTEGER NOT NULL DEFAULT 0,
-                    total_tokens INTEGER NOT NULL DEFAULT 0,
-                    estimated_cost_micros INTEGER NOT NULL DEFAULT 0,
-                    error_type TEXT,
-                    project_id TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS hosted_job_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    job_id TEXT NOT NULL,
-                    operation TEXT NOT NULL,
-                    tenant_id TEXT NOT NULL,
-                    principal_id TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    recorded_at TEXT NOT NULL,
-                    phase TEXT,
-                    error_type TEXT
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_hosted_audit_events_tenant_id
-                    ON hosted_audit_events(tenant_id);
-                CREATE INDEX IF NOT EXISTS idx_hosted_usage_events_tenant_id
-                    ON hosted_usage_events(tenant_id);
-                CREATE INDEX IF NOT EXISTS idx_hosted_usage_events_tenant_project_recorded_at
-                    ON hosted_usage_events(tenant_id, project_id, recorded_at);
-                CREATE INDEX IF NOT EXISTS idx_hosted_usage_events_tenant_project_recorded_at_jd
-                    ON hosted_usage_events(tenant_id, project_id, julianday(recorded_at));
-                CREATE INDEX IF NOT EXISTS idx_hosted_job_events_tenant_id
-                    ON hosted_job_events(tenant_id);
-                """
-            )
+            for statement in _CONTROL_PLANE_SCHEMA_STATEMENTS:
+                conn.execute(statement)
             columns = {
                 str(row[1])
                 for row in conn.execute("PRAGMA table_info(hosted_usage_events)").fetchall()
@@ -764,14 +799,22 @@ class HostedTenantCatalog:
         )
 
 class HostedApiKeyStore:
-    def __init__(self, root_path: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        root_path: str | Path | None = None,
+        *,
+        control_target: StorageTarget | None = None,
+    ) -> None:
         self._keys: dict[str, _HostedApiKey] = {}
         self._control_metadata: dict[str, HostedApiKeyRecord] = {}
         self.root_path = Path(root_path) if root_path is not None else None
-        self._control_db_path: Path | None = None
-        if self.root_path is not None:
+        self._control_target: str | Path | StorageTarget | None = None
+        if control_target is not None:
+            self._control_target = control_target
+            self._init_control_plane_schema()
+        elif self.root_path is not None:
             self.root_path.mkdir(parents=True, exist_ok=True)
-            self._control_db_path = self.root_path / "control-plane.db"
+            self._control_target = self.root_path / "control-plane.db"
             self._init_control_plane_schema()
 
     def create_key(
@@ -795,7 +838,7 @@ class HostedApiKeyStore:
             agent_ids=frozenset(agent_ids),
             created_at=_now(),
         )
-        if self._control_db_path is None:
+        if self._control_target is None:
             self._keys[key_id] = stored
         else:
             with closing(self._connect_control()) as conn:
@@ -840,7 +883,7 @@ class HostedApiKeyStore:
         raise PermissionError("Invalid hosted API key.")
 
     def revoke_key(self, key_id: str, *, revoked_by: str | None = None) -> None:
-        if self._control_db_path is None:
+        if self._control_target is None:
             try:
                 stored = self._keys[key_id]
             except KeyError as exc:
@@ -908,7 +951,7 @@ class HostedApiKeyStore:
             display=f"{prefix}...{last4}",
             created_at=stored.created_at or _now(),
         )
-        if self._control_db_path is None:
+        if self._control_target is None:
             self._control_metadata[record.key_id] = record
         else:
             try:
@@ -951,7 +994,7 @@ class HostedApiKeyStore:
         tenant_id: str,
         project_id: str,
     ) -> list[HostedApiKeyRecord]:
-        if self._control_db_path is None:
+        if self._control_target is None:
             return [
                 replace(record, revoked_at=self._keys[record.key_id].revoked_at)
                 for record in self._control_metadata.values()
@@ -998,7 +1041,7 @@ class HostedApiKeyStore:
         key_id: str,
         revoked_by: str | None = None,
     ) -> None:
-        if self._control_db_path is None:
+        if self._control_target is None:
             record = self._control_metadata.get(key_id)
             if record is None or record.tenant_id != tenant_id or record.project_id != project_id:
                 raise PermissionError("Unknown hosted API key.")
@@ -1029,9 +1072,9 @@ class HostedApiKeyStore:
         return parts[1]
 
     def _connect_control(self) -> sqlite3.Connection:
-        if self._control_db_path is None:
+        if self._control_target is None:
             raise RuntimeError("Hosted API key store is not durable.")
-        return _connect_control_db(self._control_db_path)
+        return _connect_control_db(self._control_target)
 
     def _init_control_plane_schema(self) -> None:
         with closing(self._connect_control()) as conn:
@@ -1071,7 +1114,7 @@ class HostedApiKeyStore:
             conn.commit()
 
     def _load_key(self, key_id: str) -> _HostedApiKey:
-        if self._control_db_path is None:
+        if self._control_target is None:
             try:
                 return self._keys[key_id]
             except KeyError as exc:
@@ -1124,14 +1167,27 @@ def _nullable_strings_json(values: frozenset[str | None]) -> str:
     )
 
 
-def _connect_control_db(db_path: Path) -> sqlite3.Connection:
-    _ensure_control_db_permissions(db_path)
-    conn = connect(db_path, timeout=30)
+def _connect_control_db(target: str | Path | StorageTarget) -> sqlite3.Connection:
+    _ensure_control_db_permissions(target)
+    if isinstance(target, StorageTarget):
+        conn = connect(target)
+    else:
+        conn = connect(target, timeout=30)
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
-def _ensure_control_db_permissions(db_path: Path) -> None:
+def _ensure_control_db_permissions(target: str | Path | StorageTarget) -> None:
+    """Enforce owner-only read/write on the LOCAL control-plane database file.
+
+    A `StorageTarget` (libSQL/Turso DSN) names a remote, managed database --
+    there is no local file to `os.open`/`os.chmod`, and this is a no-op for
+    that case. Filesystem permissions only apply to a local `str`/`Path`
+    target (the default, filesystem-rooted control plane).
+    """
+    if isinstance(target, StorageTarget):
+        return
+    db_path = target
     try:
         fd = os.open(db_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, _CONTROL_DB_MODE)
     except FileExistsError:
