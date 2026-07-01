@@ -793,3 +793,28 @@ guard raises if a second distinct tenant is served while the override is active
 `_local_service` override + the guard; the Task 8 live e2e stays creds-gated.
 This override is explicitly superseded and removed by Task 11 (catalog per-tenant
 target model). Replacement/reconcile filesystem ops stay local-only until P3.
+
+## Amendment 2 — 2026-07-01 (Task 8 findings feed P3)
+
+Task 8's live round-trip surfaced libSQL semantics that break several
+sqlite3-typed error handlers: libSQL raises a bare `ValueError` (not
+`sqlite3.IntegrityError`/`OperationalError`) for constraint/operational errors,
+and `with conn:` provides no implicit transaction (needs an explicit `BEGIN`).
+Task 8 fixed the ingest path; a repo-wide gap remains (background task
+`task_c531447d`). Affected libSQL-facing sites include
+`hosted_control_plane_http.py:343/346` (control-plane persistence — the P3
+target), `storage/transcript.py:629` (`search_messages`), `storage/operators.py`,
+`storage/longterm.py`, `storage/candidates.py`.
+
+**Task 9b — libSQL storage-exception normalization (after T9, before T10).**
+Add `src/vexic/storage/errors.py` with `is_unique_violation(exc) -> bool` and
+`is_operational_error(exc) -> bool` that classify BOTH sqlite3 typed exceptions
+AND libSQL bare `ValueError` (string-sniff `SQLITE_CONSTRAINT` / "UNIQUE
+constraint failed" / operational markers). Refactor `transcript.py`'s ingest
+dedup to use `is_unique_violation` (no behavior change; suite stays green). Fix
+the `StorageConnection` docstring in `connection.py` (~lines 36-38) that
+overstates `with conn:` transaction parity. Tests classify both backends via
+directly-constructed exceptions.
+
+**Task 10 update:** the control-plane's `IntegrityError`/`OperationalError`
+catches MUST adopt these helpers so control-plane persistence works on libSQL.
