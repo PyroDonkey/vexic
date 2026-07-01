@@ -2,7 +2,7 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from adapters.turso_adapter import TursoProvisioningPort
+from adapters.turso_adapter import TenantTokenCache, TursoProvisioningPort
 
 
 PLATFORM_TOKEN = "secret-platform-token-xyz"  # noqa: S105 - test fixture only
@@ -205,3 +205,83 @@ def test_from_env_builds_port_from_expected_vars():
 def test_from_env_missing_var_raises():
     with pytest.raises(ValueError):
         TursoProvisioningPort.from_env({"TURSO_ORG": "acme-org"})
+
+
+class FakeClock:
+    """Controllable fake clock for TenantTokenCache tests. Starts at 0.0
+    and only advances when `advance()` is called -- no wall-clock reads."""
+
+    def __init__(self) -> None:
+        self._now = 0.0
+
+    def __call__(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
+
+
+class FakePort:
+    """Fake TursoProvisioningPort that counts mint_token calls per db_name
+    and returns a deterministic, distinguishable fake jwt. No network."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, bool]] = []
+        self._counter = 0
+
+    def mint_token(self, db_name: str, *, expiration: str = "5m", read_only: bool = True) -> str:
+        self._counter += 1
+        self.calls.append((db_name, expiration, read_only))
+        return f"jwt-for-{db_name}-{self._counter}"
+
+
+def test_get_token_within_ttl_mints_exactly_once():
+    port = FakePort()
+    clock = FakeClock()
+    cache = TenantTokenCache(port, ttl_seconds=600, clock=clock)
+
+    first = cache.get_token("tenant-a")
+    second = cache.get_token("tenant-a")
+
+    assert first == second
+    assert len(port.calls) == 1
+
+
+def test_get_token_after_ttl_expires_remints():
+    port = FakePort()
+    clock = FakeClock()
+    cache = TenantTokenCache(port, ttl_seconds=600, clock=clock)
+
+    first = cache.get_token("tenant-a")
+    clock.advance(601)
+    second = cache.get_token("tenant-a")
+
+    assert first != second
+    assert len(port.calls) == 2
+
+
+def test_get_token_different_db_names_are_independent():
+    port = FakePort()
+    clock = FakeClock()
+    cache = TenantTokenCache(port, ttl_seconds=600, clock=clock)
+
+    token_a = cache.get_token("tenant-a")
+    token_b = cache.get_token("tenant-b")
+
+    assert token_a != token_b
+    assert len(port.calls) == 2
+    assert {call[0] for call in port.calls} == {"tenant-a", "tenant-b"}
+
+
+def test_get_token_returns_minted_value_and_cache_is_memory_only(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    port = FakePort()
+    clock = FakeClock()
+    cache = TenantTokenCache(port, ttl_seconds=600, clock=clock)
+
+    token = cache.get_token("tenant-a")
+
+    assert token == "jwt-for-tenant-a-1"
+    assert cache._cache["tenant-a"] == (token, 0.0)
+    # No file/catalog write occurred anywhere under the (empty) tmp cwd.
+    assert list(tmp_path.iterdir()) == []

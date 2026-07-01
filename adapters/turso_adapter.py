@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterable, Mapping
@@ -259,3 +260,66 @@ class TursoProvisioningPort:
             self.destroy_database(name)
             raise
         return dsn, token
+
+
+class TenantTokenCache:
+    """In-process TTL cache of short-lived per-tenant Turso tokens
+    (COA-273 Task 15, P4).
+
+    Mints a fresh, DB-scoped token via ``TursoProvisioningPort.mint_token``
+    on cache miss/expiry and caches it in memory only, keyed by
+    ``db_name``. Raw tokens are NEVER persisted anywhere -- not to the
+    control-plane catalog, not to disk -- per ADR 0019 ("mint short-lived
+    tokens, do not persist raw"). The cache is a plain ``dict`` attribute
+    on the instance; process restart or GC drops it, which is intentional.
+
+    ``ttl_seconds`` (cache lifetime) must be kept shorter than the minted
+    token's own ``expiration`` (e.g. 600s TTL vs. a 15m mint expiry) so a
+    cached token is always re-minted well before the underlying jwt itself
+    would expire -- callers never hand out a token that is valid per the
+    cache but rejected by Turso.
+
+    The ``clock`` is injected (defaults to ``time.monotonic``) and is the
+    *only* time source consulted in ``get_token`` -- this makes expiry
+    deterministic and testable via a fake clock, with no wall-clock reads
+    in the logic.
+    """
+
+    def __init__(
+        self,
+        port: TursoProvisioningPort,
+        *,
+        ttl_seconds: int = 600,
+        clock: Callable[[], float] = time.monotonic,
+        expiration: str = "15m",
+        read_only: bool = False,
+    ) -> None:
+        self._port = port
+        self._ttl_seconds = ttl_seconds
+        self._clock = clock
+        self._expiration = expiration
+        self._read_only = read_only
+        self._cache: dict[str, tuple[str, float]] = {}
+
+    def get_token(self, db_name: str) -> str:
+        """Returns a cached token for ``db_name`` if present and not yet
+        expired (per ``clock()`` and ``ttl_seconds``); otherwise mints a
+        fresh one via the port, caches it with the current timestamp, and
+        returns it. Never logs or prints the token.
+        """
+        cached = self._cache.get(db_name)
+        if cached is not None:
+            token, minted_at = cached
+            if self._clock() - minted_at < self._ttl_seconds:
+                return token
+        token = self._port.mint_token(
+            db_name, expiration=self._expiration, read_only=self._read_only
+        )
+        self._cache[db_name] = (token, self._clock())
+        return token
+
+    def invalidate(self, db_name: str) -> None:
+        """Drops any cached token for ``db_name``, forcing a re-mint on
+        the next ``get_token`` call. No-op if nothing is cached.
+        """
+        self._cache.pop(db_name, None)
