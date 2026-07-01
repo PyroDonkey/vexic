@@ -470,21 +470,23 @@ class HostedMemoryService:
         rate_limiter: HostedInMemoryRateLimiter | None = None,
         dream_phase_ports: DreamPhasePorts | None = None,
         *,
-        customer_memory_target_override: StorageTarget | None = None,
+        customer_target_resolver: Callable[[HostedTenant], StorageTarget | None]
+        | None = None,
     ) -> None:
         self.catalog = catalog
         self.api_keys = api_keys
         self.telemetry = telemetry
         self.rate_limiter = rate_limiter or HostedInMemoryRateLimiter()
         self.dream_phase_ports = dream_phase_ports
-        # P2 dogfood customer-memory override; superseded/removed by Task 11
-        # (catalog per-tenant target model). When set, ALL tenants routed
-        # through this app-lifetime singleton share one Turso StorageTarget
-        # for customer memory, while the control-plane (auth + tenant
-        # catalog) stays local. This is single-tenant only -- see the
-        # fail-fast guard in `_local_service` below.
-        self._customer_memory_target_override = customer_memory_target_override
-        self._override_served_tenant_id: str | None = None
+        # COA-273 Task 16 (P4): per-tenant customer-memory resolver. Given a
+        # `HostedTenant`, it returns a connectable, token-bearing
+        # `StorageTarget` for the tenant's Turso customer-memory DB (derived
+        # from its catalog `customer_target` DSN), or `None` to use the local
+        # `db_path`. This replaces the Task-7b single-DB override + its
+        # single-tenant guard: resolution is now per-tenant, so there is no
+        # shared-DB / second-tenant hazard. Secrets (the minted jwt) live only
+        # inside the resolver, which is built in `adapters/`.
+        self._customer_target_resolver = customer_target_resolver
 
     async def append_transcript(
         self,
@@ -729,19 +731,13 @@ class HostedMemoryService:
         return request.model_copy(update={"scope": scope}), tenant
 
     def _local_service(self, tenant: HostedTenant) -> LocalMemoryService:
-        db_path: str | StorageTarget = tenant.db_path
-        needs_schema_init = False
-        if self._customer_memory_target_override is not None:
-            self._check_override_single_tenant(tenant.tenant_id)
-            db_path = self._customer_memory_target_override
-            # Unlike a filesystem tenant (schema initialized once at
-            # `provision_tenant` time against `tenant.db_path`), the P2
-            # dogfood override target is never touched by tenant
-            # provisioning -- it is a separate Turso database entirely.
-            # `init_db`'s process-level memo (keyed on target identity)
-            # makes this a no-op after the first call, so it is safe and
-            # cheap to request on every call here.
-            needs_schema_init = True
+        target = (
+            self._customer_target_resolver(tenant)
+            if self._customer_target_resolver is not None
+            else None
+        )
+        db_path: str | StorageTarget = target if target is not None else tenant.db_path
+        needs_schema_init = target is not None
         service = LocalMemoryService(
             db_path=db_path,
             tenant_id=tenant.tenant_id,
@@ -749,22 +745,13 @@ class HostedMemoryService:
             dream_phase_ports=self.dream_phase_ports,
         )
         if needs_schema_init:
+            # A per-tenant Turso customer-memory DB is provisioned/schema-init'd
+            # out of band (factory or provisioning flow), not by filesystem
+            # tenant provisioning. `init_db`'s process-level memo (keyed on
+            # target identity) makes this a cheap no-op after the first real
+            # call, so requesting it here is safe and idempotent.
             service.init_schema()
         return service
-
-    def _check_override_single_tenant(self, tenant_id: str) -> None:
-        # P2 dogfood customer-memory override; superseded/removed by Task 11.
-        # HostedMemoryService is an app-lifetime singleton, so this state
-        # persists across requests -- fail fast rather than silently mixing
-        # a second tenant's data into the single dogfood Turso DB.
-        if self._override_served_tenant_id is None:
-            self._override_served_tenant_id = tenant_id
-            return
-        if tenant_id != self._override_served_tenant_id:
-            raise PermissionError(
-                "customer_memory_target_override is dogfood single-tenant only; "
-                "refusing to serve a second tenant"
-            )
 
     async def _run_dream_phase(
         self,

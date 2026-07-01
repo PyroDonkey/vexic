@@ -6,9 +6,13 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from urllib.parse import urlencode
+from typing import TYPE_CHECKING
+from urllib.parse import urlencode, urlsplit
 
 from vexic.storage.connection import StorageTarget
+
+if TYPE_CHECKING:
+    from vexic.hosted import HostedTenant
 
 PLATFORM_API_BASE = "https://api.turso.tech"
 
@@ -27,11 +31,6 @@ def control_plane_target(env: Mapping[str, str]) -> StorageTarget:
         _require(env, "TURSO_DATABASE_URL"),
         auth_token=_require(env, "TURSO_AUTH_TOKEN"),
     )
-
-
-# Customer-memory target resolution arrives with provisioning (P4); for the
-# P2 dogfood it reuses the single configured DB.
-customer_memory_target = control_plane_target
 
 
 @dataclass(frozen=True)
@@ -323,3 +322,46 @@ class TenantTokenCache:
         the next ``get_token`` call. No-op if nothing is cached.
         """
         self._cache.pop(db_name, None)
+
+
+def _db_name_from_dsn(customer_target: str, org: str) -> str:
+    """Derive the Turso database NAME from a customer-target DSN.
+
+    The DSN hostname is ``{db_name}-{org}.<region>.turso.io`` (Turso composes
+    the public hostname by suffixing the org slug onto the database name). The
+    db name is therefore the first hostname label with the ``-{org}`` suffix
+    removed. ``removesuffix`` is a no-op when the label does not carry the
+    suffix, so a bare label is used verbatim. This derivation lives in
+    ``adapters/`` because it is the only layer that knows ``org``.
+    """
+    host = urlsplit(customer_target).hostname or ""
+    label = host.split(".")[0]
+    return label.removesuffix(f"-{org}")
+
+
+def make_customer_target_resolver(
+    token_cache: TenantTokenCache, *, org: str
+) -> "Callable[[HostedTenant], StorageTarget | None]":
+    """Build the per-tenant customer-memory resolver (COA-273 Task 16, P4).
+
+    The returned resolver, given a ``HostedTenant``:
+    - returns ``None`` when the tenant has no ``customer_target`` (local
+      storage path, unchanged behavior);
+    - otherwise derives the Turso db NAME from the stored DSN hostname (see
+      ``_db_name_from_dsn``), mints/reuses a short-lived DB-scoped token via
+      ``token_cache.get_token(db_name)``, and returns a connectable
+      ``StorageTarget(customer_target, <jwt>)``.
+
+    Tokens are minted here (in ``adapters/``, the only place secrets live) and
+    never persisted -- the catalog stores only the DSN. The minted jwt is
+    never logged.
+    """
+
+    def resolve(tenant: "HostedTenant") -> StorageTarget | None:
+        customer_target = tenant.customer_target
+        if not customer_target:
+            return None
+        db_name = _db_name_from_dsn(customer_target, org)
+        return StorageTarget(customer_target, token_cache.get_token(db_name))
+
+    return resolve
