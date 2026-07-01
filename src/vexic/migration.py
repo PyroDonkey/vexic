@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage import init_db, init_vector_memory
 from vexic.storage.operators import MemoryProjectionRepairReport, repair_memory_projections
-from vexic.storage.connection import connect
+from vexic.storage.connection import connect, row_as_dict, rows_as_dicts
 
 ARTIFACT_VERSION = "vexic.canonical-migration.v1"
 MIGRATION_METADATA_TABLE = "canonical_migration_imports"
@@ -126,13 +126,9 @@ def _iter_payload_strings(value: object) -> Iterator[str]:
 
 
 def _rows(conn: sqlite3.Connection, table_name: str) -> list[dict[str, object]]:
-    conn.row_factory = sqlite3.Row
     if not _table_exists(conn, table_name):
         return []
-    return [
-        dict(row)
-        for row in conn.execute(f'SELECT * FROM "{table_name}" ORDER BY id ASC')
-    ]
+    return rows_as_dicts(conn.execute(f'SELECT * FROM "{table_name}" ORDER BY id ASC'))
 
 
 def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
@@ -149,7 +145,7 @@ def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
 
 
 def _target_columns(conn: sqlite3.Connection, table_name: str) -> list[str]:
-    return [str(row[1]) for row in conn.execute(f'PRAGMA table_info("{table_name}")')]
+    return [str(row[1]) for row in conn.execute(f'PRAGMA table_info("{table_name}")').fetchall()]
 
 
 def _assert_no_host_owned_tables(conn: sqlite3.Connection) -> None:
@@ -237,15 +233,15 @@ def _insert_rows(
     column_sql = ", ".join(f'"{column}"' for column in columns)
     placeholders = ", ".join("?" for _ in columns)
     imported = 0
-    conn.row_factory = sqlite3.Row
     _assert_no_extra_rows(conn, table_name, {int(row["id"]) for row in rows})
     for row in rows:
-        existing = conn.execute(
+        existing_cursor = conn.execute(
             f'SELECT {column_sql} FROM "{table_name}" WHERE id = ?',
             (row["id"],),
-        ).fetchone()
+        )
+        existing = row_as_dict(existing_cursor, existing_cursor.fetchone())
         if existing is not None:
-            if dict(existing) != {column: row[column] for column in columns}:
+            if existing != {column: row[column] for column in columns}:
                 raise ValueError(f"Conflicting canonical row in {table_name} id {row['id']}.")
             continue
         conn.execute(
@@ -265,7 +261,7 @@ def _assert_no_extra_rows(
         return
     target_ids = {
         int(row[0])
-        for row in conn.execute(f'SELECT id FROM "{table_name}"')
+        for row in conn.execute(f'SELECT id FROM "{table_name}"').fetchall()
     }
     extra_ids = sorted(target_ids - artifact_ids)
     if extra_ids:

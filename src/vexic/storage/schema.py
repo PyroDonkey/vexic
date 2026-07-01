@@ -117,18 +117,6 @@ def _ensure_memory_candidate_columns(conn: sqlite3.Connection) -> None:
     )
 
 
-def _ensure_candidate_embeddings(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        f"""
-        CREATE VIRTUAL TABLE IF NOT EXISTS memory_candidate_embeddings
-        USING vec0(
-            candidate_id integer primary key,
-            embedding float[{EMBEDDING_DIM}]
-        )
-        """
-    )
-
-
 def _ensure_embedding_metadata(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -295,18 +283,6 @@ def _ensure_long_term_memory(conn: sqlite3.Connection) -> None:
             INSERT INTO long_term_memory_fts (rowid, fact_text)
             VALUES (new.id, new.fact_text);
         END
-        """
-    )
-
-
-def _ensure_long_term_memory_embeddings(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        f"""
-        CREATE VIRTUAL TABLE IF NOT EXISTS long_term_memory_embeddings
-        USING vec0(
-            fact_id integer primary key,
-            embedding float[{EMBEDDING_DIM}]
-        )
         """
     )
 
@@ -552,11 +528,21 @@ def _ensure_session_summaries(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_vector_memory_schema(conn: sqlite3.Connection) -> None:
-    _load_vec_extension(conn)
-    _ensure_candidate_embeddings(conn)
+    # Lazy import breaks a module cycle: vectors.py imports this module's shared
+    # helpers (_load_vec_extension, _similarity_from_distance) at load time, so
+    # the backend dispatch is reached here only at call time.
+    from vexic.storage.vectors import select_vector_backend
+
+    backend = select_vector_backend(conn)
+    backend.prepare(conn)
+    backend.create_embeddings_table(
+        conn, table="memory_candidate_embeddings", id_column="candidate_id"
+    )
     _ensure_embedding_metadata(conn)
     _ensure_dedup_events(conn)
-    _ensure_long_term_memory_embeddings(conn)
+    backend.create_embeddings_table(
+        conn, table="long_term_memory_embeddings", id_column="fact_id"
+    )
 
 
 def _create_source_transcript_ledger(conn: sqlite3.Connection) -> None:
@@ -576,7 +562,7 @@ def _create_source_transcript_ledger(conn: sqlite3.Connection) -> None:
 
 
 def _source_transcript_ledger_has_legacy_unique(conn: sqlite3.Connection) -> bool:
-    for row in conn.execute("PRAGMA index_list(source_transcript_ledger)"):
+    for row in conn.execute("PRAGMA index_list(source_transcript_ledger)").fetchall():
         if not row[2] or (len(row) > 4 and row[4]):
             continue
         columns = [
@@ -584,7 +570,7 @@ def _source_transcript_ledger_has_legacy_unique(conn: sqlite3.Connection) -> boo
             for column in conn.execute(
                 "SELECT name FROM pragma_index_info(?) ORDER BY seqno",
                 (row[1],),
-            )
+            ).fetchall()
         ]
         if columns == ["source_host", "source_session_id", "source_message_id"]:
             return True
@@ -641,7 +627,11 @@ def init_db(db_path: str) -> None:
         # later connection. It lets readers run alongside a single writer, so a
         # scheduled cron brief and a live chat turn don't contend on memory.db.
         # (Python's sqlite3 already defaults timeout=5.0 for writer waits.)
-        conn.execute("PRAGMA journal_mode=WAL")
+        # Managed libSQL (ADR 0019) rejects ``PRAGMA journal_mode=WAL`` with a
+        # SQL_PARSE_ERROR and manages durability/replication server-side, so the
+        # pragma is applied to local SQLite only (verified by the 264c spike).
+        if isinstance(conn, sqlite3.Connection):
+            conn.execute("PRAGMA journal_mode=WAL")
         with conn:
             conn.execute(
                 """
