@@ -231,7 +231,7 @@ def load_messages_by_token_budget(
             ORDER BY id DESC
             """,
             (session_id, agent_id),
-        )
+        ).fetchall()
         for row in rows:
             msg = strip_prompt_payloads(
                 single_message_adapter.validate_python(json.loads(row[0]))

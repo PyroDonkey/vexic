@@ -329,7 +329,7 @@ def _estimate_session_tokens_from_id(
             ORDER BY id ASC
             """,
             params,
-        )
+        ).fetchall()
         for row in rows:
             msg = strip_prompt_payloads(
                 single_message_adapter.validate_python(json.loads(row[0]))
@@ -472,7 +472,7 @@ def _load_active_context_rows_by_token_budget(
             ORDER BY id DESC
             """,
             params,
-        )
+        ).fetchall()
         for row in rows:
             msg = strip_prompt_payloads(
                 single_message_adapter.validate_python(json.loads(row[2]))

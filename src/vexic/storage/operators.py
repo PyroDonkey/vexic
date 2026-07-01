@@ -205,7 +205,7 @@ def _guard_database_text_for_file_copy(
                     f"{_quote_identifier(table_name)} "
                     "WHERE "
                     f"{_quote_identifier(column_name)} IS NOT NULL"
-                )
+                ).fetchall()
             except sqlite3.OperationalError as exc:
                 if "no such module" in str(exc):
                     continue

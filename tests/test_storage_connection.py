@@ -66,7 +66,7 @@ class SeamGateTests(unittest.TestCase):
 
     def test_storage_code_does_not_iterate_execute_cursors_directly(self) -> None:
         package_root = Path(__file__).resolve().parent.parent / "src" / "vexic"
-        offenders: list[str] = []
+        offenders: set[str] = set()
 
         def is_execute_call(node: ast.AST) -> bool:
             return (
@@ -77,19 +77,37 @@ class SeamGateTests(unittest.TestCase):
 
         for module_path in package_root.rglob("*.py"):
             tree = ast.parse(module_path.read_text(encoding="utf-8"))
-            for node in ast.walk(tree):
-                if isinstance(node, ast.For) and is_execute_call(node.iter):
+            scopes = [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+            ]
+            for scope in scopes:
+                cursor_names = {
+                    target.id
+                    for node in ast.walk(scope)
+                    if isinstance(node, ast.Assign) and is_execute_call(node.value)
+                    for target in node.targets
+                    if isinstance(target, ast.Name)
+                }
+                for node in ast.walk(scope):
                     rel = module_path.relative_to(package_root)
-                    offenders.append(f"{rel}:{node.lineno}")
-                elif isinstance(node, ast.comprehension) and is_execute_call(node.iter):
-                    rel = module_path.relative_to(package_root)
-                    offenders.append(f"{rel}:{getattr(node, 'lineno', '?')}")
+                    if isinstance(node, ast.For) and (
+                        is_execute_call(node.iter)
+                        or (isinstance(node.iter, ast.Name) and node.iter.id in cursor_names)
+                    ):
+                        offenders.add(f"{rel}:{node.lineno}")
+                    elif isinstance(node, ast.comprehension) and (
+                        is_execute_call(node.iter)
+                        or (isinstance(node.iter, ast.Name) and node.iter.id in cursor_names)
+                    ):
+                        offenders.add(f"{rel}:{getattr(node, 'lineno', '?')}")
 
         self.assertEqual(
-            offenders,
+            sorted(offenders),
             [],
             "libSQL cursors are not iterable; call .fetchall()/.fetchone() before iterating: "
-            f"{offenders}",
+            f"{sorted(offenders)}",
         )
 
 
