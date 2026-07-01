@@ -381,6 +381,24 @@ def _polluted_transcript_reason(msg: ModelMessage) -> str | None:
     return None
 
 
+def _is_unique_constraint_violation(exc: Exception) -> bool:
+    """True when ``exc`` is a UNIQUE/PRIMARY KEY constraint violation.
+
+    ``sqlite3`` raises ``sqlite3.IntegrityError`` for this; the hosted
+    libSQL/Hrana driver (ADR 0019) has no equivalent typed exception and
+    raises a bare ``ValueError`` for every server-side SQL error instead, so
+    this call site must fall back to sniffing the message for the
+    SQLite-native ``SQLITE_CONSTRAINT``/``UNIQUE constraint failed`` text
+    rather than only catching a type unavailable on that backend.
+    """
+    if isinstance(exc, sqlite3.IntegrityError):
+        return True
+    if isinstance(exc, ValueError):
+        message = str(exc)
+        return "SQLITE_CONSTRAINT" in message or "UNIQUE constraint failed" in message
+    return False
+
+
 def ingest_source_messages(
     db_path: str,
     inputs: list[SourceTranscriptInput],
@@ -393,7 +411,17 @@ def ingest_source_messages(
     forbidden_values = tuple(forbidden_secret_values)
     with closing(connect(db_path)) as conn:
         conn.execute("PRAGMA foreign_keys=ON")
-        with conn:
+        # An explicit BEGIN, not the bare `with conn:` used elsewhere in this
+        # module: the per-row SAVEPOINT/ROLLBACK TO/RELEASE below needs a
+        # real open transaction to nest inside. On `sqlite3`, `with conn:`
+        # opens one implicitly and this makes no difference; verified against
+        # live Turso (ADR 0019) that libSQL/Hrana does NOT give the same
+        # guarantee -- each statement auto-commits its own micro-transaction
+        # unless a transaction is opened explicitly, so a SAVEPOINT taken
+        # under a bare `with conn:` is gone by the next `execute()` call
+        # ("no such savepoint").
+        conn.execute("BEGIN")
+        try:
             for item in inputs:
                 source_host = _normalize_source_host(item.source_host)
                 source_session_id = _normalize_source_id(item.source_session_id)
@@ -500,7 +528,9 @@ def ingest_source_messages(
                         """,
                         (source_host, source_session_id, source_message_id, agent_id, message_id),
                     )
-                except sqlite3.IntegrityError:
+                except (sqlite3.IntegrityError, ValueError) as exc:
+                    if not _is_unique_constraint_violation(exc):
+                        raise
                     conn.execute("ROLLBACK TO SAVEPOINT source_ingest_row")
                     conn.execute("RELEASE SAVEPOINT source_ingest_row")
                     existing = conn.execute(
@@ -539,6 +569,10 @@ def ingest_source_messages(
                         message_id=message_id,
                     )
                 )
+        except BaseException:
+            conn.rollback()
+            raise
+        conn.commit()
     return results
 
 

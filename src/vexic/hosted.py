@@ -722,15 +722,27 @@ class HostedMemoryService:
 
     def _local_service(self, tenant: HostedTenant) -> LocalMemoryService:
         db_path: str | StorageTarget = tenant.db_path
+        needs_schema_init = False
         if self._customer_memory_target_override is not None:
             self._check_override_single_tenant(tenant.tenant_id)
             db_path = self._customer_memory_target_override
-        return LocalMemoryService(
+            # Unlike a filesystem tenant (schema initialized once at
+            # `provision_tenant` time against `tenant.db_path`), the P2
+            # dogfood override target is never touched by tenant
+            # provisioning -- it is a separate Turso database entirely.
+            # `init_db`'s process-level memo (keyed on target identity)
+            # makes this a no-op after the first call, so it is safe and
+            # cheap to request on every call here.
+            needs_schema_init = True
+        service = LocalMemoryService(
             db_path=db_path,
             tenant_id=tenant.tenant_id,
             embed=self.dream_phase_ports.embed if self.dream_phase_ports else None,
             dream_phase_ports=self.dream_phase_ports,
         )
+        if needs_schema_init:
+            service.init_schema()
+        return service
 
     def _check_override_single_tenant(self, tenant_id: str) -> None:
         # P2 dogfood customer-memory override; superseded/removed by Task 11.
