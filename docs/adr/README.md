@@ -31,7 +31,7 @@ missing from this index (and the reverse).
 | 0016 | Local embedding and deferrable contradiction lower the LLM floor | accepted |
 | 0017 | Claude Code setup scaffolds a disabled Vexic MCP entry           | accepted |
 | 0018 | Claude Code read path splits SessionStart priming and MCP on-demand pull | accepted |
-| 0019 | Hosted storage cutover starts Turso-only, Neon deferred         | proposed |
+| 0019 | Hosted storage cutover starts Turso-only, Neon deferred         | accepted |
 
 Notes:
 

@@ -1,6 +1,6 @@
 # Hosted storage cutover starts Turso-only with a deferred Neon control plane
 
-Status: proposed
+Status: accepted
 
 ## Context
 
@@ -85,6 +85,19 @@ database, not assumed. Whatever path is chosen must prove equivalent retrieval
 semantics through the same storage-adapter conformance suite ADR 0005 requires
 for both the local SQLite reference adapter and the hosted SQLite-compatible
 adapter.
+
+The spike (COA-264 slice 264c) resolved this. `sqlite-vec` cannot load on a
+managed remote libSQL connection (no `enable_load_extension`), so the hosted
+adapter uses native libSQL vectors: an `F32_BLOB` column with a brute-force
+`vector_distance_cos` scan. The native ANN index (`vector_top_k`) returned no
+rows in the spike and is not used; an exact scan is correct at per-customer
+memory-database scale. FTS5 has full parity and is unchanged. Both are proven
+equivalent on the local sqlite-vec and hosted libSQL backends by the
+parametrized storage-adapter conformance suite
+(`tests/test_storage_conformance.py`), with the backend selected from the live
+connection type behind the one `connect()` seam. `PRAGMA journal_mode=WAL` is
+skipped on libSQL (Turso rejects it and manages WAL server-side); all other
+schema pragmas were verified to work remotely.
 
 ### Migration
 
