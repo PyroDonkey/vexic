@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from vexic.embeddings import EMBEDDING_DIM
-from vexic.storage.connection import connect, rows_as_dicts
+from vexic.storage.connection import StorageTarget, connect, rows_as_dicts
 from vexic.storage import schema as storage_schema
 from vexic.storage.schema import _normalize_embedding, _serialize_float32
 from vexic.storage.vectors import select_vector_backend
@@ -66,7 +66,7 @@ def conformance_conn(request: pytest.FixtureRequest, tmp_path: Any) -> Any:
     if request.param == "local":
         conn = connect(str(tmp_path / "conformance.db"))
     else:
-        conn = connect(_TURSO_URL, auth_token=_TURSO_TOKEN)  # type: ignore[arg-type]
+        conn = connect(StorageTarget(_TURSO_URL, auth_token=_TURSO_TOKEN))  # type: ignore[arg-type]
         _drop_conformance_tables(conn)
     try:
         yield conn
@@ -212,3 +212,8 @@ def test_local_libsql_initializes_full_storage_schema(
     assert "memory_candidates" in tables
     assert "memory_candidate_embeddings" in tables
     assert "long_term_memory_embeddings" in tables
+
+
+def test_storage_target_is_exported() -> None:
+    from vexic.storage import StorageTarget as ST
+    assert ST is not None

@@ -26,6 +26,7 @@ from vexic.storage.candidates import (
     nearest_candidate_ids,
     record_candidate_retrieval,
 )
+from vexic.storage.connection import StorageTarget
 from vexic.storage.longterm import (
     LongTermFact,
     LongTermNeighbor,
@@ -124,6 +125,7 @@ __all__ = [
     "SessionSummaryKind",
     "SourceTranscriptIngestResult",
     "SourceTranscriptInput",
+    "StorageTarget",
     "TranscriptHit",
     "TranscriptRangeTooLarge",
     "_assert_no_forbidden_secret_values",

@@ -59,6 +59,7 @@ from vexic.service import (
     LocalMemoryService,
     _run_dream_phase_with_usage as _run_local_dream_phase_with_usage,
 )
+from vexic.storage.connection import StorageTarget
 from vexic.usage import UsageSummary
 
 
@@ -269,7 +270,7 @@ def _write_scope_from_headers(request: object, auth: HostedAuthContext) -> Memor
 @dataclass(frozen=True)
 class HostedTenant:
     tenant_id: str
-    db_path: Path
+    db_path: str | StorageTarget
     project_ids: frozenset[str]
 
 
@@ -711,7 +712,7 @@ class HostedMemoryService:
 
     def _local_service(self, tenant: HostedTenant) -> LocalMemoryService:
         return LocalMemoryService(
-            db_path=str(tenant.db_path),
+            db_path=tenant.db_path,
             tenant_id=tenant.tenant_id,
             embed=self.dream_phase_ports.embed if self.dream_phase_ports else None,
             dream_phase_ports=self.dream_phase_ports,

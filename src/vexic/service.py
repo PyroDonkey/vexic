@@ -64,7 +64,7 @@ from vexic.storage.longterm import record_fact_use_verdict, record_long_term_ret
 from vexic.storage.operators import repair_memory_projections
 from vexic.subagents.retrieval import retrieve_candidate_fallback, retrieve_long_term_facts
 from vexic.usage import UsageSummary
-from vexic.storage.connection import connect, rows_as_dicts
+from vexic.storage.connection import StorageTarget, connect, rows_as_dicts
 
 def _iter_payload_strings(value: object) -> Iterator[str]:
     """Yield every raw string (mapping keys and values) in a JSON-able payload.
@@ -98,7 +98,7 @@ class LocalMemoryService(MemoryService):
     def __init__(
         self,
         *,
-        db_path: str,
+        db_path: str | StorageTarget,
         tenant_id: str,
         forbidden_secret_values: tuple[str, ...] = (),
         embed: EmbedTexts | None = None,
