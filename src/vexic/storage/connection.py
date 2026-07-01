@@ -1,8 +1,25 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
+
+@dataclass(frozen=True)
+class StorageTarget:
+    """A resolved storage target: a filesystem path or libSQL DSN plus an
+    optional auth token. The token is auth metadata, not identity, and must
+    never be logged: it is excluded from repr/eq/hash."""
+    target: str
+    auth_token: str | None = field(default=None, repr=False, compare=False, hash=False)
+
+    def __repr__(self) -> str:
+        tok = "***" if self.auth_token else None
+        return f"StorageTarget(target={self.target!r}, auth_token={tok})"
+
+    def as_connect_args(self) -> tuple[str, str | None]:
+        return self.target, self.auth_token
+
 
 # Hosted libSQL/Turso targets (ADR 0019) arrive as URLs; a filesystem path or
 # ":memory:" is the local SQLite backend. ``str.startswith`` accepts the tuple.
