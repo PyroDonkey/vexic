@@ -10,6 +10,7 @@ from contextlib import closing, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from vexic.contract import MemoryCapability, Principal, PrincipalType
 from vexic.hosted import (
@@ -20,7 +21,7 @@ from vexic.hosted import (
     HostedUsageEvent,
 )
 from vexic.service import LocalMemoryService
-from vexic.storage.connection import StorageTarget, connect
+from vexic.storage.connection import StorageTarget, _is_libsql_target, connect
 
 
 _CONTROL_DB_MODE = 0o600
@@ -181,6 +182,74 @@ class _HostedApiKey:
     revoked_at: str | None = None
     revoked_by: str | None = None
     active: bool = True
+
+
+@dataclass(frozen=True)
+class ReplacementTarget:
+    """A validated `activate_replacement_database` replacement, normalized to
+    either a local filesystem path or a Turso/libSQL DSN (COA-273 Task 12).
+
+    `connect_target` is what gets passed to `connect()` to read the
+    replacement's `canonical_migration_imports` metadata and run
+    `init_schema` -- a `Path` for the local kind, the DSN string for the
+    Turso kind. `repoint_value` is what gets written into the catalog on a
+    successful repoint -- the filename for `db_filename` (local) or the DSN
+    itself for `customer_target` (Turso). Construct via `_validate_local` or
+    `_validate_dsn`, never directly: those two are where the local-path
+    (under-root/customer-file) and DSN (well-formed, distinct from the
+    current target) checks branch and live.
+    """
+
+    kind: str  # "local" | "dsn"
+    connect_target: Path | str
+    repoint_value: str
+
+    @staticmethod
+    def _validate_local(root_path: Path, replacement_db_path: str | Path) -> "ReplacementTarget":
+        candidate = Path(replacement_db_path)
+        if not candidate.is_absolute():
+            candidate = root_path / candidate
+        root = root_path.resolve()
+        replacement = candidate.resolve()
+        try:
+            relative = replacement.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("replacement database must be under hosted root.") from exc
+        if len(relative.parts) != 1 or relative.name == "control-plane.db":
+            raise ValueError("replacement database must be a customer database file.")
+        if not replacement.is_file():
+            raise FileNotFoundError(f"Replacement database does not exist: {replacement}")
+        return ReplacementTarget(
+            kind="local",
+            connect_target=replacement,
+            repoint_value=relative.name,
+        )
+
+    @staticmethod
+    def _validate_dsn(current_customer_target: str | None, dsn: str) -> "ReplacementTarget":
+        if not _is_libsql_target(dsn) or not urlsplit(dsn).netloc:
+            raise ValueError("replacement database must be a well-formed libSQL DSN.")
+        if current_customer_target is not None and dsn == current_customer_target:
+            raise ValueError(
+                "replacement database must differ from the tenant's current customer target."
+            )
+        return ReplacementTarget(kind="dsn", connect_target=dsn, repoint_value=dsn)
+
+    @staticmethod
+    def from_replacement(
+        root_path: Path,
+        current_customer_target: str | None,
+        replacement: str | Path,
+    ) -> "ReplacementTarget":
+        """Branch on the replacement's kind: a `str` containing a `://`
+        authority separator is an attempted DSN, validated as Turso (well-formed
+        libSQL scheme + non-empty host, distinct from the current customer
+        target -- the filesystem/under-root/`os` checks do NOT apply). Anything
+        else (a `Path`, or a `str` filesystem path with no `://`) validates as a
+        local under-root customer db file."""
+        if isinstance(replacement, str) and "://" in replacement:
+            return ReplacementTarget._validate_dsn(current_customer_target, replacement)
+        return ReplacementTarget._validate_local(root_path, replacement)
 
 
 class HostedTenantCatalog:
@@ -457,27 +526,29 @@ class HostedTenantCatalog:
         tenant_id: str,
         replacement_db_path: str | Path,
     ) -> HostedTenant:
+        """Repoint `tenant_id` at a verified replacement database.
+
+        `replacement_db_path` is EITHER a local filesystem path (must resolve
+        under `root_path` and be a customer db file -- the original,
+        pre-Task-12 behavior) OR a Turso/libSQL DSN `str` (validated as a
+        well-formed DSN, distinct from the tenant's current
+        `customer_target`; the filesystem/`os` checks do not apply --
+        `ReplacementTarget.from_replacement` branches on which kind this is).
+
+        Both kinds share the same post-validation flow: read
+        `canonical_migration_imports` from the replacement, verify the
+        imported tenant/project match the catalog tenant, run `init_schema`
+        on the replacement, then repoint the catalog (local sets
+        `db_filename`, Turso sets `customer_target`) and bump `generation` so
+        a request-scoped service holding the pre-repoint handle stops being
+        able to write through it.
+        """
         if not tenant_id.strip():
             raise ValueError("tenant_id must not be blank.")
-        candidate = Path(replacement_db_path)
-        if not candidate.is_absolute():
-            candidate = self.root_path / candidate
-        root = self.root_path.resolve()
-        replacement = candidate.resolve()
-        try:
-            relative = replacement.relative_to(root)
-        except ValueError as exc:
-            raise ValueError("replacement database must be under hosted root.") from exc
-        if len(relative.parts) != 1 or relative.name == "control-plane.db":
-            raise ValueError("replacement database must be a customer database file.")
-        if not replacement.is_file():
-            raise FileNotFoundError(f"Replacement database does not exist: {replacement}")
-
-        db_filename = relative.name
         with closing(self._connect_control()) as conn:
             row = conn.execute(
                 """
-                SELECT db_filename
+                SELECT db_filename, customer_target
                 FROM tenants
                 WHERE tenant_id = ? AND active = 1
                 """,
@@ -485,6 +556,10 @@ class HostedTenantCatalog:
             ).fetchone()
             if row is None:
                 raise PermissionError("Unknown hosted tenant.")
+            current_customer_target = row[1]
+            target = ReplacementTarget.from_replacement(
+                self.root_path, current_customer_target, replacement_db_path
+            )
             project_rows = conn.execute(
                 """
                 SELECT project_id
@@ -495,7 +570,7 @@ class HostedTenantCatalog:
                 (tenant_id,),
             ).fetchall()
             project_ids = frozenset(str(project_row[0]) for project_row in project_rows)
-            migration_scope = self._replacement_migration_scope(replacement)
+            migration_scope = self._replacement_migration_scope(target.connect_target)
             if migration_scope is None:
                 raise PermissionError("Replacement database has no migration metadata.")
             imported_tenant_id, imported_project_id = migration_scope
@@ -503,19 +578,35 @@ class HostedTenantCatalog:
                 raise PermissionError("Replacement database tenant does not match catalog tenant.")
             if imported_project_id not in project_ids:
                 raise PermissionError("Replacement database project is outside catalog tenant projects.")
-            LocalMemoryService(db_path=str(replacement), tenant_id=tenant_id).init_schema()
-            conn.execute(
-                """
-                UPDATE tenants
-                SET db_filename = ?, active = 1
-                WHERE tenant_id = ?
-                """,
-                (db_filename, tenant_id),
+            init_schema_target = (
+                str(target.connect_target) if target.kind == "local" else target.connect_target
             )
+            LocalMemoryService(db_path=init_schema_target, tenant_id=tenant_id).init_schema()
+            if target.kind == "local":
+                conn.execute(
+                    """
+                    UPDATE tenants
+                    SET db_filename = ?, active = 1, generation = generation + 1
+                    WHERE tenant_id = ?
+                    """,
+                    (target.repoint_value, tenant_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE tenants
+                    SET customer_target = ?, active = 1, generation = generation + 1
+                    WHERE tenant_id = ?
+                    """,
+                    (target.repoint_value, tenant_id),
+                )
             conn.commit()
+            db_filename = target.repoint_value if target.kind == "local" else row[0]
             return self._tenant_from_filename(conn, tenant_id, db_filename)
 
-    def _replacement_migration_scope(self, db_path: Path) -> tuple[str, str | None] | None:
+    def _replacement_migration_scope(
+        self, db_path: Path | str
+    ) -> tuple[str, str | None] | None:
         try:
             with closing(connect(db_path)) as conn:
                 row = conn.execute(

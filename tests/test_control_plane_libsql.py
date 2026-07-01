@@ -1,6 +1,7 @@
 import contextlib
 import importlib.util
 import os
+from contextlib import closing
 
 import pytest
 
@@ -8,8 +9,10 @@ from tests.fakes.libsql import FakeLibsqlConn
 from vexic.contract import MemoryCapability
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 from vexic.hosted import HostedUsageEvent
+from vexic.migration import export_canonical_migration, import_canonical_migration
 from vexic.storage import StorageTarget
 from vexic.storage.connection import connect as storage_connect
+from vexic.storage.schema import init_db
 
 # Live gate (mirrors tests/test_hosted_turso_backend.py): only runs with real
 # Turso creds AND the optional `libsql` (vexic[hosted]) extra present.
@@ -320,3 +323,203 @@ def test_control_plane_round_trips_on_real_turso(tmp_path):
         assert _TURSO_TOKEN not in repr(target)
     finally:
         _drop_control_plane_tables()
+
+
+# ---------------------------------------------------------------------------
+# Task 12 (COA-273 P3): `activate_replacement_database` accepts EITHER a local
+# filesystem replacement (existing under-root/customer-file behavior) OR a
+# Turso DSN replacement (string-identity validation, no `Path`/`os` checks),
+# and bumps the catalog `generation` counter on a successful repoint of
+# either kind so request-scoped services holding the stale handle stop
+# writing to it.
+
+
+def _patch_connect_control_and_replacement_to_fake(
+    monkeypatch, fake_conn: FakeLibsqlConn
+) -> None:
+    """Like `_patch_connect_to_fake`, but also accepts a bare DSN `str` (the
+    Turso replacement database) in addition to the control-plane
+    `StorageTarget` -- `activate_replacement_database` connects to BOTH
+    through the same `connect()` seam, and this test suite backs both with
+    the same in-memory fake since a Turso-DSN replacement is a distinct
+    remote database in production, but the unit test only needs the shared
+    fake to hold the `canonical_migration_imports` row the catalog reads.
+
+    Also patches `vexic.storage.schema.connect`: `activate_replacement_database`
+    runs `LocalMemoryService(db_path=<replacement>).init_schema()` on the
+    replacement, and `init_db` there holds its own module-level `connect`
+    reference bound at import time (bound before this monkeypatch runs), so
+    `hosted_local.connect` alone would leave the replacement's `init_schema()`
+    dialing the real DSN.
+    """
+    import vexic.hosted_local as hosted_local
+    import vexic.storage.schema as storage_schema
+
+    def _fake_connect(target, *, auth_token=None, **kwargs):
+        if isinstance(target, StorageTarget):
+            assert target.auth_token == "s3cr3t-token"
+        else:
+            assert isinstance(target, str), f"unexpected connect() target: {target!r}"
+        return _NonClosingFakeConnHandle(fake_conn)
+
+    monkeypatch.setattr(hosted_local, "connect", _fake_connect)
+    monkeypatch.setattr(storage_schema, "connect", _fake_connect)
+
+
+def _seed_local_replacement(root, *, tenant_id: str, project_id: str):
+    """Build a local filesystem replacement db carrying valid canonical
+    migration-import metadata for `tenant_id`/`project_id`, mirroring the
+    existing local-path tests in tests/test_operator_migration.py."""
+    source_db = root / "source.db"
+    artifact = root / "canonical-migration.json"
+    replacement_db = root / "replacement.db"
+    init_db(str(source_db))
+    export_canonical_migration(
+        str(source_db),
+        artifact,
+        tenant_id=tenant_id,
+        project_id=project_id,
+    )
+    import_canonical_migration(
+        artifact,
+        str(replacement_db),
+        tenant_id=tenant_id,
+        project_id=project_id,
+    )
+    return replacement_db
+
+
+def _seed_migration_metadata(
+    fake_conn: FakeLibsqlConn,
+    *,
+    tenant_id: str,
+    project_id: str | None,
+) -> None:
+    """Populate `canonical_migration_imports` directly on the shared fake
+    connection -- `import_canonical_migration` only writes to a filesystem
+    `Path`, so a Turso-DSN replacement's migration metadata is seeded by hand
+    here (this is exactly what a real cross-backend import would leave
+    behind on the replacement database, per Task 12's scope)."""
+    fake_conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS canonical_migration_imports (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            artifact_version TEXT NOT NULL,
+            tenant_id TEXT NOT NULL,
+            project_id TEXT,
+            imported_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    fake_conn.execute(
+        """
+        INSERT INTO canonical_migration_imports (id, artifact_version, tenant_id, project_id)
+        VALUES (1, 'vexic.canonical-migration.v1', ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            tenant_id = excluded.tenant_id,
+            project_id = excluded.project_id
+        """,
+        (tenant_id, project_id),
+    )
+    fake_conn.commit()
+
+
+def test_activate_replacement_database_local_path_bumps_generation(tmp_path):
+    catalog = HostedTenantCatalog(tmp_path)
+    catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+    assert catalog.get_tenant("tenant-a").generation == 1
+    replacement_db = _seed_local_replacement(
+        tmp_path, tenant_id="tenant-a", project_id="project-a"
+    )
+
+    activated = catalog.activate_replacement_database("tenant-a", replacement_db)
+
+    assert activated.db_path == replacement_db
+    assert activated.generation == 2
+    assert catalog.get_tenant("tenant-a").generation == 2
+
+
+def test_activate_replacement_database_accepts_turso_dsn_and_bumps_generation(
+    monkeypatch, tmp_path
+):
+    fake_conn = FakeLibsqlConn()
+    _patch_connect_control_and_replacement_to_fake(monkeypatch, fake_conn)
+    control_target = StorageTarget("libsql://fake-control-plane", auth_token="s3cr3t-token")
+
+    catalog = HostedTenantCatalog(tmp_path, control_target=control_target)
+    catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+    assert catalog.get_tenant("tenant-a").generation == 1
+    _seed_migration_metadata(fake_conn, tenant_id="tenant-a", project_id="project-a")
+
+    replacement_target = "libsql://replacement-customer-db"
+    activated = catalog.activate_replacement_database("tenant-a", replacement_target)
+
+    assert activated.customer_target == replacement_target
+    assert activated.generation == 2
+    tenant = catalog.get_tenant("tenant-a")
+    assert tenant.customer_target == replacement_target
+    assert tenant.generation == 2
+
+
+def test_activate_replacement_database_rejects_dsn_equal_to_current_target(
+    monkeypatch, tmp_path
+):
+    fake_conn = FakeLibsqlConn()
+    _patch_connect_to_fake(monkeypatch, fake_conn)
+    control_target = StorageTarget("libsql://fake-control-plane", auth_token="s3cr3t-token")
+
+    catalog = HostedTenantCatalog(tmp_path, control_target=control_target)
+    catalog.provision_tenant(
+        "tenant-a",
+        project_ids={"project-a"},
+        customer_target="libsql://current-customer-db",
+    )
+    _seed_migration_metadata(fake_conn, tenant_id="tenant-a", project_id="project-a")
+
+    with pytest.raises(ValueError, match="current"):
+        catalog.activate_replacement_database(
+            "tenant-a", "libsql://current-customer-db"
+        )
+
+    tenant = catalog.get_tenant("tenant-a")
+    assert tenant.customer_target == "libsql://current-customer-db"
+    assert tenant.generation == 1
+
+
+def test_activate_replacement_database_rejects_malformed_dsn(monkeypatch, tmp_path):
+    fake_conn = FakeLibsqlConn()
+    _patch_connect_to_fake(monkeypatch, fake_conn)
+    control_target = StorageTarget("libsql://fake-control-plane", auth_token="s3cr3t-token")
+
+    catalog = HostedTenantCatalog(tmp_path, control_target=control_target)
+    catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+
+    # Has a "://" authority separator (so it is treated as an attempted DSN,
+    # not a local filesystem path) but neither a recognized libSQL scheme nor
+    # a host -- must be rejected as malformed rather than silently routed
+    # through the local-path validator.
+    with pytest.raises(ValueError, match="DSN"):
+        catalog.activate_replacement_database("tenant-a", "ftp://")
+
+    tenant = catalog.get_tenant("tenant-a")
+    assert tenant.customer_target is None
+    assert tenant.generation == 1
+
+
+def test_activate_replacement_database_rejects_dsn_tenant_mismatch(monkeypatch, tmp_path):
+    fake_conn = FakeLibsqlConn()
+    _patch_connect_control_and_replacement_to_fake(monkeypatch, fake_conn)
+    control_target = StorageTarget("libsql://fake-control-plane", auth_token="s3cr3t-token")
+
+    catalog = HostedTenantCatalog(tmp_path, control_target=control_target)
+    catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+    _seed_migration_metadata(fake_conn, tenant_id="tenant-b", project_id="project-b")
+
+    with pytest.raises(PermissionError, match="tenant"):
+        catalog.activate_replacement_database(
+            "tenant-a", "libsql://replacement-customer-db"
+        )
+
+    tenant = catalog.get_tenant("tenant-a")
+    assert tenant.customer_target is None
+    assert tenant.generation == 1
