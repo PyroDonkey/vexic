@@ -2,7 +2,7 @@
 
 Status: approved (design), fuse-audited
 Date: 2026-07-01
-Related: ADR 0019 (hosted storage cutover starts Turso-only), ADR 0005/0008/0011/0013, COA-232/263/264
+Related: ADR 0019 (hosted storage cutover starts Turso-only), ADR 0005/0008/0011/0013. Tracking issues live in the tracker, not in this spec.
 
 ## Goal
 
@@ -140,7 +140,7 @@ early value and to exercise the seam before the catalog rewrite.
 
 ## Out of scope (separate tickets)
 
-Connection pooling / durable quota (COA-263, flagged as known perf follow-up);
+Connection pooling / durable quota (known perf follow-up, tracked separately);
 Neon control-plane; S3 Object Lock export hardening; SessionStart primer install.
 
 ## Fuse audit trail
