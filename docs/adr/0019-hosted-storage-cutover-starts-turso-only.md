@@ -150,3 +150,44 @@ also stays deferred until external beta or real customer memory.
 - ADR 0013 — Hosted control-plane HTTP API is a console-facing adapter slice
 - COA-264 (this cutover), COA-232 (restore drills), COA-263 (durable quota), COA-27 (security-gap umbrella)
 - `docs/runbooks/hosted-migration.md`, `docs/runbooks/restore-drills/hosted-restore-drill.md`
+
+## Addendum — 2026-07-01: implementation clarifications (verification + multi-model audit)
+
+This addendum refines the Decision for implementation; it does not reverse ADR
+0019. It records findings from a real-Turso verification spike and a multi-model
+design audit. Design spec:
+`docs/superpowers/specs/2026-07-01-turso-hosted-cutover-design.md`.
+
+1. **The token is not carried in the DSN.** Empirically, a libSQL token embedded
+   in the URL (`?authToken=`) returns 401; the managed client authenticates only
+   via the separate `auth_token` argument. So the "already-resolved target ... an
+   authenticated libSQL DSN" language above is realized as a secret-bearing
+   `StorageTarget{target, auth_token}` handle whose token is passed to
+   `connect(target, auth_token=...)`, held only in memory, redacted in
+   `repr`/logs, and never embedded in the DSN or persisted raw.
+2. **Per-tenant DB tokens are minted short-lived, not persisted raw.** The
+   catalog stores non-secret target metadata only (DSN, provider, generation).
+   Per-tenant DB auth tokens are minted short-lived and DB-scoped through the
+   Turso Platform API in `adapters/` and cached in-process with a TTL. If
+   measured latency forces persistence, store them encrypted (AES-GCM) under an
+   adapters-only `VEXIC_CONTROL_DB_SECRET_KEY` that never enters `src/vexic`.
+3. **Schema init is once-per-target, not per-call.** `init_db` runs on every
+   storage call; against remote libSQL that is a per-request DDL round-trip. A
+   process-level init-once memo keyed by (target, schema generation), guarded by
+   a lock and set only after commit, is required. Local behavior is unchanged.
+4. **Filesystem-coupled control-plane ops guard to local targets.**
+   `_ensure_control_db_permissions` (`os.open`/`chmod`) and
+   `activate_replacement_database` `Path` checks run only for local filesystem
+   targets; remote targets use a DSN-based replacement validator.
+5. **Restore is verify-gated and generation-stamped.** The PITR restore drill
+   activates the replacement only after verification passes (else re-activate the
+   original and destroy the replacement); the catalog target carries a generation
+   that bumps on repoint so request-scoped services cannot write the quarantined
+   handle.
+6. **Split-brain window acknowledged.** While customer memory is on Turso and the
+   control-plane mapping could be lost, a Platform-API list-databases reconcile
+   path recovers tenant→DB mappings; accepted for internal dogfood with a manual
+   recovery note.
+7. **Verified safe:** `enable_load_extension` is sqlite-vec-only (chosen by
+   `select_vector_backend`); `init_db`/`init_vector_memory` do not require it on
+   libSQL, so no change is needed there.
