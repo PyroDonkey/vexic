@@ -29,12 +29,32 @@ from vexic.hosted import (
     HostedRateLimitExceeded,
     add_run_dream_phase_subcommand,
     register_hosted_write_routes,
+    resolve_storage_backend,
     run_dream_phase_command,
 )
 from vexic.mcp_http import register_mcp_routes
 from vexic.mcp_http import _scope_from_headers as _read_scope_from_headers
 from vexic.ports import HostPortNotConfigured
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
+
+
+class _TursoTargetResolver:
+    """Injection seam (Callable Protocol) for hosted-storage-target resolution.
+
+    Defaults to ``adapters.turso_adapter`` -- the only place ``src/vexic`` is
+    permitted to obtain Turso secrets (ADR 0019) -- so this default is imported
+    lazily, and callers/tests can pass a fake with no real credentials.
+    """
+
+    def control_plane_target(self, env: dict[str, str]):
+        from adapters.turso_adapter import control_plane_target
+
+        return control_plane_target(env)
+
+    def customer_memory_target(self, env: dict[str, str]):
+        from adapters.turso_adapter import customer_memory_target
+
+        return customer_memory_target(env)
 
 
 MAX_BODY_BYTES = 1_000_000
@@ -137,7 +157,33 @@ def create_app(
     return app
 
 
-def create_service_from_env() -> HostedMemoryService:
+def create_service_from_env(
+    *,
+    turso_target_resolver: _TursoTargetResolver | None = None,
+) -> HostedMemoryService:
+    """Build the hosted memory service, per-store, from ``VEXIC_STORAGE_BACKEND``.
+
+    Default (``local``, unset) preserves the exact prior behavior: a
+    filesystem-rooted ``HostedTenantCatalog``/``HostedApiKeyStore`` under
+    ``VEXIC_HOSTED_ROOT``. ``VEXIC_STORAGE_BACKEND=turso`` resolves the
+    control-plane and customer-memory ``StorageTarget``s via
+    ``turso_target_resolver`` (defaulting to ``adapters.turso_adapter``, the
+    only place secrets are read) rather than the filesystem root; this seam
+    exists so tests can inject a fake resolver with no real credentials.
+    Turso-backed catalog/key-store construction lands with per-tenant
+    provisioning (a later task) -- this function resolves the targets now so
+    that seam is exercised end-to-end as soon as it is wired.
+    """
+    backend = resolve_storage_backend(os.environ)
+    if backend == "turso":
+        resolver = turso_target_resolver or _TursoTargetResolver()
+        resolver.control_plane_target(os.environ)
+        resolver.customer_memory_target(os.environ)
+        raise NotImplementedError(
+            "VEXIC_STORAGE_BACKEND=turso is not yet wired to a Turso-backed "
+            "HostedTenantCatalog/HostedApiKeyStore; that lands with per-tenant "
+            "provisioning."
+        )
     root = Path(os.environ.get("VEXIC_HOSTED_ROOT", ".hosted-memory"))
     catalog = HostedTenantCatalog(root)
     keys = HostedApiKeyStore(root)

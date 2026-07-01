@@ -965,6 +965,20 @@ def run_dream_phase_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def resolve_storage_backend(env) -> str:
+    """Resolve the non-secret ``VEXIC_STORAGE_BACKEND`` selection flag.
+
+    Defaults to ``"local"`` (filesystem SQLite, unchanged behavior). ``"turso"``
+    selects the hosted libSQL/Turso backend (ADR 0019); any other value is
+    rejected. This helper never reads secrets -- only the flag itself -- so it
+    is safe to keep in ``src/vexic``.
+    """
+    value = env.get("VEXIC_STORAGE_BACKEND", "local").strip().lower()
+    if value not in {"local", "turso"}:
+        raise ValueError(f"invalid VEXIC_STORAGE_BACKEND: {value!r}")
+    return value
+
+
 def _hosted_root_arg(value: str | None) -> Path:
     return Path(value or os.environ.get("VEXIC_HOSTED_ROOT", ".hosted-memory"))
 
