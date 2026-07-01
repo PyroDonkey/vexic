@@ -154,3 +154,19 @@ project id, metadata-only project environment behavior, key mint/list/revoke,
 shared and agent-scoped key behavior, cross-tenant isolation, tenant and
 project usage filtering, unattributed usage remaining tenant-only, secret-safe
 responses and logs, and minted-key compatibility with `/mcp` and `/v1/*`.
+
+## Notes
+
+Co-deploying the control-plane surface and the core memory app in one FastAPI
+process is the accepted topology for this slice; the auth boundary between
+control-plane credentials and Agent API Keys is logical and enforced per
+request, not process-level. Splitting the core memory and control-plane into
+separate services or processes would change this decision and must be recorded
+as a superseding or updated ADR that states the new trust boundary, network and
+secret surface, deploy ownership, and migration plan. Do not split silently.
+
+This trigger is coupled to durable rate-limiting work (COA-263): a durable
+distributed quota store needs shared state outside the core-memory process,
+which may itself motivate the split. That choice should therefore be made as
+part of the quota design rather than as silent later hardening. See the
+security-gap umbrella COA-27.

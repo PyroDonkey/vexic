@@ -15,6 +15,7 @@ from vexic.storage.schema import (
     init_db,
     init_vector_memory,
 )
+from vexic.storage.connection import connect
 
 # Tier 3 — durable, vector-indexed facts. Owns nearest-neighbor retrieval and
 # the conn-scoped insert/retire primitives the promotion module calls inside its
@@ -61,7 +62,7 @@ def keyword_long_term_fact_ids(
         return []
 
     init_db(db_path)
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         try:
             rows = conn.execute(
                 """
@@ -93,7 +94,7 @@ def fetch_long_term_facts(
 
     init_db(db_path)
     placeholders = ", ".join("?" for _ in fact_ids)
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         rows = conn.execute(
             f"""
             SELECT id, fact_text, subject, category, importance, confidence,
@@ -128,7 +129,7 @@ def _increment_counter(db_path: str, column: str, fact_ids: list[int]) -> None:
     if not fact_ids:
         return
     placeholders = ", ".join("?" for _ in fact_ids)
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         with conn:
             conn.execute(
                 f"""
@@ -173,7 +174,7 @@ def record_long_term_retrieval(
     vector_fact_ids_json = json.dumps(list(vector_fact_ids))
     fused_fact_ids_json = json.dumps(list(fused_fact_ids))
     event_ids: list[int] = []
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         with conn:
             placeholders = ", ".join("?" for _ in fact_ids)
             scoped_ids = {
@@ -237,7 +238,7 @@ def record_fact_use_verdict(
     """
     if not used_event_ids and not unused_event_ids:
         return
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         with conn:
             if used_event_ids:
                 placeholders = ", ".join("?" for _ in used_event_ids)
@@ -301,7 +302,7 @@ def nearest_long_term_facts(
     # nearest live neighbors.
     fetch_k = max(k * 4, k + 10)
     init_vector_memory(db_path)
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         _ensure_vector_memory_schema(conn)
         rows = conn.execute(
             """

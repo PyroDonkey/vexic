@@ -6,7 +6,6 @@ import inspect
 import importlib.util
 import json
 from pathlib import Path
-import sqlite3
 import sys
 import tempfile
 import time
@@ -34,6 +33,7 @@ from vexic.rem import run_rem_phase
 from vexic.service import LocalMemoryService
 from vexic.storage import single_message_adapter
 from vexic.usage import summarize_agent_usage
+from vexic.storage.connection import connect
 
 
 class BaselineConfigError(ValueError):
@@ -338,7 +338,7 @@ def _diagnostics(
     }
     if not db_path.exists():
         return counts
-    with sqlite3.connect(db_path) as conn:
+    with connect(db_path) as conn:
         counts["tier1_found"] = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
         counts["tier2_extracted"] = conn.execute(
             "SELECT COUNT(*) FROM memory_candidates"

@@ -276,6 +276,71 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
             self.assertEqual(status["inserted"], 1)
             self.assertEqual(status["ignored"], 1)
 
+    def test_ingest_reads_stdin_as_utf8_bytes_not_locale_decoded(self) -> None:
+        # Regression: on Windows under `uv run`, sys.stdin decodes as
+        # cp1252 + surrogateescape, so any payload char whose UTF-8 encoding
+        # contains a cp1252-undefined byte (e.g. U+1041 -> E1 81 81) becomes a
+        # lone surrogate that model_validate_json rejects with string_unicode.
+        # The hook must read raw stdin bytes and let pydantic decode UTF-8.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            transcript = root / "session.jsonl"
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "sessionId": "claude-session",
+                        "uuid": "uuid-1",
+                        "message": {"role": "user", "content": "remember cedar"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            # ensure_ascii=False so the U+1041 char is emitted as raw UTF-8
+            # bytes (E1 81 81) on the wire, not an ASCII \u escape — that is
+            # what triggers the cp1252+surrogateescape mis-decode.
+            payload_bytes = json.dumps(
+                {
+                    "session_id": "claude-session၁",
+                    "transcript_path": str(transcript),
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+            self.assertIn(b"\xe1\x81\x81", payload_bytes)
+
+            class _WindowsLikeStdin:
+                def __init__(self, data: bytes) -> None:
+                    self.buffer = io.BytesIO(data)
+                    self._data = data
+
+                def read(self) -> str:
+                    # Mirror real uv-run Windows stdin text decoding.
+                    return self._data.decode("cp1252", "surrogateescape")
+
+            def fake_post(config, *, messages, forbidden_values):
+                return {"items": [{"status": "inserted"} for _ in messages]}
+
+            with (
+                patch("vexic.recorders.cli.sys.stdin", _WindowsLikeStdin(payload_bytes)),
+                patch("vexic.recorders.cli.post_source_messages", fake_post),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                code = recorder_main(
+                    [
+                        "ingest",
+                        "--base-url",
+                        "https://api.example.test",
+                        "--api-key",
+                        "vx_secret",
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "vexic-session",
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+
     def test_ingest_batches_hosted_posts_at_one_hundred_messages(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

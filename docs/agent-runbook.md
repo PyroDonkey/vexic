@@ -112,3 +112,38 @@ fix belongs in the harness or the rules, not only in the working tree.
 
 The principle: a failure that recurs should produce a rule or check fix so the
 next iteration cannot repeat it, rather than another isolated retry.
+
+## External Tracking Session Ritual
+
+The external tracking system is project tracking only and is downstream of the
+repo (see "Docs Are Downstream Of Code" in `docs/ai/AGENTS.md`). The boundary
+rule - no tracker SDKs, secrets, imports, or runtime dependencies in
+`src/vexic` - stays in `docs/ai/AGENTS.md`; this section is the per-session
+workflow only.
+
+- At the start of each work session, review relevant project issues through the
+  configured tracker connector or MCP tools when tooling and auth are available.
+  Map the requested work to an existing issue, or create one for non-trivial
+  plans and changes.
+- During work, keep the issue status and comments current when scope changes,
+  blockers, decisions, or follow-up work appear. When a reconciliation trigger
+  from "Docs Are Downstream Of Code" fires (a new or changed ADR, a change to
+  the `LocalMemoryService` operation surface, or a test-count change), reconcile
+  the affected roadmap/todo against the in-repo source of truth before finishing.
+- At finish, update the issue with the branch, commit, verification result
+  (fresh verification per `docs/ai/AGENTS.md`), and any generated follow-up
+  issues.
+
+If tracking tooling is unavailable, say so plainly and do not invent issue IDs.
+Record the reconciliation that the triggers above require - for example, in the
+commit message or the session report - so it is not lost.
+
+## Token And Cost Discipline
+
+Guidance, not a gate; there is no hard token budget enforced yet.
+
+- Route by task class. Routine doc, lint, and test reads can use a cheaper
+  model. Architecture, contract, and memory-invariant changes use a frontier
+  model.
+- Prune stale tool output and large file dumps from context between
+  verification cycles. Do not carry an obsolete dump forward.

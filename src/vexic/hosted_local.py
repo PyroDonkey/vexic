@@ -20,6 +20,7 @@ from vexic.hosted import (
     HostedUsageEvent,
 )
 from vexic.service import LocalMemoryService
+from vexic.storage.connection import connect
 
 
 _CONTROL_DB_MODE = 0o600
@@ -392,7 +393,7 @@ class HostedTenantCatalog:
 
     def _replacement_migration_scope(self, db_path: Path) -> tuple[str, str | None] | None:
         try:
-            with closing(sqlite3.connect(db_path)) as conn:
+            with closing(connect(db_path)) as conn:
                 row = conn.execute(
                     """
                     SELECT tenant_id, project_id
@@ -1125,7 +1126,7 @@ def _nullable_strings_json(values: frozenset[str | None]) -> str:
 
 def _connect_control_db(db_path: Path) -> sqlite3.Connection:
     _ensure_control_db_permissions(db_path)
-    conn = sqlite3.connect(db_path, timeout=30)
+    conn = connect(db_path, timeout=30)
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 

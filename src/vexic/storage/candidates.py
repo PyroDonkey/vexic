@@ -20,6 +20,7 @@ from vexic.storage.schema import (
     init_db,
     init_vector_memory,
 )
+from vexic.storage.connection import connect
 
 # Tier 2 candidate-fallback retrieval from the hosted MCP design: the eligibility
 # predicate shared with Deep/REM — active, unpromoted candidates only. Kept as
@@ -480,7 +481,7 @@ def backfill_missing_candidate_embeddings(
     forbidden_secret_values: Iterable[str] = (),
 ) -> int:
     init_vector_memory(db_path)
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         with conn:
             _ensure_vector_memory_schema(conn)
             count = 0
@@ -563,7 +564,7 @@ def keyword_candidate_ids(
         return []
 
     init_db(db_path)
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         try:
             rows = conn.execute(
                 f"""
@@ -607,7 +608,7 @@ def record_candidate_retrieval(
     assert_no_forbidden_secret_values(forbidden_secret_values, query)
     event_ids: list[int] = []
     init_db(db_path)
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         with conn:
             placeholders = ", ".join("?" for _ in candidate_ids)
             scoped_ids = {
@@ -667,7 +668,7 @@ def fetch_candidate_notes(
 
     init_db(db_path)
     placeholders = ", ".join("?" for _ in candidate_ids)
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         rows = conn.execute(
             f"""
             SELECT c.id, c.fact_text, c.category, c.source_message_ids, c.created_at
@@ -711,7 +712,7 @@ def nearest_candidate_ids(
 
     fetch_k = max(k * 4, k + 10)
     init_vector_memory(db_path)
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         _ensure_vector_memory_schema(conn)
         rows = conn.execute(
             f"""
@@ -735,7 +736,7 @@ def load_candidates_missing_embeddings(
     agent_id: str | None = None,
 ) -> list[tuple[int, str]]:
     init_vector_memory(db_path)
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         _ensure_vector_memory_schema(conn)
         rows = conn.execute(
             """
@@ -768,7 +769,7 @@ def load_promotion_candidates(
     agent_id: str | None = None,
 ) -> list[PromotionCandidate]:
     init_vector_memory(db_path)
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         _ensure_vector_memory_schema(conn)
         rows = conn.execute(
             """
@@ -806,7 +807,7 @@ def load_promotion_candidates(
 
 def load_rem_candidates(db_path: str, *, agent_id: str | None) -> list[RemCandidate]:
     init_db(db_path)
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         rows = conn.execute(
             """
             SELECT id, fact_text, category
@@ -855,7 +856,7 @@ def commit_rem_cycle(
         if not 0.0 <= boost <= 1.0:
             raise ValueError(f"REM boost must be between 0 and 1, got {boost}.")
 
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         with conn:
             boosted = 0
             for candidate_id, boost in boosts.items():
@@ -929,7 +930,7 @@ def commit_dream_cycle(
     _guard_candidate_texts(forbidden_secret_values, candidates)
     assert_no_forbidden_secret_values(forbidden_secret_values, error_detail or "")
 
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(connect(db_path)) as conn:
         with conn:
             stats = DedupStats()
             if candidates:
