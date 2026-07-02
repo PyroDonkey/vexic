@@ -40,6 +40,13 @@ node_modules/
 .claude/
 .mcp.json
 .codex/
+.impeccable/
+website/.impeccable/
+.github/hooks/impeccable.json
+.github/skills/impeccable/
+
+# TypeScript incremental build info
+*.tsbuildinfo
 
 # Local SQLite memory databases and sidecar files
 *.db

@@ -368,12 +368,18 @@ class HostedTenantCatalog:
     def resolve_customer_tenant(self, clerk_org_id: str) -> str | None:
         if not clerk_org_id.strip():
             raise ValueError("clerk_org_id must not be blank.")
+        # Join on `active = 1` (matching `get_tenant`) so a mapping left behind
+        # by an interrupted `provision_customer_account` -- committed before
+        # `provision_tenant` finished customer-db init -- does not resolve on
+        # the read path.
         with closing(self._connect_control()) as conn:
             row = conn.execute(
                 """
-                SELECT tenant_id
-                FROM customer_account_mappings
-                WHERE clerk_org_id = ?
+                SELECT m.tenant_id
+                FROM customer_account_mappings AS m
+                JOIN tenants AS t
+                    ON t.tenant_id = m.tenant_id AND t.active = 1
+                WHERE m.clerk_org_id = ?
                 """,
                 (clerk_org_id,),
             ).fetchone()

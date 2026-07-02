@@ -1,3 +1,4 @@
+import { AmbientCanvas } from "@/components/ambient-canvas";
 import { FactArtifact } from "@/components/fact-artifact";
 import { HeroMachine } from "@/components/hero-machine";
 import { HowItWorks } from "@/components/how-it-works";
@@ -9,15 +10,15 @@ import { GITHUB_URL } from "@/lib/links";
 const PROBLEMS = [
   {
     title: "Agents forget",
-    body: "Context windows end, sessions restart, and everything the agent learned evaporates. Long-running work needs memory that outlives the conversation."
+    body: "Context windows fill up and sessions restart, and everything the agent learned is gone. Long-running work needs memory that outlives a single conversation."
   },
   {
     title: "Stale context poisons runs",
-    body: "Naive memory keeps everything forever. Outdated facts get recalled next to fresh ones, and the agent can't tell which to trust."
+    body: "Naive memory keeps everything forever, so outdated facts surface next to fresh ones and the agent can't tell which to trust."
   },
   {
     title: "Recall is unauditable",
-    body: "When an agent asserts something from memory, most systems can't answer the only question that matters: where did that come from?"
+    body: "When an agent asserts something from memory, most systems can't tell you where it came from."
   }
 ] as const;
 
@@ -28,11 +29,11 @@ const FEATURES = [
   },
   {
     title: "Replayable indexes",
-    body: "FTS and vector indexes are rebuildable projections over canonical rows. Blow them away and rebuild — the transcript is the source of truth."
+    body: "FTS and vector indexes are rebuildable projections over canonical rows. Blow them away and rebuild. The transcript stays the source of truth."
   },
   {
     title: "Scoped memory",
-    body: "Explicit MemoryScope binds every request to tenant, project, session, and agent. Null agent scope means shared — never a wildcard."
+    body: "Explicit MemoryScope binds every request to tenant, project, session, and agent. A null agent scope means shared, not a wildcard match."
   },
   {
     title: "Redaction guard",
@@ -40,18 +41,18 @@ const FEATURES = [
   },
   {
     title: "Managed pipeline",
-    body: "Ingestion, extraction passes, and index rebuilds run as a service. Your agents call one endpoint; durability, migrations, and reindexing are Vexic's job, not yours."
+    body: "Ingestion, extraction passes, and index rebuilds run as a service. Your agents call one endpoint, and Vexic handles durability, migrations, and reindexing."
   },
   {
     title: "Read-only MCP",
-    body: "Expose transcript and long-term search to agents over hosted HTTP MCP. Writes, export, and admin tools stay deliberately out of reach."
+    body: "Expose transcript and long-term search to agents over hosted HTTP MCP. Write, export, and admin tools are deliberately left out."
   }
 ] as const;
 
 const INTEGRATIONS = [
   {
     name: "Claude Code",
-    body: "One setup command installs a transcript recorder hook and session-start memory priming. Conversations are cleaned, ingested, and recalled automatically."
+    body: "One setup command installs a transcript recorder hook and session-start memory priming. From then on Vexic cleans, ingests, and recalls conversations automatically."
   },
   {
     name: "Codex",
@@ -59,7 +60,7 @@ const INTEGRATIONS = [
   },
   {
     name: "MCP",
-    body: "Standard Model Context Protocol over streamable HTTP. Any MCP-capable agent gets search_transcript and search_long_term — nothing more."
+    body: "Standard Model Context Protocol over streamable HTTP. Any MCP-capable agent gets search_transcript and search_long_term, and nothing else."
   }
 ] as const;
 
@@ -67,8 +68,16 @@ export default function HomePage() {
   return (
     <>
       {/* Hero: one truthful run of the pipeline is the visual; the headline serves it. */}
-      <section className="px-5 pt-14 pb-20 sm:pt-20 lg:pt-24">
-        <div className="mx-auto grid w-full max-w-6xl items-center gap-12 lg:grid-cols-[minmax(0,10fr)_minmax(0,11fr)] lg:gap-14">
+      <section className="relative overflow-hidden px-5 pt-14 pb-20 sm:pt-20 lg:pt-24">
+        <AmbientCanvas
+          color="var(--primary)"
+          maxOpacity={0.6}
+          speed={1}
+          density={1}
+          fadeDirection="to-bottom"
+          className="mix-blend-screen"
+        />
+        <div className="relative mx-auto grid w-full max-w-6xl items-center gap-12 lg:grid-cols-[minmax(0,10fr)_minmax(0,11fr)] lg:gap-14">
           <div className="flex flex-col items-start">
             <p className="mb-5 flex items-center gap-2 font-mono text-xs text-muted-foreground">
               <span className="h-1.5 w-1.5 rounded-full bg-primary" aria-hidden />
@@ -79,8 +88,8 @@ export default function HomePage() {
             </h1>
             <p className="mt-5 max-w-xl text-lg leading-relaxed text-muted-foreground">
               Vexic is a hosted, provenance-first memory engine for long-running AI agents. Point
-              your agents at one endpoint — lossless transcripts in, durable facts out, every
-              memory carrying the receipts for where it came from.
+              your agents at one endpoint. Lossless transcripts go in, durable facts come out, and
+              every memory records where it came from.
             </p>
             <div id="waitlist" className="mt-8 flex w-full scroll-mt-24 flex-col items-start gap-3">
               <WaitlistForm source="hero" />
@@ -101,7 +110,7 @@ export default function HomePage() {
       {/* Problem: three statements, no cards. */}
       <Section
         title="Agent memory is broken by default"
-        lede="Bolting a vector store onto an agent isn't memory. It's a cache with no lifecycle, no scope, and no accountability."
+        lede="A vector store bolted onto an agent is just a cache. It never expires stale entries, ignores who each memory belongs to, and can't say where a recalled fact came from."
       >
         <div className="mx-auto max-w-3xl">
           {PROBLEMS.map((problem, index) => (
@@ -119,7 +128,7 @@ export default function HomePage() {
       <Section
         id="how-it-works"
         title="From raw conversation to durable, auditable facts"
-        lede="Three tiers, one direction of trust: the Tier 1 transcript is canonical, Tier 2 candidates are staged, and only reviewed facts reach the Tier 3 long-term store."
+        lede="Three tiers: the Tier 1 transcript is canonical, Tier 2 stages candidate memories, and only reviewed facts reach the Tier 3 long-term store."
       >
         <HowItWorks />
       </Section>
@@ -127,7 +136,7 @@ export default function HomePage() {
       {/* Features: spec sheet beside the artifact that proves it. */}
       <Section
         title="Built like infrastructure, not a demo"
-        lede="Memory behavior you can test, migrate, and debug — because every layer above the transcript is rebuildable."
+        lede="Memory behavior you can test, migrate, and debug, because every layer above the transcript is rebuildable."
       >
         <div className="mx-auto grid max-w-5xl gap-12 lg:grid-cols-[1fr_26rem] lg:gap-16">
           <div className="min-w-0">
@@ -175,12 +184,20 @@ export default function HomePage() {
       {/* Quickstart: hosted endpoint connect — the whole setup story. */}
       <Section
         title="Connected in one command"
-        lede="Add the hosted MCP endpoint to your agent and it has scoped, provenance-backed recall — no database to run, no indexes to babysit."
+        lede="Add the hosted MCP endpoint to your agent and it has scoped, provenance-backed recall. You don't run a database or babysit any indexes."
       >
         <Reveal variant="fade">
           <div className="mx-auto max-w-3xl overflow-hidden rounded-xl border border-border bg-card">
-            <div className="flex items-center gap-2 border-b border-border px-4 py-3">
-              <span className="font-mono text-xs text-muted-foreground">terminal</span>
+            <div className="relative flex items-center border-b border-border px-4 py-3">
+              {/* macOS traffic lights: window chrome, not palette accents. */}
+              <span className="flex gap-2" aria-hidden>
+                <span className="h-3 w-3 rounded-full bg-[#ff5f57]" />
+                <span className="h-3 w-3 rounded-full bg-[#febc2e]" />
+                <span className="h-3 w-3 rounded-full bg-[#28c840]" />
+              </span>
+              <span className="absolute left-1/2 -translate-x-1/2 font-mono text-xs text-muted-foreground">
+                terminal
+              </span>
             </div>
             <pre className="overflow-x-auto p-4 font-mono text-xs leading-relaxed sm:p-5 sm:text-sm">
               <code>
@@ -192,11 +209,6 @@ export default function HomePage() {
               </code>
             </pre>
           </div>
-          <p className="mx-auto mt-4 max-w-2xl text-center text-sm text-muted-foreground">
-            Exposes <code className="rounded bg-card px-1.5 py-0.5 font-mono text-xs">search_transcript</code> and{" "}
-            <code className="rounded bg-card px-1.5 py-0.5 font-mono text-xs">search_long_term</code> — writes and
-            admin tools are intentionally not registered.
-          </p>
         </Reveal>
       </Section>
 
@@ -210,7 +222,7 @@ export default function HomePage() {
               Give your agents a memory worth trusting
             </h2>
             <p className="mx-auto mt-4 max-w-xl text-muted-foreground">
-              Hosted Vexic is rolling out through the waitlist — managed ingestion, extraction,
+              Hosted Vexic is rolling out through the waitlist: managed ingestion, extraction,
               and recall behind one endpoint.
             </p>
             <div className="mt-8 flex flex-col items-center gap-4">

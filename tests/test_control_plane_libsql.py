@@ -550,32 +550,20 @@ class _StubProvisionService:
         raise self._exc
 
 
-def _run_boundary(exc: Exception) -> object:
-    """Run `_provision_control_tenant` through `_control_plane_storage_boundary`
-    and return the boundary's decision: either the `JSONResponse` it produced
-    for a classified storage error, or the exception that propagated out."""
+def _run_boundary(exc: Exception, tenant_lookup: str = "_provision_control_tenant") -> object:
+    """Run a control-tenant lookup (`_provision_control_tenant` by default, or
+    `_resolve_control_tenant`) through `_control_plane_storage_boundary` and
+    return the boundary's decision: either the `JSONResponse` it produced for a
+    classified storage error, or the exception that propagated out."""
     import asyncio
 
     from vexic import hosted_control_plane_http as cp
 
-    @cp._control_plane_storage_boundary
-    async def handler() -> object:
-        return cp._provision_control_tenant(_StubProvisionService(exc), "org_123")
-
-    try:
-        return asyncio.run(handler())
-    except Exception as propagated:  # noqa: BLE001 -- assert on it in the test
-        return propagated
-
-
-def _run_resolve_boundary(exc: Exception) -> object:
-    import asyncio
-
-    from vexic import hosted_control_plane_http as cp
+    lookup = getattr(cp, tenant_lookup)
 
     @cp._control_plane_storage_boundary
     async def handler() -> object:
-        return cp._resolve_control_tenant(_StubProvisionService(exc), "org_123")
+        return lookup(_StubProvisionService(exc), "org_123")
 
     try:
         return asyncio.run(handler())
@@ -657,7 +645,7 @@ def test_resolve_control_tenant_libsql_valueerror_propagates_unwrapped():
     assert not isinstance(excinfo.value, cp._ControlPlaneBadRequest)
     assert excinfo.value is libsql_operational
 
-    result = _run_resolve_boundary(libsql_operational)
+    result = _run_boundary(libsql_operational, "_resolve_control_tenant")
     assert isinstance(result, JSONResponse)
     assert result.status_code in (500, 503)
 

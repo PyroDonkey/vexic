@@ -11,7 +11,7 @@ export default function BlogPage() {
   return (
     <ComingSoon
       title="The blog is coming soon"
-      lede="Deep dives on agent memory, provenance, and replayable systems are in the works. Watch the GitHub repository for updates in the meantime."
+      lede="We're writing deep dives on agent memory, provenance, and replayable systems. Until they land, watch the GitHub repository for updates."
     />
   );
 }

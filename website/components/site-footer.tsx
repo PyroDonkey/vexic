@@ -1,11 +1,21 @@
 import Link from "next/link";
 
+import { AmbientCanvas } from "@/components/ambient-canvas";
 import { CONSOLE_URL, GITHUB_URL, NAV_LINKS } from "@/lib/links";
 
 export function SiteFooter() {
   return (
-    <footer className="border-t border-border">
-      <div className="mx-auto flex w-full max-w-6xl flex-col gap-8 px-5 py-12 sm:flex-row sm:items-start sm:justify-between">
+    <footer className="relative overflow-hidden border-t border-border">
+      {/* Quiet texture: bone-white dots read a step lighter than the canvas,
+          fading out toward the top edge so the page bookends. */}
+      <AmbientCanvas
+        color="var(--foreground)"
+        maxOpacity={0.15}
+        speed={0.6}
+        density={0.75}
+        fadeDirection="to-top"
+      />
+      <div className="relative mx-auto flex w-full max-w-6xl flex-col gap-8 px-5 py-12 sm:flex-row sm:items-start sm:justify-between">
         <div className="max-w-xs space-y-3">
           <p className="text-lg font-semibold tracking-tight">Vexic</p>
           <p className="text-sm text-muted-foreground">
@@ -48,7 +58,7 @@ export function SiteFooter() {
           </div>
         </div>
       </div>
-      <div className="border-t border-border">
+      <div className="relative border-t border-border">
         <div className="mx-auto flex w-full max-w-6xl items-center justify-between px-5 py-5 text-xs text-muted-foreground">
           <p>© {new Date().getFullYear()} Vexic</p>
           <a href={GITHUB_URL} target="_blank" rel="noreferrer" className="hover:text-foreground">
