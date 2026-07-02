@@ -15,9 +15,10 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_hosted_docker_runtime_exposes_src_package(tmp_path: Path) -> None:
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
 
-    assert re.search(r"(?m)^ENV\s+PYTHONPATH=([\"']?)/app/src\1\s*$", dockerfile)
-    assert "COPY adapters ./adapters" not in dockerfile
+    assert re.search(r"(?m)^ENV\s+PYTHONPATH=([\"']?)/app/src:/app\1\s*$", dockerfile)
+    assert "COPY adapters ./adapters" in dockerfile
     assert "vexic.hosted_control_plane_http:create_app" in dockerfile
+    assert "import adapters.turso_adapter" in dockerfile
     users = re.findall(r"(?m)^USER\s+(.+)$", dockerfile)
     assert users
     assert users[-1].strip() == "root"
@@ -28,23 +29,22 @@ def test_hosted_docker_runtime_exposes_src_package(tmp_path: Path) -> None:
         in dockerfile
     )
 
-    pythonpath_export = (
-        r"PYTHONPATH\s*=\s*([\"'])/app/src\$\{PYTHONPATH:\+:\$PYTHONPATH\}\1"
-    )
+    pythonpath_export = r"PYTHONPATH\s*=\s*([\"'])/app/src:/app\$\{PYTHONPATH:\+:\$PYTHONPATH\}\1"
     assert re.search(
         rf"(?m)^RUN\s+{pythonpath_export}\s+uv run --no-sync python -c ",
         dockerfile,
     )
 
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(ROOT / "src")
+    env["PYTHONPATH"] = os.pathsep.join([str(ROOT / "src"), str(ROOT)])
     completed = subprocess.run(
         [
             sys.executable,
             "-S",
             "-c",
             "import importlib.util; spec = importlib.util.find_spec('vexic'); "
-            "assert spec is not None; print(spec.origin)",
+            "adapter = importlib.util.find_spec('adapters.turso_adapter'); "
+            "assert spec is not None and adapter is not None; print(spec.origin)",
         ],
         cwd=tmp_path,
         env=env,

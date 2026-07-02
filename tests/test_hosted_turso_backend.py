@@ -210,7 +210,7 @@ class _FakeProvisioning:
 
 
 def test_factory_turso_branch_provisions_dogfood_and_wires_resolver(monkeypatch, tmp_path):
-    from vexic.hosted_http import create_service_from_env
+    from vexic.hosted_http import _customer_database_name, create_service_from_env
 
     monkeypatch.setenv("VEXIC_STORAGE_BACKEND", "turso")
     monkeypatch.setenv("VEXIC_HOSTED_ROOT", str(tmp_path))
@@ -220,21 +220,83 @@ def test_factory_turso_branch_provisions_dogfood_and_wires_resolver(monkeypatch,
     catalog = HostedTenantCatalog(tmp_path)
     catalog.provision_tenant("tenant-dog", project_ids={"project-dog"})
 
-    dsn = "libsql://vexic-tenant-dog-pyrodonkey.aws-us-west-2.turso.io"
+    db_name = _customer_database_name("tenant-dog")
+    dsn = f"libsql://{db_name}-pyrodonkey.aws-us-west-2.turso.io"
     provisioning = _FakeProvisioning(dsn)
 
     service = create_service_from_env(turso_provisioning=provisioning)
 
     assert isinstance(service, HostedMemoryService)
     # The dogfood tenant now carries a per-tenant DSN (not a shared DB).
-    assert provisioning.create_calls == ["vexic-tenant-dog"]
+    assert provisioning.create_calls == [db_name]
     tenant = service.catalog.get_tenant("tenant-dog")
     assert tenant.customer_target == dsn
     # The resolver is wired and mints a token for the derived db name.
     target = service._customer_target_resolver(tenant)
     assert isinstance(target, StorageTarget)
     assert target.target == dsn
-    assert provisioning.mint_port.calls[0][0] == "vexic-tenant-dog"
+    assert provisioning.mint_port.calls[0][0] == db_name
+
+
+def test_customer_database_name_sanitizes_generated_tenant_ids():
+    from vexic.hosted_http import _customer_database_name
+
+    name = _customer_database_name("tenant_abcd1234")
+
+    assert name.startswith("vexic-tenant-abcd1234-")
+    assert "_" not in name
+    assert name == name.lower()
+    assert all(ch.isalnum() or ch == "-" for ch in name)
+    assert len(name) <= 48
+
+
+def test_factory_turso_branch_provisions_new_control_plane_tenant(monkeypatch, tmp_path):
+    from vexic.hosted_control_plane_http import create_app as create_control_plane_app
+    from vexic.hosted_http import _customer_database_name, create_service_from_env
+
+    monkeypatch.setenv("VEXIC_STORAGE_BACKEND", "turso")
+    monkeypatch.setenv("VEXIC_HOSTED_ROOT", str(tmp_path))
+    monkeypatch.setenv("TURSO_ORG", "pyrodonkey")
+    dsn = "libsql://fresh-tenant-pyrodonkey.aws-us-west-2.turso.io"
+    provisioning = _FakeProvisioning(dsn)
+    service = create_service_from_env(turso_provisioning=provisioning)
+    client = TestClient(
+        create_control_plane_app(service, control_plane_tokens=("console-secret",))
+    )
+
+    response = client.post(
+        "/control/v1/clerk-orgs/org_new/projects",
+        headers={"Authorization": "Bearer console-secret"},
+        json={"name": "Solo"},
+    )
+
+    assert response.status_code == 201
+    tenant_id = response.json()["project"]["tenantId"]
+    assert "_" in tenant_id
+    assert provisioning.create_calls == [_customer_database_name(tenant_id)]
+    assert service.catalog.get_tenant(tenant_id).customer_target == dsn
+
+
+def test_factory_turso_branch_can_provision_existing_local_tenants(monkeypatch, tmp_path):
+    from vexic.hosted_http import _customer_database_name, create_service_from_env
+
+    tenant_id = "tenant_existing"
+    HostedTenantCatalog(tmp_path).provision_tenant(
+        tenant_id,
+        project_ids={"project-existing"},
+    )
+    monkeypatch.setenv("VEXIC_STORAGE_BACKEND", "turso")
+    monkeypatch.setenv("VEXIC_HOSTED_ROOT", str(tmp_path))
+    monkeypatch.setenv("TURSO_ORG", "pyrodonkey")
+    monkeypatch.setenv("VEXIC_PROVISION_EXISTING_TURSO_TARGETS", "1")
+    dsn = "libsql://existing-tenant-pyrodonkey.aws-us-west-2.turso.io"
+    provisioning = _FakeProvisioning(dsn)
+
+    service = create_service_from_env(turso_provisioning=provisioning)
+
+    assert provisioning.create_calls == [_customer_database_name(tenant_id)]
+    assert "_" not in provisioning.create_calls[0]
+    assert service.catalog.get_tenant(tenant_id).customer_target == dsn
 
 
 def test_factory_local_branch_has_no_resolver(monkeypatch, tmp_path):

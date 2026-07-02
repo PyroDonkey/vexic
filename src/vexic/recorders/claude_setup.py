@@ -170,7 +170,8 @@ def _write_mcp_config(
         "args": [
             "run",
             "--with-editable",
-            str(_repo_root()),
+            # Install the local-embed extra so search_long_term can embed queries.
+            f"{_repo_root()}[local-embed]",
             "python",
             str(_mcp_stdio_launcher()),
             "--recorder-config",
