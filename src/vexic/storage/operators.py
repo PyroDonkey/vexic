@@ -15,6 +15,7 @@ from vexic.storage.schema import (
 )
 from vexic.storage.transcript import _rebuild_messages_fts
 from vexic.storage.connection import connect, rows_as_dicts
+from vexic.storage.errors import is_operational_error
 
 
 @dataclass(frozen=True)
@@ -184,7 +185,13 @@ def _guard_database_text_for_file_copy(
             column_rows = conn.execute(
                 f"PRAGMA table_info({_quote_identifier(table_name)})"
             ).fetchall()
-        except sqlite3.OperationalError as exc:
+        except (sqlite3.OperationalError, ValueError) as exc:
+            # FTS5/vec virtual tables whose module is unavailable raise "no such
+            # module" -- a sqlite3.OperationalError locally, a bare ValueError on
+            # hosted libSQL (ADR 0019). Skip those; re-raise anything else,
+            # including unrelated ValueErrors.
+            if not is_operational_error(exc):
+                raise
             if "no such module" in str(exc):
                 continue
             raise
@@ -206,7 +213,12 @@ def _guard_database_text_for_file_copy(
                     "WHERE "
                     f"{_quote_identifier(column_name)} IS NOT NULL"
                 ).fetchall()
-            except sqlite3.OperationalError as exc:
+            except (sqlite3.OperationalError, ValueError) as exc:
+                # Same virtual-table "no such module" case as above; a
+                # sqlite3.OperationalError locally, a bare ValueError on hosted
+                # libSQL (ADR 0019). Re-raise anything else.
+                if not is_operational_error(exc):
+                    raise
                 if "no such module" in str(exc):
                     continue
                 raise

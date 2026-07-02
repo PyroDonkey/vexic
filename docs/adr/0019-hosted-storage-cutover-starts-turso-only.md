@@ -150,3 +150,100 @@ also stays deferred until external beta or real customer memory.
 - ADR 0013 — Hosted control-plane HTTP API is a console-facing adapter slice
 - COA-264 (this cutover), COA-232 (restore drills), COA-263 (durable quota), COA-27 (security-gap umbrella)
 - `docs/runbooks/hosted-migration.md`, `docs/runbooks/restore-drills/hosted-restore-drill.md`
+
+## Addendum — 2026-07-01: implementation clarifications (verification + multi-model audit)
+
+This addendum refines the Decision for implementation; it does not reverse ADR
+0019. It records findings from a real-Turso verification spike and a multi-model
+design audit. Design spec:
+`docs/superpowers/specs/2026-07-01-turso-hosted-cutover-design.md`.
+
+1. **The token is not carried in the DSN.** Empirically, a libSQL token embedded
+   in the URL (`?authToken=`) returns 401; the managed client authenticates only
+   via the separate `auth_token` argument. So the "already-resolved target ... an
+   authenticated libSQL DSN" language above is realized as a secret-bearing
+   `StorageTarget{target, auth_token}` handle whose token is passed to
+   `connect(target, auth_token=...)`, held only in memory, redacted in
+   `repr`/logs, and never embedded in the DSN or persisted raw.
+2. **Per-tenant DB tokens are minted short-lived, not persisted raw.** The
+   catalog stores non-secret target metadata only (DSN, provider, generation).
+   Per-tenant DB auth tokens are minted short-lived and DB-scoped through the
+   Turso Platform API in `adapters/` and cached in-process with a TTL. If
+   measured latency forces persistence, store them encrypted (AES-GCM) under an
+   adapters-only `VEXIC_CONTROL_DB_SECRET_KEY` that never enters `src/vexic`.
+3. **Schema init is once-per-target, not per-call.** `init_db` runs on every
+   storage call; against remote libSQL that is a per-request DDL round-trip. A
+   process-level init-once memo keyed by (target, schema generation), guarded by
+   a lock and set only after commit, is required. Local behavior is unchanged.
+4. **Filesystem-coupled control-plane ops guard to local targets.**
+   `_ensure_control_db_permissions` (`os.open`/`chmod`) and
+   `activate_replacement_database` `Path` checks run only for local filesystem
+   targets; remote targets use a DSN-based replacement validator.
+5. **Restore is verify-gated and generation-stamped.** The PITR restore drill
+   activates the replacement only after verification passes (else re-activate the
+   original and destroy the replacement); the catalog target carries a generation
+   that bumps on repoint so request-scoped services cannot write the quarantined
+   handle.
+6. **Split-brain window acknowledged.** While customer memory is on Turso and the
+   control-plane mapping could be lost, a Platform-API list-databases reconcile
+   path recovers tenant→DB mappings; accepted for internal dogfood with a manual
+   recovery note.
+7. **Verified safe:** `enable_load_extension` is sqlite-vec-only (chosen by
+   `select_vector_backend`); `init_db`/`init_vector_memory` do not require it on
+   libSQL, so no change is needed there.
+
+## Addendum 2 — 2026-07-01: implementation landed (COA-273 P0-P5 complete)
+
+All items in the Decision and the addendum above are implemented and, where
+noted, live-verified against a real Turso database; see
+`docs/hosted-mvp.md#tursolibsql-storage-backend-coa-273` for the
+implementation-facing writeup and `docs/runbooks/hosted-migration.md` for the
+operator-facing migration/restore-drill procedure. Summary of what landed:
+
+- The `StorageTarget`/`connect(target, auth_token=...)` seam (point 1 above),
+  the per-target init-once schema memo (point 3), and the local-only
+  filesystem guards on control-plane ops (point 4) are all in place, per this
+  addendum's original description.
+- Per-tenant Turso provisioning (`adapters/turso_adapter.TursoProvisioningPort`,
+  `TenantTokenCache`, `make_customer_target_resolver`) replaced the earlier
+  single-shared-database dogfood override entirely; the catalog stores a
+  per-tenant `customer_target` DSN and a `generation` counter (point 2's
+  "non-secret target metadata only" and point 5's generation stamp).
+  `TenantTokenCache` mints short-lived, DB-scoped tokens and caches them
+  in-process with a TTL shorter than the mint expiration; nothing is
+  persisted raw, and the encrypted-persistence fallback point 2 allows for
+  was not needed and was not built.
+- The split-brain reconcile path (point 6) is implemented as a pure function,
+  `adapters/turso_adapter.reconcile_tenant_databases`, over an
+  already-fetched platform database list and the catalog's tenant mapping.
+- The restore drill (point 5) is implemented as `vexic.restore.run_restore_drill`,
+  a verify-gated, generation-stamped, pure orchestration function unit tested
+  with fakes.
+- Shared cross-backend exception classifiers
+  (`src/vexic/storage/errors.py`: `is_unique_violation`, `is_operational_error`,
+  `is_retryable_operational_error`) were added and adopted at every affected
+  sqlite3-typed catch site, closing the libSQL bare-`ValueError` gap this
+  addendum's verification spike surfaced.
+- Live-verified on a real Turso database: the storage-adapter conformance
+  suite, a customer-memory round-trip, and a full per-tenant
+  provision -> round-trip -> destroy cycle. These live tests are
+  creds-gated (`TURSO_DATABASE_URL`/`TURSO_AUTH_TOKEN`/the optional `libsql`
+  extra) and skip cleanly without credentials, so the default test run stays
+  green with zero Turso setup.
+
+Known, deliberately deferred follow-ups (not blocking this ADR's acceptance,
+tracked as fix-soon items rather than open decisions):
+
+- `connect()` has no explicit timeout or retry/backoff on the hot path against
+  remote libSQL.
+- A live run of the restore drill against a real Turso point-in-time-recovery
+  snapshot has not been executed; only the drill's decision logic is
+  automated and tested. Recording that live run as a
+  `docs/runbooks/restore-drills/` artifact remains outstanding.
+- `TenantTokenCache` has no size-bounded eviction (an unbounded in-process
+  dict).
+- Some adapter type-annotation precision cleanup is outstanding.
+- `run_restore_drill`'s best-effort compensating `destroy()` on an
+  import/verify failure swallows its own exception so it can never mask the
+  original failure, which means a broken teardown could silently leave a
+  replacement database behind. Documented and accepted, not fixed.

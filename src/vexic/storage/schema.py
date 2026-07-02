@@ -1,6 +1,7 @@
 import re
 import sqlite3
 import struct
+import threading
 from contextlib import closing
 from typing import Literal
 
@@ -10,6 +11,26 @@ from vexic.embeddings import EMBEDDING_DIM, EMBEDDING_MODEL_NAME
 # secret guard from here under the old private name.
 from vexic.redaction import assert_no_forbidden_secret_values as _assert_no_forbidden_secret_values
 from vexic.storage.connection import connect
+
+# Process-level init-once memo (P1, COA-273): DDL against a hosted libSQL/Turso
+# target incurs per-request remote round-trips, so re-running the full
+# init_db/init_vector_memory body on every storage call is a latency bug there
+# (harmless-but-wasteful on local sqlite). Keyed on target identity only -- an
+# auth token rotation is not a schema change -- and populated only after the
+# guarded DDL transaction commits, so a failed init never poisons the memo.
+_INIT_LOCK = threading.Lock()
+_INITIALIZED: set[str] = set()
+
+
+def _memo_key(db_path: "str | StorageTarget") -> str:
+    from vexic.storage.connection import StorageTarget
+
+    return db_path.target if isinstance(db_path, StorageTarget) else str(db_path)
+
+
+def _reset_init_memo() -> None:  # test hook
+    with _INIT_LOCK:
+        _INITIALIZED.clear()
 
 # Shared spine for the three memory tiers. Owns the connection seam (WAL,
 # schema creation, vec-extension load), the embedding-blob math reused across
@@ -616,11 +637,17 @@ def _ensure_source_transcript_ledger(conn: sqlite3.Connection) -> None:
     )
 
 
-def init_db(db_path: str) -> None:
+def init_db(db_path: str, *, force: bool = False) -> None:
     # Lazy import breaks the schema<->transcript cycle: transcript imports the
     # secret guard from this module at load time, so the Tier-1 FTS builder is
     # reached here only at call time, once both modules are fully initialized.
     from vexic.storage.transcript import _ensure_messages_fts
+
+    key = _memo_key(db_path)
+    if not force:
+        with _INIT_LOCK:
+            if key in _INITIALIZED:
+                return
 
     with closing(connect(db_path)) as conn:
         # WAL is a persistent database property: once set it applies to every
@@ -746,9 +773,21 @@ def init_db(db_path: str) -> None:
             _ensure_promotion_labels(conn)
             _ensure_session_summaries(conn)
 
+    with _INIT_LOCK:
+        _INITIALIZED.add(key)  # only after successful commit
 
-def init_vector_memory(db_path: str) -> None:
-    init_db(db_path)
+
+def init_vector_memory(db_path: str, *, force: bool = False) -> None:
+    init_db(db_path, force=force)
+    vector_key = "vec:" + _memo_key(db_path)
+    if not force:
+        with _INIT_LOCK:
+            if vector_key in _INITIALIZED:
+                return
+
     with closing(connect(db_path)) as conn:
         with conn:
             _ensure_vector_memory_schema(conn)
+
+    with _INIT_LOCK:
+        _INITIALIZED.add(vector_key)  # only after successful commit

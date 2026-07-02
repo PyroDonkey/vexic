@@ -1,0 +1,129 @@
+"""Cross-backend storage-exception classifiers (ADR 0019).
+
+The local reference backend is ``sqlite3``, which raises typed exceptions
+(:class:`sqlite3.IntegrityError`, :class:`sqlite3.OperationalError`) for SQL
+errors. The hosted libSQL/Turso driver (used via
+:func:`vexic.storage.connection.connect`) does NOT: for every server-side SQL
+error it raises a bare :class:`ValueError` whose message carries a
+Rust-formatted Hrana payload, for example::
+
+    Hrana: `stream error: `Error { message: "SQLite error: UNIQUE constraint
+    failed: source_transcript_ledger.source_host", code: "SQLITE_CONSTRAINT" }``
+
+So every ``except sqlite3.IntegrityError``/``except sqlite3.OperationalError``
+site silently fails to catch the libSQL equivalent once it runs against Turso.
+These classifiers recognize BOTH forms, so an adopting site can keep a broad
+catch (``except (sqlite3.<Type>, ValueError) as exc:``) and re-raise when the
+classifier returns ``False`` -- unrelated ``ValueError``s (and unrelated sqlite
+errors) still propagate, never silently swallowed.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+
+# libSQL/Hrana ``code:`` fragments and message substrings that mark an
+# operational (as opposed to constraint) SQL error. ``SQLITE_ERROR`` covers the
+# generic "SQL logic error" bucket (bad column, bad FTS MATCH, missing table);
+# busy/locked cover contention; the parse markers cover malformed SQL. These
+# mirror what the sqlite3 ``OperationalError`` type spans, so no more is
+# swallowed than the native catch already swallowed.
+_OPERATIONAL_MARKERS = (
+    "SQLITE_ERROR",
+    "SQLITE_BUSY",
+    "SQLITE_LOCKED",
+    "SQLITE_IOERR",
+    "SQLITE_CANTOPEN",
+    "SQL_PARSE_ERROR",
+    "SQL_PARSE",
+    "no such table",
+    "no such column",
+    "no such module",
+    "database is locked",
+    "database table is locked",
+    "database schema is locked",
+    "database is busy",
+    "unable to open database file",
+    "disk i/o error",
+    "syntax error",
+    "malformed match",
+    "fts5:",
+)
+
+# Lock/busy/IO conditions that a retry might clear. Mirrors the intent of the
+# former ``_RETRYABLE_SQLITE_OPERATIONAL_ERRORS`` tuple in
+# ``hosted_control_plane_http.py``, extended to the libSQL message form.
+_RETRYABLE_MARKERS = (
+    "database is locked",
+    "database table is locked",
+    "database schema is locked",
+    "database is busy",
+    "unable to open database file",
+    "disk i/o error",
+    "sqlite_busy",
+    "sqlite_locked",
+    "sqlite_ioerr",
+    "sqlite_cantopen",
+)
+
+
+def _message(exc: BaseException) -> str:
+    """Best-effort message text for both ``sqlite3.*`` and the libSQL ``ValueError``.
+
+    Both drivers put the useful text in ``str(exc)``: sqlite3 the plain SQLite
+    message, libSQL the Hrana/``code:`` payload. Callers lower-case the result
+    when matching case-insensitively.
+    """
+    return str(exc)
+
+
+def is_unique_violation(exc: BaseException) -> bool:
+    """True when ``exc`` is a UNIQUE/PRIMARY KEY (constraint) violation.
+
+    ``sqlite3`` raises :class:`sqlite3.IntegrityError`; the hosted libSQL driver
+    raises a bare :class:`ValueError` whose message contains ``SQLITE_CONSTRAINT``
+    or ``UNIQUE constraint failed``. An unrelated ``ValueError`` returns ``False``
+    so adopting sites re-raise it.
+    """
+    if isinstance(exc, sqlite3.IntegrityError):
+        return True
+    if isinstance(exc, ValueError):
+        message = _message(exc)
+        return "SQLITE_CONSTRAINT" in message or "UNIQUE constraint failed" in message
+    return False
+
+
+def is_operational_error(exc: BaseException) -> bool:
+    """True when ``exc`` is an operational SQL error (bad SQL, contention, ...).
+
+    Preserves the exact reach of the native ``except sqlite3.OperationalError``
+    it replaces: ANY :class:`sqlite3.OperationalError` classifies True regardless
+    of message. For the hosted libSQL backend it additionally recognizes the bare
+    :class:`ValueError` whose Hrana payload carries an operational marker (e.g.
+    ``SQLITE_ERROR``/``SQLITE_BUSY``/``SQL_PARSE`` or "no such"/"database is
+    locked"/malformed-MATCH text). A pure constraint ``ValueError`` and unrelated
+    ``ValueError``s return ``False`` so adopting sites re-raise them.
+    """
+    if isinstance(exc, sqlite3.OperationalError):
+        return True
+    if isinstance(exc, ValueError):
+        message = _message(exc).lower()
+        return any(marker.lower() in message for marker in _OPERATIONAL_MARKERS)
+    return False
+
+
+def is_retryable_operational_error(exc: BaseException) -> bool:
+    """True when ``exc`` is an operational error a retry might clear.
+
+    Mirrors the semantics of the former
+    ``_is_retryable_sqlite_operational_error`` in ``hosted_control_plane_http.py``
+    -- locked/busy/IO/open conditions -- extended to the libSQL ``ValueError``
+    form. A non-retryable operational error (e.g. a syntax error) returns
+    ``False``; non-storage exceptions return ``False``.
+    """
+    if isinstance(exc, sqlite3.OperationalError) or (
+        isinstance(exc, ValueError) and is_operational_error(exc)
+    ):
+        message = _message(exc).lower()
+        return any(marker in message for marker in _RETRYABLE_MARKERS)
+    return False

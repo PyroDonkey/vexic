@@ -18,6 +18,7 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
+from vexic.storage.errors import is_operational_error, is_unique_violation
 from vexic.storage.schema import _assert_no_forbidden_secret_values, _fts_match_query
 from vexic.text_utils import estimate_tokens
 from vexic.storage.connection import connect
@@ -393,7 +394,17 @@ def ingest_source_messages(
     forbidden_values = tuple(forbidden_secret_values)
     with closing(connect(db_path)) as conn:
         conn.execute("PRAGMA foreign_keys=ON")
-        with conn:
+        # An explicit BEGIN, not the bare `with conn:` used elsewhere in this
+        # module: the per-row SAVEPOINT/ROLLBACK TO/RELEASE below needs a
+        # real open transaction to nest inside. On `sqlite3`, `with conn:`
+        # opens one implicitly and this makes no difference; verified against
+        # live Turso (ADR 0019) that libSQL/Hrana does NOT give the same
+        # guarantee -- each statement auto-commits its own micro-transaction
+        # unless a transaction is opened explicitly, so a SAVEPOINT taken
+        # under a bare `with conn:` is gone by the next `execute()` call
+        # ("no such savepoint").
+        conn.execute("BEGIN")
+        try:
             for item in inputs:
                 source_host = _normalize_source_host(item.source_host)
                 source_session_id = _normalize_source_id(item.source_session_id)
@@ -500,7 +511,9 @@ def ingest_source_messages(
                         """,
                         (source_host, source_session_id, source_message_id, agent_id, message_id),
                     )
-                except sqlite3.IntegrityError:
+                except (sqlite3.IntegrityError, ValueError) as exc:
+                    if not is_unique_violation(exc):
+                        raise
                     conn.execute("ROLLBACK TO SAVEPOINT source_ingest_row")
                     conn.execute("RELEASE SAVEPOINT source_ingest_row")
                     existing = conn.execute(
@@ -539,6 +552,10 @@ def ingest_source_messages(
                         message_id=message_id,
                     )
                 )
+        except BaseException:
+            conn.rollback()
+            raise
+        conn.commit()
     return results
 
 
@@ -592,7 +609,12 @@ def search_messages(
                 """,
                 (safe_query, session_id, agent_id, agent_id, limit),
             ).fetchall()
-        except sqlite3.OperationalError:
+        except (sqlite3.OperationalError, ValueError) as exc:
+            # A malformed FTS MATCH surfaces as sqlite3.OperationalError locally
+            # and as a bare ValueError on hosted libSQL (ADR 0019); both mean
+            # "no hits for this query". Unrelated ValueErrors re-raise.
+            if not is_operational_error(exc):
+                raise
             return []
 
         return [

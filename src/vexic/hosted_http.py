@@ -29,12 +29,40 @@ from vexic.hosted import (
     HostedRateLimitExceeded,
     add_run_dream_phase_subcommand,
     register_hosted_write_routes,
+    resolve_storage_backend,
     run_dream_phase_command,
 )
 from vexic.mcp_http import register_mcp_routes
 from vexic.mcp_http import _scope_from_headers as _read_scope_from_headers
 from vexic.ports import HostPortNotConfigured
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
+
+
+class _TursoProvisioning:
+    """Injection seam for the ``turso`` factory branch (COA-273 Task 16, P4).
+
+    Wraps the two secret-bearing pieces that ``src/vexic`` is NOT permitted to
+    construct directly (ADR 0019): the ``TursoProvisioningPort`` (platform API
+    token) and the per-tenant customer-target resolver (mints DB-scoped jwts).
+    Both are built in ``adapters.turso_adapter`` and imported lazily so the
+    default import graph carries no Turso secrets, and tests can inject a fake
+    with no real credentials.
+    """
+
+    def build_port(self, env: dict[str, str]):
+        from adapters.turso_adapter import TursoProvisioningPort
+
+        return TursoProvisioningPort.from_env(env)
+
+    def build_resolver(self, token_cache, *, org: str):
+        from adapters.turso_adapter import make_customer_target_resolver
+
+        return make_customer_target_resolver(token_cache, org=org)
+
+    def build_token_cache(self, port):
+        from adapters.turso_adapter import TenantTokenCache
+
+        return TenantTokenCache(port)
 
 
 MAX_BODY_BYTES = 1_000_000
@@ -137,15 +165,75 @@ def create_app(
     return app
 
 
-def create_service_from_env() -> HostedMemoryService:
+def create_service_from_env(
+    *,
+    turso_provisioning: _TursoProvisioning | None = None,
+) -> HostedMemoryService:
+    """Build the hosted memory service, per-store, from ``VEXIC_STORAGE_BACKEND``.
+
+    Default (``local``, unset) preserves the exact prior behavior: a
+    filesystem-rooted ``HostedTenantCatalog``/``HostedApiKeyStore`` under
+    ``VEXIC_HOSTED_ROOT``, with no customer-target resolver (each tenant's
+    local ``db_path`` is used unchanged).
+
+    ``VEXIC_STORAGE_BACKEND=turso`` (COA-273 Task 16, P4) keeps the
+    control-plane (``HostedTenantCatalog``/``HostedApiKeyStore``, i.e. auth +
+    tenant lookup) LOCAL/filesystem-rooted exactly as in the ``local`` branch,
+    but routes customer memory to a per-tenant Turso database. It builds a
+    ``TursoProvisioningPort`` + ``TenantTokenCache`` (via the injected
+    ``turso_provisioning`` seam, defaulting to ``adapters.turso_adapter`` --
+    the only place secrets are read) and injects a per-tenant
+    ``customer_target_resolver`` that mints short-lived, DB-scoped tokens on
+    demand. If a dogfood tenant is named via ``VEXIC_DOGFOOD_TENANT_ID`` and it
+    has no ``customer_target`` yet, the factory provisions a real per-tenant
+    Turso DB for it (idempotent ``create_database`` + ``provision_tenant``) and
+    stores only the DSN in the catalog -- NOT a single shared DB. The seam
+    exists so tests can inject a fake with no real credentials.
+    """
+    backend = resolve_storage_backend(os.environ)
     root = Path(os.environ.get("VEXIC_HOSTED_ROOT", ".hosted-memory"))
     catalog = HostedTenantCatalog(root)
     keys = HostedApiKeyStore(root)
+    customer_target_resolver = None
+    if backend == "turso":
+        provisioning = turso_provisioning or _TursoProvisioning()
+        org = os.environ["TURSO_ORG"].strip()
+        port = provisioning.build_port(dict(os.environ))
+        cache = provisioning.build_token_cache(port)
+        _ensure_dogfood_tenant_target(catalog, port)
+        customer_target_resolver = provisioning.build_resolver(cache, org=org)
     return HostedMemoryService(
         catalog,
         keys,
         telemetry=catalog,
         rate_limiter=HostedInMemoryRateLimiter(),
+        customer_target_resolver=customer_target_resolver,
+    )
+
+
+def _ensure_dogfood_tenant_target(catalog: HostedTenantCatalog, port: object) -> None:
+    """Provision a real per-tenant Turso DB for the dogfood tenant if it has
+    no ``customer_target`` yet (COA-273 Task 16, P4).
+
+    The dogfood tenant is named by ``VEXIC_DOGFOOD_TENANT_ID`` (unset -> no-op,
+    so the ``turso`` backend is usable with tenants provisioned out of band,
+    e.g. the live test which builds the service directly with a tenant that
+    already carries a DSN). When set and the tenant's ``customer_target`` is
+    empty, it creates a per-tenant database ``vexic-{tenant_id}`` (idempotent)
+    and stores only the returned DSN via ``provision_tenant`` -- never a shared
+    DB, never a token.
+    """
+    tenant_id = os.environ.get("VEXIC_DOGFOOD_TENANT_ID", "").strip()
+    if not tenant_id:
+        return
+    tenant = catalog.get_tenant(tenant_id)
+    if tenant.customer_target:
+        return
+    dsn = port.create_database(f"vexic-{tenant_id}")
+    catalog.provision_tenant(
+        tenant_id,
+        project_ids=tenant.project_ids,
+        customer_target=dsn,
     )
 
 

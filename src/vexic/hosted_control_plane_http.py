@@ -15,6 +15,11 @@ from fastapi.responses import JSONResponse, Response
 from vexic.hosted import HostedMemoryService
 from vexic.hosted_http import create_app as create_hosted_memory_app
 from vexic.hosted_http import create_service_from_env
+from vexic.storage.errors import (
+    is_operational_error,
+    is_retryable_operational_error,
+    is_unique_violation,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -320,16 +325,6 @@ class _ControlPlaneBadRequest(ValueError):
     pass
 
 
-_RETRYABLE_SQLITE_OPERATIONAL_ERRORS = (
-    "database is locked",
-    "database table is locked",
-    "database schema is locked",
-    "database is busy",
-    "unable to open database file",
-    "disk i/o error",
-)
-
-
 def _control_plane_storage_boundary(
     handler: Callable[_ControlPlaneParams, Awaitable[_ControlPlaneResponseT]],
 ) -> Callable[_ControlPlaneParams, Awaitable[_ControlPlaneResponseT | JSONResponse]]:
@@ -338,36 +333,44 @@ def _control_plane_storage_boundary(
         *args: _ControlPlaneParams.args,
         **kwargs: _ControlPlaneParams.kwargs,
     ) -> _ControlPlaneResponseT | JSONResponse:
+        # Broad catch spanning both backends: local sqlite3 raises typed
+        # sqlite3.Error subclasses; hosted libSQL raises a bare ValueError with
+        # the Hrana/`code:` payload (ADR 0019). The shared classifiers normalize
+        # both. Any exception that is NOT a storage constraint/operational error
+        # -- including a domain ValueError such as _ControlPlaneBadRequest bound
+        # to its own FastAPI exception handler -- re-raises untouched.
         try:
             return await handler(*args, **kwargs)
-        except sqlite3.IntegrityError as exc:
-            _log_control_plane_sqlite_error("integrity", exc, args, kwargs)
-            return _error_response(409, "conflict", "Control-plane write conflict.")
-        except sqlite3.OperationalError as exc:
-            if _is_retryable_sqlite_operational_error(exc):
-                _log_control_plane_sqlite_error(
-                    "retryable_operational",
-                    exc,
-                    args,
-                    kwargs,
-                )
-                return _error_response(
-                    503,
-                    "storage_unavailable",
-                    "Control-plane storage is temporarily unavailable.",
-                )
-            _log_control_plane_sqlite_error("operational", exc, args, kwargs)
-            return _error_response(500, "internal_error", "Control-plane storage failed.")
-        except sqlite3.Error as exc:
-            _log_control_plane_sqlite_error("sqlite", exc, args, kwargs)
-            return _error_response(500, "internal_error", "Control-plane storage failed.")
+        except (sqlite3.Error, ValueError) as exc:
+            if is_unique_violation(exc):
+                _log_control_plane_sqlite_error("integrity", exc, args, kwargs)
+                return _error_response(409, "conflict", "Control-plane write conflict.")
+            if is_operational_error(exc):
+                if is_retryable_operational_error(exc):
+                    _log_control_plane_sqlite_error(
+                        "retryable_operational",
+                        exc,
+                        args,
+                        kwargs,
+                    )
+                    return _error_response(
+                        503,
+                        "storage_unavailable",
+                        "Control-plane storage is temporarily unavailable.",
+                    )
+                _log_control_plane_sqlite_error("operational", exc, args, kwargs)
+                return _error_response(500, "internal_error", "Control-plane storage failed.")
+            if isinstance(exc, sqlite3.Error):
+                _log_control_plane_sqlite_error("sqlite", exc, args, kwargs)
+                return _error_response(500, "internal_error", "Control-plane storage failed.")
+            raise
 
     return wrapped
 
 
 def _log_control_plane_sqlite_error(
     category: str,
-    exc: sqlite3.Error,
+    exc: BaseException,
     args: tuple[object, ...],
     kwargs: dict[str, object],
 ) -> None:
@@ -406,15 +409,16 @@ def _correlation_id(request: Request | None) -> str | None:
     return None
 
 
-def _is_retryable_sqlite_operational_error(exc: sqlite3.OperationalError) -> bool:
-    message = str(exc).lower()
-    return any(fragment in message for fragment in _RETRYABLE_SQLITE_OPERATIONAL_ERRORS)
-
-
 def _provision_control_tenant(service: HostedMemoryService, clerk_org_id: str) -> str:
     try:
         return service.catalog.provision_customer_account(clerk_org_id)
     except ValueError as exc:
+        # On the hosted libSQL/Turso backend a genuine constraint/operational
+        # SQL failure surfaces as a bare `ValueError` (ADR 0019). Let it
+        # propagate to the storage boundary for 409/503/500 classification
+        # instead of mis-wrapping it as an HTTP 400 domain-validation error.
+        if is_unique_violation(exc) or is_operational_error(exc):
+            raise
         raise _ControlPlaneBadRequest(str(exc)) from exc
 
 

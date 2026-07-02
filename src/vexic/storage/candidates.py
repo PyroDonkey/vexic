@@ -20,6 +20,7 @@ from vexic.storage.schema import (
     init_vector_memory,
 )
 from vexic.storage.connection import connect
+from vexic.storage.errors import is_operational_error
 from vexic.storage.vectors import select_vector_backend
 
 # Tier 2 candidate-fallback retrieval from the hosted MCP design: the eligibility
@@ -579,7 +580,12 @@ def keyword_candidate_ids(
                 """,
                 (safe_query, agent_id, k),
             ).fetchall()
-        except sqlite3.OperationalError:
+        except (sqlite3.OperationalError, ValueError) as exc:
+            # A malformed FTS MATCH is a sqlite3.OperationalError locally and a
+            # bare ValueError on hosted libSQL (ADR 0019); both mean "no hits".
+            # Unrelated ValueErrors re-raise.
+            if not is_operational_error(exc):
+                raise
             return []
     return [int(row[0]) for row in rows]
 

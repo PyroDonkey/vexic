@@ -45,7 +45,12 @@ Notes:
   COA-264, and ADR 0019 records how that cutover starts: Turso-only as a
   bootstrap posture (customer memory and the control-plane catalog both on
   managed libSQL), with the Neon Postgres control plane deferred to a later
-  promotion before external-customer memory.
+  promotion before external-customer memory. ADR 0019's 2026-07-01 addendum
+  records the implementation clarifications from a real-Turso verification spike
+  and design audit (token is a separate `connect` arg via a secret-bearing
+  `StorageTarget`, per-tenant tokens minted short-lived, init-once schema memo,
+  verify-gated generation-stamped restore). The full-posture implementation is
+  owned by its own Linear issue; testing is COA-272.
 - 0007 corresponds to the multi-agent scoping work. The repo, not a tracking
   view, defines the accepted scope semantics.
 - 0011 corresponds to the local/self-host to hosted migration-path decision for

@@ -1,8 +1,25 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
+
+@dataclass(frozen=True)
+class StorageTarget:
+    """A resolved storage target: a filesystem path or libSQL DSN plus an
+    optional auth token. The token is auth metadata, not identity, and must
+    never be logged: it is excluded from repr/eq/hash."""
+    target: str
+    auth_token: str | None = field(default=None, repr=False, compare=False, hash=False)
+
+    def __repr__(self) -> str:
+        tok = "***" if self.auth_token else None
+        return f"StorageTarget(target={self.target!r}, auth_token={tok})"
+
+    def as_connect_args(self) -> tuple[str, str | None]:
+        return self.target, self.auth_token
+
 
 # Hosted libSQL/Turso targets (ADR 0019) arrive as URLs; a filesystem path or
 # ":memory:" is the local SQLite backend. ``str.startswith`` accepts the tuple.
@@ -16,9 +33,19 @@ class StorageConnection(Protocol):
 
     The libSQL connection (ADR 0019 verification spike) supports this DB-API
     subset -- ``execute``/``executemany``/``cursor``/``commit``/``rollback``/
-    ``close`` and the ``with conn:`` transaction context (rollback on exception,
-    verified equivalent to ``sqlite3``) -- but NOT a settable ``row_factory``
-    (use :func:`rows_as_dicts`), named/dict params, or ``enable_load_extension``.
+    ``close`` and the ``with conn:`` transaction context (rollback on
+    exception) -- but NOT a settable ``row_factory`` (use :func:`rows_as_dicts`),
+    named/dict params, or ``enable_load_extension``.
+
+    Transaction caveat (verified live against Turso, ADR 0019): the ``with conn:``
+    context rolls back on exception on both backends, but on managed libSQL it
+    does NOT open an implicit transaction the way ``sqlite3`` does -- each
+    ``execute`` auto-commits its own micro-transaction. So a ``SAVEPOINT`` /
+    ``ROLLBACK TO SAVEPOINT`` / ``RELEASE SAVEPOINT`` sequence does NOT persist
+    across ``execute`` calls under a bare ``with conn:`` on libSQL (the savepoint
+    is gone by the next call, "no such savepoint"). Nested savepoint logic must
+    issue an explicit ``BEGIN`` first so it has a real open transaction to nest
+    inside (see ``transcript.ingest_source_messages``).
     """
 
     def execute(self, sql: str, parameters: Any = ..., /) -> Any: ...
@@ -58,6 +85,11 @@ def connect(
     from the environment (ADR 0019). The ``libsql`` client is an optional
     ``hosted`` extra, imported lazily so the local path needs no extra dependency.
     """
+    if isinstance(target, StorageTarget):
+        if auth_token is not None:
+            raise ValueError("Pass auth_token via StorageTarget or the kwarg, not both.")
+        target, auth_token = target.as_connect_args()
+
     if _is_libsql_target(target):
         # ``target`` is trusted configuration -- a resolved DSN handed in by the
         # adapters/ layer -- never user input, so scheme-based routing here is

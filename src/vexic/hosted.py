@@ -59,6 +59,7 @@ from vexic.service import (
     LocalMemoryService,
     _run_dream_phase_with_usage as _run_local_dream_phase_with_usage,
 )
+from vexic.storage.connection import StorageTarget
 from vexic.usage import UsageSummary
 
 
@@ -269,8 +270,16 @@ def _write_scope_from_headers(request: object, auth: HostedAuthContext) -> Memor
 @dataclass(frozen=True)
 class HostedTenant:
     tenant_id: str
-    db_path: Path
+    db_path: str | StorageTarget
     project_ids: frozenset[str]
+    # Catalog data model only (COA-273 Task 11): `customer_target` is the DSN
+    # string for the tenant's customer-memory database, or `None` to use the
+    # local `db_path` (unchanged behavior). NEVER a token here -- resolving
+    # this into a connectable, token-bearing `StorageTarget` is P4 work.
+    # `generation` is a repoint counter bumped by Task 12; both fields default
+    # so existing `HostedTenant(...)` construction keeps working.
+    customer_target: str | None = None
+    generation: int = 1
 
 
 @dataclass(frozen=True)
@@ -460,12 +469,24 @@ class HostedMemoryService:
         telemetry: HostedTelemetrySink | None = None,
         rate_limiter: HostedInMemoryRateLimiter | None = None,
         dream_phase_ports: DreamPhasePorts | None = None,
+        *,
+        customer_target_resolver: Callable[[HostedTenant], StorageTarget | None]
+        | None = None,
     ) -> None:
         self.catalog = catalog
         self.api_keys = api_keys
         self.telemetry = telemetry
         self.rate_limiter = rate_limiter or HostedInMemoryRateLimiter()
         self.dream_phase_ports = dream_phase_ports
+        # COA-273 Task 16 (P4): per-tenant customer-memory resolver. Given a
+        # `HostedTenant`, it returns a connectable, token-bearing
+        # `StorageTarget` for the tenant's Turso customer-memory DB (derived
+        # from its catalog `customer_target` DSN), or `None` to use the local
+        # `db_path`. This replaces the Task-7b single-DB override + its
+        # single-tenant guard: resolution is now per-tenant, so there is no
+        # shared-DB / second-tenant hazard. Secrets (the minted jwt) live only
+        # inside the resolver, which is built in `adapters/`.
+        self._customer_target_resolver = customer_target_resolver
 
     async def append_transcript(
         self,
@@ -710,12 +731,27 @@ class HostedMemoryService:
         return request.model_copy(update={"scope": scope}), tenant
 
     def _local_service(self, tenant: HostedTenant) -> LocalMemoryService:
-        return LocalMemoryService(
-            db_path=str(tenant.db_path),
+        target = (
+            self._customer_target_resolver(tenant)
+            if self._customer_target_resolver is not None
+            else None
+        )
+        db_path: str | StorageTarget = target if target is not None else tenant.db_path
+        needs_schema_init = target is not None
+        service = LocalMemoryService(
+            db_path=db_path,
             tenant_id=tenant.tenant_id,
             embed=self.dream_phase_ports.embed if self.dream_phase_ports else None,
             dream_phase_ports=self.dream_phase_ports,
         )
+        if needs_schema_init:
+            # A per-tenant Turso customer-memory DB is provisioned/schema-init'd
+            # out of band (factory or provisioning flow), not by filesystem
+            # tenant provisioning. `init_db`'s process-level memo (keyed on
+            # target identity) makes this a cheap no-op after the first real
+            # call, so requesting it here is safe and idempotent.
+            service.init_schema()
+        return service
 
     async def _run_dream_phase(
         self,
@@ -962,6 +998,20 @@ def run_dream_phase_command(args: argparse.Namespace) -> int:
         )
     )
     return 0
+
+
+def resolve_storage_backend(env) -> str:
+    """Resolve the non-secret ``VEXIC_STORAGE_BACKEND`` selection flag.
+
+    Defaults to ``"local"`` (filesystem SQLite, unchanged behavior). ``"turso"``
+    selects the hosted libSQL/Turso backend (ADR 0019); any other value is
+    rejected. This helper never reads secrets -- only the flag itself -- so it
+    is safe to keep in ``src/vexic``.
+    """
+    value = env.get("VEXIC_STORAGE_BACKEND", "local").strip().lower()
+    if value not in {"local", "turso"}:
+        raise ValueError(f"invalid VEXIC_STORAGE_BACKEND: {value!r}")
+    return value
 
 
 def _hosted_root_arg(value: str | None) -> Path:

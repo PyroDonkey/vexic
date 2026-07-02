@@ -10,6 +10,7 @@ from contextlib import closing, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from vexic.contract import MemoryCapability, Principal, PrincipalType
 from vexic.hosted import (
@@ -20,7 +21,8 @@ from vexic.hosted import (
     HostedUsageEvent,
 )
 from vexic.service import LocalMemoryService
-from vexic.storage.connection import connect
+from vexic.storage.connection import StorageTarget, _is_libsql_target, connect
+from vexic.storage.errors import is_operational_error
 
 
 _CONTROL_DB_MODE = 0o600
@@ -30,6 +32,111 @@ _CONTROL_PLANE_AGENT_CAPABILITIES = frozenset(
         MemoryCapability.SEARCH,
         MemoryCapability.EXPAND_HISTORY,
     }
+)
+
+# Split into individual DDL statements (rather than one `executescript()`
+# blob) so schema init runs identically over a local `sqlite3.Connection` or
+# a hosted libSQL/Turso connection through the `connect()` seam -- neither
+# the real libSQL driver nor `FakeLibsqlConn` implements `executescript`.
+_CONTROL_PLANE_SCHEMA_STATEMENTS: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS tenants (
+        tenant_id TEXT PRIMARY KEY,
+        db_filename TEXT NOT NULL UNIQUE,
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        customer_target TEXT,
+        generation INTEGER NOT NULL DEFAULT 1
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS tenant_projects (
+        tenant_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        PRIMARY KEY (tenant_id, project_id),
+        FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS customer_account_mappings (
+        clerk_org_id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS hosted_projects (
+        project_id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        environment TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS hosted_audit_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        operation TEXT NOT NULL,
+        tenant_id TEXT,
+        principal_id TEXT,
+        status TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        error_type TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS hosted_usage_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        tenant_id TEXT,
+        principal_id TEXT,
+        status TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        model_requests INTEGER NOT NULL DEFAULT 0,
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        total_tokens INTEGER NOT NULL DEFAULT 0,
+        estimated_cost_micros INTEGER NOT NULL DEFAULT 0,
+        error_type TEXT,
+        project_id TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS hosted_job_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        tenant_id TEXT NOT NULL,
+        principal_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        phase TEXT,
+        error_type TEXT
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_hosted_audit_events_tenant_id
+        ON hosted_audit_events(tenant_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_hosted_usage_events_tenant_id
+        ON hosted_usage_events(tenant_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_hosted_usage_events_tenant_project_recorded_at
+        ON hosted_usage_events(tenant_id, project_id, recorded_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_hosted_usage_events_tenant_project_recorded_at_jd
+        ON hosted_usage_events(tenant_id, project_id, julianday(recorded_at))
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_hosted_job_events_tenant_id
+        ON hosted_job_events(tenant_id)
+    """,
 )
 
 
@@ -78,11 +185,88 @@ class _HostedApiKey:
     active: bool = True
 
 
+@dataclass(frozen=True)
+class ReplacementTarget:
+    """A validated `activate_replacement_database` replacement, normalized to
+    either a local filesystem path or a Turso/libSQL DSN (COA-273 Task 12).
+
+    `connect_target` is what gets passed to `connect()` to read the
+    replacement's `canonical_migration_imports` metadata and run
+    `init_schema` -- a `Path` for the local kind, the DSN string for the
+    Turso kind. `repoint_value` is what gets written into the catalog on a
+    successful repoint -- the filename for `db_filename` (local) or the DSN
+    itself for `customer_target` (Turso). Construct via `_validate_local` or
+    `_validate_dsn`, never directly: those two are where the local-path
+    (under-root/customer-file) and DSN (well-formed, distinct from the
+    current target) checks branch and live.
+    """
+
+    kind: str  # "local" | "dsn"
+    connect_target: Path | str
+    repoint_value: str
+
+    @staticmethod
+    def _validate_local(root_path: Path, replacement_db_path: str | Path) -> "ReplacementTarget":
+        candidate = Path(replacement_db_path)
+        if not candidate.is_absolute():
+            candidate = root_path / candidate
+        root = root_path.resolve()
+        replacement = candidate.resolve()
+        try:
+            relative = replacement.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("replacement database must be under hosted root.") from exc
+        if len(relative.parts) != 1 or relative.name == "control-plane.db":
+            raise ValueError("replacement database must be a customer database file.")
+        if not replacement.is_file():
+            raise FileNotFoundError(f"Replacement database does not exist: {replacement}")
+        return ReplacementTarget(
+            kind="local",
+            connect_target=replacement,
+            repoint_value=relative.name,
+        )
+
+    @staticmethod
+    def _validate_dsn(current_customer_target: str | None, dsn: str) -> "ReplacementTarget":
+        if not _is_libsql_target(dsn) or not urlsplit(dsn).netloc:
+            raise ValueError("replacement database must be a well-formed libSQL DSN.")
+        if current_customer_target is not None and dsn == current_customer_target:
+            raise ValueError(
+                "replacement database must differ from the tenant's current customer target."
+            )
+        return ReplacementTarget(kind="dsn", connect_target=dsn, repoint_value=dsn)
+
+    @staticmethod
+    def from_replacement(
+        root_path: Path,
+        current_customer_target: str | None,
+        replacement: str | Path,
+    ) -> "ReplacementTarget":
+        """Branch on the replacement's kind: a `str` containing a `://`
+        authority separator is an attempted DSN, validated as Turso (well-formed
+        libSQL scheme + non-empty host, distinct from the current customer
+        target -- the filesystem/under-root/`os` checks do NOT apply). Anything
+        else (a `Path`, or a `str` filesystem path with no `://`) validates as a
+        local under-root customer db file."""
+        if isinstance(replacement, str) and "://" in replacement:
+            return ReplacementTarget._validate_dsn(current_customer_target, replacement)
+        return ReplacementTarget._validate_local(root_path, replacement)
+
+
 class HostedTenantCatalog:
-    def __init__(self, root_path: str | Path) -> None:
+    def __init__(
+        self,
+        root_path: str | Path,
+        *,
+        control_target: StorageTarget | None = None,
+    ) -> None:
         self.root_path = Path(root_path)
         self.root_path.mkdir(parents=True, exist_ok=True)
-        self._control_db_path = self.root_path / "control-plane.db"
+        self._control_target: str | Path | StorageTarget = (
+            control_target
+            if control_target is not None
+            else self.root_path / "control-plane.db"
+        )
         self._init_control_plane_schema()
 
     def provision_tenant(
@@ -90,6 +274,7 @@ class HostedTenantCatalog:
         tenant_id: str,
         *,
         project_ids: set[str] | frozenset[str] = frozenset(),
+        customer_target: str | None = None,
     ) -> HostedTenant:
         if not tenant_id.strip():
             raise ValueError("tenant_id must not be blank.")
@@ -110,10 +295,10 @@ class HostedTenantCatalog:
                 db_filename = self._allocate_db_filename(conn)
                 conn.execute(
                     """
-                    INSERT INTO tenants (tenant_id, db_filename, active)
-                    VALUES (?, ?, 0)
+                    INSERT INTO tenants (tenant_id, db_filename, active, customer_target)
+                    VALUES (?, ?, 0, ?)
                     """,
-                    (tenant_id, db_filename),
+                    (tenant_id, db_filename, customer_target),
                 )
                 conn.commit()
                 needs_customer_init = True
@@ -131,6 +316,15 @@ class HostedTenantCatalog:
                 """,
                 (tenant_id,),
             )
+            if customer_target is not None:
+                conn.execute(
+                    """
+                    UPDATE tenants
+                    SET customer_target = ?
+                    WHERE tenant_id = ?
+                    """,
+                    (customer_target, tenant_id),
+                )
             self._insert_projects(conn, tenant_id, project_ids)
             conn.commit()
             return self._tenant_from_filename(conn, tenant_id, db_filename)
@@ -333,27 +527,29 @@ class HostedTenantCatalog:
         tenant_id: str,
         replacement_db_path: str | Path,
     ) -> HostedTenant:
+        """Repoint `tenant_id` at a verified replacement database.
+
+        `replacement_db_path` is EITHER a local filesystem path (must resolve
+        under `root_path` and be a customer db file -- the original,
+        pre-Task-12 behavior) OR a Turso/libSQL DSN `str` (validated as a
+        well-formed DSN, distinct from the tenant's current
+        `customer_target`; the filesystem/`os` checks do not apply --
+        `ReplacementTarget.from_replacement` branches on which kind this is).
+
+        Both kinds share the same post-validation flow: read
+        `canonical_migration_imports` from the replacement, verify the
+        imported tenant/project match the catalog tenant, run `init_schema`
+        on the replacement, then repoint the catalog (local sets
+        `db_filename`, Turso sets `customer_target`) and bump `generation` so
+        a request-scoped service holding the pre-repoint handle stops being
+        able to write through it.
+        """
         if not tenant_id.strip():
             raise ValueError("tenant_id must not be blank.")
-        candidate = Path(replacement_db_path)
-        if not candidate.is_absolute():
-            candidate = self.root_path / candidate
-        root = self.root_path.resolve()
-        replacement = candidate.resolve()
-        try:
-            relative = replacement.relative_to(root)
-        except ValueError as exc:
-            raise ValueError("replacement database must be under hosted root.") from exc
-        if len(relative.parts) != 1 or relative.name == "control-plane.db":
-            raise ValueError("replacement database must be a customer database file.")
-        if not replacement.is_file():
-            raise FileNotFoundError(f"Replacement database does not exist: {replacement}")
-
-        db_filename = relative.name
         with closing(self._connect_control()) as conn:
             row = conn.execute(
                 """
-                SELECT db_filename
+                SELECT db_filename, customer_target
                 FROM tenants
                 WHERE tenant_id = ? AND active = 1
                 """,
@@ -361,6 +557,10 @@ class HostedTenantCatalog:
             ).fetchone()
             if row is None:
                 raise PermissionError("Unknown hosted tenant.")
+            current_customer_target = row[1]
+            target = ReplacementTarget.from_replacement(
+                self.root_path, current_customer_target, replacement_db_path
+            )
             project_rows = conn.execute(
                 """
                 SELECT project_id
@@ -371,7 +571,7 @@ class HostedTenantCatalog:
                 (tenant_id,),
             ).fetchall()
             project_ids = frozenset(str(project_row[0]) for project_row in project_rows)
-            migration_scope = self._replacement_migration_scope(replacement)
+            migration_scope = self._replacement_migration_scope(target.connect_target)
             if migration_scope is None:
                 raise PermissionError("Replacement database has no migration metadata.")
             imported_tenant_id, imported_project_id = migration_scope
@@ -379,19 +579,35 @@ class HostedTenantCatalog:
                 raise PermissionError("Replacement database tenant does not match catalog tenant.")
             if imported_project_id not in project_ids:
                 raise PermissionError("Replacement database project is outside catalog tenant projects.")
-            LocalMemoryService(db_path=str(replacement), tenant_id=tenant_id).init_schema()
-            conn.execute(
-                """
-                UPDATE tenants
-                SET db_filename = ?, active = 1
-                WHERE tenant_id = ?
-                """,
-                (db_filename, tenant_id),
+            init_schema_target = (
+                str(target.connect_target) if target.kind == "local" else target.connect_target
             )
+            LocalMemoryService(db_path=init_schema_target, tenant_id=tenant_id).init_schema()
+            if target.kind == "local":
+                conn.execute(
+                    """
+                    UPDATE tenants
+                    SET db_filename = ?, active = 1, generation = generation + 1
+                    WHERE tenant_id = ?
+                    """,
+                    (target.repoint_value, tenant_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE tenants
+                    SET customer_target = ?, active = 1, generation = generation + 1
+                    WHERE tenant_id = ?
+                    """,
+                    (target.repoint_value, tenant_id),
+                )
             conn.commit()
+            db_filename = target.repoint_value if target.kind == "local" else row[0]
             return self._tenant_from_filename(conn, tenant_id, db_filename)
 
-    def _replacement_migration_scope(self, db_path: Path) -> tuple[str, str | None] | None:
+    def _replacement_migration_scope(
+        self, db_path: Path | str
+    ) -> tuple[str, str | None] | None:
         try:
             with closing(connect(db_path)) as conn:
                 row = conn.execute(
@@ -401,8 +617,18 @@ class HostedTenantCatalog:
                     WHERE id = 1
                     """
                 ).fetchone()
-        except sqlite3.DatabaseError:
-            return None
+        except (sqlite3.DatabaseError, ValueError) as exc:
+            # A missing `canonical_migration_imports` table (or otherwise
+            # unreadable replacement db) is a "no migration metadata" signal:
+            # local sqlite raises a typed `sqlite3.DatabaseError` (preserved
+            # here at its original blanket reach); the hosted libSQL backend
+            # raises a bare `ValueError` ("no such table") (ADR 0019), gated
+            # through `is_operational_error` so an unrelated `ValueError`
+            # re-raises rather than being silently swallowed. Both signals ->
+            # return None (yields a clean PermissionError upstream).
+            if isinstance(exc, sqlite3.DatabaseError) or is_operational_error(exc):
+                return None
+            raise
         if row is None:
             return None
         return str(row[0]), None if row[1] is None else str(row[1])
@@ -583,99 +809,32 @@ class HostedTenantCatalog:
         ]
 
     def _connect_control(self) -> sqlite3.Connection:
-        return _connect_control_db(self._control_db_path)
+        return _connect_control_db(self._control_target)
 
     def _init_control_plane_schema(self) -> None:
+        # Individual `execute()` calls, not `executescript()`: the latter is a
+        # `sqlite3`-only API not part of the libSQL-compatible
+        # `StorageConnection` protocol (see `vexic.storage.schema.init_db` for
+        # the same pattern on the customer-memory schema).
         with closing(self._connect_control()) as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS tenants (
-                    tenant_id TEXT PRIMARY KEY,
-                    db_filename TEXT NOT NULL UNIQUE,
-                    active INTEGER NOT NULL DEFAULT 1,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                );
-
-                CREATE TABLE IF NOT EXISTS tenant_projects (
-                    tenant_id TEXT NOT NULL,
-                    project_id TEXT NOT NULL,
-                    PRIMARY KEY (tenant_id, project_id),
-                    FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS customer_account_mappings (
-                    clerk_org_id TEXT PRIMARY KEY,
-                    tenant_id TEXT NOT NULL UNIQUE,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS hosted_projects (
-                    project_id TEXT PRIMARY KEY,
-                    tenant_id TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    environment TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS hosted_audit_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    operation TEXT NOT NULL,
-                    tenant_id TEXT,
-                    principal_id TEXT,
-                    status TEXT NOT NULL,
-                    recorded_at TEXT NOT NULL,
-                    error_type TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS hosted_usage_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    kind TEXT NOT NULL,
-                    operation TEXT NOT NULL,
-                    tenant_id TEXT,
-                    principal_id TEXT,
-                    status TEXT NOT NULL,
-                    recorded_at TEXT NOT NULL,
-                    model_requests INTEGER NOT NULL DEFAULT 0,
-                    input_tokens INTEGER NOT NULL DEFAULT 0,
-                    output_tokens INTEGER NOT NULL DEFAULT 0,
-                    total_tokens INTEGER NOT NULL DEFAULT 0,
-                    estimated_cost_micros INTEGER NOT NULL DEFAULT 0,
-                    error_type TEXT,
-                    project_id TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS hosted_job_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    job_id TEXT NOT NULL,
-                    operation TEXT NOT NULL,
-                    tenant_id TEXT NOT NULL,
-                    principal_id TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    recorded_at TEXT NOT NULL,
-                    phase TEXT,
-                    error_type TEXT
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_hosted_audit_events_tenant_id
-                    ON hosted_audit_events(tenant_id);
-                CREATE INDEX IF NOT EXISTS idx_hosted_usage_events_tenant_id
-                    ON hosted_usage_events(tenant_id);
-                CREATE INDEX IF NOT EXISTS idx_hosted_usage_events_tenant_project_recorded_at
-                    ON hosted_usage_events(tenant_id, project_id, recorded_at);
-                CREATE INDEX IF NOT EXISTS idx_hosted_usage_events_tenant_project_recorded_at_jd
-                    ON hosted_usage_events(tenant_id, project_id, julianday(recorded_at));
-                CREATE INDEX IF NOT EXISTS idx_hosted_job_events_tenant_id
-                    ON hosted_job_events(tenant_id);
-                """
-            )
+            for statement in _CONTROL_PLANE_SCHEMA_STATEMENTS:
+                conn.execute(statement)
             columns = {
                 str(row[1])
                 for row in conn.execute("PRAGMA table_info(hosted_usage_events)").fetchall()
             }
             if "project_id" not in columns:
                 conn.execute("ALTER TABLE hosted_usage_events ADD COLUMN project_id TEXT")
+            tenant_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(tenants)").fetchall()
+            }
+            if "customer_target" not in tenant_columns:
+                conn.execute("ALTER TABLE tenants ADD COLUMN customer_target TEXT")
+            if "generation" not in tenant_columns:
+                conn.execute(
+                    "ALTER TABLE tenants ADD COLUMN generation INTEGER NOT NULL DEFAULT 1"
+                )
             conn.commit()
 
     def _allocate_db_filename(self, conn: sqlite3.Connection) -> str:
@@ -757,21 +916,41 @@ class HostedTenantCatalog:
             """,
             (tenant_id,),
         ).fetchall()
+        catalog_row = conn.execute(
+            """
+            SELECT customer_target, generation
+            FROM tenants
+            WHERE tenant_id = ?
+            """,
+            (tenant_id,),
+        ).fetchone()
+        customer_target = None if catalog_row is None else catalog_row[0]
+        generation = 1 if catalog_row is None else int(catalog_row[1])
         return HostedTenant(
             tenant_id=tenant_id,
             db_path=self.root_path / db_filename,
             project_ids=frozenset(row[0] for row in project_rows),
+            customer_target=customer_target,
+            generation=generation,
         )
 
 class HostedApiKeyStore:
-    def __init__(self, root_path: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        root_path: str | Path | None = None,
+        *,
+        control_target: StorageTarget | None = None,
+    ) -> None:
         self._keys: dict[str, _HostedApiKey] = {}
         self._control_metadata: dict[str, HostedApiKeyRecord] = {}
         self.root_path = Path(root_path) if root_path is not None else None
-        self._control_db_path: Path | None = None
-        if self.root_path is not None:
+        self._control_target: str | Path | StorageTarget | None = None
+        if control_target is not None:
+            self._control_target = control_target
+            self._init_control_plane_schema()
+        elif self.root_path is not None:
             self.root_path.mkdir(parents=True, exist_ok=True)
-            self._control_db_path = self.root_path / "control-plane.db"
+            self._control_target = self.root_path / "control-plane.db"
             self._init_control_plane_schema()
 
     def create_key(
@@ -795,7 +974,7 @@ class HostedApiKeyStore:
             agent_ids=frozenset(agent_ids),
             created_at=_now(),
         )
-        if self._control_db_path is None:
+        if self._control_target is None:
             self._keys[key_id] = stored
         else:
             with closing(self._connect_control()) as conn:
@@ -840,7 +1019,7 @@ class HostedApiKeyStore:
         raise PermissionError("Invalid hosted API key.")
 
     def revoke_key(self, key_id: str, *, revoked_by: str | None = None) -> None:
-        if self._control_db_path is None:
+        if self._control_target is None:
             try:
                 stored = self._keys[key_id]
             except KeyError as exc:
@@ -908,7 +1087,7 @@ class HostedApiKeyStore:
             display=f"{prefix}...{last4}",
             created_at=stored.created_at or _now(),
         )
-        if self._control_db_path is None:
+        if self._control_target is None:
             self._control_metadata[record.key_id] = record
         else:
             try:
@@ -951,7 +1130,7 @@ class HostedApiKeyStore:
         tenant_id: str,
         project_id: str,
     ) -> list[HostedApiKeyRecord]:
-        if self._control_db_path is None:
+        if self._control_target is None:
             return [
                 replace(record, revoked_at=self._keys[record.key_id].revoked_at)
                 for record in self._control_metadata.values()
@@ -998,7 +1177,7 @@ class HostedApiKeyStore:
         key_id: str,
         revoked_by: str | None = None,
     ) -> None:
-        if self._control_db_path is None:
+        if self._control_target is None:
             record = self._control_metadata.get(key_id)
             if record is None or record.tenant_id != tenant_id or record.project_id != project_id:
                 raise PermissionError("Unknown hosted API key.")
@@ -1029,9 +1208,9 @@ class HostedApiKeyStore:
         return parts[1]
 
     def _connect_control(self) -> sqlite3.Connection:
-        if self._control_db_path is None:
+        if self._control_target is None:
             raise RuntimeError("Hosted API key store is not durable.")
-        return _connect_control_db(self._control_db_path)
+        return _connect_control_db(self._control_target)
 
     def _init_control_plane_schema(self) -> None:
         with closing(self._connect_control()) as conn:
@@ -1071,7 +1250,7 @@ class HostedApiKeyStore:
             conn.commit()
 
     def _load_key(self, key_id: str) -> _HostedApiKey:
-        if self._control_db_path is None:
+        if self._control_target is None:
             try:
                 return self._keys[key_id]
             except KeyError as exc:
@@ -1124,14 +1303,27 @@ def _nullable_strings_json(values: frozenset[str | None]) -> str:
     )
 
 
-def _connect_control_db(db_path: Path) -> sqlite3.Connection:
-    _ensure_control_db_permissions(db_path)
-    conn = connect(db_path, timeout=30)
+def _connect_control_db(target: str | Path | StorageTarget) -> sqlite3.Connection:
+    _ensure_control_db_permissions(target)
+    if isinstance(target, StorageTarget):
+        conn = connect(target)
+    else:
+        conn = connect(target, timeout=30)
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
-def _ensure_control_db_permissions(db_path: Path) -> None:
+def _ensure_control_db_permissions(target: str | Path | StorageTarget) -> None:
+    """Enforce owner-only read/write on the LOCAL control-plane database file.
+
+    A `StorageTarget` (libSQL/Turso DSN) names a remote, managed database --
+    there is no local file to `os.open`/`os.chmod`, and this is a no-op for
+    that case. Filesystem permissions only apply to a local `str`/`Path`
+    target (the default, filesystem-rooted control plane).
+    """
+    if isinstance(target, StorageTarget):
+        return
+    db_path = target
     try:
         fd = os.open(db_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, _CONTROL_DB_MODE)
     except FileExistsError:

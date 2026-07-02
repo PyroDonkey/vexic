@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage import init_db, init_vector_memory
 from vexic.storage.operators import MemoryProjectionRepairReport, repair_memory_projections
-from vexic.storage.connection import connect, row_as_dict, rows_as_dicts
+from vexic.storage.connection import StorageTarget, connect, row_as_dict, rows_as_dicts
 
 ARTIFACT_VERSION = "vexic.canonical-migration.v1"
 MIGRATION_METADATA_TABLE = "canonical_migration_imports"
@@ -272,7 +272,7 @@ def _assert_no_extra_rows(
 
 
 def _record_import_metadata(
-    target_db_path: str,
+    target_db_path: str | Path | StorageTarget,
     *,
     tenant_id: str,
     project_id: str | None,
@@ -314,7 +314,7 @@ def _load_artifact(artifact_path: str | Path) -> _CanonicalMigrationArtifact:
 
 def import_canonical_migration(
     artifact_path: str | Path,
-    target_db_path: str,
+    target_db_path: str | Path | StorageTarget,
     *,
     tenant_id: str,
     project_id: str | None,
@@ -330,10 +330,19 @@ def import_canonical_migration(
         *_iter_payload_strings(artifact.model_dump(mode="json")),
     )
 
-    target = Path(target_db_path)
-    if target.exists():
-        with closing(connect(target)) as conn:
+    # A `StorageTarget` (libSQL/Turso DSN) names a remote, managed database --
+    # there is no local file to `Path.exists()` against, so the pre-import
+    # host-owned-table check always connects for a remote target. A local
+    # path/str target keeps the existing behavior byte-identical: only probe
+    # when a file is already there (a brand-new local file has no tables yet).
+    if isinstance(target_db_path, StorageTarget):
+        with closing(connect(target_db_path)) as conn:
             _assert_no_host_owned_tables(conn)
+    else:
+        target = Path(target_db_path)
+        if target.exists():
+            with closing(connect(target)) as conn:
+                _assert_no_host_owned_tables(conn)
     init_vector_memory(target_db_path)
     rows_imported = 0
     with closing(connect(target_db_path)) as conn:
