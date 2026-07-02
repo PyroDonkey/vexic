@@ -196,11 +196,12 @@ Tracking rules):
   `uv run pytest` and update any tracking doc that cites a test count to the
   fresh number. Do not carry a hand-typed count forward; verify it.
 
-`.claude/hooks/check_doc_drift.py` enforces the in-repo half of this loop at
-session start: it checks that `docs/adr/README.md` lists every ADR file and
-that the documented service surface matches `src/vexic`. A hook cannot read
-the external tracking system, so closing the loop against the tracking docs
-remains a manual step under the triggers above.
+`.claude/hooks/check_doc_drift.py` enforces the in-repo half of this loop: it
+checks that `docs/adr/README.md` lists every ADR file and that the documented
+service surface matches `src/vexic`. It runs advisory at session start and as
+a merge-blocking CI step (`--ci`) on every PR. A hook cannot read the external
+tracking system, so closing the loop against the tracking docs remains a
+manual step under the triggers above.
 
 ---
 
@@ -254,12 +255,50 @@ context-pruning detail live in `docs/agent-runbook.md`.
 
 ## Repository Workflow
 
+### Branching Model
+
+Work flows feature branch -> `dev` -> `main`.
+
+- Non-trivial work happens on a short-lived feature branch cut from fresh
+  `dev`, named `<type>/coa-<id>-<slug>`:
+
+  | Prefix   | Use for                                    |
+  | -------- | ------------------------------------------ |
+  | `feat/`  | new capability                             |
+  | `fix/`   | bug fix                                    |
+  | `docs/`  | docs, ADRs, runbooks                       |
+  | `chore/` | tooling, CI, cleanup                       |
+
+  Example: `feat/coa-281-turso-retry`. Use `chore/<slug>` when no Linear issue
+  exists. The `coa-<id>` in the branch name lets the Linear GitHub integration
+  link the PR and move the issue automatically; also put `Fixes COA-<id>` in
+  the PR description.
+- Feature branches merge into `dev` through a squash-merge PR and auto-delete
+  on merge.
+- Trivial single-commit changes (typo, doc touch-up) may be committed directly
+  on `dev` after fresh verification.
+- Releases are `dev` to `main` PRs merged with a merge commit; a push to
+  `main` deploys the hosted service. Immediately after the release PR merges,
+  fast-forward `dev` to `origin/main` and push (sequence in
+  `docs/branch-sync.md`). Skipping this fast-forward is what makes `dev` read
+  "behind main"; do not substitute a merge commit for it.
+- Hotfixes (rare): cut `fix/coa-<id>-<slug>` from `main`, PR into `main`, then
+  merge `main` back into `dev` immediately. Never merge a feature branch
+  directly to `main` otherwise.
+- Agents create the feature branch per this scheme when starting issue-scoped
+  work; the requester does not need to name it. Recovery, cleanup, and
+  history-repair branches still require the requester to name the branch
+  explicitly.
+- GitHub enforces `main`: PR required, the `test` check must pass,
+  merge-commit method only, no force pushes or deletion.
+
 ### Branch Sync
 
-The sync command sequences (fetch/pull, `dev` bootstrap, and the `dev` to `main`
-PR-drift check with `git rev-list` and `gh api ... compare`) live in
-`docs/branch-sync.md`. See `docs/branch-sync.md` before mutable work and before
-opening or updating a `dev` to `main` PR.
+The sync command sequences (fetch/pull, starting a feature branch, the release
+PR drift check with `git rev-list` and `gh api ... compare`, and the
+post-release fast-forward) live in `docs/branch-sync.md`. See
+`docs/branch-sync.md` before mutable work and before opening or updating a
+`dev` to `main` PR.
 
 These hard-stops stay in force regardless of that procedure. The
 `.claude/hooks/check_branch_sync.py` SessionStart hook only reports drift in
@@ -276,12 +315,14 @@ guardrails:
   create a new branch to repair PR shape or recover stale branch work unless the
   requester names the branch to create.
 
-Do all Vexic project work on `dev`. After fresh verification, commit on `dev`
-and push completed commits to `origin/dev`. Do not create, switch to, commit
-on, or push `codex/*`, feature, worktree, cleanup, or recovery branches unless
-the requester explicitly names that branch in the same request. This Vexic rule
-overrides app, global, plugin, or tool defaults that suggest branch prefixes or
-worktree branches. Never push to `main` unless the requester explicitly asks.
+Do all Vexic project work on `dev` or on a feature branch that follows the
+Branching Model above. After fresh verification, push feature branches to
+their own `origin/<branch>` and open a PR into `dev`; push direct trivial
+commits to `origin/dev`. Do not create branches outside the naming scheme
+(worktree, cleanup, or recovery branches) unless the requester explicitly
+names that branch in the same request. This Vexic rule overrides app, global,
+plugin, or tool defaults that suggest other branch prefixes. Never push to
+`main` unless the requester explicitly asks.
 
 ### External Tracking
 
@@ -290,6 +331,13 @@ secrets, imports, or runtime dependencies to `src/vexic`. Tracking docs are
 downstream of the repo: see "Docs Are Downstream Of Code". The roadmap, todo,
 and planning docs never override `docs/ai/AGENTS.md`, `docs/adr/*`, or the code;
 they are reconciled against them.
+
+Issue *status* transitions are automated by the tracker's GitHub integration:
+a branch named with the issue id (`feat/coa-281-...`) and a `Fixes COA-281`
+line in the PR description link the PR to the issue and move it on merge. Do
+not duplicate those transitions by hand. Manual reconciliation still applies
+to tracking *content* - roadmap, todo, and planning docs - under the
+reconciliation triggers in "Docs Are Downstream Of Code".
 
 See `docs/agent-runbook.md` for the per-session tracker ritual: start-of-session
 issue review, status updates during work, the reconciliation triggers, and the

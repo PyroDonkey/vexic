@@ -1,6 +1,9 @@
 #!/usr/bin/env python
 """SessionStart hook: warn when in-repo docs drift from in-repo code.
 
+Also runs in CI with `--ci`: same checks, but findings go to stderr and drift
+exits 1 so a drifting PR cannot merge.
+
 Read-only. It checks two in-repo invariants and reports drift; it never edits
 files. A hook cannot read an external tracking system, so this only enforces the
 in-repo half of the "Docs Are Downstream Of Code" loop in docs/ai/AGENTS.md:
@@ -144,7 +147,7 @@ def _check_service_surface(warnings: list[str]) -> None:
         )
 
 
-def main() -> int:
+def main(ci: bool = False) -> int:
     if not REPO_ROOT.joinpath(".git").exists() and not ADR_DIR.exists():
         return 0
 
@@ -159,6 +162,19 @@ def main() -> int:
             check(warnings)
         except Exception as exc:  # fail safe: report, never block
             notes.append(f"Doc drift {label} check could not run: {exc!r}")
+
+    if ci:
+        # CI fails closed: drift blocks the merge, and a check that could not
+        # run is treated as failure rather than silently passing.
+        for line in notes + warnings:
+            print(line, file=sys.stderr)
+        if warnings or notes:
+            return 1
+        print(
+            "Doc drift check: ADR index and LocalMemoryService surface match "
+            "the in-repo source of truth."
+        )
+        return 0
 
     if not warnings and not notes:
         _emit(
@@ -181,6 +197,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if "--ci" in sys.argv[1:]:
+        # No fail-safe wrapper in CI: an unexpected error must fail the job.
+        sys.exit(main(ci=True))
     try:
         sys.exit(main())
     except Exception as exc:
