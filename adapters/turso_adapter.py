@@ -256,7 +256,13 @@ class TursoProvisioningPort:
         try:
             token = self.mint_token(name, expiration=expiration, read_only=read_only)
         except Exception:
-            self.destroy_database(name)
+            # Best-effort compensation. A failing destroy must not mask the
+            # original mint_token error, so swallow the cleanup exception and
+            # let the bare re-raise surface the root cause.
+            try:
+                self.destroy_database(name)
+            except Exception:
+                pass
             raise
         return dsn, token
 

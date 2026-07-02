@@ -172,6 +172,37 @@ def test_provision_compensates_with_destroy_when_mint_fails():
     assert methods == ["POST", "POST", "DELETE"]
 
 
+def test_provision_destroy_failure_does_not_mask_mint_error():
+    """If the compensating destroy also fails, the caller must still see the
+    original mint_token error -- not the cleanup exception.
+    """
+    org, group, name = "acme-org", "default", "tenant-a"
+
+    class FailingMintAndDestroyTransport(FakeTransport):
+        def __call__(self, method, url, headers, body):
+            parsed = urlparse(url)
+            if method == "POST" and parsed.path.endswith("/auth/tokens"):
+                self.calls.append((method, parsed.path, {}))
+                raise RuntimeError("mint token failed: 500 server error")
+            if method == "DELETE":
+                self.calls.append((method, parsed.path, {}))
+                raise RuntimeError("destroy failed: 500 server error")
+            return super().__call__(method, url, headers, body)
+
+    transport = FailingMintAndDestroyTransport(
+        {
+            ("POST", f"/v1/organizations/{org}/databases"): (200, _create_body(name, org)),
+        }
+    )
+    port = TursoProvisioningPort(org, group, http_call=transport, platform_token=PLATFORM_TOKEN)
+
+    with pytest.raises(RuntimeError, match="mint token failed"):
+        port.provision(name)
+
+    methods = [call[0] for call in transport.calls]
+    assert methods == ["POST", "POST", "DELETE"]
+
+
 def test_create_database_non_2xx_raises_without_leaking_token():
     org, group, name = "acme-org", "default", "tenant-a"
     transport = FakeTransport(
