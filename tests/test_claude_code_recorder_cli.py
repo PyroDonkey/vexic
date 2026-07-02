@@ -756,7 +756,7 @@ class ClaudeCodeSetupTests(unittest.TestCase):
                 [
                     "run",
                     "--with-editable",
-                    str(repo_root),
+                    f"{repo_root}[local-embed]",
                     "python",
                     str(launcher),
                     "--recorder-config",
@@ -1251,7 +1251,7 @@ class ClaudeCodeSetupTests(unittest.TestCase):
             self.assertIn(repo_root.replace("\\", "/"), hook_command)
             self.assertEqual(server["command"], str(uv_path))
             self.assertIn("--with-editable", server["args"])
-            self.assertIn(repo_root, server["args"])
+            self.assertIn(f"{repo_root}[local-embed]", server["args"])
             self.assertNotIn(str(setup_python), json.dumps(mcp_config))
 
     def test_top_level_setup_rejects_missing_uv_before_writing_setup_files(self) -> None:
@@ -1845,7 +1845,7 @@ class ClaudeCodeRecorderPrimeCommandTests(unittest.TestCase):
                 ["/v1/search_long_term", "/v1/search_transcript"],
             )
             for request, timeout in calls:
-                self.assertEqual(timeout, 5.0)
+                self.assertEqual(timeout, 15.0)
                 self.assertEqual(request.get_header("Authorization"), "Bearer vx_secret")
                 self.assertEqual(request.get_header("X-vexic-project-id"), "project-a")
                 self.assertEqual(request.get_header("X-vexic-session-id"), "session-a")

@@ -18,7 +18,7 @@ class HostedIngestConfig:
     project_id: str
     session_id: str
     agent_id: str | None
-    timeout_seconds: float = 10.0
+    timeout_seconds: float = 30.0
 
 
 def post_source_messages(
