@@ -803,7 +803,7 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                     PromotionDecision(
                         agent_a_candidate_id,
                         _unit_vector(1.0),
-                        retired_fact_id=999,
+                        retired_fact_ids=(999,),
                     ),
                     "Missing retiring fact",
                 ),
@@ -820,7 +820,7 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                     PromotionDecision(
                         agent_a_candidate_id,
                         _unit_vector(1.0),
-                        retired_fact_id=agent_b_fact_id,
+                        retired_fact_ids=(agent_b_fact_id,),
                     ),
                     "agent scope",
                 ),

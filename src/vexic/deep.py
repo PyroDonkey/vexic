@@ -58,7 +58,7 @@ def build_contradiction_agent(
 @dataclass(frozen=True)
 class _PendingPromotion:
     candidate: PromotionCandidate
-    retired_fact_id: int | None = None
+    retired_fact_ids: tuple[int, ...] = ()
     retired_candidate_ids: tuple[int, ...] = ()
 
 
@@ -258,8 +258,8 @@ async def run_deep_phase(
                     candidate_retired = True
                 if candidate_retired:
                     continue
-                retired_fact_id = (
-                    contradicted_neighbors[0].fact_id if contradicted_neighbors else None
+                retired_fact_ids = tuple(
+                    neighbor.fact_id for neighbor in contradicted_neighbors
                 )
 
                 retired_candidate_ids: list[int] = []
@@ -282,7 +282,7 @@ async def run_deep_phase(
                     surviving_pending.append(
                         _PendingPromotion(
                             candidate=pending.candidate,
-                            retired_fact_id=pending.retired_fact_id,
+                            retired_fact_ids=pending.retired_fact_ids,
                             retired_candidate_ids=(
                                 *pending.retired_candidate_ids,
                                 candidate.candidate_id,
@@ -300,7 +300,7 @@ async def run_deep_phase(
                     *surviving_pending,
                     _PendingPromotion(
                         candidate=candidate,
-                        retired_fact_id=retired_fact_id,
+                        retired_fact_ids=retired_fact_ids,
                         retired_candidate_ids=tuple(sorted(set(retired_candidate_ids))),
                     ),
                 ]
@@ -310,7 +310,7 @@ async def run_deep_phase(
                     PromotionDecision(
                         candidate_id=pending.candidate.candidate_id,
                         embedding=pending.candidate.embedding,
-                        retired_fact_id=pending.retired_fact_id,
+                        retired_fact_ids=pending.retired_fact_ids,
                         retired_candidate_ids=pending.retired_candidate_ids,
                     )
                 )

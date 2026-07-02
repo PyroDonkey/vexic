@@ -25,6 +25,7 @@ from vexic.mcp_stdio import (
     _tool_error,
     _tool_text,
 )
+from vexic.ports import HostPortNotConfigured
 from vexic.redaction import assert_no_forbidden_secret_values_in_payload
 
 
@@ -254,8 +255,11 @@ async def _call_tool(
         return _tool_error(f"unknown tool: {name}")
     except HostedRateLimitExceeded:
         raise
-    except Exception as exc:
+    except (HostPortNotConfigured, PermissionError, ValueError) as exc:
+        # Deliberate operator/caller-facing messages; safe to echo.
         return _tool_error(str(exc))
+    except Exception:
+        return _tool_error("Hosted memory request failed.")
 
 
 def _scope_from_headers(request: Request, auth: HostedAuthContext) -> MemoryScope:

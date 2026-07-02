@@ -1,7 +1,7 @@
 "use client";
 
 import { Copy, KeyRound, ShieldCheck, SlidersHorizontal, Trash2 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { BarList } from "@/components/tremor/bar-list";
@@ -72,6 +72,9 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
   const [projectLoadState, setProjectLoadState] = useState<LoadState>("loading");
   const [keysLoadState, setKeysLoadState] = useState<LoadState>("loading");
   const [usageLoadState, setUsageLoadState] = useState<LoadState>("loading");
+  // Bumped by every loadKeys call and by createKey, so an in-flight key-list
+  // fetch that resolves after a newer write cannot clobber the fresher state.
+  const keysRequestSeq = useRef(0);
 
   async function loadProject() {
     try {
@@ -88,14 +91,17 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
   }
 
   async function loadKeys() {
+    const seq = ++keysRequestSeq.current;
     try {
       setKeysLoadState("loading");
       const response = await fetch(`/api/control-plane/projects/${projectId}/keys`, { cache: "no-store" });
       if (!response.ok) throw new Error(`Key list failed with ${response.status}`);
       const data = (await response.json()) as { keys: AgentKey[] };
+      if (seq !== keysRequestSeq.current) return;
       setKeys(data.keys);
       setKeysLoadState("ready");
     } catch {
+      if (seq !== keysRequestSeq.current) return;
       setKeysLoadState("error");
       toast.error("Agent API Keys failed to load.");
     }
@@ -145,6 +151,7 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
     }
 
     const data = (await response.json()) as { rawKey: string; key: AgentKey };
+    keysRequestSeq.current += 1;
     setRawKey(data.rawKey);
     setCreatedKey(data.key);
     setKeys((current) => [data.key, ...current.filter((key) => key.id !== data.key.id)]);

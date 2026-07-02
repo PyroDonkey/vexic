@@ -103,9 +103,14 @@ async function errorForResponse(response, url) {
     return new ControlPlaneClientError(409, "conflict", upstreamMessage ?? "Control-plane write conflict.");
   }
 
-  if (response.status === 401 || response.status === 403 || response.status >= 500) {
+  if (response.status === 429) {
     logUpstreamFailure(response.status, upstreamCode, url);
+    return new ControlPlaneClientError(429, "rate_limited", upstreamMessage ?? "Control plane rate limit exceeded.");
   }
+
+  // Anything else is unexpected; always log so outages, quota denials, and
+  // auth failures are distinguishable in server logs.
+  logUpstreamFailure(response.status, upstreamCode, url);
   return new ControlPlaneClientError(500, "control_plane_unavailable", "Control plane is unavailable.");
 }
 

@@ -373,7 +373,11 @@ async def handle_jsonrpc_message(
         return _response(
             message_id,
             {
-                "protocolVersion": requested_version or MCP_PROTOCOL_VERSION,
+                "protocolVersion": (
+                    requested_version
+                    if requested_version == MCP_PROTOCOL_VERSION
+                    else MCP_PROTOCOL_VERSION
+                ),
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {
                     "name": "vexic-local-memory",
