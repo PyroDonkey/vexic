@@ -119,7 +119,7 @@ def _parser() -> argparse.ArgumentParser:
     ingest.add_argument("--project-id")
     ingest.add_argument("--session-id")
     ingest.add_argument("--agent-id")
-    ingest.add_argument("--timeout-seconds", type=float, default=10.0)
+    ingest.add_argument("--timeout-seconds", type=float, default=30.0)
     ingest.add_argument("--forbidden-value", action="append", default=[])
     ingest.add_argument("--status-path", type=Path)
 
@@ -131,7 +131,7 @@ def _parser() -> argparse.ArgumentParser:
     prime.add_argument("--project-id")
     prime.add_argument("--session-id")
     prime.add_argument("--agent-id")
-    prime.add_argument("--timeout-seconds", type=float, default=5.0)
+    prime.add_argument("--timeout-seconds", type=float, default=15.0)
     prime.add_argument("--max-chars", type=int, default=DEFAULT_PRIME_MAX_CHARS)
     prime.add_argument("--status-path", type=Path)
 

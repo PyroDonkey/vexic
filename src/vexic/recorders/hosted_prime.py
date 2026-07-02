@@ -21,7 +21,7 @@ class HostedPrimeConfig:
     project_id: str
     session_id: str
     agent_id: str | None
-    timeout_seconds: float = 5.0
+    timeout_seconds: float = 15.0
 
 
 def fetch_prime_context(
