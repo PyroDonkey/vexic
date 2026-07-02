@@ -87,7 +87,9 @@ def register_control_plane_routes(
     ) -> JSONResponse:
         if not _has_control_plane_credential(request, control_plane_tokens):
             return _error_response(401, "unauthorized", "Invalid control-plane credential.")
-        tenant_id = _provision_control_tenant(service, clerk_org_id)
+        tenant_id = _resolve_control_tenant(service, clerk_org_id)
+        if tenant_id is None:
+            return JSONResponse({"projects": []})
         projects = service.catalog.list_control_projects(tenant_id)
         return JSONResponse({"projects": [_project_payload(project) for project in projects]})
 
@@ -120,7 +122,9 @@ def register_control_plane_routes(
     ) -> JSONResponse:
         if not _has_control_plane_credential(request, control_plane_tokens):
             return _error_response(401, "unauthorized", "Invalid control-plane credential.")
-        tenant_id = _provision_control_tenant(service, clerk_org_id)
+        tenant_id = _resolve_control_tenant(service, clerk_org_id)
+        if tenant_id is None:
+            return _error_response(404, "not_found", "Project not found.")
         try:
             project = service.catalog.get_control_project(tenant_id, project_id)
         except PermissionError:
@@ -160,7 +164,9 @@ def register_control_plane_routes(
     ) -> JSONResponse:
         if not _has_control_plane_credential(request, control_plane_tokens):
             return _error_response(401, "unauthorized", "Invalid control-plane credential.")
-        tenant_id = _provision_control_tenant(service, clerk_org_id)
+        tenant_id = _resolve_control_tenant(service, clerk_org_id)
+        if tenant_id is None:
+            return _error_response(404, "not_found", "Project not found.")
         try:
             service.catalog.get_control_project(tenant_id, project_id)
         except PermissionError:
@@ -213,7 +219,9 @@ def register_control_plane_routes(
     ) -> Response:
         if not _has_control_plane_credential(request, control_plane_tokens):
             return _error_response(401, "unauthorized", "Invalid control-plane credential.")
-        tenant_id = _provision_control_tenant(service, clerk_org_id)
+        tenant_id = _resolve_control_tenant(service, clerk_org_id)
+        if tenant_id is None:
+            return _error_response(404, "not_found", "Key not found.")
         try:
             service.api_keys.revoke_control_plane_key(
                 tenant_id=tenant_id,
@@ -233,8 +241,18 @@ def register_control_plane_routes(
     ) -> JSONResponse:
         if not _has_control_plane_credential(request, control_plane_tokens):
             return _error_response(401, "unauthorized", "Invalid control-plane credential.")
-        tenant_id = _provision_control_tenant(service, clerk_org_id)
+        tenant_id = _resolve_control_tenant(service, clerk_org_id)
         period_start, period_end = _usage_period()
+        if tenant_id is None:
+            return JSONResponse(
+                {
+                    "usage": _usage_payload(
+                        [],
+                        period_start=period_start,
+                        period_end=period_end,
+                    )
+                }
+            )
         events = service.catalog.usage_events(
             tenant_id,
             recorded_at_gte=period_start,
@@ -259,7 +277,9 @@ def register_control_plane_routes(
     ) -> JSONResponse:
         if not _has_control_plane_credential(request, control_plane_tokens):
             return _error_response(401, "unauthorized", "Invalid control-plane credential.")
-        tenant_id = _provision_control_tenant(service, clerk_org_id)
+        tenant_id = _resolve_control_tenant(service, clerk_org_id)
+        if tenant_id is None:
+            return _error_response(404, "not_found", "Project not found.")
         try:
             service.catalog.get_control_project(tenant_id, project_id)
         except PermissionError:
@@ -417,6 +437,18 @@ def _provision_control_tenant(service: HostedMemoryService, clerk_org_id: str) -
         # SQL failure surfaces as a bare `ValueError` (ADR 0019). Let it
         # propagate to the storage boundary for 409/503/500 classification
         # instead of mis-wrapping it as an HTTP 400 domain-validation error.
+        if is_unique_violation(exc) or is_operational_error(exc):
+            raise
+        raise _ControlPlaneBadRequest(str(exc)) from exc
+
+
+def _resolve_control_tenant(
+    service: HostedMemoryService,
+    clerk_org_id: str,
+) -> str | None:
+    try:
+        return service.catalog.resolve_customer_tenant(clerk_org_id)
+    except ValueError as exc:
         if is_unique_violation(exc) or is_operational_error(exc):
             raise
         raise _ControlPlaneBadRequest(str(exc)) from exc
