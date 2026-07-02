@@ -11,14 +11,15 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
 COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src ./src
+COPY adapters ./adapters
 
 RUN uv sync --frozen --no-dev --extra hosted
 RUN useradd --uid 10001 --create-home --user-group --shell /usr/sbin/nologin vexic \
     && mkdir -p /data/vexic \
     && chown -R vexic:vexic /data/vexic
 
-ENV PYTHONPATH=/app/src
-RUN PYTHONPATH="/app/src${PYTHONPATH:+:$PYTHONPATH}" uv run --no-sync python -c "from uvicorn.importer import import_from_string; import_from_string('vexic.hosted_control_plane_http:create_app')"
+ENV PYTHONPATH=/app/src:/app
+RUN PYTHONPATH="/app/src:/app${PYTHONPATH:+:$PYTHONPATH}" uv run --no-sync python -c "from uvicorn.importer import import_from_string; import_from_string('vexic.hosted_control_plane_http:create_app'); import adapters.turso_adapter"
 
 EXPOSE 8000
 

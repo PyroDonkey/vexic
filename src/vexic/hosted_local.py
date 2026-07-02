@@ -10,6 +10,7 @@ from contextlib import closing, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urlsplit
 
 from vexic.contract import MemoryCapability, Principal, PrincipalType
@@ -259,9 +260,11 @@ class HostedTenantCatalog:
         root_path: str | Path,
         *,
         control_target: StorageTarget | None = None,
+        customer_target_factory: Callable[[str], str] | None = None,
     ) -> None:
         self.root_path = Path(root_path)
         self.root_path.mkdir(parents=True, exist_ok=True)
+        self._customer_target_factory = customer_target_factory
         self._control_target: str | Path | StorageTarget = (
             control_target
             if control_target is not None
@@ -285,7 +288,7 @@ class HostedTenantCatalog:
         with closing(self._connect_control()) as conn:
             row = conn.execute(
                 """
-                SELECT db_filename, active
+                SELECT db_filename, active, customer_target
                 FROM tenants
                 WHERE tenant_id = ?
                 """,
@@ -293,18 +296,24 @@ class HostedTenantCatalog:
             ).fetchone()
             if row is None:
                 db_filename = self._allocate_db_filename(conn)
+                target = self._new_customer_target(tenant_id, customer_target)
                 conn.execute(
                     """
                     INSERT INTO tenants (tenant_id, db_filename, active, customer_target)
                     VALUES (?, ?, 0, ?)
                     """,
-                    (tenant_id, db_filename, customer_target),
+                    (tenant_id, db_filename, target),
                 )
                 conn.commit()
                 needs_customer_init = True
             else:
                 db_filename = row[0]
                 needs_customer_init = not bool(row[1])
+                target = (
+                    self._new_customer_target(tenant_id, customer_target)
+                    if customer_target is not None or row[2] is None
+                    else None
+                )
             if needs_customer_init:
                 tenant_db_path = self.root_path / db_filename
                 LocalMemoryService(db_path=str(tenant_db_path), tenant_id=tenant_id).init_schema()
@@ -316,14 +325,14 @@ class HostedTenantCatalog:
                 """,
                 (tenant_id,),
             )
-            if customer_target is not None:
+            if target is not None:
                 conn.execute(
                     """
                     UPDATE tenants
                     SET customer_target = ?
                     WHERE tenant_id = ?
                     """,
-                    (customer_target, tenant_id),
+                    (target, tenant_id),
                 )
             self._insert_projects(conn, tenant_id, project_ids)
             conn.commit()
@@ -345,12 +354,13 @@ class HostedTenantCatalog:
             if row is None:
                 tenant_id = self._allocate_tenant_id(conn)
                 db_filename = self._allocate_db_filename(conn)
+                customer_target = self._new_customer_target(tenant_id, None)
                 conn.execute(
                     """
-                    INSERT INTO tenants (tenant_id, db_filename, active)
-                    VALUES (?, ?, 0)
+                    INSERT INTO tenants (tenant_id, db_filename, active, customer_target)
+                    VALUES (?, ?, 0, ?)
                     """,
-                    (tenant_id, db_filename),
+                    (tenant_id, db_filename, customer_target),
                 )
                 conn.execute(
                     """
@@ -364,6 +374,32 @@ class HostedTenantCatalog:
             conn.commit()
         self.provision_tenant(tenant_id)
         return tenant_id
+
+    def provision_missing_customer_targets(self) -> list[HostedTenant]:
+        if self._customer_target_factory is None:
+            return []
+        with closing(self._connect_control()) as conn:
+            rows = conn.execute(
+                """
+                SELECT tenant_id, db_filename
+                FROM tenants
+                WHERE active = 1 AND customer_target IS NULL
+                ORDER BY tenant_id
+                """
+            ).fetchall()
+        provisioned: list[HostedTenant] = []
+        for tenant_id, _db_filename in rows:
+            provisioned.append(self.provision_tenant(str(tenant_id)))
+        return provisioned
+
+    def _new_customer_target(
+        self,
+        tenant_id: str,
+        customer_target: str | None,
+    ) -> str | None:
+        if customer_target is not None or self._customer_target_factory is None:
+            return customer_target
+        return self._customer_target_factory(tenant_id)
 
     def resolve_customer_tenant(self, clerk_org_id: str) -> str | None:
         if not clerk_org_id.strip():
