@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -941,8 +942,11 @@ def add_run_dream_phase_subcommand(
     run_phase = subcommands.add_parser("run-dream-phase")
     run_phase.add_argument("--root")
     run_phase.add_argument("--api-key-env", default="VEXIC_API_KEY")
-    run_phase.add_argument("--adapter", required=True)
-    run_phase.add_argument("--model-group", required=True)
+    run_phase.add_argument("--adapter", help=f"defaults to {DREAM_PHASE_ADAPTER_ENV}")
+    run_phase.add_argument(
+        "--model-group",
+        help=f"defaults to {DREAM_PHASE_MODEL_GROUP_ENV} or {DEFAULT_DREAM_PHASE_MODEL_GROUP!r}",
+    )
     run_phase.add_argument("--tenant-id", required=True)
     run_phase.add_argument("--project-id")
     run_phase.add_argument("--session-id")
@@ -1035,6 +1039,42 @@ def _secret_env_values(names: list[str]) -> dict[str, str] | None:
     return secrets_by_name or None
 
 
+DREAM_PHASE_ADAPTER_ENV = "VEXIC_DREAM_PHASE_ADAPTER"
+DREAM_PHASE_MODEL_GROUP_ENV = "VEXIC_DREAM_PHASE_MODEL_GROUP"
+DEFAULT_DREAM_PHASE_MODEL_GROUP = "hosted-dream"
+
+
+def dream_phase_ports_from_env(env: Mapping[str, str]) -> DreamPhasePorts | None:
+    """Build dream-phase ports from non-secret deploy configuration.
+
+    Reads only the host adapter *file path* and model group name; provider
+    secrets stay inside the adapter module itself (which reads its own
+    environment, e.g. ``OPENROUTER_API_KEY``), never in ``src/vexic``. An
+    unset/blank adapter path returns ``None`` so every model-backed operation
+    keeps failing closed with ``HostPortNotConfigured``. A configured but
+    unloadable adapter raises at service build time so a misconfigured deploy
+    fails loudly instead of serving with silently-missing ports.
+    """
+    adapter_path = env.get(DREAM_PHASE_ADAPTER_ENV, "").strip()
+    if not adapter_path:
+        return None
+    adapter = _load_dream_phase_adapter(Path(adapter_path))
+    return DreamPhasePorts(
+        model_group=_dream_phase_model_group(env),
+        embed=adapter.embed_texts,
+        extraction_agent_factory=adapter.build_extraction_agent,
+        rem_agent_factory=adapter.build_rem_agent,
+        contradiction_agent_factory=adapter.build_contradiction_agent,
+    )
+
+
+def _dream_phase_model_group(env: Mapping[str, str]) -> str:
+    return (
+        env.get(DREAM_PHASE_MODEL_GROUP_ENV, "").strip()
+        or DEFAULT_DREAM_PHASE_MODEL_GROUP
+    )
+
+
 def _load_dream_phase_adapter(path: Path) -> ModuleType:
     if not path.exists():
         raise missing_host_port("Dream phase adapter")
@@ -1061,9 +1101,15 @@ def _load_dream_phase_adapter(path: Path) -> ModuleType:
 
 
 def _dream_phase_ports(args: argparse.Namespace) -> DreamPhasePorts:
-    adapter = _load_dream_phase_adapter(Path(args.adapter))
+    adapter_path = args.adapter or os.environ.get(DREAM_PHASE_ADAPTER_ENV, "").strip()
+    if not adapter_path:
+        raise missing_host_port(
+            "Dream phase adapter",
+            hint=f"Pass --adapter or set {DREAM_PHASE_ADAPTER_ENV}.",
+        )
+    adapter = _load_dream_phase_adapter(Path(adapter_path))
     return DreamPhasePorts(
-        model_group=args.model_group,
+        model_group=args.model_group or _dream_phase_model_group(os.environ),
         embed=adapter.embed_texts,
         extraction_agent_factory=adapter.build_extraction_agent,
         rem_agent_factory=adapter.build_rem_agent,

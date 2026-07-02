@@ -412,6 +412,24 @@ Required Railway config:
 - Persistent volume mounted at `/data/vexic`
 - Health check path: `/health`
 
+Dream-phase / embedding model port config (optional; unset keeps every
+model-backed operation, including the `search_long_term` vector path, failing
+closed with `HostPortNotConfigured`):
+
+- `VEXIC_DREAM_PHASE_ADAPTER=/app/adapters/openrouter_live_adapter.py` — path
+  to a host adapter module baked into the image; loading it wires
+  `DreamPhasePorts` (embedding plus Light/REM/Deep agents) into the deployed
+  service at startup. A configured-but-unloadable adapter fails the deploy
+  loudly at app startup.
+- `VEXIC_DREAM_PHASE_MODEL_GROUP` — optional model group name, default
+  `hosted-dream`.
+- `OPENROUTER_API_KEY=<platform key>` — read only by the adapter module,
+  never by `src/vexic`.
+- Optional model selection read by the adapter: `VEXIC_LIVE_EMBEDDING_MODEL`
+  (default `openai/text-embedding-3-small`), `VEXIC_LIVE_MODEL` (default
+  `openai/gpt-4o-mini`), or a per-group override such as
+  `VEXIC_LIVE_HOSTED_DREAM_MODEL` for the `hosted-dream` group.
+
 GitHub Actions deploy trigger:
 
 - `.github/workflows/deploy-hosted.yml` runs on pushes to `main` and manual
@@ -463,13 +481,24 @@ Run one hosted dream phase through a host-owned adapter:
 
 ```powershell
 $env:VEXIC_API_KEY = "<raw-key>"
-uv run --no-sync python -m vexic.hosted_http run-dream-phase --root /data/vexic --api-key-env VEXIC_API_KEY --adapter /data/vexic/dream_phase_adapter.py --model-group hosted-alpha --tenant-id tenant-a --project-id project-a --session-id session-a --agent-id agent-a --phase light
+uv run --no-sync python -m vexic.hosted_http run-dream-phase --root /data/vexic --api-key-env VEXIC_API_KEY --adapter /app/adapters/openrouter_live_adapter.py --model-group hosted-dream --tenant-id tenant-a --project-id project-a --session-id session-a --agent-id agent-a --phase light
 ```
 
-The adapter file must define `embed_texts`, `build_extraction_agent`,
+`--adapter` defaults to `VEXIC_DREAM_PHASE_ADAPTER` and `--model-group` to
+`VEXIC_DREAM_PHASE_MODEL_GROUP` (then `hosted-dream`), so in a deployed
+environment that already carries the dream-phase env config both flags may be
+omitted. The adapter file must define `embed_texts`, `build_extraction_agent`,
 `build_rem_agent`, and `build_contradiction_agent`. Provider secrets stay in
 the host environment; pass secret variable names with `--secret-env NAME` when
 Vexic should include those values in redaction checks.
+
+Dream-phase trigger, recorded: the current trigger is this documented manual
+CLI run, executed in the deployed environment (Railway one-off command against
+the same volume/env) per scope and phase after transcripts have been recorded.
+A scheduled background worker remains the target and is deliberately deferred
+until the dream-phase concurrency lock and the tenant model-credential
+strategy land; running unattended on the platform key without spend caps is
+not acceptable yet.
 
 Revoke a throwaway key by key id, not by raw key:
 
