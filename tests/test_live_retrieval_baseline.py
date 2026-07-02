@@ -228,7 +228,7 @@ class LiveRetrievalBaselineTests(unittest.TestCase):
         adapter.write_text(
             textwrap.dedent(
                 """
-                from vexic.models import ContradictionJudgment, FactCandidate, RemBoost, RemBoostPlan
+                from vexic.models import ContradictionJudgment, FactCandidate
 
                 class _Result:
                     def __init__(self, output):
@@ -261,19 +261,12 @@ class LiveRetrievalBaselineTests(unittest.TestCase):
                             ]
                         )
 
-                class _RemAgent:
-                    async def run(self, prompt):
-                        return _Result(RemBoostPlan(boosts=[RemBoost(candidate_id=1, boost=0.2)]))
-
                 class _ContradictionAgent:
                     async def run(self, prompt):
                         return _Result(ContradictionJudgment(contradicts=False, confidence=0.9))
 
                 def build_extraction_agent(model_group, secrets=None):
                     return _ExtractionAgent()
-
-                def build_rem_agent(model_group, secrets=None):
-                    return _RemAgent()
 
                 def build_contradiction_agent(model_group, secrets=None):
                     return _ContradictionAgent()
@@ -357,9 +350,6 @@ class LiveRetrievalBaselineTests(unittest.TestCase):
                 def build_extraction_agent(model_group, secrets=None):
                     return _ExtractionAgent()
 
-                def build_rem_agent(model_group, secrets=None):
-                    raise AssertionError("REM should not run")
-
                 def build_contradiction_agent(model_group, secrets=None):
                     raise AssertionError("Deep should not run")
 
@@ -419,9 +409,6 @@ class LiveRetrievalBaselineTests(unittest.TestCase):
 
                 def build_extraction_agent(model_group, secrets=None):
                     return _ExtractionAgent()
-
-                def build_rem_agent(model_group, secrets=None):
-                    raise AssertionError("REM should not run")
 
                 def build_contradiction_agent(model_group, secrets=None):
                     raise AssertionError("Deep should not run")

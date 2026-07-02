@@ -41,12 +41,7 @@ def _padded_vector(*components: float) -> list[float]:
 
 
 def _rem_candidate(candidate_id: int, embedding: list[float] | None) -> RemCandidate:
-    return RemCandidate(
-        candidate_id=candidate_id,
-        fact_text=f"Ryan cedar fact {candidate_id}.",
-        category="fact",
-        embedding=embedding,
-    )
+    return RemCandidate(candidate_id=candidate_id, embedding=embedding)
 
 
 class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):

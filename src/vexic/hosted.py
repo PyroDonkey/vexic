@@ -1063,7 +1063,6 @@ def dream_phase_ports_from_env(env: Mapping[str, str]) -> DreamPhasePorts | None
         model_group=_dream_phase_model_group(env),
         embed=adapter.embed_texts,
         extraction_agent_factory=adapter.build_extraction_agent,
-        rem_agent_factory=adapter.build_rem_agent,
         contradiction_agent_factory=adapter.build_contradiction_agent,
     )
 
@@ -1092,7 +1091,6 @@ def _load_dream_phase_adapter(path: Path) -> ModuleType:
     for name in (
         "embed_texts",
         "build_extraction_agent",
-        "build_rem_agent",
         "build_contradiction_agent",
     ):
         if not callable(getattr(module, name, None)):
@@ -1112,7 +1110,6 @@ def _dream_phase_ports(args: argparse.Namespace) -> DreamPhasePorts:
         model_group=args.model_group or _dream_phase_model_group(os.environ),
         embed=adapter.embed_texts,
         extraction_agent_factory=adapter.build_extraction_agent,
-        rem_agent_factory=adapter.build_rem_agent,
         contradiction_agent_factory=adapter.build_contradiction_agent,
         secrets=_secret_env_values(args.secret_env),
     )

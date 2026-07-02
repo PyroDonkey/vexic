@@ -87,13 +87,11 @@ class CandidateNote:
 
 @dataclass(frozen=True)
 class RemCandidate:
-    # Minimal REM input: the id, the classification surface, and the stored
-    # embedding the centrality heuristic scores against -- None when the vector
-    # is missing (e.g. an interrupted Light repair), which scores 0.0 and
-    # resets any stale boost. No provenance, counters, or lifecycle flags.
+    # Minimal REM input: the id and the stored embedding the centrality
+    # heuristic scores against -- None when the vector is missing (e.g. an
+    # interrupted Light repair), which scores 0.0 and resets any stale boost.
+    # No text, provenance, counters, or lifecycle flags.
     candidate_id: int
-    fact_text: str
-    category: str
     embedding: list[float] | None = None
 
 
@@ -826,7 +824,7 @@ def load_rem_candidates(db_path: str, *, agent_id: str | None) -> list[RemCandid
         # boost from an earlier cycle.
         rows = conn.execute(
             """
-            SELECT c.id, c.fact_text, c.category, e.embedding
+            SELECT c.id, e.embedding
             FROM memory_candidates AS c
             LEFT JOIN memory_candidate_embeddings AS e ON e.candidate_id = c.id
             WHERE c.promoted = 0
@@ -842,9 +840,7 @@ def load_rem_candidates(db_path: str, *, agent_id: str | None) -> list[RemCandid
     return [
         RemCandidate(
             candidate_id=int(row[0]),
-            fact_text=str(row[1]),
-            category=str(row[2]),
-            embedding=None if row[3] is None else _embedding_blob_to_list(row[3]),
+            embedding=None if row[1] is None else _embedding_blob_to_list(row[1]),
         )
         for row in rows
     ]

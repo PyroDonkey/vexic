@@ -272,7 +272,6 @@ def _load_adapter(path: Path) -> ModuleType:
     spec.loader.exec_module(module)
     for name in (
         "build_extraction_agent",
-        "build_rem_agent",
         "build_contradiction_agent",
         "embed_texts",
     ):

@@ -15,7 +15,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
 
 from vexic.embeddings import EMBEDDING_DIM
-from vexic.models import ContradictionJudgment, FactCandidate, RemBoostPlan
+from vexic.models import ContradictionJudgment, FactCandidate
 
 
 PROVIDER = "openrouter"
@@ -29,12 +29,6 @@ Use the closed category vocabulary exactly: preference, fact, goal, event,
 relationship, skill, constraint, context.
 Every candidate must include source_message_ids from the [message_id=N] markers.
 Return an empty list when there are no durable user facts.\
-"""
-
-REM_INSTRUCTIONS = """\
-Assign reinforcement boosts only for candidate_id values present in the prompt.
-Use 0 for isolated or weak candidates and higher values for mutually reinforcing
-or important candidates. Do not invent, rewrite, promote, or retire facts.\
 """
 
 CONTRADICTION_INSTRUCTIONS = """\
@@ -142,14 +136,6 @@ def build_extraction_agent(
 ) -> Agent[None, list[FactCandidate]]:
     _reject_passed_secrets(secrets)
     return _agent(model_group, list[FactCandidate], EXTRACTION_INSTRUCTIONS)
-
-
-def build_rem_agent(
-    model_group: str,
-    secrets: Mapping[str, str] | None = None,
-) -> Agent[None, RemBoostPlan]:
-    _reject_passed_secrets(secrets)
-    return _agent(model_group, RemBoostPlan, REM_INSTRUCTIONS)
 
 
 def build_contradiction_agent(
