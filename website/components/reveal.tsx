@@ -11,10 +11,14 @@ import { useEffect, useRef, type ReactNode } from "react";
 export function Reveal({
   children,
   delay = 0,
+  variant = "rise",
   className = ""
 }: {
   children: ReactNode;
   delay?: number;
+  /** "rise" for list content entering the flow; "fade" for artifact panels
+      that should appear in place. */
+  variant?: "rise" | "fade";
   className?: string;
 }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -41,6 +45,7 @@ export function Reveal({
             }
             el.style.transitionDelay = `${delay}s`;
             el.classList.add("reveal-hidden");
+            if (variant === "fade") el.classList.add("reveal-fade");
             return;
           }
           if (entry.isIntersecting) {
@@ -53,7 +58,7 @@ export function Reveal({
     );
     observer.observe(el);
     return () => observer.disconnect();
-  }, [delay]);
+  }, [delay, variant]);
 
   return (
     <div ref={ref} className={className}>

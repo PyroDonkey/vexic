@@ -39,12 +39,12 @@ const FEATURES = [
     body: "A persistence and egress secret guard applies forbidden-value redaction before anything is stored or leaves the boundary."
   },
   {
-    title: "Local-first SQLite",
-    body: "A Python core with a SQLite reference service and conformance tests. Run it on your machine today; hosted integrations are the path, not the requirement."
+    title: "Managed pipeline",
+    body: "Ingestion, extraction passes, and index rebuilds run as a service. Your agents call one endpoint; durability, migrations, and reindexing are Vexic's job, not yours."
   },
   {
     title: "Read-only MCP",
-    body: "Expose transcript and long-term search to agents over stdio or hosted HTTP MCP. Writes, export, and admin tools stay deliberately out of reach."
+    body: "Expose transcript and long-term search to agents over hosted HTTP MCP. Writes, export, and admin tools stay deliberately out of reach."
   }
 ] as const;
 
@@ -55,11 +55,11 @@ const INTEGRATIONS = [
   },
   {
     name: "Codex",
-    body: "Drop a TOML block into your Codex MCP config and point it at the stdio launcher. Scoped, read-only search from any Codex session."
+    body: "Drop a TOML block into your Codex MCP config and point it at your Vexic endpoint. Scoped, read-only search from any Codex session."
   },
   {
     name: "MCP",
-    body: "Standard Model Context Protocol, stdio or streamable HTTP. Any MCP-capable agent gets search_transcript and search_long_term — nothing more."
+    body: "Standard Model Context Protocol over streamable HTTP. Any MCP-capable agent gets search_transcript and search_long_term — nothing more."
   }
 ] as const;
 
@@ -72,15 +72,15 @@ export default function HomePage() {
           <div className="flex flex-col items-start">
             <p className="mb-5 flex items-center gap-2 font-mono text-xs text-muted-foreground">
               <span className="h-1.5 w-1.5 rounded-full bg-primary" aria-hidden />
-              local-first core on GitHub · hosted waitlist open
+              hosted memory service · early access waitlist open
             </p>
             <h1 className="text-4xl font-semibold tracking-tight text-balance sm:text-5xl">
               Memory your agents can trust
             </h1>
             <p className="mt-5 max-w-xl text-lg leading-relaxed text-muted-foreground">
-              Vexic is a provenance-first, replayable memory engine for long-running AI agents.
-              Lossless transcripts in, durable facts out — every memory carrying the receipts for
-              where it came from.
+              Vexic is a hosted, provenance-first memory engine for long-running AI agents. Point
+              your agents at one endpoint — lossless transcripts in, durable facts out, every
+              memory carrying the receipts for where it came from.
             </p>
             <div id="waitlist" className="mt-8 flex w-full scroll-mt-24 flex-col items-start gap-3">
               <WaitlistForm source="hero" />
@@ -120,7 +120,6 @@ export default function HomePage() {
         id="how-it-works"
         title="From raw conversation to durable, auditable facts"
         lede="Three tiers, one direction of trust: the Tier 1 transcript is canonical, Tier 2 candidates are staged, and only reviewed facts reach the Tier 3 long-term store."
-        className="bg-background-raised"
       >
         <HowItWorks />
       </Section>
@@ -140,47 +139,56 @@ export default function HomePage() {
             ))}
           </div>
           <div className="min-w-0 lg:sticky lg:top-24 lg:self-start">
-            <Reveal>
+            <Reveal variant="fade">
               <FactArtifact />
             </Reveal>
           </div>
         </div>
       </Section>
 
-      {/* Integrations */}
-      <Section title="Meets your agents where they run" className="bg-background-raised">
-        <div className="grid gap-6 md:grid-cols-3">
-          {INTEGRATIONS.map((integration, index) => (
-            <Reveal key={integration.name} delay={index * 0.12}>
-              <div className="h-full rounded-xl border border-border bg-card p-6">
-                <h3 className="mb-2 font-mono text-sm text-primary">{integration.name}</h3>
-                <p className="text-sm leading-relaxed text-muted-foreground">{integration.body}</p>
-              </div>
-            </Reveal>
-          ))}
+      {/* Integrations: offset two-column — heading hangs left, list rows hang
+          off structural lines on the right. No panel here on purpose: the
+          terminal below stays the only artifact box in this stretch. */}
+      <Section>
+        <div className="mx-auto grid max-w-5xl gap-10 lg:grid-cols-[minmax(0,4fr)_minmax(0,7fr)] lg:gap-16">
+          <div>
+            <h2 className="text-3xl font-semibold tracking-tight text-balance sm:text-4xl">
+              Meets your agents where they run
+            </h2>
+            <p className="mt-4 text-base text-pretty text-muted-foreground sm:text-lg">
+              One hosted endpoint, spoken over the protocols your agents already use.
+            </p>
+          </div>
+          <div>
+            {INTEGRATIONS.map((integration, index) => (
+              <Reveal key={integration.name} delay={index * 0.1}>
+                <div className="grid gap-1.5 border-t border-border py-6 sm:grid-cols-[9rem_1fr] sm:gap-6">
+                  <h3 className="font-mono text-sm text-primary">{integration.name}</h3>
+                  <p className="text-sm leading-relaxed text-muted-foreground">{integration.body}</p>
+                </div>
+              </Reveal>
+            ))}
+          </div>
         </div>
       </Section>
 
-      {/* Quickstart */}
+      {/* Quickstart: hosted endpoint connect — the whole setup story. */}
       <Section
-        title="Running locally in one command"
-        lede="Point the read-only MCP server at a local SQLite database and your agent has scoped, provenance-backed recall."
+        title="Connected in one command"
+        lede="Add the hosted MCP endpoint to your agent and it has scoped, provenance-backed recall — no database to run, no indexes to babysit."
       >
-        <Reveal>
+        <Reveal variant="fade">
           <div className="mx-auto max-w-3xl overflow-hidden rounded-xl border border-border bg-card">
             <div className="flex items-center gap-2 border-b border-border px-4 py-3">
               <span className="font-mono text-xs text-muted-foreground">terminal</span>
             </div>
             <pre className="overflow-x-auto p-4 font-mono text-xs leading-relaxed sm:p-5 sm:text-sm">
               <code>
-                <span className="text-muted-foreground"># Vexic as a read-only MCP server</span>
+                <span className="text-muted-foreground"># Vexic as a hosted MCP server</span>
                 {"\n"}
-                <span className="text-primary">claude</span> mcp add --scope local vexic -- \{"\n"}
-                {"  "}uv run python \{"\n"}
-                {"  "}scripts/vexic-mcp-stdio.py \{"\n"}
-                {"  "}--db-path ./memory.db \{"\n"}
-                {"  "}--tenant-id local \{"\n"}
-                {"  "}--session-id default
+                <span className="text-primary">claude</span> mcp add --transport http vexic \{"\n"}
+                {"  "}https://api.vexic.dev/mcp \{"\n"}
+                {"  "}--header <span className="text-primary">&quot;Authorization: Bearer $VEXIC_API_KEY&quot;</span>
               </code>
             </pre>
           </div>
@@ -192,18 +200,18 @@ export default function HomePage() {
         </Reveal>
       </Section>
 
-      {/* Final CTA: the one committed-color moment on the page. The local
-          --muted-foreground override keeps secondary text hued on the emerald
-          surface instead of washed-out gray. */}
-      <Section className="bg-background-raised">
+      {/* Final CTA: dark panel with a subtle emerald wash — the color moment
+          comes from the tinted gradient and the mint capture button, not a
+          flat colored surface. */}
+      <Section>
         <Reveal>
-          <div className="mx-auto max-w-3xl rounded-2xl border border-primary/35 bg-primary-surface px-6 py-14 text-center [--muted-foreground:var(--primary-surface-muted)]">
+          <div className="mx-auto max-w-3xl rounded-2xl border border-primary/25 bg-gradient-to-br from-card to-primary/10 px-6 py-14 text-center">
             <h2 className="text-2xl font-semibold tracking-tight text-balance sm:text-4xl">
               Give your agents a memory worth trusting
             </h2>
-            <p className="mx-auto mt-4 max-w-xl text-primary-surface-muted">
-              Join the waitlist for early access to hosted Vexic, or start with the local-first core
-              on GitHub today.
+            <p className="mx-auto mt-4 max-w-xl text-muted-foreground">
+              Hosted Vexic is rolling out through the waitlist — managed ingestion, extraction,
+              and recall behind one endpoint.
             </p>
             <div className="mt-8 flex flex-col items-center gap-4">
               <WaitlistForm source="footer-cta" />
@@ -211,9 +219,9 @@ export default function HomePage() {
                 href={GITHUB_URL}
                 target="_blank"
                 rel="noreferrer"
-                className="text-sm text-primary-surface-muted transition-colors hover:text-foreground"
+                className="text-sm text-muted-foreground transition-colors hover:text-foreground"
               >
-                Explore the source on GitHub →
+                Read the source on GitHub →
               </a>
             </div>
           </div>
