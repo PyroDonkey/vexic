@@ -94,7 +94,9 @@
   }
 
   .text-gradient {
-    background: linear-gradient(
+    /* background-image longhand: the `background` shorthand would reset
+       background-clip when the minifier reorders declarations. */
+    background-image: linear-gradient(
       100deg,
       var(--foreground) 30%,
       var(--primary) 65%,
@@ -103,6 +105,7 @@
     -webkit-background-clip: text;
     background-clip: text;
     color: transparent;
+    -webkit-text-fill-color: transparent;
   }
 
   .hero-grid {
