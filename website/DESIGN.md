@@ -38,6 +38,9 @@ Exact hexes — tokens must match these values, not approximations:
   `primary/25`, `primary/35`) for borders and washes.
 - Destructive red (`oklch(0.704 0.191 22.216)`) exists for form errors only;
   it is a functional state color, not an accent.
+- The quickstart terminal's macOS traffic lights (`#ff5f57` / `#febc2e` /
+  `#28c840`) are window chrome inside a depicted terminal, not palette
+  accents; they appear nowhere else.
 
 The final-CTA panel is the page's one section-level color moment: a dark
 panel with a subtle emerald gradient wash (`from-card to-primary/10`,
@@ -108,7 +111,11 @@ temperature throughout; sage carries the only tint besides emerald.)
 - **No infinite loops.** The hero machine runs its pipeline three times and
   parks on the completed state; the flow-spine comet sweeps three times and
   rests; the status dot pulses only while the machine runs. Compositor goes
-  idle once the mechanism has been demonstrated.
+  idle once the mechanism has been demonstrated. Sanctioned exception: the
+  ambient canvas backdrops (`components/ambient-canvas.tsx`, hero + footer)
+  drift continuously, but only while on screen and the tab is visible —
+  IntersectionObserver and visibilitychange park the rAF loop otherwise, and
+  reduced-motion gets a single static frame.
 - Scroll reveals enhance an already-visible default (hidden state applied
   from JS only): rise for list rows, fade-in-place for artifacts; ~100ms
   stagger for stacked rows.
