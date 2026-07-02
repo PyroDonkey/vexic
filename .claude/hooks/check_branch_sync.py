@@ -92,9 +92,13 @@ def main() -> int:
         if behind > 0:
             warnings.append(
                 f"`{WORK_BRANCH}` is BEHIND `origin/{DEFAULT_BRANCH}` by "
-                f"{behind} commit(s). Sync on dev before working or opening a PR:\n"
+                f"{behind} commit(s). This is the expected state right after a "
+                f"release merge; fast-forward `{WORK_BRANCH}` first:\n"
                 f"    git switch {WORK_BRANCH} && git fetch origin && "
-                f"git merge origin/{DEFAULT_BRANCH} && git push origin {WORK_BRANCH}"
+                f"git merge --ff-only origin/{DEFAULT_BRANCH} && "
+                f"git push origin {WORK_BRANCH}\n"
+                f"If --ff-only fails the branches have truly diverged: stop "
+                f"and report per docs/branch-sync.md instead of merging."
             )
 
     dev_vs_origin_dev = _left_right(f"origin/{WORK_BRANCH}", WORK_BRANCH, notes)
