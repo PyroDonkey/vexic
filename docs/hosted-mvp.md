@@ -273,6 +273,123 @@ the user approves the project MCP server in Claude Code, targeted reads go
 through the scaffolded stdio proxy to hosted `/mcp`. The raw API key stays in
 the user-local recorder config, not `.mcp.json` or Claude settings.
 
+## Turso/libSQL Storage Backend (COA-273)
+
+The hosted storage cutover decided by
+[ADR 0019](adr/0019-hosted-storage-cutover-starts-turso-only.md) is implemented.
+`src/vexic/storage/connection.py` exposes one `connect(target, *, auth_token=None)`
+seam used by every storage module (local SQLite and hosted libSQL alike); a
+`StorageTarget(target, auth_token)` handle carries the resolved DSN plus an
+auth token that is redacted from `repr`/logs and never embedded in the DSN
+itself (a libSQL client rejects a token passed via `?authToken=`; it must go
+through the connection's separate `auth_token` argument). `src/vexic` never
+reads Turso credentials from the environment; the repo-root `adapters/`
+directory does that, per ADR 0008/0013 precedent.
+
+- **Non-secret backend flag.** `resolve_storage_backend` (in `vexic.hosted`)
+  reads `VEXIC_STORAGE_BACKEND` (`"local"` default, or `"turso"`) and is safe
+  to keep in `src/vexic` because it carries no credential. `local` is the
+  unchanged filesystem-SQLite path; `turso` keeps the control-plane catalog
+  and API-key store local/filesystem-rooted and routes only customer-memory
+  storage to per-tenant Turso databases.
+- **Per-tenant provisioning, not a shared dogfood override.** `adapters/turso_adapter.py`
+  provides `TursoProvisioningPort` (`create_database`/`mint_token`/`destroy_database`/
+  `provision`, all against the Turso Platform API, mocked HTTP transport in
+  tests) and `make_customer_target_resolver`, which `create_service_from_env`
+  (`vexic.hosted_http`) wires in when `VEXIC_STORAGE_BACKEND=turso`. Each
+  tenant gets its own isolated Turso database; the catalog stores only the
+  non-secret DSN (`customer_target` column) plus a `generation` counter, never
+  a raw token. An earlier single-shared-database dogfood override (from the
+  P2 milestone) has been fully replaced by this per-tenant path.
+- **Token store decision: mint short-lived, cache in-process, never persist
+  raw.** `TenantTokenCache` mints a fresh, DB-scoped token via
+  `TursoProvisioningPort.mint_token` on cache miss/expiry and holds it only in
+  an in-memory `dict` keyed by database name, with an injectable clock for
+  deterministic TTL tests. The cache TTL (default 600s) is kept shorter than
+  the minted token's own expiration (default `15m`) so a cached token is
+  always re-minted well before Turso would reject it. Nothing is written to
+  the catalog, disk, or any persistent store; a process restart or GC simply
+  drops the cache and the next call re-mints. This is the accepted answer to
+  ADR 0019's open token-store question for the current scale — if measured
+  latency ever forces persistence, the ADR addendum records the fallback
+  (encrypted at rest under an `adapters/`-only key that never enters
+  `src/vexic`), but that fallback is not built.
+- **Schema init is once per target, not per call.** `src/vexic/storage/schema.py`
+  keeps a process-level, lock-guarded, target-keyed memo (`_memo_key`/
+  `_reset_init_memo`) so `init_db`/`init_vector_memory` run their DDL exactly
+  once per distinct target (a token rotation is not a schema change and does
+  not bust the memo); the memo is populated only after the guarded DDL commits,
+  so a failed init never poisons it. Local SQLite behavior is unchanged; this
+  matters for libSQL because every DDL statement against a remote database is
+  a network round-trip, and re-running `init_db` on every storage call would
+  be a per-request latency tax.
+- **Control-plane over the same seam, local-only filesystem guards.** The
+  control-plane catalog and API-key store open through the same `connect()`
+  seam (`StorageTarget`-aware). Filesystem-coupled operations —
+  `_ensure_control_db_permissions` (`os.open`/`chmod`) and the `Path`-based
+  half of `activate_replacement_database` — run only when the target is a
+  local filesystem path; a DSN-shaped replacement (Turso) instead validates as
+  a well-formed libSQL URL distinct from the tenant's current
+  `customer_target`, and repointing bumps the catalog row's `generation`
+  rather than swapping a filename, so a request-scoped service holding the
+  pre-repoint handle cannot keep writing the quarantined database.
+- **Split-brain reconcile.** Because the control-plane mapping and the Turso
+  Platform API's own database list are two independent sources of truth,
+  `adapters/turso_adapter.reconcile_tenant_databases` compares the platform's
+  list-databases response against the catalog's tenant -> `customer_target`
+  mapping and reports matched, orphaned (platform-only), and dangling
+  (catalog-only) entries. It is a pure function over two already-fetched
+  collections — no network I/O, no secrets — so recovery from a lost or
+  stale mapping is a documented, tested reconcile pass rather than manual
+  Turso-console archaeology. This is accepted as adequate for the internal
+  dogfood posture; it does not remove the split-brain window ADR 0019's
+  addendum describes.
+- **Cross-backend exception classifiers.** `src/vexic/storage/errors.py`
+  provides `is_unique_violation`, `is_operational_error`, and
+  `is_retryable_operational_error`, which recognize both typed `sqlite3.*`
+  exceptions and the bare `ValueError` libSQL raises for the equivalent
+  server-side errors (its message carries a Hrana/`code:` payload instead of a
+  typed exception). Every previously sqlite3-typed catch on a shared code path
+  (control-plane persistence, transcript ingest/search, candidates, longterm,
+  operators) now goes through these classifiers, re-raising when the
+  classifier returns `False` so an unrelated `ValueError` is never silently
+  swallowed.
+- **Creds-gated live tests.** Tests that exercise a real Turso database
+  (conformance parity, customer-memory round-trip, per-tenant
+  provision -> round-trip -> destroy, the `turso` pytest marker) check for
+  `TURSO_DATABASE_URL`/`TURSO_AUTH_TOKEN`/the optional `libsql` package at
+  collection time and skip (not fail) when any is absent. `uv run pytest -q`
+  is green with zero Turso credentials configured; live verification requires
+  loading real Turso credentials and running the `turso`-marked suite
+  separately.
+- **Restore drill.** `src/vexic/restore.py` provides `run_restore_drill`, a
+  pure orchestration function (provision -> import -> verify -> activate-or-destroy)
+  over caller-injected callables — it reads no secrets and does no I/O itself.
+  It activates the replacement (repointing the catalog and bumping
+  `generation`) only when `verify` returns `True`; otherwise it destroys the
+  replacement and leaves the original active. The decision logic is unit
+  tested with fakes. Actually restoring from a real Turso point-in-time-recovery
+  snapshot against production data remains a manual/operator-run step (see
+  `docs/runbooks/hosted-migration.md`); only the automated decision logic
+  above is exercised in CI.
+
+Known follow-ups, deliberately not built in this cutover:
+
+- `connect()` has no explicit timeout or retry/backoff on the hot path against
+  remote libSQL; a slow or transiently-failing Turso call currently propagates
+  directly rather than being retried.
+- `TenantTokenCache` has no size-bounded eviction — it is an unbounded `dict`
+  keyed by database name, acceptable at current dogfood tenant counts but not
+  reviewed for large tenant fleets.
+- Some adapter type annotations (e.g. around the injected HTTP transport and
+  provisioning seams) are looser than ideal and are flagged for a precision
+  pass.
+- In `run_restore_drill`, the best-effort compensating `destroy()` call made
+  after an `import_canonical`/`verify` failure swallows its own exception so
+  it can never mask the original failure; this means a broken teardown can
+  silently leave the replacement database behind rather than surfacing a
+  second error. Documented and accepted for now, not fixed.
+
 ## Railway Alpha Deploy
 
 Use the committed `Dockerfile`; do not rely on Railway Nixpacks for this slice.
@@ -281,9 +398,11 @@ The image installs Python 3.13 dependencies with `uv` and includes
 
 Alpha storage choice: mount a Railway persistent volume at `/data/vexic` and
 keep `VEXIC_HOSTED_ROOT=/data/vexic`. This preserves the current
-SQLite-compatible Customer Memory Database boundary from ADR 0005. Turso/libSQL
-remains the next hosted-storage option when the alpha needs managed database
-operations instead of a single Railway volume.
+SQLite-compatible Customer Memory Database boundary from ADR 0005. The Turso/libSQL
+cutover (ADR 0019, see "Turso/libSQL Storage Backend" above) is implemented and
+live-verified against a real Turso database, but the deployed Railway alpha has
+not yet been switched over to it; `VEXIC_STORAGE_BACKEND` stays unset/`local`
+on the live deployment until that cutover is scheduled.
 
 Required Railway config:
 
@@ -441,14 +560,21 @@ ready.
 
 Not production/customer-data ready yet:
 
-- no production control-plane catalog, audit store, usage store, or job ledger;
-- no customer-readiness restore drill, incident tabletop/security-review
-  signoff, network hardening, distributed rate limiting, or implemented
-  support-access workflow; the Railway-volume alpha restore drill passed with
-  caveats in the 2026-06-26 Railway alpha volume restore-drill artifact under
-  `docs/runbooks/restore-drills/`,
-  but Turso PITR, Neon control-plane recovery, and S3 Object Lock export
-  restore remain blocked;
+- no production control-plane catalog, audit store, usage store, or job ledger
+  (the control-plane catalog and API-key store stay local/filesystem-rooted
+  even under `VEXIC_STORAGE_BACKEND=turso`; only customer memory moved to
+  per-tenant Turso databases — see "Turso/libSQL Storage Backend" above);
+- no customer-readiness restore drill signed off end-to-end, incident
+  tabletop/security-review signoff, network hardening, distributed rate
+  limiting, or implemented support-access workflow; the Railway-volume alpha
+  restore drill passed with caveats in the 2026-06-26 Railway alpha volume
+  restore-drill artifact under `docs/runbooks/restore-drills/`. The Turso
+  restore-drill *decision logic* (`vexic.restore.run_restore_drill`:
+  provision -> import -> verify -> activate-or-destroy) is implemented and
+  unit tested, but an actual live run against a real Turso PITR snapshot is a
+  manual/operator-run step that has not been executed and recorded as an
+  artifact; Neon control-plane recovery and S3 Object Lock export restore
+  remain blocked/deferred;
 - no Cloudflare/WAF configuration, origin lock-down, auth-failure throttling,
   alerting, or abuse override workflow;
 - no billing, dashboard, portal, enterprise SSO, or compliance claims;

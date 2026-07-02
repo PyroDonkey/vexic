@@ -92,10 +92,58 @@ endpoint, or customer self-serve import API.
   canonical rows outside the artifact, import fails closed. Investigate the
   replacement database rather than overwriting in place.
 
+## Turso/libSQL Targets (ADR 0019)
+
+`import_canonical_migration` accepts a `vexic.storage.StorageTarget` (a
+resolved libSQL DSN plus auth token) as `target_db_path`, in addition to a
+local filesystem path. Both `_record_import_metadata` and the pre-import
+host-owned-table check go through the shared `connect()` seam, so a Turso
+target and a local `.db` file run the same canonical-import logic; the only
+branch is that a remote `StorageTarget` has no local file to `Path.exists()`
+against, so the host-owned-table probe always connects rather than being
+skipped for a "brand-new" file. This closes the "no Postgres adapter / no
+physical file copy" note below for the libSQL case specifically — import
+still writes canonical rows through SQL, never a raw file or page copy,
+against either backend.
+
+Resolving the actual Turso DSN and auth token for a target tenant/database is
+an `adapters/` concern (see `docs/hosted-mvp.md#tursolibsql-storage-backend-coa-273`)
+and stays outside this runbook's local-file-oriented preconditions section;
+an operator migrating into a Turso-backed replacement still needs a
+`StorageTarget` resolved out of band before calling `import_canonical_migration`.
+
+## Restore Drill (PITR)
+
+`vexic.restore.run_restore_drill` implements the verify-gated,
+generation-stamped restore decision logic this runbook's replacement/repoint
+steps depend on: provision a replacement, import the canonical artifact into
+it, verify it, and only then activate it (repointing the catalog and bumping
+the tenant's `generation` counter so a request-scoped service holding the
+pre-repoint handle cannot keep writing the quarantined database); if
+verification fails, the replacement is destroyed instead and the original
+stays active. This orchestration function is pure — it takes the provision/
+import/verify/activate/destroy steps as injected callables, reads no secrets,
+and does no I/O of its own — so the decision logic is unit tested with fakes
+independent of any real Turso account.
+
+Running this drill against a **real Turso point-in-time-recovery snapshot**
+is a separate, manual, operator-run exercise: an operator provisions a
+replacement database from a Turso PITR restore point (Turso Platform API,
+outside `src/vexic`), then wires that replacement into
+`run_restore_drill`'s `provision_replacement`/`import_canonical`/`verify`/
+`activate`/`destroy` callables. That live run has not yet been executed and
+recorded as an artifact under `docs/runbooks/restore-drills/` — only the
+decision logic above is automated and covered by tests today. Record any live
+Turso PITR drill the same way the 2026-06-26 Railway alpha volume drill was
+recorded, per the "Record evidence" step above.
+
 ## What This Does Not Do
 
 - No public import API.
 - No Postgres adapter.
 - No customer self-serve artifact upload.
-- No physical SQLite file/page copy.
+- No physical SQLite file/page copy (Turso/libSQL import is SQL-level too —
+  see "Turso/libSQL Targets" above).
 - No migration of host-owned extension tables without a separate host plan.
+- No completed live Turso PITR restore-drill run yet (decision logic only —
+  see "Restore Drill (PITR)" above).
