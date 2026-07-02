@@ -42,6 +42,8 @@ node_modules/
 .codex/
 .impeccable/
 website/.impeccable/
+.github/hooks/impeccable.json
+.github/skills/impeccable/
 
 # TypeScript incremental build info
 *.tsbuildinfo
