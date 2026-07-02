@@ -29,6 +29,7 @@ from vexic.hosted import (
     HostedMemoryService,
     HostedRateLimitExceeded,
     add_run_dream_phase_subcommand,
+    dream_phase_ports_from_env,
     register_hosted_write_routes,
     resolve_storage_backend,
     run_dream_phase_command,
@@ -190,6 +191,12 @@ def create_service_from_env(
     Turso DB for it (idempotent ``create_database`` + ``provision_tenant``) and
     stores only the DSN in the catalog -- NOT a single shared DB. The seam
     exists so tests can inject a fake with no real credentials.
+
+    Dream-phase model ports are wired from ``VEXIC_DREAM_PHASE_ADAPTER`` /
+    ``VEXIC_DREAM_PHASE_MODEL_GROUP`` via ``dream_phase_ports_from_env`` on
+    both backends; unset leaves ports ``None`` (model-backed operations,
+    including the ``search_long_term`` vector path, fail closed with
+    ``HostPortNotConfigured``).
     """
     backend = resolve_storage_backend(os.environ)
     root = Path(os.environ.get("VEXIC_HOSTED_ROOT", ".hosted-memory"))
@@ -218,6 +225,7 @@ def create_service_from_env(
         keys,
         telemetry=catalog,
         rate_limiter=HostedInMemoryRateLimiter(),
+        dream_phase_ports=dream_phase_ports_from_env(os.environ),
         customer_target_resolver=customer_target_resolver,
     )
 
