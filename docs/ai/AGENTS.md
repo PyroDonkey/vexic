@@ -104,7 +104,10 @@ not part of the public `MemoryService` Protocol.
 explicit dream-phase host ports are supplied, and fails closed with
 `HostPortNotConfigured` through `missing_host_port` when no host adapter is
 provided. Inside supplied dream-phase ports, embedding may fall back to the
-optional local adapter and Deep contradiction may be deferred.
+optional local adapter and Deep contradiction may be deferred. REM executes
+locally as a deterministic embedding-centrality heuristic and consumes none
+of the supplied ports, but still runs only inside the same fail-closed gate
+(ADR 0020).
 
 Do not "fix" model-backed dream execution by importing private host runtime code.
 Implement a scoped Vexic adapter slice only when the project maintainer starts
