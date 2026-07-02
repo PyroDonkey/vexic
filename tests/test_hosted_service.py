@@ -1294,6 +1294,35 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "clerk_org_id must not be blank"):
             self.catalog.resolve_customer_tenant(" ")
 
+    def test_resolve_customer_tenant_skips_half_provisioned_tenant(self) -> None:
+        # Simulate `provision_customer_account` interrupted after committing
+        # the mapping + inactive tenant row but before `provision_tenant`
+        # finished customer-db init: the read path must not resolve it.
+        control_db = Path(self.temp_dir.name) / "control-plane.db"
+        with closing(sqlite3.connect(control_db)) as conn:
+            conn.execute(
+                """
+                INSERT INTO tenants (tenant_id, db_filename, active)
+                VALUES ('tenant_half', 'customer-half.db', 0)
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO customer_account_mappings (clerk_org_id, tenant_id)
+                VALUES ('org_half', 'tenant_half')
+                """
+            )
+            conn.commit()
+
+        self.assertIsNone(self.catalog.resolve_customer_tenant("org_half"))
+
+        # The write path heals the interrupted provisioning, after which the
+        # tenant resolves.
+        tenant_id = self.catalog.provision_customer_account("org_half")
+
+        self.assertEqual(tenant_id, "tenant_half")
+        self.assertEqual(self.catalog.resolve_customer_tenant("org_half"), "tenant_half")
+
     def test_customer_account_provisioning_handles_competing_mapping_claim(self) -> None:
         original = self.catalog.provision_tenant
         control_db = Path(self.temp_dir.name) / "control-plane.db"

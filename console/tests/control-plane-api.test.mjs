@@ -160,6 +160,19 @@ test("configured control-plane URL uses the hosted client and maps upstream auth
   assert.match(new Headers(calls[0].options.headers).get("authorization"), /^Bearer/);
 });
 
+test("hosted client tolerates an unprovisioned org on first read", async () => {
+  resetStoreForTests();
+  process.env.NODE_ENV = "test";
+  process.env.VEXIC_CONTROL_PLANE_URL = "https://api.example.test";
+  process.env.VEXIC_CONTROL_PLANE_TOKEN = "console-secret";
+  mock.method(globalThis, "fetch", async () => Response.json({ projects: [] }));
+
+  const response = await listProjectsResponse(request("GET", "/api/control-plane/projects"), authedOrg);
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(await json(response), { projects: [] });
+});
+
 test("production without a control-plane URL fails closed after org guards", async () => {
   resetStoreForTests();
   process.env.NODE_ENV = "production";

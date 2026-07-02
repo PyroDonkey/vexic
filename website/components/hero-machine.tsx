@@ -7,7 +7,7 @@ const EASE_OUT = [0.25, 1, 0.5, 1] as const;
 
 const TRANSCRIPT = [
   { id: "msg_0184", role: "user", text: "we're moving the api to us-east-2 next sprint" },
-  { id: "msg_0185", role: "agent", text: "noted — updating the deploy scripts" },
+  { id: "msg_0185", role: "agent", text: "noted, updating the deploy scripts" },
   { id: "msg_0192", role: "user", text: "hold that migration, we're staying in us-west-1" },
   { id: "msg_0193", role: "agent", text: "understood, cancelling the region move" }
 ] as const;
@@ -151,7 +151,7 @@ export function HeroMachine() {
       <p className="sr-only">
         Diagram: transcript messages are ingested losslessly, pass through light, REM, and deep
         extraction phases, and become durable facts. Each promoted fact links back to its exact
-        source messages — including corrections that superseded earlier statements.
+        source messages, including corrections that superseded earlier statements.
       </p>
       <div className="relative" aria-hidden>
         {/* Promotion glow: a static token-derived shadow whose opacity is
@@ -307,7 +307,7 @@ export function HeroMachine() {
                     <span className="shrink-0 text-primary">promoted ✓</span>
                   </div>
                   <p className="mt-1 text-foreground">
-                    deploy region is us-west-1 — the us-east-2 migration was cancelled
+                    deploy region is us-west-1, the us-east-2 migration was cancelled
                   </p>
                   <div ref={sourcesRef} className="mt-1.5 flex flex-wrap items-baseline gap-x-2 text-muted-foreground">
                     <span>sources</span>

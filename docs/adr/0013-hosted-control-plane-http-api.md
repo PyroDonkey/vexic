@@ -61,9 +61,10 @@ Organization.
 A Clerk Organization maps deterministically to one hosted tenant through a
 persisted Customer Account Mapping in the hosted control-plane database. The
 Console sends a Clerk organization id under delegated authority, and the hosted
-adapter resolves or provisions a Vexic-owned `tenant_id` from that mapping. The
-hosted adapter never accepts caller-supplied tenant ids on the control-plane
-HTTP surface. Tenant and project operations are idempotent.
+adapter resolves a Vexic-owned `tenant_id` from that mapping, provisioning one
+only on write operations (see the COA-248 addendum below). The hosted adapter
+never accepts caller-supplied tenant ids on the control-plane HTTP surface.
+Tenant and project operations are idempotent.
 
 Projects are Vexic-owned control-plane records under the resolved tenant. Normal
 project creation generates a hosted `proj_...` id, stores minimal project
@@ -128,6 +129,24 @@ Logs and telemetry must not include supplied control-plane credential values.
 Keys minted through the control-plane API authenticate through the existing
 hosted Agent API Key path. Revocation through the control-plane API makes the
 same key invalid for `/mcp` and `/v1/*`.
+
+## Addendum (COA-248): reads are side-effect-free
+
+Originally every control-plane handler provisioned the tenant as its first
+action, so a read-only GET (for example the Console's first project-list load)
+minted a tenant row, a Customer Account Mapping, and a customer database file.
+COA-248 removed passive provisioning from the read path:
+
+- GET endpoints and key revocation resolve an existing Customer Account
+  Mapping without inserting anything. Resolution only returns tenants that
+  completed provisioning (`active = 1`).
+- When no tenant exists for the Clerk organization: project listing returns an
+  empty list, tenant usage returns a zero-usage payload, and project-scoped
+  reads (project lookup, key listing, project usage) and key revocation return
+  `404 not_found`.
+- Write paths still auto-provision idempotently: `POST .../tenant`,
+  `POST .../projects`, `PUT .../projects/{project_id}`, and
+  `POST .../projects/{project_id}/keys`.
 
 ## Deferred
 

@@ -9,19 +9,19 @@ const STEPS = [
   {
     tag: "01 · record",
     title: "Lossless transcript",
-    body: "Cleaned conversation rows land in an append-only Tier 1 store. Rows are never updated or deleted — this is the source of truth every other layer replays from.",
+    body: "Cleaned conversation rows land in an append-only Tier 1 store. Rows are never updated or deleted. It's the source of truth every other layer replays from.",
     detail: "tier 1 · messages · append-only"
   },
   {
     tag: "02 · stage",
     title: "Extraction pipeline",
-    body: "Light extraction stages candidate memories in Tier 2, a REM pass clusters and reinforces what repeats, and deep review promotes or supersedes. Nothing becomes durable without passing review.",
+    body: "Light extraction stages candidate memories in Tier 2, a REM pass clusters and reinforces what repeats, and deep review promotes or supersedes them. A memory only becomes durable after it passes review.",
     detail: "tier 2 · light → rem → deep"
   },
   {
     tag: "03 · promote",
     title: "Durable facts, with receipts",
-    body: "Every promoted Tier 3 fact carries provenance, confidence, and category — pointing back to the exact transcript rows it came from. Recall you can audit, test, and roll back.",
+    body: "Every promoted Tier 3 fact carries provenance, confidence, and category, and points back to the exact transcript rows it came from. You can audit any recall, test it, and roll it back.",
     detail: "tier 3 · provenance · confidence · category"
   }
 ] as const;

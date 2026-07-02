@@ -124,16 +124,26 @@ class HostedHttpTests(unittest.TestCase):
     def _control_auth(self) -> dict[str, str]:
         return {"Authorization": "Bearer console-secret"}
 
-    def _assert_no_customer_provisioning(self) -> None:
+    def _customer_provisioning_state(self) -> tuple[list, list, int]:
         root = Path(self.temp_dir.name)
         with contextlib.closing(sqlite3.connect(root / "control-plane.db")) as conn:
             tenants = conn.execute("SELECT tenant_id FROM tenants").fetchall()
             mappings = conn.execute(
                 "SELECT clerk_org_id, tenant_id FROM customer_account_mappings"
             ).fetchall()
+        return tenants, mappings, len(list(root.glob("customer-*.db")))
+
+    def _assert_no_customer_provisioning(self) -> None:
+        tenants, mappings, customer_dbs = self._customer_provisioning_state()
         self.assertEqual(tenants, [])
         self.assertEqual(mappings, [])
-        self.assertEqual(list(root.glob("customer-*.db")), [])
+        self.assertEqual(customer_dbs, 0)
+
+    def _assert_fresh_org_provisioned(self, clerk_org_id: str) -> None:
+        tenants, mappings, customer_dbs = self._customer_provisioning_state()
+        self.assertEqual(len(tenants), 1)
+        self.assertEqual(mappings, [(clerk_org_id, tenants[0][0])])
+        self.assertEqual(customer_dbs, 1)
 
     def test_health_requires_no_api_key(self) -> None:
         response = self.client.get("/health")
@@ -403,18 +413,41 @@ class HostedHttpTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 201)
-        root = Path(self.temp_dir.name)
-        with contextlib.closing(sqlite3.connect(root / "control-plane.db")) as conn:
-            tenant_rows = conn.execute("SELECT tenant_id FROM tenants").fetchall()
-            mapping_rows = conn.execute(
-                """
-                SELECT clerk_org_id, tenant_id
-                FROM customer_account_mappings
-                """
-            ).fetchall()
-        self.assertEqual(len(tenant_rows), 1)
-        self.assertEqual(mapping_rows, [("org_new", tenant_rows[0][0])])
-        self.assertEqual(len(list(root.glob("customer-*.db"))), 1)
+        self._assert_fresh_org_provisioned("org_new")
+
+    def test_control_plane_project_put_still_provisions_fresh_org(self) -> None:
+        client = TestClient(
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
+        )
+
+        self._assert_no_customer_provisioning()
+        response = client.put(
+            "/control/v1/clerk-orgs/org_new/projects/proj_manual",
+            headers=self._control_auth(),
+            json={"name": "Manual"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["project"]["id"], "proj_manual")
+        self._assert_fresh_org_provisioned("org_new")
+
+    def test_control_plane_key_create_still_provisions_fresh_org(self) -> None:
+        client = TestClient(
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
+        )
+
+        self._assert_no_customer_provisioning()
+        response = client.post(
+            "/control/v1/clerk-orgs/org_new/projects/proj_missing/keys",
+            headers=self._control_auth(),
+            json={"name": "agent key"},
+        )
+
+        # The project does not exist, so key creation fails -- but the write
+        # path still auto-provisions the tenant, as before COA-248.
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["error"]["code"], "not_found")
+        self._assert_fresh_org_provisioned("org_new")
 
     def test_control_plane_project_create_list_and_get_use_hosted_project_ids(self) -> None:
         client = TestClient(
