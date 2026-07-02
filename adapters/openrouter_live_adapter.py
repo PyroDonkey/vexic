@@ -52,7 +52,7 @@ def _require_openrouter_model(model: str, env_name: str) -> str:
     model = model.strip()
     if ":" in model or "/" not in model:
         raise RuntimeError(
-            f"{env_name} must use an OpenRouter model id like openai/gpt-4o-mini."
+            f"{env_name} must use an OpenRouter model id like deepseek/deepseek-v4-pro."
         )
     return model
 
@@ -97,7 +97,7 @@ def _model_name(model_group: str) -> str:
         return _require_openrouter_model(group_model, group_env)
     if default_model := os.environ.get("VEXIC_LIVE_MODEL"):
         return _require_openrouter_model(default_model, "VEXIC_LIVE_MODEL")
-    return "openai/gpt-4o-mini"
+    return "deepseek/deepseek-v4-pro"
 
 
 def _embedding_model_name() -> str:
