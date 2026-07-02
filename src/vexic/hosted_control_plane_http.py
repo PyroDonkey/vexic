@@ -7,7 +7,7 @@ import sqlite3
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from functools import wraps
-from typing import ParamSpec, TypeVar
+from typing import NoReturn, ParamSpec, TypeVar
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
@@ -433,13 +433,7 @@ def _provision_control_tenant(service: HostedMemoryService, clerk_org_id: str) -
     try:
         return service.catalog.provision_customer_account(clerk_org_id)
     except ValueError as exc:
-        # On the hosted libSQL/Turso backend a genuine constraint/operational
-        # SQL failure surfaces as a bare `ValueError` (ADR 0019). Let it
-        # propagate to the storage boundary for 409/503/500 classification
-        # instead of mis-wrapping it as an HTTP 400 domain-validation error.
-        if is_unique_violation(exc) or is_operational_error(exc):
-            raise
-        raise _ControlPlaneBadRequest(str(exc)) from exc
+        _classify_control_plane_value_error(exc)
 
 
 def _resolve_control_tenant(
@@ -449,9 +443,17 @@ def _resolve_control_tenant(
     try:
         return service.catalog.resolve_customer_tenant(clerk_org_id)
     except ValueError as exc:
-        if is_unique_violation(exc) or is_operational_error(exc):
-            raise
-        raise _ControlPlaneBadRequest(str(exc)) from exc
+        _classify_control_plane_value_error(exc)
+
+
+def _classify_control_plane_value_error(exc: ValueError) -> NoReturn:
+    # On the hosted libSQL/Turso backend a genuine constraint/operational
+    # SQL failure surfaces as a bare `ValueError` (ADR 0019). Let it
+    # propagate to the storage boundary for 409/503/500 classification
+    # instead of mis-wrapping it as an HTTP 400 domain-validation error.
+    if is_unique_violation(exc) or is_operational_error(exc):
+        raise exc
+    raise _ControlPlaneBadRequest(str(exc)) from exc
 
 
 async def _json_body(request: Request) -> dict[str, object]:
