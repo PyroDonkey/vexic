@@ -54,8 +54,8 @@ export function WaitlistForm({ source = "hero" }: { source?: string }) {
               ✓
             </span>
             <p>
-              You&apos;re on the list. We&apos;ll email <span className="font-semibold">{email}</span>{" "}
-              when early access opens.
+              You&apos;re on the list. We&apos;ll email{" "}
+              <span className="font-semibold break-all">{email}</span> when early access opens.
             </p>
           </div>
           <button
@@ -83,12 +83,12 @@ export function WaitlistForm({ source = "hero" }: { source?: string }) {
               placeholder="you@company.com"
               value={email}
               onChange={(event) => setEmail(event.target.value)}
-              className="h-11 w-full rounded-md border border-input bg-background-raised px-3.5 text-sm placeholder:text-muted-foreground focus:ring-2 focus:ring-ring focus:outline-none sm:w-auto sm:flex-1"
+              className="h-11 w-full rounded-md border border-input bg-background px-3.5 font-mono text-sm placeholder:text-muted-foreground focus:ring-2 focus:ring-ring focus:outline-none sm:w-auto sm:flex-1"
             />
             <button
               type="submit"
               disabled={state.status === "submitting"}
-              className="h-11 rounded-md bg-primary px-5 text-sm font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-60"
+              className="h-11 rounded-md bg-primary px-5 font-mono text-sm font-semibold text-primary-foreground transition-[filter,translate] hover:brightness-110 active:translate-y-px active:brightness-95 disabled:opacity-60"
             >
               {state.status === "submitting" ? "Joining…" : "Join the waitlist"}
             </button>

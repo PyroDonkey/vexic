@@ -24,14 +24,14 @@ export const metadata: Metadata = {
     template: "%s — Vexic"
   },
   description:
-    "Provenance-first, replayable memory engine for long-running AI agents. Lossless transcripts, staged extraction, and durable facts that carry their receipts.",
+    "Hosted, provenance-first memory for long-running AI agents. Lossless transcripts, staged extraction, and durable facts that carry their receipts — behind one endpoint.",
   icons: {
     icon: "/favicon.svg"
   },
   openGraph: {
     title: "Vexic — Memory your agents can trust",
     description:
-      "Provenance-first, replayable memory engine for long-running AI agents.",
+      "Hosted, provenance-first memory engine for long-running AI agents.",
     url: siteUrl,
     siteName: "Vexic",
     type: "website"
@@ -40,7 +40,7 @@ export const metadata: Metadata = {
     card: "summary_large_image",
     title: "Vexic — Memory your agents can trust",
     description:
-      "Provenance-first, replayable memory engine for long-running AI agents."
+      "Hosted, provenance-first memory engine for long-running AI agents."
   }
 };
 

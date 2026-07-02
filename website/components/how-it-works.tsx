@@ -65,6 +65,8 @@ export function HowItWorks() {
               transition={reduceMotion ? { duration: 0 } : { delay: 0.3 + index * 0.55, duration: 0.35 }}
             />
           ))}
+          {/* Three sweeps then rest (ends on the opacity-0 keyframe) so the
+              compositor goes idle once the flow has been demonstrated. */}
           <motion.circle
             r="4"
             cy="30"
@@ -73,7 +75,7 @@ export function HowItWorks() {
             animate={cometActive ? { cx: [20, 780], opacity: [0, 1, 1, 0] } : { cx: 20, opacity: 0 }}
             transition={
               cometActive
-                ? { duration: 3.2, repeat: Infinity, ease: "easeInOut", delay: 1.6 }
+                ? { duration: 3.2, repeat: 2, ease: "easeInOut", delay: 1.6 }
                 : { duration: 0 }
             }
           />
@@ -87,7 +89,7 @@ export function HowItWorks() {
               <p className="mb-3 font-mono text-xs text-primary">{step.tag}</p>
               <h3 className="mb-2 text-lg font-semibold">{step.title}</h3>
               <p className="text-sm leading-relaxed text-muted-foreground">{step.body}</p>
-              <p className="mt-4 rounded-md bg-background-raised px-3 py-2 font-mono text-xs text-muted-foreground">
+              <p className="mt-4 rounded-md bg-background px-3 py-2 font-mono text-xs text-muted-foreground">
                 {step.detail}
               </p>
             </article>

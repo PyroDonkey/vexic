@@ -6,30 +6,29 @@
  * surfaces cohere with the identity instead of reading as generic zinc.
  */
 :root {
-  --background: oklch(0.13 0.008 162.48);
-  --background-raised: oklch(0.16 0.01 162.48);
-  --foreground: oklch(0.985 0.004 162.48);
-  --card: oklch(0.17 0.01 162.48);
-  --card-foreground: oklch(0.985 0.004 162.48);
-  --primary: oklch(0.696 0.17 162.48);
-  --primary-foreground: oklch(0.145 0.008 162.48);
-  --primary-dim: oklch(0.53 0.105 162.48);
-  /* Committed brand surface for the single most-colored moment on the page
-     (final CTA). Muted variant keeps text on it hued, never washed-out gray. */
-  --primary-surface: oklch(0.21 0.042 162.48);
-  --primary-surface-muted: oklch(0.82 0.05 162.48);
-  --secondary: oklch(0.274 0.012 162.48);
-  --secondary-foreground: oklch(0.985 0.004 162.48);
-  --muted: oklch(0.234 0.012 162.48);
-  --muted-foreground: oklch(0.72 0.016 162.48);
-  --accent: oklch(0.274 0.012 162.48);
-  --accent-foreground: oklch(0.985 0.004 162.48);
+  /* DESIGN.md palette, hex-faithful. One unified off-black canvas; raised
+     panels only for cards/code/terminal artifacts; structural #2a2a2a lines;
+     sage secondary text carries the only tint besides the single emerald
+     accent. No warm/cool gray drift. */
+  --background: #131313;
+  --foreground: #e5e2e1;
+  --card: #1c1b1b;
+  --card-foreground: #e5e2e1;
+  --primary: #10b981;
+  --primary-foreground: #131313;
+  --secondary: #2a2a2a;
+  --secondary-foreground: #e5e2e1;
+  --muted: #2a2a2a;
+  --muted-foreground: #9aa89e;
+  --accent: #2a2a2a;
+  --accent-foreground: #e5e2e1;
   --destructive: oklch(0.704 0.191 22.216);
-  --border: oklch(0.87 0.07 162.48 / 11%);
-  /* Form-field boundaries need ~3:1 against the surface (WCAG 1.4.11);
-     the 15% hairline used for decorative borders is too faint here. */
-  --input: oklch(0.93 0.03 162.48 / 32%);
-  --ring: oklch(0.696 0.17 162.48);
+  --border: #2a2a2a;
+  /* Form-field boundaries need ≥3:1 against every surface they sit on
+     (WCAG 1.4.11); the structural #2a2a2a line is too faint for inputs, so
+     they get a lighter neutral (~4.5:1 on canvas and panel fills). */
+  --input: oklch(0.93 0.005 162.48 / 45%);
+  --ring: #10b981;
   --radius: 0.5rem;
   --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
 }
@@ -38,15 +37,11 @@
   --font-sans: "Geist", "Geist Fallback", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "Geist Mono", "Geist Mono Fallback", ui-monospace, SFMono-Regular, monospace;
   --color-background: var(--background);
-  --color-background-raised: var(--background-raised);
   --color-foreground: var(--foreground);
   --color-card: var(--card);
   --color-card-foreground: var(--card-foreground);
   --color-primary: var(--primary);
   --color-primary-foreground: var(--primary-foreground);
-  --color-primary-dim: var(--primary-dim);
-  --color-primary-surface: var(--primary-surface);
-  --color-primary-surface-muted: var(--primary-surface-muted);
   --color-secondary: var(--secondary);
   --color-secondary-foreground: var(--secondary-foreground);
   --color-muted: var(--muted);
@@ -88,7 +83,16 @@
   }
 
   ::selection {
-    background: oklch(0.696 0.17 162.48 / 35%);
+    background: color-mix(in oklab, var(--primary) 35%, transparent);
+  }
+
+  /* Elements without a component-level focus style get a full-opacity ring;
+     the inherited outline-ring/50 alone composites to ~2.7:1 on the page
+     background, below the 3:1 an indicator needs. Components that draw their
+     own ring (e.g. the waitlist input) opt out with focus:outline-none. */
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
   }
 }
 
@@ -101,6 +105,12 @@
     transition:
       opacity 0.5s var(--ease-out-quart),
       translate 0.5s var(--ease-out-quart);
+  }
+
+  /* Fade-only variant for artifact panels (terminal, fact JSON): evidence
+     appears in place instead of sliding in like list content. */
+  .reveal-hidden.reveal-fade {
+    translate: 0 0;
   }
 
   .reveal-hidden.reveal-shown {

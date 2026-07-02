@@ -1,6 +1,5 @@
 "use client";
 
-import Image from "next/image";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useState } from "react";
@@ -17,23 +16,16 @@ export function SiteNav() {
   return (
     <header className="sticky top-0 z-50 border-b border-border bg-background/80 backdrop-blur-md">
       <nav className="mx-auto flex h-16 w-full max-w-6xl items-center justify-between px-5">
-        <Link href="/" aria-label="Vexic home" className="flex items-center gap-2">
-          <Image
-            src="/vexic-logo-reversed.svg"
-            alt="Vexic"
-            width={96}
-            height={28}
-            priority
-            className="h-7 w-auto"
-          />
+        <Link href="/" aria-label="Vexic home" className="text-lg font-semibold tracking-tight">
+          Vexic
         </Link>
 
-        <div className="hidden items-center gap-6 text-sm text-muted-foreground sm:flex">
+        <div className="hidden items-center gap-9 text-muted-foreground sm:flex">
           {NAV_LINKS.map((link) => (
             <Link
               key={link.href}
               href={link.href}
-              className="transition-colors hover:text-foreground"
+              className="font-mono text-xs tracking-wide uppercase transition-colors hover:text-foreground"
             >
               {link.label}
             </Link>
@@ -42,7 +34,7 @@ export function SiteNav() {
             href={GITHUB_URL}
             target="_blank"
             rel="noreferrer"
-            className="transition-colors hover:text-foreground"
+            className="font-mono text-xs tracking-wide uppercase transition-colors hover:text-foreground"
           >
             GitHub
           </a>
@@ -58,7 +50,7 @@ export function SiteNav() {
           <a
             href={waitlistHref}
             onClick={() => setOpen(false)}
-            className="rounded-md bg-primary px-3.5 py-2 text-sm font-semibold text-primary-foreground transition-opacity hover:opacity-90"
+            className="rounded-md bg-primary px-3.5 py-2 font-mono text-sm font-semibold text-primary-foreground transition-[filter,translate] hover:brightness-110 active:translate-y-px active:brightness-95"
           >
             Get early access
           </a>
@@ -81,15 +73,15 @@ export function SiteNav() {
         </div>
       </nav>
 
-      {open && (
-        <div id="mobile-nav" className="border-t border-border bg-background sm:hidden">
+      {/* Always mounted so aria-controls points at a real element when closed. */}
+      <div id="mobile-nav" hidden={!open} className="border-t border-border bg-background sm:hidden">
           <div className="mx-auto flex w-full max-w-6xl flex-col px-5 py-2 text-sm">
             {NAV_LINKS.map((link) => (
               <Link
                 key={link.href}
                 href={link.href}
                 onClick={() => setOpen(false)}
-                className="flex min-h-11 items-center text-muted-foreground transition-colors hover:text-foreground"
+                className="flex min-h-11 items-center font-mono text-xs tracking-wide uppercase text-muted-foreground transition-colors hover:text-foreground"
               >
                 {link.label}
               </Link>
@@ -99,7 +91,7 @@ export function SiteNav() {
               target="_blank"
               rel="noreferrer"
               onClick={() => setOpen(false)}
-              className="flex min-h-11 items-center text-muted-foreground transition-colors hover:text-foreground"
+              className="flex min-h-11 items-center font-mono text-xs tracking-wide uppercase text-muted-foreground transition-colors hover:text-foreground"
             >
               GitHub
             </a>
@@ -112,7 +104,6 @@ export function SiteNav() {
             </a>
           </div>
         </div>
-      )}
     </header>
   );
 }
