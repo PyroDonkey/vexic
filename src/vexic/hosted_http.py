@@ -208,7 +208,7 @@ def create_service_from_env(
         cache = provisioning.build_token_cache(port)
         if os.environ.get("VEXIC_PROVISION_EXISTING_TURSO_TARGETS", "").strip() == "1":
             catalog.provision_missing_customer_targets()
-        _ensure_dogfood_tenant_target(catalog, port)
+        _ensure_dogfood_tenant_target(catalog)
         customer_target_resolver = provisioning.build_resolver(cache, org=org)
     else:
         catalog = HostedTenantCatalog(root)
@@ -222,7 +222,7 @@ def create_service_from_env(
     )
 
 
-def _ensure_dogfood_tenant_target(catalog: HostedTenantCatalog, port: object) -> None:
+def _ensure_dogfood_tenant_target(catalog: HostedTenantCatalog) -> None:
     """Provision a real per-tenant Turso DB for the dogfood tenant if it has
     no ``customer_target`` yet (COA-273 Task 16, P4).
 
@@ -230,9 +230,9 @@ def _ensure_dogfood_tenant_target(catalog: HostedTenantCatalog, port: object) ->
     so the ``turso`` backend is usable with tenants provisioned out of band,
     e.g. the live test which builds the service directly with a tenant that
     already carries a DSN). When set and the tenant's ``customer_target`` is
-    empty, it creates a deterministic Turso-safe per-tenant database name
-    (idempotent) and stores only the returned DSN via ``provision_tenant`` --
-    never a shared DB, never a token.
+    empty, re-provisioning lets the catalog's ``customer_target_factory``
+    create a deterministic Turso-safe per-tenant database (idempotent) and
+    store only the returned DSN -- never a shared DB, never a token.
     """
     tenant_id = os.environ.get("VEXIC_DOGFOOD_TENANT_ID", "").strip()
     if not tenant_id:
@@ -240,12 +240,7 @@ def _ensure_dogfood_tenant_target(catalog: HostedTenantCatalog, port: object) ->
     tenant = catalog.get_tenant(tenant_id)
     if tenant.customer_target:
         return
-    dsn = port.create_database(_customer_database_name(tenant_id))
-    catalog.provision_tenant(
-        tenant_id,
-        project_ids=tenant.project_ids,
-        customer_target=dsn,
-    )
+    catalog.provision_tenant(tenant_id, project_ids=tenant.project_ids)
 
 
 def _customer_database_name(tenant_id: str) -> str:

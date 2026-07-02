@@ -309,11 +309,10 @@ class HostedTenantCatalog:
             else:
                 db_filename = row[0]
                 needs_customer_init = not bool(row[1])
-                target = (
-                    self._new_customer_target(tenant_id, customer_target)
-                    if customer_target is not None or row[2] is None
-                    else None
-                )
+                if customer_target is None and row[2]:
+                    target = None  # keep the existing customer target
+                else:
+                    target = self._new_customer_target(tenant_id, customer_target)
             if needs_customer_init:
                 tenant_db_path = self.root_path / db_filename
                 LocalMemoryService(db_path=str(tenant_db_path), tenant_id=tenant_id).init_schema()
@@ -381,14 +380,14 @@ class HostedTenantCatalog:
         with closing(self._connect_control()) as conn:
             rows = conn.execute(
                 """
-                SELECT tenant_id, db_filename
+                SELECT tenant_id
                 FROM tenants
                 WHERE active = 1 AND customer_target IS NULL
                 ORDER BY tenant_id
                 """
             ).fetchall()
         provisioned: list[HostedTenant] = []
-        for tenant_id, _db_filename in rows:
+        for (tenant_id,) in rows:
             provisioned.append(self.provision_tenant(str(tenant_id)))
         return provisioned
 
