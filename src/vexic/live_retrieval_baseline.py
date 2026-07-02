@@ -252,8 +252,11 @@ def _validate_caps(args: argparse.Namespace, rows: list[FixtureRow]) -> None:
 
 
 def estimate_provider_calls(row_count: int, top_n: int, neighbor_k: int) -> int:
+    # One Light extraction call plus Deep's contradiction budget and a small
+    # fixed allowance. REM is a local centrality heuristic and makes no
+    # provider calls, so it contributes nothing here.
     deep_pair_calls = top_n * (top_n - 1) // 2
-    calls_per_row = 1 + 1 + (top_n * neighbor_k) + deep_pair_calls + 3
+    calls_per_row = 1 + (top_n * neighbor_k) + deep_pair_calls + 3
     return row_count * calls_per_row
 
 
@@ -426,11 +429,7 @@ async def _run_row_inner(
         extraction_agent_factory=_wrap_factory(adapter.build_extraction_agent, budget),
         embed=embed,
     )
-    await run_rem_phase(
-        str(db_path),
-        args.model_group,
-        rem_agent_factory=_wrap_factory(adapter.build_rem_agent, budget),
-    )
+    await run_rem_phase(str(db_path))
     await run_deep_phase(
         str(db_path),
         args.model_group,

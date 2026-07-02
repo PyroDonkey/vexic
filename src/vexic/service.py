@@ -694,10 +694,7 @@ async def _run_dream_phase_with_usage(
 
         usage = await run_rem_phase(
             service.db_path,
-            ports.model_group,
             agent_id=request.scope.agent_id,
-            secrets=ports.secrets,
-            rem_agent_factory=ports.rem_agent_factory,
             forbidden_secret_values=service._redaction_values(request.redaction),
         )
     else:

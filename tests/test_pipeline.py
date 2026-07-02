@@ -15,7 +15,7 @@ from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 from vexic.embeddings import EMBEDDING_DIM
 from vexic.deep import run_deep_phase
-from vexic.models import ContradictionJudgment, FactCandidate, RemBoost, RemBoostPlan
+from vexic.models import ContradictionJudgment, FactCandidate
 from vexic.pipeline import _main, run_light_phase
 from vexic.ports import HostPortNotConfigured
 from vexic.rem import REM_TOP_K, compute_centrality_boosts, run_rem_phase
@@ -345,10 +345,15 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = str(Path(temp_dir) / "memory.db")
             init_db(db_path)
-            for agent_id, fact_text in (
-                ("agent-a", "Ryan agent a cedar candidate."),
-                ("agent-b", "Ryan agent b cedar candidate."),
-                (None, "Ryan shared cedar candidate."),
+            # agent-a gets two candidates with identical unit-vector embeddings
+            # (centrality 1.0). Their categories differ so commit-time dedup
+            # does not merge them. agent-b and the shared scope each hold a
+            # single candidate, whose centrality is 0.0 by definition.
+            for agent_id, fact_text, category in (
+                ("agent-a", "Ryan agent a cedar candidate.", "fact"),
+                ("agent-a", "Ryan agent a cedar twin.", "preference"),
+                ("agent-b", "Ryan agent b cedar candidate.", "fact"),
+                (None, "Ryan shared cedar candidate.", "fact"),
             ):
                 commit_dream_cycle(
                     db_path,
@@ -356,7 +361,7 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                         FactCandidate(
                             fact_text=fact_text,
                             subject="Ryan",
-                            category="fact",
+                            category=category,
                             importance=5,
                             confidence=0.8,
                             source_message_ids=[1],
@@ -370,31 +375,6 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                     messages_processed=0,
                     last_processed_message_id=0,
                 )
-            prompts: list[str] = []
-
-            class RemAgent:
-                async def run(self, prompt: str) -> object:
-                    prompts.append(prompt)
-                    candidate_ids = [
-                        int(candidate_id)
-                        for candidate_id in re.findall(r"candidate_id=(\d+)", prompt)
-                    ]
-                    if not candidate_ids:
-                        raise AssertionError("REM prompt did not include scoped candidates.")
-                    return SimpleNamespace(
-                        output=RemBoostPlan(
-                            boosts=[
-                                RemBoost(candidate_id=candidate_id, boost=0.5)
-                                for candidate_id in candidate_ids
-                            ]
-                        ),
-                        usage=lambda: SimpleNamespace(
-                            requests=1,
-                            input_tokens=1,
-                            output_tokens=1,
-                            total_tokens=2,
-                        ),
-                    )
 
             def rem_state() -> tuple[list[tuple[str | None, str, float]], list[tuple[str | None, int]]]:
                 with closing(sqlite3.connect(db_path)) as conn:
@@ -405,6 +385,9 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                         ORDER BY id
                         """
                     ).fetchall()
+                    # candidates_boosted counts UPDATE rowcount, so 0.0 writes
+                    # count too: the > 0 filter keeps every REM run that touched
+                    # at least one candidate in its scope.
                     rem_runs = conn.execute(
                         """
                         SELECT agent_id, candidates_boosted
@@ -415,53 +398,40 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                     ).fetchall()
                 return candidates, rem_runs
 
-            await run_rem_phase(
-                db_path,
-                "glm",
-                agent_id="agent-a",
-                rem_agent_factory=lambda *_args, **_kwargs: RemAgent(),
-            )
+            await run_rem_phase(db_path, agent_id="agent-a")
             after_agent_a = rem_state()
 
-            await run_rem_phase(
-                db_path,
-                "glm",
-                agent_id=None,
-                rem_agent_factory=lambda *_args, **_kwargs: RemAgent(),
-            )
+            await run_rem_phase(db_path, agent_id=None)
             after_shared = rem_state()
 
-        self.assertEqual(len(prompts), 2)
-        self.assertIn("Ryan agent a cedar candidate.", prompts[0])
-        self.assertNotIn("Ryan agent b cedar candidate.", prompts[0])
-        self.assertNotIn("Ryan shared cedar candidate.", prompts[0])
-        self.assertIn("Ryan shared cedar candidate.", prompts[1])
-        self.assertNotIn("Ryan agent a cedar candidate.", prompts[1])
-        self.assertNotIn("Ryan agent b cedar candidate.", prompts[1])
         self.assertEqual(
             after_agent_a,
             (
                 [
-                    ("agent-a", "Ryan agent a cedar candidate.", 0.5),
+                    ("agent-a", "Ryan agent a cedar candidate.", 1.0),
+                    ("agent-a", "Ryan agent a cedar twin.", 1.0),
                     ("agent-b", "Ryan agent b cedar candidate.", 0.0),
                     (None, "Ryan shared cedar candidate.", 0.0),
                 ],
-                [("agent-a", 1)],
+                [("agent-a", 2)],
             ),
         )
         self.assertEqual(
             after_shared,
             (
                 [
-                    ("agent-a", "Ryan agent a cedar candidate.", 0.5),
+                    ("agent-a", "Ryan agent a cedar candidate.", 1.0),
+                    ("agent-a", "Ryan agent a cedar twin.", 1.0),
                     ("agent-b", "Ryan agent b cedar candidate.", 0.0),
-                    (None, "Ryan shared cedar candidate.", 0.5),
+                    (None, "Ryan shared cedar candidate.", 0.0),
                 ],
-                [("agent-a", 1), (None, 1)],
+                [("agent-a", 2), (None, 1)],
             ),
         )
 
-    async def test_rem_phase_redaction_failure_does_not_call_model(self) -> None:
+    async def test_rem_phase_succeeds_when_fact_text_contains_forbidden_value(self) -> None:
+        # REM builds no prompts and calls no model, so a forbidden secret in a
+        # candidate's fact text is never egressed and must not fail the phase.
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = str(Path(temp_dir) / "memory.db")
             init_db(db_path)
@@ -485,22 +455,19 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                 messages_processed=1,
                 last_processed_message_id=1,
             )
-            factory_calls = 0
 
-            def rem_agent_factory(*_args: object, **_kwargs: object) -> object:
-                nonlocal factory_calls
-                factory_calls += 1
-                return SimpleNamespace()
+            await run_rem_phase(db_path, forbidden_secret_values=("cedar-secret",))
 
-            with self.assertRaises(ValueError):
-                await run_rem_phase(
-                    db_path,
-                    "glm",
-                    rem_agent_factory=rem_agent_factory,
-                    forbidden_secret_values=("cedar-secret",),
-                )
+            with closing(sqlite3.connect(db_path)) as conn:
+                boost = conn.execute(
+                    "SELECT rem_boost FROM memory_candidates"
+                ).fetchone()[0]
+                rem_status = conn.execute(
+                    "SELECT status FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()[0]
 
-        self.assertEqual(factory_calls, 0)
+        self.assertEqual(boost, 0.0)
+        self.assertEqual(rem_status, "ok")
 
     async def test_deep_phase_promotes_only_requested_agent_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

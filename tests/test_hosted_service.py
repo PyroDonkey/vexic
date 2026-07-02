@@ -37,7 +37,7 @@ from vexic.hosted import (
     HostedRateLimitExceeded,
     HostedUsageEvent,
 )
-from vexic.models import ContradictionJudgment, FactCandidate, RemBoost, RemBoostPlan
+from vexic.models import ContradictionJudgment, FactCandidate
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 from vexic.ports import DreamPhasePorts, HostPortNotConfigured
 from vexic.storage import single_message_adapter
@@ -1449,27 +1449,6 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 )
 
-        class RemAgent:
-            async def run(self, prompt: str) -> object:
-                candidate_ids = [
-                    int(candidate_id)
-                    for candidate_id in re.findall(r"candidate_id=(\d+)", prompt)
-                ]
-                return SimpleNamespace(
-                    output=RemBoostPlan(
-                        boosts=[
-                            RemBoost(candidate_id=candidate_id, boost=0.5)
-                            for candidate_id in candidate_ids
-                        ]
-                    ),
-                    usage=lambda: SimpleNamespace(
-                        requests=1,
-                        input_tokens=3,
-                        output_tokens=2,
-                        total_tokens=5,
-                    ),
-                )
-
         class ContradictionAgent:
             async def run(self, prompt: str) -> object:
                 return SimpleNamespace(
@@ -1493,7 +1472,6 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                 model_group="fake",
                 embed=lambda texts: [_unit_vector() for _ in texts],
                 extraction_agent_factory=lambda *_args, **_kwargs: ExtractionAgent(),
-                rem_agent_factory=lambda *_args, **_kwargs: RemAgent(),
                 contradiction_agent_factory=lambda *_args, **_kwargs: ContradictionAgent(),
             ),
         )
@@ -1556,10 +1534,12 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job_usage[0].input_tokens, 11)
         self.assertEqual(job_usage[0].output_tokens, 7)
         self.assertEqual(job_usage[0].total_tokens, 18)
-        self.assertEqual(job_usage[1].model_requests, 1)
-        self.assertEqual(job_usage[1].input_tokens, 3)
-        self.assertEqual(job_usage[1].output_tokens, 2)
-        self.assertEqual(job_usage[1].total_tokens, 5)
+        # The REM phase is a local centrality heuristic: no model calls, so its
+        # job usage event reports all zeros.
+        self.assertEqual(job_usage[1].model_requests, 0)
+        self.assertEqual(job_usage[1].input_tokens, 0)
+        self.assertEqual(job_usage[1].output_tokens, 0)
+        self.assertEqual(job_usage[1].total_tokens, 0)
 
     async def test_hosted_dream_worker_redaction_failure_does_not_call_model(
         self,
