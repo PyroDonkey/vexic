@@ -89,6 +89,31 @@ def test_live_adapter_strips_model_env_values(
     assert captured["model_name"] == "openai/gpt-4o-mini"
 
 
+def test_live_adapter_defaults_to_deepseek_v4_pro(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _load_adapter()
+    captured: dict[str, str] = {}
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
+    monkeypatch.delenv("VEXIC_LIVE_MODEL", raising=False)
+    monkeypatch.delenv("VEXIC_LIVE_RETRIEVAL_SMOKE_MODEL", raising=False)
+
+    class _ChatModel:
+        def __init__(self, model_name: str, *, provider: object) -> None:
+            captured["model_name"] = model_name
+
+    class _Agent:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+    monkeypatch.setattr(adapter, "Agent", _Agent)
+    monkeypatch.setattr(adapter, "OpenAIChatModel", _ChatModel)
+
+    adapter.build_extraction_agent("retrieval-smoke")
+
+    assert captured["model_name"] == "deepseek/deepseek-v4-pro"
+
+
 def test_live_adapter_embedding_can_run_inside_active_event_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

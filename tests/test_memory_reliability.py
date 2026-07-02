@@ -10,7 +10,7 @@ from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 from vexic.deep import run_deep_phase
 from vexic.embeddings import EMBEDDING_DIM
-from vexic.models import ContradictionJudgment, FactCandidate, RemBoost, RemBoostPlan
+from vexic.models import ContradictionJudgment, FactCandidate
 from vexic.pipeline import run_light_phase
 from vexic.rem import run_rem_phase
 from vexic.storage import (
@@ -80,11 +80,6 @@ class _StableExtractionAgent:
                 )
             ]
         )
-
-
-class _NoOpRemAgent:
-    async def run(self, prompt: str) -> _FakeResult:
-        return _FakeResult(RemBoostPlan(boosts=[RemBoost(candidate_id=1, boost=0.25)]))
 
 
 class _ContradictionAgent:
@@ -372,7 +367,6 @@ class DreamCycleReliabilityTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("vexic.pipeline.build_extraction_agent", return_value=_StableExtractionAgent()),
-            patch("vexic.rem.build_rem_agent", return_value=_NoOpRemAgent()),
             patch(
                 "vexic.deep.build_contradiction_agent",
                 return_value=_ContradictionAgent(contradicts=False),
@@ -383,14 +377,14 @@ class DreamCycleReliabilityTests(unittest.IsolatedAsyncioTestCase):
                 "glm",
                 embed=lambda texts: [_unit_vector(1.0) for _ in texts],
             )
-            await run_rem_phase(self.db_path, "glm")
+            await run_rem_phase(self.db_path)
             await run_deep_phase(self.db_path, "glm")
             await run_light_phase(
                 self.db_path,
                 "glm",
                 embed=lambda texts: [_unit_vector(1.0) for _ in texts],
             )
-            await run_rem_phase(self.db_path, "glm")
+            await run_rem_phase(self.db_path)
             await run_deep_phase(self.db_path, "glm")
 
         with closing(sqlite3.connect(self.db_path)) as conn:
@@ -817,7 +811,6 @@ class OfflineRetrievalBaselinePreflightTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("vexic.pipeline.build_extraction_agent", return_value=_StableExtractionAgent()),
-            patch("vexic.rem.build_rem_agent", return_value=_NoOpRemAgent()),
             patch(
                 "vexic.deep.build_contradiction_agent",
                 return_value=_ContradictionAgent(contradicts=False),
@@ -828,7 +821,7 @@ class OfflineRetrievalBaselinePreflightTests(unittest.IsolatedAsyncioTestCase):
                 "glm",
                 embed=lambda texts: [_unit_vector(1.0) for _ in texts],
             )
-            await run_rem_phase(self.db_path, "glm")
+            await run_rem_phase(self.db_path)
             await run_deep_phase(self.db_path, "glm")
 
         with patch(

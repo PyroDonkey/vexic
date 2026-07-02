@@ -213,17 +213,19 @@ uv run --with-editable . python -m vexic.live_retrieval_baseline `
   --model-group retrieval-smoke `
   --output-dir .\artifacts\live-retrieval `
   --max-rows 1 `
-  --max-provider-calls 6 `
+  --max-provider-calls 5 `
   --timeout-seconds 120
 ```
 
 Without `--allow-live`, the command exits 0 before importing the adapter or
 calling providers. The host-owned OpenRouter adapter reads `OPENROUTER_API_KEY`
 from the process environment and supplies `build_extraction_agent`,
-`build_rem_agent`, `build_contradiction_agent`, and `embed_texts`; Vexic core
-does not read provider secrets. The adapter lives under repo-local `adapters/`
-by design because it is host-owned provider wiring, not package core. Embedding
-can alternatively use the optional local `vexic[local-embed]` adapter.
+`build_contradiction_agent`, and `embed_texts`; Vexic core does not read
+provider secrets. REM is a local heuristic and makes no provider calls (ADR
+0020), which is why a `--max-provider-calls 5` budget covers the default
+single-row run. The adapter lives under repo-local `adapters/` by design
+because it is host-owned provider wiring, not package core. Embedding can
+alternatively use the optional local `vexic[local-embed]` adapter.
 
 Fixture rows are JSONL objects with `id`, `transcript`, `question`, and
 `expected_fact`. `transcript` may be a list of strings or `{ "role": "user" |
