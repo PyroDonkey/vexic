@@ -9,8 +9,9 @@
 ## Scope Of This Runbook
 
 This runbook is about the agent's own work sessions in this repository: editing
-code and docs, running verification, and committing on `dev`. It is operational
-hygiene for the agent, not a product feature.
+code and docs, running verification, and committing on a feature branch or
+`dev` per the Branching Model in `docs/ai/AGENTS.md`. It is operational hygiene
+for the agent, not a product feature.
 
 It is deliberately distinct from Vexic's product behavior. Vexic the product is
 a provenance-first, replayable memory core that records customer agent memory:
@@ -31,8 +32,9 @@ markdown note, the session report, or the commit body is enough.
 
 A run record should capture:
 
-- Session identity: date, branch worked on (normally `dev`), and the requested
-  task in one or two sentences.
+- Session identity: date, branch worked on (a feature branch per the naming
+  scheme in `docs/ai/AGENTS.md`, or `dev` for trivial direct commits), and the
+  requested task in one or two sentences.
 - Actions taken: the ordered, high-level steps the agent performed.
 - Tool calls: the meaningful read and search calls used to orient, and any
   shell commands run, with enough detail to repeat them.
@@ -78,8 +80,9 @@ gates already require the agent to stop rather than improvise when:
 - a `git pull --ff-only` fails and branches have diverged;
 - a `dev` to `main` PR is noisy, a branch is stale, an upstream branch is gone,
   or branch history needs cleanup;
-- `git rev-list --left-right --count origin/main...dev` shows `dev` is behind,
-  or `gh api ... compare/main...dev` lists unintended files;
+- `git rev-list --left-right --count origin/main...dev` shows `dev` is behind
+  and the post-release fast-forward in `docs/branch-sync.md` does not resolve
+  it, or `gh api ... compare/main...dev` lists unintended files;
 - a dirty worktree blocks branch sync;
 - a request conflicts with a rule in `docs/ai/AGENTS.md`, in which case the agent names
   the violated rule and offers a Vexic-compatible path.
@@ -130,9 +133,11 @@ workflow only.
   from "Docs Are Downstream Of Code" fires (a new or changed ADR, a change to
   the `LocalMemoryService` operation surface, or a test-count change), reconcile
   the affected roadmap/todo against the in-repo source of truth before finishing.
-- At finish, update the issue with the branch, commit, verification result
+- At finish, update the issue with the branch, PR, commit, verification result
   (fresh verification per `docs/ai/AGENTS.md`), and any generated follow-up
-  issues.
+  issues. Status transitions themselves are automated by the tracker's GitHub
+  integration when the branch name carries the issue id and the PR says
+  `Fixes COA-<id>`; do not duplicate them by hand.
 
 If tracking tooling is unavailable, say so plainly and do not invent issue IDs.
 Record the reconciliation that the triggers above require - for example, in the
