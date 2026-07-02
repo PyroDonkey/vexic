@@ -469,6 +469,98 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(boost, 0.0)
         self.assertEqual(rem_status, "ok")
 
+    async def test_rem_phase_resets_stale_boost_when_embedding_disappears(self) -> None:
+        # A candidate boosted in an earlier cycle whose embedding later goes
+        # missing (e.g. an interrupted repair) must be reset to 0.0, not keep
+        # its stale boost -- the reason the loader LEFT JOINs embeddings.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            commit_dream_cycle(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="Ryan cedar stale boost candidate.",
+                        subject="Ryan",
+                        category="fact",
+                        importance=5,
+                        confidence=0.8,
+                        source_message_ids=[1],
+                    )
+                ],
+                candidate_embeddings=[_unit_vector(1.0)],
+                agent_id=None,
+                status="ok",
+                started_at="2026-01-01T00:00:00Z",
+                finished_at="2026-01-01T00:00:01Z",
+                messages_processed=1,
+                last_processed_message_id=1,
+            )
+            with closing(sqlite3.connect(db_path)) as conn:
+                _load_vec_extension(conn)
+                conn.execute("UPDATE memory_candidates SET rem_boost = 0.7")
+                conn.execute("DELETE FROM memory_candidate_embeddings")
+                conn.commit()
+
+            await run_rem_phase(db_path)
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                boost = conn.execute(
+                    "SELECT rem_boost FROM memory_candidates"
+                ).fetchone()[0]
+
+        self.assertEqual(boost, 0.0)
+
+    async def test_rem_phase_commits_error_run_and_reraises_on_failure(self) -> None:
+        # A failing cycle must leave boosts untouched, record an error
+        # dream_run with no boosts, and re-raise.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            commit_dream_cycle(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="Ryan cedar error path candidate.",
+                        subject="Ryan",
+                        category="fact",
+                        importance=5,
+                        confidence=0.8,
+                        source_message_ids=[1],
+                    )
+                ],
+                candidate_embeddings=[_unit_vector(1.0)],
+                agent_id=None,
+                status="ok",
+                started_at="2026-01-01T00:00:00Z",
+                finished_at="2026-01-01T00:00:01Z",
+                messages_processed=1,
+                last_processed_message_id=1,
+            )
+            with closing(sqlite3.connect(db_path)) as conn:
+                _load_vec_extension(conn)
+                conn.execute("UPDATE memory_candidates SET rem_boost = 0.7")
+                conn.commit()
+
+            with patch(
+                "vexic.rem.compute_centrality_boosts",
+                side_effect=RuntimeError("boom"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    await run_rem_phase(db_path)
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                boost = conn.execute(
+                    "SELECT rem_boost FROM memory_candidates"
+                ).fetchone()[0]
+                status, boosted = conn.execute(
+                    "SELECT status, candidates_boosted FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+
+        self.assertEqual(boost, 0.7)
+        self.assertEqual(status, "error")
+        self.assertEqual(boosted, 0)
+
     async def test_deep_phase_promotes_only_requested_agent_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = str(Path(temp_dir) / "memory.db")
@@ -914,6 +1006,50 @@ class RemCentralityBoostTests(unittest.TestCase):
         )
 
         self.assertEqual(boosts, {1: 0.0, 2: 0.0})
+
+    def test_two_candidate_pair_scores_single_cosine_not_topk_dilution(self) -> None:
+        # A pair has one neighbor each, so the boost is that single cosine.
+        # Dividing by top_k instead of available neighbors would report 0.2
+        # (0.6 / 3) and silently punish small scopes.
+        boosts = compute_centrality_boosts(
+            [
+                _rem_candidate(1, _unit_vector(1.0)),
+                _rem_candidate(2, _padded_vector(0.6, 0.8)),
+            ]
+        )
+
+        self.assertAlmostEqual(boosts[1], 0.6)
+        self.assertAlmostEqual(boosts[2], 0.6)
+
+    def test_clustered_candidates_outrank_isolated_candidate(self) -> None:
+        # Centrality rewards tight clusters -- including near-duplicates that
+        # survived commit-time dedup (which only merges same subject+category).
+        # That inflation is intentional and pinned here: the cluster maxes out
+        # while the orthogonal outsider gets nothing.
+        boosts = compute_centrality_boosts(
+            [
+                _rem_candidate(1, _unit_vector(1.0)),
+                _rem_candidate(2, _unit_vector(1.0)),
+                _rem_candidate(3, _unit_vector(1.0)),
+                _rem_candidate(4, _unit_vector(1.0)),
+                _rem_candidate(5, _padded_vector(0.0, 1.0)),
+            ]
+        )
+
+        self.assertEqual(
+            boosts, {1: 1.0, 2: 1.0, 3: 1.0, 4: 1.0, 5: 0.0}
+        )
+
+    def test_mismatched_embedding_dimensions_raise(self) -> None:
+        # zip(..., strict=True) fails loudly on corrupt vectors instead of
+        # silently truncating the dot product.
+        with self.assertRaises(ValueError):
+            compute_centrality_boosts(
+                [
+                    _rem_candidate(1, [1.0, 0.0]),
+                    _rem_candidate(2, [0.0, 1.0, 0.0]),
+                ]
+            )
 
     def test_same_input_yields_identical_boosts(self) -> None:
         candidates = [
