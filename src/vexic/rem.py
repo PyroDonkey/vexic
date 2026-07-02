@@ -15,6 +15,49 @@ from vexic.usage import UsageSummary, summarize_agent_usage
 REM_MAX_CANDIDATES_PER_BATCH = 50
 REM_MAX_PROMPT_TOKENS_PER_BATCH = 12_000
 
+REM_TOP_K = 3
+
+
+def compute_centrality_boosts(
+    candidates: list[RemCandidate],
+    *,
+    top_k: int = REM_TOP_K,
+) -> dict[int, float]:
+    """Deterministic embedding-centrality boost for every candidate.
+
+    Each candidate with a stored embedding scores the mean cosine similarity to
+    its ``top_k`` most similar embedded peers (fewer when fewer peers exist --
+    no zero-padding), clamped to [0, 1]. Embeddings are L2-normalized at write
+    time, so cosine similarity is a plain dot product. Candidates without an
+    embedding score 0.0 and never count as anyone's neighbor; writing the zero
+    also resets any stale boost from an earlier cycle.
+    """
+    if top_k <= 0:
+        raise ValueError("top_k must be greater than 0.")
+
+    boosts = {candidate.candidate_id: 0.0 for candidate in candidates}
+    embedded = [
+        (candidate.candidate_id, candidate.embedding)
+        for candidate in candidates
+        if candidate.embedding is not None
+    ]
+    for index, (candidate_id, embedding) in enumerate(embedded):
+        similarities = sorted(
+            (
+                sum(a * b for a, b in zip(embedding, other, strict=True))
+                for other_index, (_, other) in enumerate(embedded)
+                if other_index != index
+            ),
+            reverse=True,
+        )
+        if not similarities:
+            continue
+        top = similarities[:top_k]
+        mean = sum(top) / len(top)
+        boosts[candidate_id] = min(1.0, max(0.0, mean))
+
+    return boosts
+
 REM_SYSTEM_PROMPT = """\
 You cluster short-term memory candidates and assign reinforcement boosts.
 

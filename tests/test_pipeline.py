@@ -18,13 +18,15 @@ from vexic.deep import run_deep_phase
 from vexic.models import ContradictionJudgment, FactCandidate, RemBoost, RemBoostPlan
 from vexic.pipeline import _main, run_light_phase
 from vexic.ports import HostPortNotConfigured
-from vexic.rem import run_rem_phase
+from vexic.rem import REM_TOP_K, compute_centrality_boosts, run_rem_phase
 from vexic.storage import (
     CandidateRetirementDecision,
     PromotionDecision,
+    RemCandidate,
     commit_deep_cycle,
     commit_dream_cycle,
     init_db,
+    load_rem_candidates,
     save_messages,
 )
 from vexic.storage.schema import _load_vec_extension
@@ -32,6 +34,19 @@ from vexic.storage.schema import _load_vec_extension
 
 def _unit_vector(first: float) -> list[float]:
     return [first] + [0.0] * (EMBEDDING_DIM - 1)
+
+
+def _padded_vector(*components: float) -> list[float]:
+    return [*components] + [0.0] * (EMBEDDING_DIM - len(components))
+
+
+def _rem_candidate(candidate_id: int, embedding: list[float] | None) -> RemCandidate:
+    return RemCandidate(
+        candidate_id=candidate_id,
+        fact_text=f"Ryan cedar fact {candidate_id}.",
+        category="fact",
+        embedding=embedding,
+    )
 
 
 class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
@@ -862,6 +877,151 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(invalid_run_count, 0)
         self.assertEqual(agent_a_promoted, 0)
+
+
+class RemCentralityBoostTests(unittest.TestCase):
+    def test_empty_candidates_return_empty_dict(self) -> None:
+        self.assertEqual(compute_centrality_boosts([]), {})
+
+    def test_single_candidate_gets_zero_boost(self) -> None:
+        boosts = compute_centrality_boosts([_rem_candidate(1, _unit_vector(1.0))])
+
+        self.assertEqual(boosts, {1: 0.0})
+
+    def test_candidate_without_embedding_scores_zero_and_is_not_a_neighbor(self) -> None:
+        # If the missing embedding leaked in as a zero-similarity neighbor, the
+        # two identical candidates would average (1.0 + 0.0) / 2 instead of 1.0.
+        boosts = compute_centrality_boosts(
+            [
+                _rem_candidate(1, _unit_vector(1.0)),
+                _rem_candidate(2, _unit_vector(1.0)),
+                _rem_candidate(3, None),
+            ]
+        )
+
+        self.assertEqual(boosts, {1: 1.0, 2: 1.0, 3: 0.0})
+
+    def test_fewer_neighbors_than_top_k_means_over_available_only(self) -> None:
+        # Three embedded candidates leave each with two neighbors, fewer than
+        # REM_TOP_K + 1 embedded overall. Zero-padding to top_k would yield
+        # (1.0 + 0.0 + 0.0) / 3 instead of (1.0 + 0.0) / 2.
+        self.assertLess(3, REM_TOP_K + 1)
+        boosts = compute_centrality_boosts(
+            [
+                _rem_candidate(1, _unit_vector(1.0)),
+                _rem_candidate(2, _unit_vector(1.0)),
+                _rem_candidate(3, _padded_vector(0.0, 1.0)),
+            ]
+        )
+
+        self.assertAlmostEqual(boosts[1], 0.5)
+        self.assertAlmostEqual(boosts[2], 0.5)
+        self.assertAlmostEqual(boosts[3], 0.0)
+
+    def test_identical_unit_vectors_boost_to_one(self) -> None:
+        boosts = compute_centrality_boosts(
+            [
+                _rem_candidate(1, _unit_vector(1.0)),
+                _rem_candidate(2, _unit_vector(1.0)),
+            ]
+        )
+
+        self.assertEqual(boosts, {1: 1.0, 2: 1.0})
+
+    def test_orthogonal_vectors_boost_to_zero(self) -> None:
+        boosts = compute_centrality_boosts(
+            [
+                _rem_candidate(1, _unit_vector(1.0)),
+                _rem_candidate(2, _padded_vector(0.0, 1.0)),
+            ]
+        )
+
+        self.assertEqual(boosts, {1: 0.0, 2: 0.0})
+
+    def test_negative_cosine_is_clamped_to_zero(self) -> None:
+        boosts = compute_centrality_boosts(
+            [
+                _rem_candidate(1, _unit_vector(1.0)),
+                _rem_candidate(2, _unit_vector(-1.0)),
+            ]
+        )
+
+        self.assertEqual(boosts, {1: 0.0, 2: 0.0})
+
+    def test_same_input_yields_identical_boosts(self) -> None:
+        candidates = [
+            _rem_candidate(1, _padded_vector(0.6, 0.8)),
+            _rem_candidate(2, _padded_vector(0.8, 0.6)),
+            _rem_candidate(3, _padded_vector(0.0, 1.0)),
+            _rem_candidate(4, _unit_vector(-1.0)),
+            _rem_candidate(5, None),
+        ]
+
+        self.assertEqual(
+            compute_centrality_boosts(candidates),
+            compute_centrality_boosts(candidates),
+        )
+
+    def test_boosts_cover_every_candidate_and_stay_in_range(self) -> None:
+        candidates = [
+            _rem_candidate(1, _padded_vector(0.6, 0.8)),
+            _rem_candidate(2, _padded_vector(0.8, 0.6)),
+            _rem_candidate(3, _padded_vector(0.0, 1.0)),
+            _rem_candidate(4, _unit_vector(1.0)),
+            _rem_candidate(5, _unit_vector(-1.0)),
+            _rem_candidate(6, None),
+        ]
+
+        boosts = compute_centrality_boosts(candidates)
+
+        self.assertEqual(set(boosts), {candidate.candidate_id for candidate in candidates})
+        for candidate_id, boost in boosts.items():
+            with self.subTest(candidate_id=candidate_id):
+                self.assertGreaterEqual(boost, 0.0)
+                self.assertLessEqual(boost, 1.0)
+
+
+class RemCandidateLoaderTests(unittest.TestCase):
+    def test_load_rem_candidates_keeps_candidates_without_embeddings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            for fact_text, embedding in (
+                ("Ryan cedar fact one.", _unit_vector(1.0)),
+                ("Ryan cedar fact two.", _padded_vector(0.0, 1.0)),
+            ):
+                commit_dream_cycle(
+                    db_path,
+                    [
+                        FactCandidate(
+                            fact_text=fact_text,
+                            subject="Ryan",
+                            category="fact",
+                            importance=5,
+                            confidence=0.8,
+                            source_message_ids=[1],
+                        )
+                    ],
+                    candidate_embeddings=[embedding],
+                    agent_id=None,
+                    status="ok",
+                    started_at="2026-01-01T00:00:00Z",
+                    finished_at="2026-01-01T00:00:01Z",
+                    messages_processed=1,
+                    last_processed_message_id=1,
+                )
+            with closing(sqlite3.connect(db_path)) as conn:
+                _load_vec_extension(conn)
+                conn.execute("DELETE FROM memory_candidate_embeddings WHERE candidate_id = 2")
+                conn.commit()
+
+            candidates = load_rem_candidates(db_path, agent_id=None)
+
+        self.assertEqual(
+            [candidate.candidate_id for candidate in candidates], [1, 2]
+        )
+        self.assertEqual(candidates[0].embedding, _unit_vector(1.0))
+        self.assertIsNone(candidates[1].embedding)
 
 
 class PipelineCliTests(unittest.TestCase):
