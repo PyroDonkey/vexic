@@ -20,16 +20,16 @@ const siteUrl = process.env.NEXT_PUBLIC_SITE_URL ?? "https://vexic.dev";
 export const metadata: Metadata = {
   metadataBase: new URL(siteUrl),
   title: {
-    default: "Vexic — Memory your agents can trust",
-    template: "%s — Vexic"
+    default: "Vexic · Memory your agents can trust",
+    template: "%s · Vexic"
   },
   description:
-    "Hosted, provenance-first memory for long-running AI agents. Lossless transcripts, staged extraction, and durable facts that carry their receipts — behind one endpoint.",
+    "Hosted, provenance-first memory for long-running AI agents. Lossless transcripts, staged extraction, and durable facts behind one endpoint, each one traceable to the messages it came from.",
   icons: {
     icon: "/favicon.svg"
   },
   openGraph: {
-    title: "Vexic — Memory your agents can trust",
+    title: "Vexic · Memory your agents can trust",
     description:
       "Hosted, provenance-first memory engine for long-running AI agents.",
     url: siteUrl,
@@ -38,7 +38,7 @@ export const metadata: Metadata = {
   },
   twitter: {
     card: "summary_large_image",
-    title: "Vexic — Memory your agents can trust",
+    title: "Vexic · Memory your agents can trust",
     description:
       "Hosted, provenance-first memory engine for long-running AI agents."
   }

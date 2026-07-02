@@ -94,7 +94,7 @@ export function WaitlistForm({ source = "hero" }: { source?: string }) {
             </button>
           </div>
           <p className="mt-2 text-xs text-muted-foreground">
-            Early access is rolling out gradually. No spam — one email when it&apos;s your turn.
+            Early access rolls out gradually. We&apos;ll send one email when it&apos;s your turn, and nothing else.
           </p>
         </form>
       )}
