@@ -40,6 +40,11 @@ node_modules/
 .claude/
 .mcp.json
 .codex/
+.impeccable/
+website/.impeccable/
+
+# TypeScript incremental build info
+*.tsbuildinfo
 
 # Local SQLite memory databases and sidecar files
 *.db
