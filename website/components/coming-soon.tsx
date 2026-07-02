@@ -3,9 +3,9 @@ import Link from "next/link";
 import { Section } from "@/components/section";
 import { GITHUB_URL } from "@/lib/links";
 
-export function ComingSoon({ eyebrow, title, lede }: { eyebrow: string; title: string; lede: string }) {
+export function ComingSoon({ title, lede }: { title: string; lede: string }) {
   return (
-    <Section eyebrow={eyebrow} title={title} lede={lede} className="min-h-[60vh]">
+    <Section title={title} lede={lede} className="min-h-[60vh]">
       <div className="flex flex-col items-center gap-4">
         <a
           href={GITHUB_URL}

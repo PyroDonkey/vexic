@@ -35,6 +35,11 @@ Vexic package runtime and is not part of the Python memory-engine install.
 
 ## Environment
 
+Required for waitlist persistence in production:
+
+- `TURSO_DATABASE_URL` — libSQL database URL for waitlist signups.
+- `TURSO_AUTH_TOKEN` — auth token for that database.
+
 Optional (all have defaults):
 
 - `NEXT_PUBLIC_SITE_URL` — canonical site origin for metadata, robots, and
@@ -44,11 +49,14 @@ Optional (all have defaults):
 
 ## Waitlist
 
-`POST /api/waitlist` is a stub: it validates the email (shared validator in
-`lib/waitlist.mjs`, covered by `npm test`) and acknowledges the signup without
-storing it. Wire a durable store or provider before treating signups as real.
-The hero, final CTA, and `/pricing` forms all post to this route with a
-`source` field for later attribution.
+`POST /api/waitlist` validates the email (shared validator in
+`lib/waitlist.mjs`, covered by `npm test`) and persists signups to a
+Turso/libSQL table (`waitlist_signups`, keyed by email; duplicates are
+idempotent successes). Configure `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN`
+in the deployment environment. Without them, production returns 503 instead
+of pretending to save; local dev logs and acknowledges so the form can be
+exercised. The hero, final CTA, and `/pricing` forms all post to this route
+with a `source` field for attribution.
 
 ## Pages
 
