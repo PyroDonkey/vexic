@@ -1,0 +1,68 @@
+import Image from "next/image";
+import Link from "next/link";
+
+import { CONSOLE_URL, GITHUB_URL, NAV_LINKS } from "@/lib/links";
+
+export function SiteFooter() {
+  return (
+    <footer className="border-t border-border bg-background-raised">
+      <div className="mx-auto flex w-full max-w-6xl flex-col gap-8 px-5 py-12 sm:flex-row sm:items-start sm:justify-between">
+        <div className="max-w-xs space-y-3">
+          <Image
+            src="/vexic-logo-reversed.svg"
+            alt="Vexic"
+            width={96}
+            height={28}
+            className="h-7 w-auto"
+          />
+          <p className="text-sm text-muted-foreground">
+            Provenance-first, replayable memory for long-running AI agents.
+          </p>
+        </div>
+
+        <div className="flex gap-16 text-sm">
+          <div className="space-y-3">
+            <p className="font-semibold">Product</p>
+            <ul className="space-y-2 text-muted-foreground">
+              {NAV_LINKS.map((link) => (
+                <li key={link.href}>
+                  <Link href={link.href} className="transition-colors hover:text-foreground">
+                    {link.label}
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          </div>
+          <div className="space-y-3">
+            <p className="font-semibold">Resources</p>
+            <ul className="space-y-2 text-muted-foreground">
+              <li>
+                <a
+                  href={GITHUB_URL}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="transition-colors hover:text-foreground"
+                >
+                  GitHub
+                </a>
+              </li>
+              <li>
+                <a href={CONSOLE_URL} className="transition-colors hover:text-foreground">
+                  Sign in
+                </a>
+              </li>
+            </ul>
+          </div>
+        </div>
+      </div>
+      <div className="border-t border-border">
+        <div className="mx-auto flex w-full max-w-6xl items-center justify-between px-5 py-5 text-xs text-muted-foreground">
+          <p>© {new Date().getFullYear()} Vexic</p>
+          <a href={GITHUB_URL} target="_blank" rel="noreferrer" className="hover:text-foreground">
+            github.com/PyroDonkey/vexic
+          </a>
+        </div>
+      </div>
+    </footer>
+  );
+}
