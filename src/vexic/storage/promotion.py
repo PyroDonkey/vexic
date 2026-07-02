@@ -33,12 +33,12 @@ from vexic.storage.connection import connect
 
 @dataclass(frozen=True)
 class PromotionDecision:
-    # One Deep-phase promotion. The candidate graduates to Tier 3; if it
-    # contradicts an existing Tier 3 fact, that neighbor is retired in the
-    # same transaction and linked to the new fact.
+    # One Deep-phase promotion. The candidate graduates to Tier 3; every
+    # lower-confidence Tier 3 fact it contradicts is retired in the same
+    # transaction and linked to the new fact.
     candidate_id: int
     embedding: list[float]
-    retired_fact_id: int | None = None
+    retired_fact_ids: tuple[int, ...] = ()
     retired_candidate_ids: tuple[int, ...] = ()
 
 
@@ -94,10 +94,14 @@ def _validate_decision_agent_scope(
             )
 
     if isinstance(decision, PromotionDecision):
-        fact_id = decision.retired_fact_id
+        retiring_fact_ids: tuple[int, ...] = decision.retired_fact_ids
     else:
-        fact_id = decision.retired_by_fact_id
-    if fact_id is not None:
+        retiring_fact_ids = (
+            (decision.retired_by_fact_id,)
+            if decision.retired_by_fact_id is not None
+            else ()
+        )
+    for fact_id in retiring_fact_ids:
         row = conn.execute(
             "SELECT agent_id FROM long_term_memory WHERE id = ?",
             (fact_id,),
@@ -154,18 +158,18 @@ def _promote_candidate(
     decision: PromotionDecision,
     *,
     forbidden_secret_values: Iterable[str] = (),
-) -> tuple[bool, bool]:
-    # Returns (promoted, retired). The promotion module owns the idempotency
+) -> tuple[bool, int]:
+    # Returns (promoted, retired_fact_count). The promotion module owns the idempotency
     # contract here:
     #   * already-promoted candidate WITH a linked Tier 3 fact -> skip
-    #     (False, False). This covers both a benign sequential re-run AND a
+    #     (False, 0). This covers both a benign sequential re-run AND a
     #     concurrent loser that read the candidate after the winner committed
     #     promoted=1; both are indistinguishable from the row alone, so we skip
     #     rather than raise — a benign race must never abort the surrounding
     #     batch. A promoted flag with NO durable fact is corruption (unreachable
     #     by the atomic claim+insert), so it still fails loud below.
     #   * atomic-claim loss (read saw promoted=0, but a concurrent winner claimed
-    #     in the read->write window) -> skip (False, False), no Tier 3 write.
+    #     in the read->write window) -> skip (False, 0), no Tier 3 write.
     #   * genuinely-invalid input (missing / retired / stale / empty provenance)
     #     -> raise. These are caller errors, not races, and fail the cycle loud.
     if len(decision.embedding) != EMBEDDING_DIM:
@@ -198,7 +202,7 @@ def _promote_candidate(
 
     if promoted:
         if long_term_fact_exists_for_candidate(conn, decision.candidate_id):
-            return (False, False)
+            return (False, 0)
         raise ValueError(
             f"Candidate {decision.candidate_id} is flagged promoted but has no Tier 3 "
             "fact; refusing to skip a corrupt promotion state."
@@ -223,7 +227,7 @@ def _promote_candidate(
     # for the window between read and write. promoted_fact_id is filled after the
     # insert below.
     if not claim_candidate_for_promotion(conn, decision.candidate_id):
-        return (False, False)
+        return (False, 0)
 
     fact_id = insert_long_term_fact(
         conn,
@@ -242,15 +246,16 @@ def _promote_candidate(
     )
     link_candidate_to_promoted_fact(conn, decision.candidate_id, fact_id)
 
-    retired_flag = False
-    if decision.retired_fact_id is not None:
-        retired_flag = retire_long_term_fact(
+    retired_count = 0
+    for retiring_fact_id in decision.retired_fact_ids:
+        if retire_long_term_fact(
             conn,
-            fact_id=decision.retired_fact_id,
+            fact_id=retiring_fact_id,
             superseded_by_fact_id=fact_id,
             agent_id=agent_id,
-        )
-    return (True, retired_flag)
+        ):
+            retired_count += 1
+    return (True, retired_count)
 
 
 def commit_deep_cycle(
@@ -313,8 +318,7 @@ def commit_deep_cycle(
                                     ),
                                 ):
                                     retirements += 1
-                    if retired:
-                        retirements += 1
+                    retirements += retired
 
             conn.execute(
                 """

@@ -537,15 +537,16 @@ def test_activate_replacement_database_rejects_dsn_tenant_mismatch(monkeypatch, 
 
 
 class _StubProvisionService:
-    """Minimal stand-in whose `catalog.provision_customer_account` raises a
-    preset exception, so `_provision_control_tenant` can be exercised without a
-    real catalog or Turso connection."""
+    """Minimal stand-in whose catalog tenant lookup raises a preset exception."""
 
     def __init__(self, exc: Exception) -> None:
         self.catalog = self
         self._exc = exc
 
     def provision_customer_account(self, clerk_org_id: str) -> str:
+        raise self._exc
+
+    def resolve_customer_tenant(self, clerk_org_id: str) -> str | None:
         raise self._exc
 
 
@@ -560,6 +561,21 @@ def _run_boundary(exc: Exception) -> object:
     @cp._control_plane_storage_boundary
     async def handler() -> object:
         return cp._provision_control_tenant(_StubProvisionService(exc), "org_123")
+
+    try:
+        return asyncio.run(handler())
+    except Exception as propagated:  # noqa: BLE001 -- assert on it in the test
+        return propagated
+
+
+def _run_resolve_boundary(exc: Exception) -> object:
+    import asyncio
+
+    from vexic import hosted_control_plane_http as cp
+
+    @cp._control_plane_storage_boundary
+    async def handler() -> object:
+        return cp._resolve_control_tenant(_StubProvisionService(exc), "org_123")
 
     try:
         return asyncio.run(handler())
@@ -623,6 +639,36 @@ def test_provision_control_tenant_domain_valueerror_still_becomes_bad_request():
 
     with pytest.raises(cp._ControlPlaneBadRequest) as excinfo:
         cp._provision_control_tenant(_StubProvisionService(domain_error), "org_123")
+
+    assert "clerk_org_id" in str(excinfo.value)
+
+
+def test_resolve_control_tenant_libsql_valueerror_propagates_unwrapped():
+    from vexic import hosted_control_plane_http as cp
+
+    libsql_operational = ValueError(
+        'Hrana: `stream error: `Error { message: "SQLite error: no such '
+        'table: customer_account_mappings", code: "SQLITE_ERROR" }``'
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        cp._resolve_control_tenant(_StubProvisionService(libsql_operational), "org_123")
+
+    assert not isinstance(excinfo.value, cp._ControlPlaneBadRequest)
+    assert excinfo.value is libsql_operational
+
+    result = _run_resolve_boundary(libsql_operational)
+    assert isinstance(result, JSONResponse)
+    assert result.status_code in (500, 503)
+
+
+def test_resolve_control_tenant_domain_valueerror_still_becomes_bad_request():
+    from vexic import hosted_control_plane_http as cp
+
+    domain_error = ValueError("clerk_org_id must not be blank.")
+
+    with pytest.raises(cp._ControlPlaneBadRequest) as excinfo:
+        cp._resolve_control_tenant(_StubProvisionService(domain_error), "org_123")
 
     assert "clerk_org_id" in str(excinfo.value)
 

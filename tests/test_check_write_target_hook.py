@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _load_hook() -> ModuleType:
     spec = importlib.util.spec_from_file_location(
-        "check_write_target", ROOT / ".claude" / "hooks" / "check_write_target.py"
+        "check_write_target", ROOT / "scripts" / "check_write_target.py"
     )
     assert spec is not None
     assert spec.loader is not None
@@ -141,7 +141,7 @@ def test_empty_or_malformed_input_allows(
 
 def test_hook_error_path_emits_no_permission_decision() -> None:
     completed = subprocess.run(
-        [sys.executable, str(ROOT / ".claude" / "hooks" / "check_write_target.py")],
+        [sys.executable, str(ROOT / "scripts" / "check_write_target.py")],
         input="{",
         capture_output=True,
         text=True,

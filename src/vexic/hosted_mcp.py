@@ -94,12 +94,26 @@ def _forward_http_error(
 ) -> None:
     raw = exc.read().decode("utf-8", errors="replace")
     try:
-        json.loads(raw)
+        payload = json.loads(raw)
     except json.JSONDecodeError:
-        _write_jsonrpc_error(stdout, message_id, f"Hosted MCP returned HTTP {exc.code}.")
+        payload = None
+    if isinstance(payload, dict) and payload.get("jsonrpc") == "2.0" and "id" in payload:
+        # Upstream already speaks JSON-RPC; forward its envelope verbatim.
+        stdout.write(raw + ("\n" if not raw.endswith("\n") else ""))
+        stdout.flush()
         return
-    stdout.write(raw + ("\n" if not raw.endswith("\n") else ""))
-    stdout.flush()
+    # Anything else (e.g. the hosted server's {"error": {...}} REST envelope on
+    # 429/401) must be re-wrapped so the client can correlate it to its request.
+    detail: str | None = None
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict) and isinstance(error.get("message"), str):
+            detail = error["message"]
+    _write_jsonrpc_error(
+        stdout,
+        message_id,
+        detail or f"Hosted MCP returned HTTP {exc.code}.",
+    )
 
 
 def run_recorder_config_proxy(

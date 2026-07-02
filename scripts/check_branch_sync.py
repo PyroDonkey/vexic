@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""SessionStart hook: fetch origin and warn if dev/main have drifted.
+"""Read-only branch drift check for optional local agent hooks.
 
 Read-only: it fetches remote refs and reports drift, but never merges, resets,
 or switches branches. Agents must still do the sync deliberately on `dev`.

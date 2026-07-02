@@ -11,19 +11,19 @@ export const metadata: Metadata = {
 export default function PricingPage() {
   return (
     <Section
-      eyebrow="Pricing"
       title="Pricing lands with the hosted launch"
       lede="Hosted Vexic is in internal alpha and pricing is being finalized alongside it. Leave your email and we'll notify you the moment plans go live."
+      headingLevel="h1"
       className="min-h-[60vh]"
     >
-      <div className="mx-auto flex max-w-md flex-col items-center gap-6">
+      <div id="waitlist" className="mx-auto flex max-w-md scroll-mt-24 flex-col items-center gap-6">
         <WaitlistForm source="pricing" />
         <div className="rounded-xl border border-border bg-card p-5 text-sm text-muted-foreground">
           <p className="mb-2 font-semibold text-foreground">What to expect</p>
           <ul className="list-disc space-y-1 pl-5">
-            <li>The local-first Python core stays open on GitHub.</li>
             <li>Hosted plans will price on stored memory and retrieval volume.</li>
             <li>Waitlist members get first access and launch pricing.</li>
+            <li>The memory core stays open source on GitHub.</li>
           </ul>
         </div>
       </div>

@@ -40,7 +40,7 @@ async function body(request) {
 export async function listProjectsResponse(_request, auth) {
   const denied = requireOrg(auth);
   if (denied) return denied;
-  return storeResponse(() => listProjects(auth.orgId), (projects) => json({ projects }));
+  return storeResponse(() => listProjects(auth.orgId), (projects) => json({ projects: projects ?? [] }));
 }
 
 export async function createProjectResponse(request, auth) {

@@ -10,7 +10,6 @@ export const metadata: Metadata = {
 export default function BlogPage() {
   return (
     <ComingSoon
-      eyebrow="Blog"
       title="The blog is coming soon"
       lede="Deep dives on agent memory, provenance, and replayable systems are in the works. Watch the GitHub repository for updates in the meantime."
     />

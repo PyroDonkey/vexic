@@ -104,11 +104,11 @@ class _ContradictionAgent:
 
 class MemoryReliabilityCommandDocumentationTests(unittest.TestCase):
     def test_reliability_gate_discovery_markers_are_documented(self) -> None:
-        readme = (REPO_ROOT / "README.md").read_text()
+        usage_doc = (REPO_ROOT / "docs" / "usage.md").read_text()
 
-        self.assertIn("## Running the Project", readme)
-        self.assertIn("<!-- memory-reliability-gate -->", readme)
-        self.assertIn("<!-- memory-reliability-live-smoke -->", readme)
+        self.assertIn("## Running the Project", usage_doc)
+        self.assertIn("<!-- memory-reliability-gate -->", usage_doc)
+        self.assertIn("<!-- memory-reliability-live-smoke -->", usage_doc)
 
 
 class FreshCandidateFallbackReliabilityTests(unittest.IsolatedAsyncioTestCase):

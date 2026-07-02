@@ -1,5 +1,8 @@
 # Vexic Agent Instructions
 
+Internal tooling doc for automated agents and maintainers; not public product
+documentation.
+
 Single source of truth for agents working in this repository.
 Plain markdown, no tool-specific syntax.
 
@@ -156,6 +159,7 @@ Each doc owns one thing. Avoid duplicate status and copied platform history.
   conventions.
 - `docs/ai/CLAUDE.md` - Claude Code prompt-context pointer.
 - `docs/ai/CONTEXT.md` - product-language glossary for planning.
+- `docs/ai/kilo-review-policy.md` - internal review-agent calibration.
 - `docs/adr/README.md` - index of every ADR with title and one-line status.
 - `docs/adr/*` - dated architecture decision records.
 - `docs/provenance.md` - extraction provenance from the private source host.
@@ -196,12 +200,12 @@ Tracking rules):
   `uv run pytest` and update any tracking doc that cites a test count to the
   fresh number. Do not carry a hand-typed count forward; verify it.
 
-`.claude/hooks/check_doc_drift.py` enforces the in-repo half of this loop: it
-checks that `docs/adr/README.md` lists every ADR file and that the documented
-service surface matches `src/vexic`. It runs advisory at session start and as
-a merge-blocking CI step (`--ci`) on every PR. A hook cannot read the external
-tracking system, so closing the loop against the tracking docs remains a
-manual step under the triggers above.
+`scripts/check_doc_drift.py` enforces the in-repo half of this loop: it checks
+that `docs/adr/README.md` lists every ADR file and that the documented service
+surface matches `src/vexic`. CI runs it with `--ci` on every PR. A local agent
+hook may call the same script, but `.claude/` configuration is machine-local and
+ignored by Git. A hook cannot read the external tracking system, so closing the
+loop against the tracking docs remains a manual step under the triggers above.
 
 ---
 
@@ -304,9 +308,8 @@ post-release fast-forward) live in `docs/branch-sync.md`. See
 `dev` to `main` PR.
 
 These hard-stops stay in force regardless of that procedure. The
-`.claude/hooks/check_branch_sync.py` SessionStart hook only reports drift in
-read-only form; it never merges, resets, or blocks, so these are the actual
-guardrails:
+`scripts/check_branch_sync.py` helper only reports drift in read-only form; it
+never merges, resets, or blocks, so these are the actual guardrails:
 
 - Never push to `main` unless the requester explicitly asks.
 - If any `git pull --ff-only` fails, stop and report the divergence. Do not
@@ -372,10 +375,9 @@ rg -n "^(from|import) engine\\." src/vexic tests
 rg -n "C[o]alescent|A[g]entOS|Telegram|Blog Writer|teammate" docs/ai/AGENTS.md README.md docs src/vexic tests console
 ```
 
-Alongside the two SessionStart hooks (`.claude/hooks/check_doc_drift.py` and
-`.claude/hooks/check_branch_sync.py`), the `.claude/hooks/check_write_target.py`
-PreToolUse guard fails closed against Tier-1 `messages` mutation and against
-changes to the host-extension `background_tool_audit` table.
+`scripts/check_doc_drift.py --ci` is the committed doc-drift gate. Optional
+local agent hooks may also call `scripts/check_branch_sync.py` and
+`scripts/check_write_target.py`; keep `.claude/` hook configuration local.
 
 Run the LongMemEval evals with `vexic.run_evals`; see `docs/examples.md` for the
 exact command and worked behavior examples.

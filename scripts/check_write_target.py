@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""PreToolUse hook: fail closed against the Vexic memory invariants.
+"""Fail closed against Vexic memory invariants for optional local agent hooks.
 
 The memory invariants in docs/ai/AGENTS.md are enforced in code and tests, but not at
 the agent harness layer. This hook closes the harness-layer gap by denying a
@@ -22,8 +22,8 @@ that actually invoke `sqlite3`; a command that merely *mentions* SQL text
 the string) is allowed, because it does not execute against the database. It
 also allows non-Bash tools, read-only SQL such as `SELECT`, mutations of other
 tables, SQL piped from a file (which it cannot read), and anything it cannot
-confidently classify. Like the other hooks here, any internal error fails safe
-(allow), never blocking the agent.
+confidently classify. Any internal error fails safe (allow), never blocking the
+agent.
 """
 
 from __future__ import annotations

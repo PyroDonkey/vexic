@@ -210,18 +210,23 @@ async def run_light_phase(
         return usage
 
     except Exception as exc:
-        commit_dream_cycle(
-            db_path,
-            [],
-            agent_id=agent_id,
-            status="error",
-            started_at=started_at,
-            finished_at=utc_now_iso(),
-            messages_processed=0,
-            last_processed_message_id=watermark,
-            error_detail=traceback.format_exc(),
-            forbidden_secret_values=forbidden,
-        )
+        # Best-effort audit. A failure writing the error row must not mask the
+        # original exception that actually broke the cycle.
+        try:
+            commit_dream_cycle(
+                db_path,
+                [],
+                agent_id=agent_id,
+                status="error",
+                started_at=started_at,
+                finished_at=utc_now_iso(),
+                messages_processed=0,
+                last_processed_message_id=watermark,
+                error_detail=traceback.format_exc(),
+                forbidden_secret_values=forbidden,
+            )
+        except Exception:
+            pass
         print(f"Light phase: ERROR -- {exc}. Watermark held; will retry.")
         raise
 

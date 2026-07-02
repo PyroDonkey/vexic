@@ -1274,6 +1274,26 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(tenant.project_ids, frozenset({"project-a", "project-b"}))
 
+    def test_customer_account_tenant_can_be_resolved_without_provisioning(self) -> None:
+        root = Path(self.temp_dir.name)
+
+        self.assertIsNone(self.catalog.resolve_customer_tenant("org_missing"))
+        with closing(sqlite3.connect(root / "control-plane.db")) as conn:
+            tenants = conn.execute("SELECT tenant_id FROM tenants").fetchall()
+            mappings = conn.execute(
+                "SELECT clerk_org_id, tenant_id FROM customer_account_mappings"
+            ).fetchall()
+
+        self.assertEqual(tenants, [])
+        self.assertEqual(mappings, [])
+        self.assertEqual(list(root.glob("customer-*.db")), [])
+
+        tenant_id = self.catalog.provision_customer_account("org_123")
+
+        self.assertEqual(self.catalog.resolve_customer_tenant("org_123"), tenant_id)
+        with self.assertRaisesRegex(ValueError, "clerk_org_id must not be blank"):
+            self.catalog.resolve_customer_tenant(" ")
+
     def test_customer_account_provisioning_handles_competing_mapping_claim(self) -> None:
         original = self.catalog.provision_tenant
         control_db = Path(self.temp_dir.name) / "control-plane.db"

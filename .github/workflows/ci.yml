@@ -16,6 +16,6 @@ jobs:
       - name: Set up Python
         run: uv python install 3.13
       - name: Check doc drift
-        run: uv run python .claude/hooks/check_doc_drift.py --ci
+        run: uv run python scripts/check_doc_drift.py --ci
       - name: Run tests
         run: uv run pytest

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""SessionStart hook: warn when in-repo docs drift from in-repo code.
+"""Warn when in-repo docs drift from in-repo code.
 
 Also runs in CI with `--ci`: same checks, but findings go to stderr and drift
 exits 1 so a drifting PR cannot merge.
@@ -26,7 +26,7 @@ import re
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[1]
 ADR_DIR = REPO_ROOT / "docs" / "adr"
 ADR_INDEX = ADR_DIR / "README.md"
 CONTRACT = REPO_ROOT / "src" / "vexic" / "contract" / "__init__.py"

@@ -365,6 +365,20 @@ class HostedTenantCatalog:
         self.provision_tenant(tenant_id)
         return tenant_id
 
+    def resolve_customer_tenant(self, clerk_org_id: str) -> str | None:
+        if not clerk_org_id.strip():
+            raise ValueError("clerk_org_id must not be blank.")
+        with closing(self._connect_control()) as conn:
+            row = conn.execute(
+                """
+                SELECT tenant_id
+                FROM customer_account_mappings
+                WHERE clerk_org_id = ?
+                """,
+                (clerk_org_id,),
+            ).fetchone()
+        return None if row is None else str(row[0])
+
     def provision_project(self, tenant_id: str, project_id: str) -> HostedTenant:
         if not project_id.strip():
             raise ValueError("project_id must not be blank.")

@@ -35,10 +35,9 @@ node_modules/
 .env.*
 !.env.example
 !.env.sample
-.claude/settings.local.json
 
 # Local agent tooling
-.claude/launch.json
+.claude/
 .mcp.json
 .codex/
 

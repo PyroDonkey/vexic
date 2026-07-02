@@ -114,7 +114,7 @@ Add this bullet to the notes section if the file has an ADR notes list:
 Run:
 
 ```powershell
-python .claude\hooks\check_doc_drift.py
+python scripts\check_doc_drift.py --ci
 ```
 
 Expected: exit `0`, with the ADR index and LocalMemoryService surface reported as matching.
@@ -1715,7 +1715,7 @@ Expected:
 Run:
 
 ```powershell
-python .claude\hooks\check_doc_drift.py
+python scripts\check_doc_drift.py --ci
 ```
 
 Expected: exit `0`.
