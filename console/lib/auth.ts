@@ -15,7 +15,10 @@ export async function readAuthContext(): Promise<ConsoleAuthContext> {
 
   const session = await auth();
   const claims = session.sessionClaims as Record<string, unknown> | null;
-  const metadata = (claims?.publicMetadata ?? claims?.metadata ?? {}) as Record<string, unknown>;
+  // Only publicMetadata is trusted: it is writable solely via Clerk's backend
+  // API. A bare `metadata` claim could be template-mapped from user-writable
+  // unsafeMetadata, which would let a customer self-grant support access.
+  const metadata = (claims?.publicMetadata ?? {}) as Record<string, unknown>;
   const isInternalSupport =
     metadata.vexicInternal === true ||
     metadata.vexicRole === "internal" ||

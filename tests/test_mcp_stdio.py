@@ -419,7 +419,16 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
             thread.join(timeout=1)
 
         self.assertEqual(code, 0)
-        self.assertEqual(json.loads(stdout.getvalue()), _HostedApiHandler.response_payload)
+        # Upstream REST error envelopes are not JSON-RPC; the proxy must
+        # re-wrap them so the client can correlate the reply to its request id.
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "error": {"code": -32000, "message": "Invalid hosted API key."},
+            },
+        )
         self.assertEqual(stderr.getvalue(), "")
         self.assertNotIn("vx_test_key", stdout.getvalue())
 

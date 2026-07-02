@@ -1,31 +1,37 @@
 @import "tailwindcss";
 
 /*
- * Dark-first marketing theme. Tokens derive from console/app/globals.css dark
- * palette: emerald primary oklch(0.696 0.17 162.48) on near-black zinc surfaces.
+ * Dark-first marketing theme. Emerald primary oklch(0.696 0.17 162.48) carries
+ * the brand; every neutral is tinted toward the same hue (162) at low chroma so
+ * surfaces cohere with the identity instead of reading as generic zinc.
  */
 :root {
-  --background: oklch(0.13 0.005 285.823);
-  --background-raised: oklch(0.16 0.006 285.885);
-  --foreground: oklch(0.985 0.003 247.858);
-  --card: oklch(0.17 0.006 285.885);
-  --card-foreground: oklch(0.985 0.003 247.858);
+  --background: oklch(0.13 0.008 162.48);
+  --background-raised: oklch(0.16 0.01 162.48);
+  --foreground: oklch(0.985 0.004 162.48);
+  --card: oklch(0.17 0.01 162.48);
+  --card-foreground: oklch(0.985 0.004 162.48);
   --primary: oklch(0.696 0.17 162.48);
-  --primary-foreground: oklch(0.145 0.005 285.823);
-  --primary-dim: oklch(0.53 0.105 184.704);
-  --secondary: oklch(0.274 0.006 286.033);
-  --secondary-foreground: oklch(0.985 0.003 247.858);
-  --muted: oklch(0.234 0.006 286.033);
-  --muted-foreground: oklch(0.705 0.015 286.067);
-  --accent: oklch(0.274 0.006 286.033);
-  --accent-foreground: oklch(0.985 0.003 247.858);
+  --primary-foreground: oklch(0.145 0.008 162.48);
+  --primary-dim: oklch(0.53 0.105 162.48);
+  /* Committed brand surface for the single most-colored moment on the page
+     (final CTA). Muted variant keeps text on it hued, never washed-out gray. */
+  --primary-surface: oklch(0.21 0.042 162.48);
+  --primary-surface-muted: oklch(0.82 0.05 162.48);
+  --secondary: oklch(0.274 0.012 162.48);
+  --secondary-foreground: oklch(0.985 0.004 162.48);
+  --muted: oklch(0.234 0.012 162.48);
+  --muted-foreground: oklch(0.72 0.016 162.48);
+  --accent: oklch(0.274 0.012 162.48);
+  --accent-foreground: oklch(0.985 0.004 162.48);
   --destructive: oklch(0.704 0.191 22.216);
-  --border: oklch(1 0 0 / 10%);
-  --input: oklch(1 0 0 / 15%);
+  --border: oklch(0.87 0.07 162.48 / 11%);
+  /* Form-field boundaries need ~3:1 against the surface (WCAG 1.4.11);
+     the 15% hairline used for decorative borders is too faint here. */
+  --input: oklch(0.93 0.03 162.48 / 32%);
   --ring: oklch(0.696 0.17 162.48);
-  --glow: oklch(0.696 0.17 162.48 / 22%);
-  --glow-soft: oklch(0.696 0.17 162.48 / 9%);
   --radius: 0.5rem;
+  --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
 }
 
 @theme inline {
@@ -39,6 +45,8 @@
   --color-primary: var(--primary);
   --color-primary-foreground: var(--primary-foreground);
   --color-primary-dim: var(--primary-dim);
+  --color-primary-surface: var(--primary-surface);
+  --color-primary-surface-muted: var(--primary-surface-muted);
   --color-secondary: var(--secondary);
   --color-secondary-foreground: var(--secondary-foreground);
   --color-muted: var(--muted);
@@ -49,8 +57,6 @@
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
-  --color-glow: var(--glow);
-  --color-glow-soft: var(--glow-soft);
   --radius-sm: calc(var(--radius) * 0.75);
   --radius-md: calc(var(--radius) * 0.875);
   --radius-lg: var(--radius);
@@ -87,32 +93,32 @@
 }
 
 @layer utilities {
-  .glow-ring {
-    box-shadow:
-      0 0 0 1px oklch(0.696 0.17 162.48 / 25%),
-      0 0 24px var(--glow-soft);
+  /* Scroll-reveal states. The hidden class is added from JS only (see
+     components/reveal.tsx), so content is visible by default without JS. */
+  .reveal-hidden {
+    opacity: 0;
+    translate: 0 24px;
+    transition:
+      opacity 0.5s var(--ease-out-quart),
+      translate 0.5s var(--ease-out-quart);
   }
 
-  .text-gradient {
-    /* background-image longhand: the `background` shorthand would reset
-       background-clip when the minifier reorders declarations. */
-    background-image: linear-gradient(
-      100deg,
-      var(--foreground) 30%,
-      var(--primary) 65%,
-      oklch(0.85 0.12 175) 100%
-    );
-    -webkit-background-clip: text;
-    background-clip: text;
-    color: transparent;
-    -webkit-text-fill-color: transparent;
+  .reveal-hidden.reveal-shown {
+    opacity: 1;
+    translate: 0 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
   }
 
-  .hero-grid {
-    background-image:
-      linear-gradient(oklch(1 0 0 / 4%) 1px, transparent 1px),
-      linear-gradient(90deg, oklch(1 0 0 / 4%) 1px, transparent 1px);
-    background-size: 44px 44px;
-    mask-image: radial-gradient(ellipse 90% 70% at 50% 0%, black 40%, transparent 100%);
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
   }
 }

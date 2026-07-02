@@ -199,6 +199,11 @@ def export_canonical_migration(
             *_iter_payload_strings(payload),
         )
     except Exception:
+        # Intentional (see test_canonical_migration_overwrite_removes_stale_artifact_
+        # on_redaction_failure): with overwrite=True the caller asked for the old
+        # artifact to be superseded, and a redaction failure means the DB now
+        # holds a forbidden value — keeping a possibly secret-bearing stale
+        # export around is worse than removing it.
         if overwrite:
             target.unlink(missing_ok=True)
         raise
