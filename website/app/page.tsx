@@ -79,7 +79,7 @@ export default function HomePage() {
               Early access — internal alpha
             </p>
             <h1 className="text-4xl font-semibold tracking-tight text-balance sm:text-5xl lg:text-6xl">
-              Memory your agents <span className="text-gradient">can trust</span>
+              Memory your agents <span className="text-gradient inline-block">can trust</span>
             </h1>
             <p className="mt-5 max-w-xl text-lg leading-relaxed text-muted-foreground">
               Vexic is a provenance-first, replayable memory engine for long-running AI agents.
