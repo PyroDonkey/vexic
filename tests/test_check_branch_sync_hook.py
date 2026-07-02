@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _load_hook() -> ModuleType:
     spec = importlib.util.spec_from_file_location(
-        "check_branch_sync", ROOT / ".claude" / "hooks" / "check_branch_sync.py"
+        "check_branch_sync", ROOT / "scripts" / "check_branch_sync.py"
     )
     assert spec is not None
     assert spec.loader is not None

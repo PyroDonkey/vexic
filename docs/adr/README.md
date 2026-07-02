@@ -7,9 +7,9 @@ reconcile the downstream tracking roadmap/todo against it. See "Docs Are
 Downstream Of Code" in `docs/ai/AGENTS.md`, which defines the reconciliation
 triggers.
 
-Every ADR file in this directory must appear in the table below. The
-`.claude/hooks/check_doc_drift.py` SessionStart hook flags any ADR file that is
-missing from this index (and the reverse).
+Every ADR file in this directory must appear in the table below.
+`scripts/check_doc_drift.py --ci` flags any ADR file that is missing from this
+index (and the reverse).
 
 | ADR  | Title                                                           | Status   |
 | ---- | --------------------------------------------------------------- | -------- |

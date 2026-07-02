@@ -101,13 +101,11 @@ fix belongs in the harness or the rules, not only in the working tree.
   the next session starts with the corrected rule. Editing
   `docs/ai/AGENTS.md` is a settled-rule change; surface it to the requester
   rather than rewriting boundaries unilaterally.
-- If the failure is a drift that a check could have caught, prefer a hook. The
-  repository already enforces parts of this loop at session start:
-  `.claude/hooks/check_doc_drift.py` checks that `docs/adr/README.md` lists every
-  ADR file and that the documented service surface matches `src/vexic`, and
-  `.claude/hooks/check_branch_sync.py` reports `dev`-to-`main` drift in
-  read-only form. A new recurring failure mode is a candidate for the same kind
-  of guard.
+- If the failure is a drift that a check could have caught, prefer a check.
+  The repository already has `scripts/check_doc_drift.py` for ADR/service
+  surface drift and `scripts/check_branch_sync.py` for read-only branch drift
+  reporting. Local agent hooks may call these scripts, but hook configuration
+  stays out of Git.
 - Close the loop in-session where the triggers fire. `docs/ai/AGENTS.md` lists
   reconciliation triggers (a new or changed ADR, a change to the
   `LocalMemoryService` operation surface, or a test-count change) that must be

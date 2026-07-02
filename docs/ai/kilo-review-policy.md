@@ -1,11 +1,12 @@
-# REVIEW.md
+# Kilo review policy
 
-Code-review policy for **Vexic**, a provenance-first, replayable memory core for
-long-running AI agents. Kilo reads this from the PR/MR **base** branch, so it
-must live there to take effect (a PR that only edits REVIEW.md is not reviewed
-under its own rules). Prefer these domain rules over built-in guidance where they
-differ; Kilo's hard safety, read-only, diff-line, duplicate, and output-format
-constraints still win.
+Internal tooling doc for review agents and maintainers; not public product
+documentation.
+
+This policy was formerly the repo-root `REVIEW.md`. It is preserved here for
+manual review-agent configuration and Vexic-specific review calibration. Prefer
+these domain rules over built-in guidance where they differ; Kilo's hard safety,
+read-only, diff-line, duplicate, and output-format constraints still win.
 
 ## What Vexic is
 
@@ -27,9 +28,9 @@ corruption of memory (wrong tier, lost provenance, cross-tenant leakage), not
 typical web-app bugs, so review for invariants, not style. Priority: (1)
 memory-correctness invariants, (2) tenant scope + redaction + secrets, (3)
 architecture boundaries, (4) tests for changed behavior, (5) provenance/doc
-drift, (6) style. CI runs only `uv run pytest` (no lint/type/hook gate), so the
-reviewer is the sole gate for contract drift, doc drift, and type correctness;
-do not block on formatting.
+drift, (6) style. CI runs doc-drift checking plus `uv run pytest`; the reviewer
+is still the gate for contract drift, type correctness, and behavior that tests
+do not cover. Do not block on formatting.
 
 A destructive fix is usually the wrong fix here: prefer supersede / retire in
 place, rebuild a projection, or mark data unverified over deleting or updating
@@ -116,11 +117,10 @@ risk).
   `test_package_manager_policy.py`, `test_schema_ownership.py`.
 - Do not run the live provider smoke (`vexic.live_retrieval_baseline`); it is
   opt-in behind `--allow-live` and `OPENROUTER_API_KEY`. Out of scope.
-- Hook awareness: only `.claude/hooks/check_write_target.py` is fail-closed (a
-  PreToolUse guard blocking Tier-1 `messages` and `background_tool_audit`
-  mutation). `check_doc_drift.py` (ADR-index + service-surface parity) and
-  `check_branch_sync.py` are SessionStart reporters, not blockers, and none run
-  in CI - verify that parity, and any change weakening these guards, manually.
+- Hook awareness: Claude runtime hooks are local-only and are not committed.
+  `scripts/check_doc_drift.py --ci` is the committed ADR-index and
+  service-surface parity check. Verify any change weakening local guardrails
+  manually.
 - `expand_history` has no dedicated audit hook on the local stdio path yet;
   treat any change that widens that egress as high-risk until audit coverage
   exists.

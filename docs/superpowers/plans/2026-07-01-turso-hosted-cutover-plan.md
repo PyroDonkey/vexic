@@ -751,7 +751,7 @@ Assert that constructing a catalog with a `StorageTarget("libsql://...")` contro
 - Modify: `docs/hosted-mvp.md`, `docs/runbooks/hosted-migration.md`, `docs/adr/0019-hosted-storage-cutover-starts-turso-only.md`
 
 - [ ] **Step 1:** Document the token-store decision (measured), the init-once memo, connect timeout/retry, the reconcile path, and skip behavior; note the drill in the runbook.
-- [ ] **Step 2:** Run `uv run python .claude/hooks/check_doc_drift.py` (or start a session) to confirm no ADR/index drift.
+- [ ] **Step 2:** Run `uv run python scripts/check_doc_drift.py --ci` to confirm no ADR/index drift.
 - [ ] **Step 3: Commit**
 
 ```bash

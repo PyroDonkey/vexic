@@ -517,19 +517,19 @@ class LiveRetrievalBaselineTests(unittest.TestCase):
 
 
 class LiveRetrievalBaselineDocumentationTests(unittest.TestCase):
-    def test_readme_documents_live_provider_smoke_command_and_artifacts(self) -> None:
-        readme = (REPO_ROOT / "README.md").read_text()
+    def test_usage_doc_documents_live_provider_smoke_command_and_artifacts(self) -> None:
+        usage_doc = (REPO_ROOT / "docs" / "usage.md").read_text()
 
-        self.assertIn("uv run --with-editable . python -m vexic.live_retrieval_baseline", readme)
-        self.assertNotIn("scripts\\live_retrieval_baseline.py", readme)
-        self.assertIn("adapters\\openrouter_live_adapter.py", readme)
-        self.assertIn("--provider openrouter", readme)
-        self.assertIn("--allow-live", readme)
-        self.assertIn("--provider", readme)
-        self.assertIn("--model-group", readme)
-        self.assertIn("--max-provider-calls", readme)
-        self.assertIn("retrieval_metrics.json", readme)
-        self.assertIn("answer_synthesis_metrics.json", readme)
+        self.assertIn("uv run --with-editable . python -m vexic.live_retrieval_baseline", usage_doc)
+        self.assertNotIn("scripts\\live_retrieval_baseline.py", usage_doc)
+        self.assertIn("adapters\\openrouter_live_adapter.py", usage_doc)
+        self.assertIn("--provider openrouter", usage_doc)
+        self.assertIn("--allow-live", usage_doc)
+        self.assertIn("--provider", usage_doc)
+        self.assertIn("--model-group", usage_doc)
+        self.assertIn("--max-provider-calls", usage_doc)
+        self.assertIn("retrieval_metrics.json", usage_doc)
+        self.assertIn("answer_synthesis_metrics.json", usage_doc)
 
 
 if __name__ == "__main__":

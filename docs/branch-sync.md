@@ -71,6 +71,6 @@ back-merged): stop and report; do not merge or rebase without direction.
 3. Immediately merge `main` back into `dev`:
    `git switch dev && git fetch origin && git merge origin/main && git push origin dev`.
 
-The `.claude/hooks/check_branch_sync.py` SessionStart hook mirrors the drift
-check in read-only form: it fetches origin and reports drift, but never merges.
-If it reports drift, run the matching sequence above before starting work.
+`scripts/check_branch_sync.py` mirrors the drift check in read-only form: it
+fetches origin and reports drift, but never merges. If a local hook or manual
+run reports drift, run the matching sequence above before starting work.
