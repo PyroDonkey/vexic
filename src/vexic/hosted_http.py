@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from collections.abc import Awaitable, Callable
@@ -192,16 +193,26 @@ def create_service_from_env(
     """
     backend = resolve_storage_backend(os.environ)
     root = Path(os.environ.get("VEXIC_HOSTED_ROOT", ".hosted-memory"))
-    catalog = HostedTenantCatalog(root)
-    keys = HostedApiKeyStore(root)
     customer_target_resolver = None
     if backend == "turso":
         provisioning = turso_provisioning or _TursoProvisioning()
         org = os.environ["TURSO_ORG"].strip()
         port = provisioning.build_port(dict(os.environ))
+        catalog = HostedTenantCatalog(
+            root,
+            customer_target_factory=lambda tenant_id: port.create_database(
+                _customer_database_name(tenant_id)
+            ),
+        )
+        keys = HostedApiKeyStore(root)
         cache = provisioning.build_token_cache(port)
-        _ensure_dogfood_tenant_target(catalog, port)
+        if os.environ.get("VEXIC_PROVISION_EXISTING_TURSO_TARGETS", "").strip() == "1":
+            catalog.provision_missing_customer_targets()
+        _ensure_dogfood_tenant_target(catalog)
         customer_target_resolver = provisioning.build_resolver(cache, org=org)
+    else:
+        catalog = HostedTenantCatalog(root)
+        keys = HostedApiKeyStore(root)
     return HostedMemoryService(
         catalog,
         keys,
@@ -211,7 +222,7 @@ def create_service_from_env(
     )
 
 
-def _ensure_dogfood_tenant_target(catalog: HostedTenantCatalog, port: object) -> None:
+def _ensure_dogfood_tenant_target(catalog: HostedTenantCatalog) -> None:
     """Provision a real per-tenant Turso DB for the dogfood tenant if it has
     no ``customer_target`` yet (COA-273 Task 16, P4).
 
@@ -219,9 +230,9 @@ def _ensure_dogfood_tenant_target(catalog: HostedTenantCatalog, port: object) ->
     so the ``turso`` backend is usable with tenants provisioned out of band,
     e.g. the live test which builds the service directly with a tenant that
     already carries a DSN). When set and the tenant's ``customer_target`` is
-    empty, it creates a per-tenant database ``vexic-{tenant_id}`` (idempotent)
-    and stores only the returned DSN via ``provision_tenant`` -- never a shared
-    DB, never a token.
+    empty, re-provisioning lets the catalog's ``customer_target_factory``
+    create a deterministic Turso-safe per-tenant database (idempotent) and
+    store only the returned DSN -- never a shared DB, never a token.
     """
     tenant_id = os.environ.get("VEXIC_DOGFOOD_TENANT_ID", "").strip()
     if not tenant_id:
@@ -229,12 +240,16 @@ def _ensure_dogfood_tenant_target(catalog: HostedTenantCatalog, port: object) ->
     tenant = catalog.get_tenant(tenant_id)
     if tenant.customer_target:
         return
-    dsn = port.create_database(f"vexic-{tenant_id}")
-    catalog.provision_tenant(
-        tenant_id,
-        project_ids=tenant.project_ids,
-        customer_target=dsn,
-    )
+    catalog.provision_tenant(tenant_id, project_ids=tenant.project_ids)
+
+
+def _customer_database_name(tenant_id: str) -> str:
+    slug = "".join(ch if ch.isalnum() else "-" for ch in tenant_id.lower())
+    slug = "-".join(part for part in slug.split("-") if part) or "tenant"
+    digest = hashlib.sha256(tenant_id.encode("utf-8")).hexdigest()[:10]
+    max_slug_chars = 48 - len("vexic--") - len(digest)
+    safe_slug = slug[:max_slug_chars].rstrip("-") or "tenant"
+    return f"vexic-{safe_slug}-{digest}"
 
 
 async def _handle(
