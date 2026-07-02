@@ -124,6 +124,17 @@ class HostedHttpTests(unittest.TestCase):
     def _control_auth(self) -> dict[str, str]:
         return {"Authorization": "Bearer console-secret"}
 
+    def _assert_no_customer_provisioning(self) -> None:
+        root = Path(self.temp_dir.name)
+        with contextlib.closing(sqlite3.connect(root / "control-plane.db")) as conn:
+            tenants = conn.execute("SELECT tenant_id FROM tenants").fetchall()
+            mappings = conn.execute(
+                "SELECT clerk_org_id, tenant_id FROM customer_account_mappings"
+            ).fetchall()
+        self.assertEqual(tenants, [])
+        self.assertEqual(mappings, [])
+        self.assertEqual(list(root.glob("customer-*.db")), [])
+
     def test_health_requires_no_api_key(self) -> None:
         response = self.client.get("/health")
 
@@ -185,13 +196,19 @@ class HostedHttpTests(unittest.TestCase):
             raise_server_exceptions=False,
         )
 
-        response = client.post(
+        provision = client.post(
             "/control/v1/clerk-orgs/%20/tenant",
             headers=self._control_auth(),
         )
+        projects = client.get(
+            "/control/v1/clerk-orgs/%20/projects",
+            headers=self._control_auth(),
+        )
 
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.json()["error"]["code"], "invalid_request")
+        self.assertEqual(provision.status_code, 400)
+        self.assertEqual(projects.status_code, 400)
+        self.assertEqual(provision.json()["error"]["code"], "invalid_request")
+        self.assertEqual(projects.json()["error"]["code"], "invalid_request")
 
     def test_control_plane_sqlite_integrity_errors_are_sanitized(self) -> None:
         client = TestClient(
@@ -231,6 +248,7 @@ class HostedHttpTests(unittest.TestCase):
             create_control_plane_app(self.service, control_plane_tokens=("console-secret",)),
             raise_server_exceptions=False,
         )
+        self.catalog.provision_customer_account("org_123")
 
         with patch.object(
             self.catalog,
@@ -302,6 +320,101 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(second.status_code, 200)
         self.assertEqual(first.json()["tenant"]["clerkOrgId"], "org_123")
         self.assertEqual(first.json()["tenant"]["tenantId"], second.json()["tenant"]["tenantId"])
+
+    def test_control_plane_unknown_org_reads_and_revoke_do_not_provision(self) -> None:
+        client = TestClient(
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
+        )
+
+        projects = client.get(
+            "/control/v1/clerk-orgs/org_new/projects",
+            headers=self._control_auth(),
+        )
+        self.assertEqual(projects.status_code, 200)
+        self.assertEqual(projects.json(), {"projects": []})
+        self._assert_no_customer_provisioning()
+
+        project = client.get(
+            "/control/v1/clerk-orgs/org_new/projects/proj_missing",
+            headers=self._control_auth(),
+        )
+        self.assertEqual(project.status_code, 404)
+        self.assertEqual(project.json()["error"]["code"], "not_found")
+        self.assertEqual(project.json()["error"]["message"], "Project not found.")
+        self._assert_no_customer_provisioning()
+
+        keys = client.get(
+            "/control/v1/clerk-orgs/org_new/projects/proj_missing/keys",
+            headers=self._control_auth(),
+        )
+        self.assertEqual(keys.status_code, 404)
+        self.assertEqual(keys.json()["error"]["code"], "not_found")
+        self.assertEqual(keys.json()["error"]["message"], "Project not found.")
+        self._assert_no_customer_provisioning()
+
+        tenant_usage = client.get(
+            "/control/v1/clerk-orgs/org_new/usage",
+            headers=self._control_auth(),
+        )
+        self.assertEqual(tenant_usage.status_code, 200)
+        self.assertEqual(
+            tenant_usage.json()["usage"]["totals"],
+            {
+                "requests": 0,
+                "writes": 0,
+                "retrievals": 0,
+                "modelRequests": 0,
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "totalTokens": 0,
+                "estimatedCostMicros": 0,
+            },
+        )
+        self._assert_no_customer_provisioning()
+
+        project_usage = client.get(
+            "/control/v1/clerk-orgs/org_new/projects/proj_missing/usage",
+            headers=self._control_auth(),
+        )
+        self.assertEqual(project_usage.status_code, 404)
+        self.assertEqual(project_usage.json()["error"]["code"], "not_found")
+        self.assertEqual(project_usage.json()["error"]["message"], "Project not found.")
+        self._assert_no_customer_provisioning()
+
+        revoked = client.post(
+            "/control/v1/clerk-orgs/org_new/projects/proj_missing/keys/key_missing/revoke",
+            headers=self._control_auth(),
+        )
+        self.assertEqual(revoked.status_code, 404)
+        self.assertEqual(revoked.json()["error"]["code"], "not_found")
+        self.assertEqual(revoked.json()["error"]["message"], "Key not found.")
+        self._assert_no_customer_provisioning()
+
+    def test_control_plane_project_create_still_provisions_fresh_org(self) -> None:
+        client = TestClient(
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
+        )
+
+        self._assert_no_customer_provisioning()
+        response = client.post(
+            "/control/v1/clerk-orgs/org_new/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo"},
+        )
+
+        self.assertEqual(response.status_code, 201)
+        root = Path(self.temp_dir.name)
+        with contextlib.closing(sqlite3.connect(root / "control-plane.db")) as conn:
+            tenant_rows = conn.execute("SELECT tenant_id FROM tenants").fetchall()
+            mapping_rows = conn.execute(
+                """
+                SELECT clerk_org_id, tenant_id
+                FROM customer_account_mappings
+                """
+            ).fetchall()
+        self.assertEqual(len(tenant_rows), 1)
+        self.assertEqual(mapping_rows, [("org_new", tenant_rows[0][0])])
+        self.assertEqual(len(list(root.glob("customer-*.db"))), 1)
 
     def test_control_plane_project_create_list_and_get_use_hosted_project_ids(self) -> None:
         client = TestClient(
