@@ -290,7 +290,10 @@ Work flows feature branch -> `dev` -> `main`.
   history-repair branches still require the requester to name the branch
   explicitly.
 - GitHub enforces `main`: PR required, the `test` check must pass,
-  merge-commit method only, no force pushes or deletion.
+  merge-commit method only, no force pushes or deletion; admin bypass applies
+  to PR merges only, never direct pushes. `dev` is protected against deletion
+  and force pushes (this also stops branch auto-delete from removing
+  `origin/dev` when a release PR merges) but accepts normal pushes.
 
 ### Branch Sync
 

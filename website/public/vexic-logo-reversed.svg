@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 232 72" role="img" aria-labelledby="title desc">
+  <title id="title">Vexic logo reversed</title>
+  <desc id="desc">The Vexic logo adapted for dark backgrounds.</desc>
+  <g transform="translate(8 4)">
+    <path d="M13 12 31 52" fill="none" stroke="#ffffff" stroke-linecap="round" stroke-width="9.5"/>
+    <path d="M51 12 33 52" fill="none" stroke="#5eead4" stroke-linecap="round" stroke-width="9.5"/>
+    <circle cx="32" cy="52" r="5.75" fill="#f59e0b"/>
+  </g>
+  <text x="84" y="48" fill="#ffffff" font-family="Arial, Helvetica, sans-serif" font-size="40" font-weight="700">Vexic</text>
+</svg>
