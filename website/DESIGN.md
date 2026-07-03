@@ -90,8 +90,11 @@ temperature throughout; sage carries the only tint besides emerald.)
 
 - One `#131313` canvas; rhythm comes from spacing (`py-20 sm:py-28`) and
   structural lines, not background bands.
-- Hero: asymmetric split (copy left, hero machine right,
-  `10fr / 11fr` grid) — never centered.
+- Hero: compact centered copy (headline, one three-beat line, waitlist
+  form — no kicker, no secondary link) above a full-width hero machine
+  whose pipeline flows left-to-right (intake → extraction → durable
+  memory, recall panel below). The machine is the hero; copy stays terse
+  so the eye lands on the pipeline.
 - Vary section grammar: problems = centered heading + divider rows;
   features = list-with-sidebar (sticky JSON artifact); integrations =
   offset two-column (heading hangs left, divider rows right); quickstart =
@@ -137,7 +140,8 @@ temperature throughout; sage carries the only tint besides emerald.)
 - No custom mouse cursors.
 - No overlapping text/image elements.
 - No 3-column equal-card feature rows (numbered process sequences exempt).
-- No centered hero section.
+- No centered body sections (the compact hero copy block is the one
+  sanctioned centered moment; it exists to frame the full-width machine).
 - No filler UI copy: "Scroll to explore," bouncing chevrons.
 - No AI copywriting clichés: "Elevate," "Seamless," "Unleash," "Next-Gen,"
   "Supercharge."

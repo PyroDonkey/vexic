@@ -1,6 +1,6 @@
 import { ImageResponse } from "next/og";
 
-export const alt = "Vexic · Memory your agents can trust";
+export const alt = "Vexic · Agent memory you can trust";
 export const size = { width: 1200, height: 630 };
 export const contentType = "image/png";
 
@@ -51,7 +51,7 @@ export default function OpengraphImage() {
               letterSpacing: "-0.02em"
             }}
           >
-            Memory your agents
+            Agent memory
           </div>
           <div
             style={{
@@ -62,7 +62,7 @@ export default function OpengraphImage() {
               color: "#34D399"
             }}
           >
-            can trust.
+            you can trust.
           </div>
         </div>
 
