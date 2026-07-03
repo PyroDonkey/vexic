@@ -99,6 +99,13 @@ operations:
 It also exposes `init_schema()` as a local adapter helper. `init_schema()` is
 not part of the public `MemoryService` Protocol.
 
+> Naming layers: the `MemoryService` operation names above
+> (`search_transcript`, `search_long_term`, `expand_history`) and the `/v1/`
+> HTTP routes are the service/contract layer and are unchanged. The
+> model-facing **MCP tool** names are `recall_conversation_history` and
+> `recall_user_memory` (ADR 0021); do not conflate the two layers when
+> reconciling docs against code.
+
 `run_dream_phase` is deliberately settled as a host-port operation in v0.1:
 `LocalMemoryService` authorizes and checks lifecycle state, executes only when
 explicit dream-phase host ports are supplied, and fails closed with
