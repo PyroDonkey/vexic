@@ -45,7 +45,7 @@ or egress); Tier-1 `messages` update/delete; a durable Tier-3 fact without
 `source_message_ids`; `expand_history` or any privileged egress without
 `MemoryCapability.EXPAND_HISTORY`, redaction, or the message/char caps; an
 MCP/hosted surface registering writes/export/delete/rebuild/admin by default
-(defaults are `search_transcript` + `search_long_term` only); provider secrets
+(defaults are `recall_conversation_history` + `recall_user_memory` only); provider secrets
 or API keys committed, logged, or written into client/`.mcp.json` config; SQL
 built by string interpolation in a storage adapter.
 
