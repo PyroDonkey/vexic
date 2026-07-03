@@ -650,7 +650,7 @@ class ClaudeCodeRecorderHostedRoundTripTests(unittest.TestCase):
                         "--hook-input",
                         str(hook_payload),
                         "--base-url",
-                        "http://testserver",
+                        "https://testserver",
                         "--api-key",
                         api_key,
                         "--project-id",

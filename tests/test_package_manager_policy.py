@@ -116,6 +116,9 @@ def test_console_env_contract_is_documented() -> None:
         "VEXIC_INTERNAL_ORG_ID",
         "VEXIC_CONTROL_PLANE_URL",
         "VEXIC_CONTROL_PLANE_TOKEN",
+        # The Clerk SDK ships its own product telemetry; the console documents
+        # and defaults it off so the only external emitter is opt-in.
+        "CLERK_TELEMETRY_DISABLED",
     ):
         assert name in env_example
         assert name in console_readme

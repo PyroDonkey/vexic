@@ -24,6 +24,7 @@ from vexic.mcp_stdio import (
     _parse_args,
     handle_jsonrpc_message,
     main,
+    run_stdio,
 )
 from vexic.storage import save_messages
 from vexic.hosted_mcp import create_hosted_http_memory_service, run_recorder_config_proxy
@@ -75,6 +76,40 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
 
     async def _request(self, message: dict) -> dict | None:
         return await handle_jsonrpc_message(message, self.config)
+
+    async def test_run_stdio_error_responses_never_echo_exception_content(self) -> None:
+        sentinel = "user-pasted-credential-abc123"
+
+        async def raising_handle(message: dict, config: McpServerConfig) -> dict | None:
+            raise RuntimeError(f"validation blew up on {sentinel}")
+
+        stdout = io.StringIO()
+        with patch("vexic.mcp_stdio.handle_jsonrpc_message", raising_handle):
+            await run_stdio(
+                self.config,
+                stdin=io.StringIO('{"jsonrpc":"2.0","id":1,"method":"tools/call"}\n'),
+                stdout=stdout,
+                stderr=io.StringIO(),
+            )
+
+        response = json.loads(stdout.getvalue())
+        self.assertNotIn(sentinel, stdout.getvalue())
+        self.assertIn("RuntimeError", response["error"]["message"])
+
+    async def test_run_stdio_reports_parse_errors_by_position_without_input_echo(self) -> None:
+        sentinel = "user-pasted-credential-abc123"
+        stdout = io.StringIO()
+        await run_stdio(
+            self.config,
+            stdin=io.StringIO(f'{{"jsonrpc": "2.0", "note": "{sentinel}"\n'),
+            stdout=stdout,
+            stderr=io.StringIO(),
+        )
+
+        response = json.loads(stdout.getvalue())
+        self.assertEqual(response["error"]["code"], -32700)
+        self.assertNotIn(sentinel, stdout.getvalue())
+        self.assertIn("parse error at line", response["error"]["message"])
 
     async def test_initialize_advertises_read_only_server(self) -> None:
         response = await self._request(

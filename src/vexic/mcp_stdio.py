@@ -416,11 +416,23 @@ async def run_stdio(
             continue
         try:
             message = json.loads(line)
+        except json.JSONDecodeError as exc:
+            response = _error(
+                None, -32700, f"parse error at line {exc.lineno} column {exc.colno}"
+            )
+        else:
             if not isinstance(message, dict):
-                raise ValueError("message must be an object")
-            response = await handle_jsonrpc_message(message, config)
-        except Exception as exc:
-            response = _error(None, -32700, f"parse error: {exc}")
+                response = _error(None, -32700, "parse error: message must be an object")
+            else:
+                try:
+                    response = await handle_jsonrpc_message(message, config)
+                except Exception as exc:
+                    # Exception text can quote request payloads (for example
+                    # pydantic validation errors embed input values); return
+                    # the type only.
+                    response = _error(
+                        None, -32700, f"request failed: {type(exc).__name__}"
+                    )
         if response is not None:
             _write_message(stdout, response)
         stderr.flush()
