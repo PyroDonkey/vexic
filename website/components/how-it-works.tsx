@@ -22,7 +22,7 @@ const STEPS = [
     tag: "03 · promote",
     title: "Durable facts, with receipts",
     body: "Every promoted Tier 3 fact carries provenance, confidence, and category, and points back to the exact transcript rows it came from. You can audit any recall, test it, and roll it back.",
-    detail: "tier 3 · provenance · confidence · category"
+    detail: "tier 3 · long_term_memory · durable"
   }
 ] as const;
 
@@ -85,10 +85,10 @@ export function HowItWorks() {
       <div className="grid gap-6 md:grid-cols-3">
         {STEPS.map((step, index) => (
           <Reveal key={step.tag} delay={index * 0.15}>
-            <article className="h-full rounded-xl border border-border bg-card p-6">
+            <article className="flex h-full flex-col rounded-xl border border-border bg-card p-6">
               <p className="mb-3 font-mono text-xs text-primary">{step.tag}</p>
               <h3 className="mb-2 text-lg font-semibold">{step.title}</h3>
-              <p className="text-sm leading-relaxed text-muted-foreground">{step.body}</p>
+              <p className="flex-1 text-sm leading-relaxed text-muted-foreground">{step.body}</p>
               <p className="mt-4 rounded-md bg-background px-3 py-2 font-mono text-xs text-muted-foreground">
                 {step.detail}
               </p>
