@@ -158,6 +158,11 @@ source, the documented RPO remains the true data-loss bound.
 
 ## Compromised Credentials
 
+The rotation procedure lives in `docs/runbooks/secret-rotation.md`. Database
+tokens are minted short-lived with an `exp` claim; a token without `exp` is
+itself a rotation trigger. Live secrets live in deploy-platform secret
+management, never in a working-tree file.
+
 The v1 compromised-credential response is runbook-driven:
 
 - revoke affected Vexic API keys;
