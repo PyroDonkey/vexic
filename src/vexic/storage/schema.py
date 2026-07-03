@@ -3,9 +3,12 @@ import sqlite3
 import struct
 import threading
 from contextlib import closing
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from vexic.embeddings import EMBEDDING_DIM, EMBEDDING_MODEL_NAME
+
+if TYPE_CHECKING:
+    from vexic.ports import ContentCodec
 
 # Back-compat re-export: storage-internal callers keep importing the persistence
 # secret guard from here under the old private name.
@@ -637,10 +640,19 @@ def _ensure_source_transcript_ledger(conn: sqlite3.Connection) -> None:
     )
 
 
-def init_db(db_path: str, *, force: bool = False) -> None:
+def init_db(
+    db_path: str,
+    *,
+    force: bool = False,
+    content_codec: "ContentCodec | None" = None,
+) -> None:
     # Lazy import breaks the schema<->transcript cycle: transcript imports the
     # secret guard from this module at load time, so the Tier-1 FTS builder is
     # reached here only at call time, once both modules are fully initialized.
+    # ``content_codec`` is threaded to the FTS builder so a rebuild against an
+    # encoded transcript decodes rows instead of choking on ciphertext; codec-
+    # aware callers (the service, the dream pipeline) pass their own codec so
+    # whichever call wins the memoized first-init carries it (ADR 0023).
     from vexic.storage.transcript import _ensure_messages_fts
 
     key = _memo_key(db_path)
@@ -686,7 +698,7 @@ def init_db(db_path: str, *, force: bool = False) -> None:
                 """
             )
 
-            _ensure_messages_fts(conn)
+            _ensure_messages_fts(conn, content_codec)
             _ensure_source_transcript_ledger(conn)
 
             conn.execute(

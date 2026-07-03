@@ -169,6 +169,37 @@ class ContentCodecTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("legacy plain row", expanded.text)
 
+    async def test_fts_rebuild_decodes_encoded_rows(self) -> None:
+        # A future FTS schema change drops messages_fts and forces a rebuild.
+        # The rebuild re-derives each body from message_json, so it must decode
+        # through the codec; a codec-aware init_db keeps search working.
+        await self._append(f"{SENTINEL} lives in the transcript")
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            with conn:
+                conn.execute("DROP TABLE messages_fts")
+
+        init_db(self.db_path, force=True, content_codec=Base64Codec())
+
+        result = await self.service.search_transcript(
+            SearchTranscriptRequest(
+                scope=_scope({MemoryCapability.SEARCH}),
+                query=SENTINEL,
+            )
+        )
+        self.assertEqual(len(result.hits), 1)
+        self.assertIn(SENTINEL, result.hits[0].body)
+
+    async def test_fts_rebuild_without_codec_cannot_decode_encoded_rows(self) -> None:
+        # Guards the regression: a codec-blind rebuild feeds ciphertext to
+        # json.loads and raises instead of silently corrupting the index.
+        await self._append(f"{SENTINEL} lives in the transcript")
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            with conn:
+                conn.execute("DROP TABLE messages_fts")
+
+        with self.assertRaises(ValueError):
+            init_db(self.db_path, force=True)
+
     async def test_identity_default_stores_plaintext_json(self) -> None:
         plaintext_service = LocalMemoryService(
             db_path=self.db_path, tenant_id="tenant-a"

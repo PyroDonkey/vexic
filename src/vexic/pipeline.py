@@ -122,7 +122,7 @@ async def run_light_phase(
     embedder = embed or embed_texts
 
     try:
-        init_db(db_path)
+        init_db(db_path, content_codec=content_codec)
         watermark = get_watermark(db_path, agent_id=agent_id)
 
         rows = load_messages_since(

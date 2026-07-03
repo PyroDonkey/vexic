@@ -122,7 +122,10 @@ def _messages_fts_columns(conn: sqlite3.Connection) -> list[str]:
     return [row[1] for row in rows]
 
 
-def _ensure_messages_fts(conn: sqlite3.Connection) -> None:
+def _ensure_messages_fts(
+    conn: sqlite3.Connection,
+    content_codec: ContentCodec | None = None,
+) -> None:
     exists = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'"
     ).fetchone()
@@ -144,7 +147,11 @@ def _ensure_messages_fts(conn: sqlite3.Connection) -> None:
         needs_rebuild = True
 
     if needs_rebuild:
-        _rebuild_messages_fts(conn)
+        # The rebuild re-derives each plaintext body from message_json, so it
+        # MUST decode through the same codec that wrote the rows. Passing None
+        # here against a codec-encoded transcript would feed ciphertext to
+        # json.loads and raise JSONDecodeError (ADR 0023).
+        _rebuild_messages_fts(conn, content_codec)
 
 
 def _rebuild_messages_fts(
