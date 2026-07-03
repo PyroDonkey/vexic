@@ -69,7 +69,10 @@ is a consumer, not a dependency.
 
 - Writers append serialized Pydantic AI messages.
 - Existing rows are never updated or deleted.
-- Stored text is cleaned replay material, not raw provider payload.
+- Stored text is cleaned replay material, not raw provider payload. Cleaned
+  is not redacted: cleaning strips provider metadata, tool payloads, and
+  system prompts, while visible user/assistant text is stored verbatim --
+  including any secret or personal detail the user typed into the chat.
 - Agent scope is stored as nullable `agent_id`; existing `NULL` rows are shared
   agent-scope transcript rows and are not backfilled.
 - `source_transcript_ledger` records idempotent host-recorder source keys and
@@ -180,6 +183,12 @@ on violations.
 
 The guard is intentionally simple and fail-closed. It rejects exact non-empty
 forbidden values; it does not sanitize payloads or discover secrets itself.
+
+Recorders and importers pass no forbidden values by default, so clean user and
+assistant text is ingested verbatim (ADR 0002). Pattern-based masking is host
+policy: a host that needs scrubbing applies it before ingest, or configures
+forbidden values to reject offending writes outright. Vexic core deliberately
+does not rewrite stored ground-truth text.
 
 ## Storage
 
