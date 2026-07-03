@@ -4,7 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useState } from "react";
 
-import { CONSOLE_URL, GITHUB_URL, NAV_LINKS } from "@/lib/links";
+import { GITHUB_URL, NAV_LINKS, SIGN_IN_URL } from "@/lib/links";
 
 export function SiteNav() {
   const [open, setOpen] = useState(false);
@@ -42,7 +42,7 @@ export function SiteNav() {
 
         <div className="flex items-center gap-3">
           <a
-            href={CONSOLE_URL}
+            href={SIGN_IN_URL}
             className="hidden text-sm text-muted-foreground transition-colors hover:text-foreground sm:block"
           >
             Sign in
@@ -96,7 +96,7 @@ export function SiteNav() {
               GitHub
             </a>
             <a
-              href={CONSOLE_URL}
+              href={SIGN_IN_URL}
               onClick={() => setOpen(false)}
               className="flex min-h-11 items-center text-muted-foreground transition-colors hover:text-foreground"
             >
