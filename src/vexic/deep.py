@@ -8,13 +8,13 @@ inputs exist; 0 is the accepted value for unimplemented signals.
 """
 
 import asyncio
-import traceback
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from math import log
 from typing import Any
 
+from vexic.error_reporting import format_error_detail
 from vexic.ports import AgentFactory, missing_host_port
 from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage import (
@@ -346,12 +346,14 @@ async def run_deep_phase(
                 started_at=started_at,
                 finished_at=utc_now_iso(),
                 status="error",
-                error_detail=traceback.format_exc(),
+                error_detail=format_error_detail(exc),
                 forbidden_secret_values=forbidden,
             )
         except Exception:
             pass
-        print(f"Deep phase: ERROR -- {exc}. Tier 3 unchanged; will retry.")
+        print(
+            f"Deep phase: ERROR -- {type(exc).__name__}. Tier 3 unchanged; will retry."
+        )
         raise
 
 

@@ -24,9 +24,10 @@ const STEP_STAGED = 8;
 const STEP_PROMOTED = 9;
 const FINAL_STEP = STEP_PROMOTED;
 
-/* Loop a few times, then park on the completed state so the compositor can
-   go idle instead of animating the hero fold forever. */
-const MAX_RUNS = 3;
+/* One full run, then park on the completed state: replays would wipe the
+   promoted fact off the shelf mid-read (the opposite of durable memory), and
+   the compositor goes idle once the mechanism has been demonstrated. */
+const MAX_RUNS = 1;
 
 /** ms to hold on each step before advancing (index = step). */
 const STEP_HOLDS = [1000, 620, 620, 620, 860, 430, 430, 640, 1100, 6500];

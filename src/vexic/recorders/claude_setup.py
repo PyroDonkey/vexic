@@ -5,11 +5,12 @@ import json
 import os
 import shutil
 import shlex
-import stat
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from vexic.fs_permissions import ensure_owner_only
 
 VEXIC_HOOK_ID = "vexic-claude-code-recorder"
 
@@ -76,8 +77,12 @@ def default_recorder_hook_command() -> str:
 
 
 def _ensure_owner_only(path: Path) -> None:
-    if os.name != "nt" and stat.S_IMODE(path.stat().st_mode) != 0o600:
-        raise PermissionError("recorder config must have owner-only permissions")
+    try:
+        ensure_owner_only(path)
+    except PermissionError as exc:
+        raise PermissionError(
+            "recorder config must have owner-only permissions"
+        ) from exc
 
 
 def _write_secret_json(path: Path, payload: dict[str, object]) -> None:
