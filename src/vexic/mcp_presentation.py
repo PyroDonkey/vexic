@@ -53,6 +53,12 @@ _MESSAGE_ID_FOOTNOTE = (
     "them to the user."
 )
 
+PRESENTATION_REMINDER = (
+    "(Answer in your own words as if you simply remember this. Don't mention "
+    "searching, memory tools, transcripts, or where the information came from "
+    "unless the user asks.)"
+)
+
 _UNAVAILABLE = (
     "This memory surface is read-only. No transcript append, verbatim history "
     "expansion, export, delete, rebuild, or admin tools are available."
@@ -80,11 +86,14 @@ def server_instructions(enable_expand_history: bool = False) -> str:
         "or earlier conversations.\n"
         "\n"
         "HOW TO PRESENT RESULTS: answer naturally in your own words, as if you "
-        "remember. Never show the user tool names, message ids, fact ids, raw "
+        "simply remember. Never mention that you searched, looked something up, "
+        "or used a tool; never mention transcripts, memory systems, priming, "
+        "sessions, prior turns, or whether something is saved to long-term "
+        "memory. Never show the user tool names, message ids, fact ids, raw "
         "timestamps, confidence scores, or raw result text. When timing matters "
         "to the answer, phrase dates as natural prose ('back in early July', "
-        "'a few weeks ago') — never in metadata form. Give provenance only if "
-        "the user explicitly asks where you learned something. Treat results "
+        "'a few weeks ago') — never in metadata form. Mention where or when you "
+        "learned something only if the user explicitly asks. Treat results "
         "marked tentative/unverified as uncertain and confirm with the user "
         "before relying on them.\n"
         "\n"
@@ -117,6 +126,7 @@ def render_transcript_hits(
         lines.append(f"- {marker}{hit.body}")
     if include_message_ids:
         lines.extend(["", _MESSAGE_ID_FOOTNOTE])
+    lines.extend(["", PRESENTATION_REMINDER])
     return "\n".join(lines)
 
 
@@ -127,12 +137,13 @@ def render_long_term(
     if facts:
         lines = ["Long-term memory about the user:", ""]
         lines.extend(f"- {fact.fact_text} ({fact.category.value})" for fact in facts)
-        return "\n".join(lines)
-    if candidate_notes:
+    elif candidate_notes:
         lines = [UNVERIFIED_NOTES_PREAMBLE, ""]
         lines.extend(
             f"- tentative: {note.fact_text} ({note.category.value})"
             for note in candidate_notes
         )
-        return "\n".join(lines)
-    return "No long-term memories found for this query."
+    else:
+        return "No long-term memories found for this query."
+    lines.extend(["", PRESENTATION_REMINDER])
+    return "\n".join(lines)
