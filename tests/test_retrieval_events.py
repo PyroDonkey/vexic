@@ -417,5 +417,77 @@ class RetrievalEventTests(unittest.TestCase):
         self.assertEqual(tuple(stored), (3, 1))
 
 
+class RetrievalQueryRetentionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.temp_dir.name) / "memory.db")
+        init_db(self.db_path)
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO retrieval_events
+                        (fact_id, session_id, query, rewritten_query, retrieved_at, used)
+                    VALUES (1, 'session-1', 'aged secret query', 'aged rewrite',
+                            '2026-01-01T00:00:00+00:00', 1)
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO retrieval_events
+                        (fact_id, session_id, query, rewritten_query, retrieved_at)
+                    VALUES (1, 'session-1', 'fresh query', 'fresh rewrite',
+                            '2026-06-30T00:00:00+00:00')
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO candidate_retrieval_events
+                        (candidate_id, session_id, query, retrieved_at)
+                    VALUES (7, 'session-1', 'aged candidate query',
+                            '2026-01-01T00:00:00+00:00')
+                    """
+                )
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_expiry_blanks_aged_query_text_but_keeps_rows_and_counters(self) -> None:
+        from vexic.storage.retention import expire_retrieval_queries
+
+        expired = expire_retrieval_queries(
+            self.db_path, older_than="2026-06-01T00:00:00+00:00"
+        )
+
+        self.assertEqual(expired, {"retrieval_events": 1, "candidate_retrieval_events": 1})
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            rows = conn.execute(
+                """
+                SELECT query, rewritten_query, used
+                FROM retrieval_events ORDER BY id
+                """
+            ).fetchall()
+            candidate_rows = conn.execute(
+                "SELECT query FROM candidate_retrieval_events"
+            ).fetchall()
+
+        # Rows survive (retrieved_count/used_count derive from them); only the
+        # content-bearing query text is blanked, and the use verdict is kept.
+        self.assertEqual(rows, [("", None, 1), ("fresh query", "fresh rewrite", None)])
+        self.assertEqual(candidate_rows, [("",)])
+
+    def test_expiry_is_idempotent(self) -> None:
+        from vexic.storage.retention import expire_retrieval_queries
+
+        expire_retrieval_queries(self.db_path, older_than="2026-06-01T00:00:00+00:00")
+        expired = expire_retrieval_queries(
+            self.db_path, older_than="2026-06-01T00:00:00+00:00"
+        )
+
+        self.assertEqual(
+            expired, {"retrieval_events": 0, "candidate_retrieval_events": 0}
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

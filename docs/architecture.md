@@ -36,7 +36,9 @@ is a consumer, not a dependency.
 
 ## Goals
 
-- Lossless transcript: Tier 1 rows are never updated or deleted.
+- Lossless transcript: Tier 1 rows are never updated or deleted, with one
+  deliberate exception -- `purge_scope` physically erases a tombstoned scope
+  (ADR 0022).
 - Glass-box facts: every durable fact carries provenance, confidence, category,
   and editability metadata.
 - Replayable projections: FTS, vectors, and summaries are rebuildable from
@@ -59,7 +61,6 @@ is a consumer, not a dependency.
   memory behavior.
 - External vector databases for the local core.
 - Destructive chat-window compression.
-- Physical purge semantics before a backend/SLA decision exists.
 
 ## Memory Tiers
 
@@ -68,7 +69,8 @@ is a consumer, not a dependency.
 `messages` is the ground-truth transcript table.
 
 - Writers append serialized Pydantic AI messages.
-- Existing rows are never updated or deleted.
+- Existing rows are never updated or deleted by ordinary operation; the only
+  destructive path is `purge_scope` over a tombstoned scope (ADR 0022).
 - Stored text is cleaned replay material, not raw provider payload.
 - Agent scope is stored as nullable `agent_id`; existing `NULL` rows are shared
   agent-scope transcript rows and are not backfilled.

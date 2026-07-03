@@ -143,7 +143,16 @@ Memory is retained by default.
 - Scope deletion is modeled as a tombstone/scope-deny contract.
 - The local SQLite adapter records tombstones in `scope_tombstones` and blocks
   retrieval, export, replay, and rebuild for matching scopes.
-- Physical purge is backend and SLA specific, and remains deferred.
+- Physical purge is a second deliberate step (`purge_scope`, ADR 0022): it
+  requires an existing tombstone for exactly the target scope, irreversibly
+  deletes the scope's canonical rows, projections, and content-bearing
+  telemetry from the primary database in one transaction, and records
+  `purged_at` plus per-table counts on the tombstone. Provider backups retain
+  residual copies until their own retention expires; wording must not promise
+  instantaneous global erasure.
+- Content-bearing retrieval telemetry supports age-based expiry
+  (`expire_retrieval_queries`): query text is blanked in place, rows and
+  derived counters survive.
 
 Audit records for lifecycle operations should retain actor, scope, operation,
 and correlation metadata without retaining deleted payload text unnecessarily.
