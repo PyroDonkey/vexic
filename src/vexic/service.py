@@ -4,10 +4,13 @@ import json
 import os
 import sqlite3
 import tempfile
+import time
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import closing
 from pathlib import Path
+
+from vexic.fs_permissions import ensure_owner_only
 
 from vexic.contract import (
     AppendTranscriptRequest,
@@ -103,12 +106,18 @@ class LocalMemoryService(MemoryService):
         forbidden_secret_values: tuple[str, ...] = (),
         embed: EmbedTexts | None = None,
         dream_phase_ports: DreamPhasePorts | None = None,
+        artifact_dir: str | Path | None = None,
     ) -> None:
         self.db_path = db_path
         self.tenant_id = tenant_id
         self.forbidden_secret_values = forbidden_secret_values
         self.embed = embed
         self.dream_phase_ports = dream_phase_ports
+        # Export/replay/rebuild artifacts hold full memory content. The
+        # default stays the OS temp dir for compatibility; hosts should point
+        # this at a managed, owner-only location and schedule prune_artifacts.
+        self.artifact_dir = None if artifact_dir is None else Path(artifact_dir)
+        self._artifact_dir_prepared = False
 
     def init_schema(self) -> None:
         init_db(self.db_path)
@@ -156,8 +165,50 @@ class LocalMemoryService(MemoryService):
         if any(self._scope_matches_tombstone(scope, row) for row in rows):
             raise PermissionError(f"Memory scope is tombstoned for {operation}.")
 
+    def _artifact_root(self) -> Path:
+        if self.artifact_dir is None:
+            return Path(tempfile.gettempdir())
+        if not self._artifact_dir_prepared:
+            self.artifact_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if os.name != "nt":
+                # mkdir's mode only applies at creation; a pre-existing
+                # directory keeps its old bits, so tighten before verifying.
+                # (NT enforcement rewrites the DACL inside ensure_owner_only.)
+                self.artifact_dir.chmod(0o700)
+            ensure_owner_only(self.artifact_dir, directory=True)
+            self._artifact_dir_prepared = True
+        return self.artifact_dir
+
     def _artifact_path(self, kind: str) -> Path:
-        return Path(tempfile.gettempdir()) / f"vexic-{kind}-{uuid.uuid4().hex}.json"
+        return self._artifact_root() / f"vexic-{kind}-{uuid.uuid4().hex}.json"
+
+    def prune_artifacts(self, *, older_than_seconds: float) -> int:
+        """Delete aged ``vexic-*.json`` artifacts from the artifact root.
+
+        Artifacts are plaintext full-content snapshots; they are meant to be
+        consumed and discarded, not to accumulate. Returns the removed count.
+        """
+        if older_than_seconds < 0:
+            raise ValueError(
+                "older_than_seconds must be >= 0; a negative window would "
+                "delete artifacts written moments ago."
+            )
+        root = self._artifact_root()
+        if not root.exists():
+            return 0
+        cutoff = time.time() - older_than_seconds
+        removed = 0
+        for artifact in root.glob("vexic-*.json"):
+            try:
+                aged = artifact.stat().st_mtime < cutoff
+            except FileNotFoundError:
+                # Deleted between glob and stat by a concurrent consumer;
+                # already gone is the outcome pruning wanted.
+                continue
+            if aged:
+                artifact.unlink(missing_ok=True)
+                removed += 1
+        return removed
 
     def _write_json_artifact(
         self,
