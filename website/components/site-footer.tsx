@@ -58,13 +58,8 @@ export function SiteFooter() {
           </div>
         </div>
       </div>
-      <div className="relative border-t border-border">
-        <div className="mx-auto flex w-full max-w-6xl items-center justify-between px-5 py-5 text-xs text-muted-foreground">
-          <p>© {new Date().getFullYear()} Vexic</p>
-          <a href={GITHUB_URL} target="_blank" rel="noreferrer" className="hover:text-foreground">
-            github.com/PyroDonkey/vexic
-          </a>
-        </div>
+      <div className="relative mx-auto w-full max-w-6xl px-5 pb-8 text-xs text-muted-foreground">
+        <p>© {new Date().getFullYear()} Vexic</p>
       </div>
     </footer>
   );

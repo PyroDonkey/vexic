@@ -222,9 +222,14 @@ Without `--allow-live`, the command exits 0 before importing the adapter or
 calling providers. The host-owned OpenRouter adapter reads `OPENROUTER_API_KEY`
 from the process environment and supplies `build_extraction_agent`,
 `build_contradiction_agent`, and `embed_texts`; Vexic core does not read
-provider secrets. REM is a local heuristic and makes no provider calls (ADR
-0020), which is why a `--max-provider-calls 5` budget covers the default
-single-row run. The adapter lives under repo-local `adapters/` by design
+provider secrets. Every adapter request pins the OpenRouter provider
+preference `data_collection: "deny"`, restricting routing to model providers
+that neither retain nor train on prompts (transcript and fact text travel in
+these requests; see the ADR 0009 telemetry boundary). Pair it with
+account-level ZDR in the OpenRouter dashboard for defense in depth; the pin
+can reduce provider availability for exotic models. REM is a local heuristic
+and makes no provider calls (ADR 0020), which is why a
+`--max-provider-calls 5` budget covers the default single-row run. The adapter lives under repo-local `adapters/` by design
 because it is host-owned provider wiring, not package core. Embedding can
 alternatively use the optional local `vexic[local-embed]` adapter.
 
@@ -294,6 +299,49 @@ curl.exe -s https://api.vexic.dev/v1/search_long_term `
   -H "Content-Type: application/json" `
   -d "{\"scope\":{\"tenant_id\":\"tenant_from_console\",\"project_id\":\"project-a\",\"agent_id\":\"agent-a\",\"principal\":{\"principal_id\":\"agent-a\",\"principal_type\":\"agent\"},\"trust_boundary\":\"networked\",\"capabilities\":[\"memory:search\"]},\"query\":\"cedar\",\"limit\":5}"
 ```
+
+## Hosted Quickstart
+
+End-to-end path from a fresh Console account to an agent that reads Vexic
+memory. This consolidates pieces otherwise spread across `README.md`,
+`docs/hosted-mvp.md`, and ADR 0010.
+
+1. **Create a Project in the Vexic Console.** The Console returns the project's
+   `tenantId`. Everything below is scoped to that tenant; you never guess or
+   type a tenant id by hand.
+
+2. **Create an Agent API Key** for that project in the Console. Copy the raw
+   key once — it is not shown again. The create/list response also includes a
+   `scopeTemplate` carrying the correct `tenant_id`, `project_id`, `principal`,
+   `trust_boundary`, and capabilities; keep it for step 4.
+
+3. **Point your MCP client at the hosted API** with that key. For Claude Code,
+   the setup command scaffolds the hook, recorder config, and a project
+   `.mcp.json` entry (the raw key is stored in the recorder config, not in
+   `.mcp.json`):
+
+   ```powershell
+   uv run --with-editable . python -m vexic.cli setup claude-code --base-url https://api.vexic.dev --api-key <raw-key> --project-id project-a --session-id session-a
+   ```
+
+   Claude Code treats the project MCP server as pending until you approve/enable
+   it. See [Claude Code Transcript Import](#claude-code-transcript-import) for
+   what the hook and recorder do.
+
+4. **Make the first read.** Once approved, the agent has two read-only MCP
+   tools: `recall_conversation_history` (this and earlier conversations with the
+   user) and `recall_user_memory` (durable facts, preferences, and decisions).
+   Results come back as **prose the model presents in its own words**, not JSON
+   (ADR 0021). To verify the wiring directly against `/mcp` before involving an
+   agent, use the smoke request in [Native HTTP MCP](#native-http-mcp); to hit
+   the underlying search endpoints (`/v1/search_transcript`,
+   `/v1/search_long_term`, backing `src/vexic/hosted_http.py`) with the copied
+   `scopeTemplate`, see the curl examples under
+   [Hosted MVP Shell](#hosted-mvp-shell).
+
+The MCP tool names (`recall_conversation_history`, `recall_user_memory`) are the
+model-facing surface; the `/v1/search_*` routes are the underlying HTTP
+endpoints. They name the same reads at different layers.
 
 ## Native HTTP MCP
 

@@ -13,6 +13,7 @@ from vexic.storage.schema import (
     _serialize_float32,
     init_db,
 )
+from vexic.ports import ContentCodec
 from vexic.storage.transcript import _rebuild_messages_fts
 from vexic.storage.connection import connect, rows_as_dicts
 from vexic.storage.errors import is_operational_error
@@ -232,6 +233,7 @@ def repair_memory_projections(
     candidate_embeddings: Mapping[int, list[float]] | None = None,
     long_term_embeddings: Mapping[int, list[float]] | None = None,
     forbidden_secret_values: Iterable[str] = (),
+    content_codec: "ContentCodec | None" = None,
 ) -> MemoryProjectionRepairReport:
     """Repair rebuildable memory projections without mutating the Transcript."""
     init_db(db_path)
@@ -243,7 +245,7 @@ def repair_memory_projections(
                 _ensure_vector_memory_schema(conn)
             _guard_rebuildable_projection_text(conn, forbidden_secret_values)
 
-            _rebuild_messages_fts(conn)
+            _rebuild_messages_fts(conn, content_codec)
             messages_fts_rows = int(
                 conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0]
             )

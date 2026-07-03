@@ -4,10 +4,13 @@ import json
 import os
 import sqlite3
 import tempfile
+import time
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import closing
 from pathlib import Path
+
+from vexic.fs_permissions import ensure_owner_only
 
 from vexic.contract import (
     AppendTranscriptRequest,
@@ -26,6 +29,8 @@ from vexic.contract import (
     MemoryCategory,
     MemoryScope,
     MemoryService,
+    PurgeScopeRequest,
+    PurgeScopeResult,
     RecordRetrievalEventRequest,
     RecordRetrievalEventResult,
     RedactionContext,
@@ -47,7 +52,7 @@ from vexic.contract import (
     TombstoneRecord,
     require_capability,
 )
-from vexic.ports import DreamPhasePorts, EmbedTexts, missing_host_port
+from vexic.ports import ContentCodec, DreamPhasePorts, EmbedTexts, missing_host_port
 from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage import (
     TranscriptRangeTooLarge,
@@ -62,6 +67,8 @@ from vexic.storage import (
 )
 from vexic.storage.longterm import record_fact_use_verdict, record_long_term_retrieval
 from vexic.storage.operators import repair_memory_projections
+from vexic.storage.purge import purge_scope_rows
+from vexic.timeutil import utc_now_iso
 from vexic.subagents.retrieval import retrieve_candidate_fallback, retrieve_long_term_facts
 from vexic.usage import UsageSummary
 from vexic.storage.connection import StorageTarget, connect, rows_as_dicts
@@ -103,15 +110,33 @@ class LocalMemoryService(MemoryService):
         forbidden_secret_values: tuple[str, ...] = (),
         embed: EmbedTexts | None = None,
         dream_phase_ports: DreamPhasePorts | None = None,
+        content_codec: ContentCodec | None = None,
+        artifact_dir: str | Path | None = None,
     ) -> None:
         self.db_path = db_path
         self.tenant_id = tenant_id
         self.forbidden_secret_values = forbidden_secret_values
         self.embed = embed
         self.dream_phase_ports = dream_phase_ports
+        # ADR 0023: canonical transcript content is encoded through this
+        # codec before storage and decoded after reads. None = plaintext
+        # (the local default); hosted adapters supply an encrypting codec.
+        self.content_codec = content_codec
+        # Export/replay/rebuild artifacts hold full memory content. The
+        # default stays the OS temp dir for compatibility; hosts should point
+        # this at a managed, owner-only location and schedule prune_artifacts.
+        self.artifact_dir = None if artifact_dir is None else Path(artifact_dir)
+        self._artifact_dir_prepared = False
+
+    def _decode_content(self, stored: str) -> str:
+        if self.content_codec is None:
+            return stored
+        return self.content_codec.decode(stored)
 
     def init_schema(self) -> None:
-        init_db(self.db_path)
+        # Thread the codec so a first-init FTS rebuild decodes encoded rows;
+        # every service entrypoint routes through here (ADR 0023).
+        init_db(self.db_path, content_codec=self.content_codec)
 
     def _authorize(self, scope: MemoryScope, capability: MemoryCapability) -> None:
         if scope.tenant_id != self.tenant_id:
@@ -156,8 +181,50 @@ class LocalMemoryService(MemoryService):
         if any(self._scope_matches_tombstone(scope, row) for row in rows):
             raise PermissionError(f"Memory scope is tombstoned for {operation}.")
 
+    def _artifact_root(self) -> Path:
+        if self.artifact_dir is None:
+            return Path(tempfile.gettempdir())
+        if not self._artifact_dir_prepared:
+            self.artifact_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if os.name != "nt":
+                # mkdir's mode only applies at creation; a pre-existing
+                # directory keeps its old bits, so tighten before verifying.
+                # (NT enforcement rewrites the DACL inside ensure_owner_only.)
+                self.artifact_dir.chmod(0o700)
+            ensure_owner_only(self.artifact_dir, directory=True)
+            self._artifact_dir_prepared = True
+        return self.artifact_dir
+
     def _artifact_path(self, kind: str) -> Path:
-        return Path(tempfile.gettempdir()) / f"vexic-{kind}-{uuid.uuid4().hex}.json"
+        return self._artifact_root() / f"vexic-{kind}-{uuid.uuid4().hex}.json"
+
+    def prune_artifacts(self, *, older_than_seconds: float) -> int:
+        """Delete aged ``vexic-*.json`` artifacts from the artifact root.
+
+        Artifacts are plaintext full-content snapshots; they are meant to be
+        consumed and discarded, not to accumulate. Returns the removed count.
+        """
+        if older_than_seconds < 0:
+            raise ValueError(
+                "older_than_seconds must be >= 0; a negative window would "
+                "delete artifacts written moments ago."
+            )
+        root = self._artifact_root()
+        if not root.exists():
+            return 0
+        cutoff = time.time() - older_than_seconds
+        removed = 0
+        for artifact in root.glob("vexic-*.json"):
+            try:
+                aged = artifact.stat().st_mtime < cutoff
+            except FileNotFoundError:
+                # Deleted between glob and stat by a concurrent consumer;
+                # already gone is the outcome pruning wanted.
+                continue
+            if aged:
+                artifact.unlink(missing_ok=True)
+                removed += 1
+        return removed
 
     def _write_json_artifact(
         self,
@@ -195,7 +262,9 @@ class LocalMemoryService(MemoryService):
             ).fetchall()
         hits: list[TranscriptHit] = []
         for row in rows:
-            message = single_message_adapter.validate_python(json.loads(row[2]))
+            message = single_message_adapter.validate_python(
+                json.loads(self._decode_content(row[2]))
+            )
             body = message_search_text(message)
             if body:
                 hits.append(
@@ -305,6 +374,7 @@ class LocalMemoryService(MemoryService):
             session_id=request.scope.session_id or "default",
             agent_id=request.scope.agent_id,
             forbidden_secret_values=self._redaction_values(request.redaction),
+            content_codec=self.content_codec,
         )
         return AppendTranscriptResult(message_ids=message_ids)
 
@@ -327,6 +397,7 @@ class LocalMemoryService(MemoryService):
             session_id=request.scope.session_id or "default",
             agent_id=request.scope.agent_id,
             forbidden_secret_values=self._redaction_values(request.redaction),
+            content_codec=self.content_codec,
         )
         return IngestSourceTranscriptResult(
             items=[
@@ -387,6 +458,7 @@ class LocalMemoryService(MemoryService):
                 session_id=request.scope.session_id or "default",
                 agent_id=request.scope.agent_id,
                 max_rows=row_cap,
+                content_codec=self.content_codec,
             )
         except TranscriptRangeTooLarge:
             return ExpandHistoryResult(text="", truncated=True)
@@ -463,7 +535,7 @@ class LocalMemoryService(MemoryService):
         self,
         request: RecordRetrievalEventRequest,
     ) -> RecordRetrievalEventResult:
-        init_db(self.db_path)
+        self.init_schema()
         self._authorize(request.scope, request.required_capability)
         if (
             request.scope.session_id is not None
@@ -500,7 +572,7 @@ class LocalMemoryService(MemoryService):
         self,
         request: RetireFactRequest,
     ) -> RetireFactResult:
-        init_db(self.db_path)
+        self.init_schema()
         self._authorize(request.scope, request.required_capability)
         self._assert_not_tombstoned(
             self._with_default_session(request.scope),
@@ -549,7 +621,7 @@ class LocalMemoryService(MemoryService):
         self,
         request: ExportScopeRequest,
     ) -> ExportScopeResult:
-        init_db(self.db_path)
+        self.init_schema()
         self._authorize(request.scope, request.required_capability)
         scoped = self._with_default_session(request.scope)
         self._assert_not_tombstoned(scoped, "export")
@@ -564,7 +636,7 @@ class LocalMemoryService(MemoryService):
         self,
         request: ReplayScopeRequest,
     ) -> ReplayScopeResult:
-        init_db(self.db_path)
+        self.init_schema()
         self._authorize(request.scope, request.required_capability)
         scoped = self._with_default_session(request.scope)
         self._assert_not_tombstoned(scoped, "replay")
@@ -579,13 +651,14 @@ class LocalMemoryService(MemoryService):
         self,
         request: RebuildRequest,
     ) -> RebuildResult:
-        init_db(self.db_path)
+        self.init_schema()
         self._authorize(request.scope, request.required_capability)
         scoped = self._with_default_session(request.scope)
         self._assert_not_tombstoned(scoped, "rebuild")
         report = repair_memory_projections(
             self.db_path,
             forbidden_secret_values=self._redaction_values(request.redaction),
+            content_codec=self.content_codec,
         )
         if not request.return_artifacts:
             return RebuildResult()
@@ -616,7 +689,7 @@ class LocalMemoryService(MemoryService):
         self,
         request: DeleteScopeRequest,
     ) -> DeleteScopeResult:
-        init_db(self.db_path)
+        self.init_schema()
         self._authorize(request.scope, request.required_capability)
         if request.target_scope.tenant_id != self.tenant_id:
             raise PermissionError("target_scope tenant_id does not match opened database.")
@@ -662,12 +735,64 @@ class LocalMemoryService(MemoryService):
             )
         )
 
+    async def purge_scope(
+        self,
+        request: PurgeScopeRequest,
+    ) -> PurgeScopeResult:
+        init_db(self.db_path)
+        self._authorize(request.scope, request.required_capability)
+        if request.target_scope.tenant_id != self.tenant_id:
+            raise PermissionError("target_scope tenant_id does not match opened database.")
+        assert_no_forbidden_secret_values(
+            self._redaction_values(request.redaction),
+            request.reason,
+        )
+        with closing(connect(self.db_path)) as conn:
+            tombstone_rows = conn.execute(
+                """
+                SELECT id FROM scope_tombstones
+                WHERE target_tenant_id = ?
+                    AND target_project_id IS ?
+                    AND target_user_id IS ?
+                    AND target_session_id IS ?
+                    AND target_agent_id IS ?
+                """,
+                (
+                    request.target_scope.tenant_id,
+                    request.target_scope.project_id,
+                    request.target_scope.user_id,
+                    request.target_scope.session_id,
+                    request.target_scope.agent_id,
+                ),
+            ).fetchall()
+        tombstone_ids = [int(row[0]) for row in tombstone_rows]
+        if not tombstone_ids:
+            raise ValueError(
+                "No tombstone matches the target scope; run delete_scope first. "
+                "Purge is the second deliberate step of erasure."
+            )
+        purged_at = utc_now_iso()
+        counts = purge_scope_rows(
+            self.db_path,
+            target_session_id=request.target_scope.session_id,
+            target_agent_id=request.target_scope.agent_id,
+            tombstone_ids=tombstone_ids,
+            purged_at=purged_at,
+            dry_run=request.dry_run,
+        )
+        return PurgeScopeResult(
+            tombstone_id=str(max(tombstone_ids)),
+            purged=counts,
+            dry_run=request.dry_run,
+            purged_at=None if request.dry_run else purged_at,
+        )
+
 
 async def _run_dream_phase_with_usage(
     service: LocalMemoryService,
     request: RunDreamPhaseRequest,
 ) -> tuple[RunDreamPhaseResult, UsageSummary]:
-    init_db(service.db_path)
+    service.init_schema()
     service._authorize(request.scope, request.required_capability)
     service._assert_not_tombstoned(
         service._with_default_session(request.scope),
@@ -688,6 +813,7 @@ async def _run_dream_phase_with_usage(
             extraction_agent_factory=ports.extraction_agent_factory,
             embed=ports.embed,
             forbidden_secret_values=service._redaction_values(request.redaction),
+            content_codec=service.content_codec,
         )
     elif request.phase is DreamPhase.REM:
         from vexic.rem import run_rem_phase

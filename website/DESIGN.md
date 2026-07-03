@@ -108,9 +108,10 @@ temperature throughout; sage carries the only tint besides emerald.)
   paint-level exception). Never layout properties. The hero machine's
   promotion glow animates the opacity of a static token-derived shadow, not
   `box-shadow` itself — the one sanctioned glow on the site.
-- **No infinite loops.** The hero machine runs its pipeline three times and
-  parks on the completed state; the flow-spine comet sweeps three times and
-  rests; the status dot pulses only while the machine runs. Compositor goes
+- **No infinite loops.** The hero machine runs its pipeline once and parks on
+  the completed state (a replay would wipe the promoted fact, undercutting the
+  durable-memory story); the flow-spine comet sweeps three times and rests;
+  the status dot pulses only while the machine runs. Compositor goes
   idle once the mechanism has been demonstrated. Sanctioned exception: the
   ambient canvas backdrops (`components/ambient-canvas.tsx`, hero + footer)
   drift continuously, but only while on screen and the tab is visible —

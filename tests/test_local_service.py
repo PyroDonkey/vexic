@@ -1670,5 +1670,142 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             )
 
 
+class ArtifactLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_export_writes_artifacts_under_configured_artifact_dir(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        with tempfile.TemporaryDirectory() as temp:
+            db_path = str(Path(temp) / "memory.db")
+            artifact_dir = Path(temp) / "managed-artifacts"
+            service = LocalMemoryService(
+                db_path=db_path,
+                tenant_id="tenant-a",
+                artifact_dir=artifact_dir,
+            )
+            service.init_schema()
+            save_messages(
+                db_path,
+                [ModelRequest(parts=[UserPromptPart(content="cedar transcript")])],
+            )
+
+            export = await service.export_scope(
+                ExportScopeRequest(
+                    scope=_scope(capabilities={MemoryCapability.EXPORT}),
+                    redaction=RedactionContext(forbidden_values=()),
+                )
+            )
+
+            artifact = Path(export.artifact_ref)
+            self.assertEqual(artifact.parent, artifact_dir)
+            self.assertIn("cedar transcript", artifact.read_text(encoding="utf-8"))
+
+    async def test_prune_artifacts_removes_only_aged_vexic_artifacts(self) -> None:
+        import os
+
+        from vexic.service import LocalMemoryService
+
+        with tempfile.TemporaryDirectory() as temp:
+            db_path = str(Path(temp) / "memory.db")
+            artifact_dir = Path(temp) / "managed-artifacts"
+            service = LocalMemoryService(
+                db_path=db_path,
+                tenant_id="tenant-a",
+                artifact_dir=artifact_dir,
+            )
+            service.init_schema()
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            aged = artifact_dir / "vexic-export-old.json"
+            fresh = artifact_dir / "vexic-export-new.json"
+            unrelated = artifact_dir / "notes.txt"
+            for path in (aged, fresh, unrelated):
+                path.write_text("{}", encoding="utf-8")
+            hour = 3600
+            old_time = 1_700_000_000
+            os.utime(aged, (old_time, old_time))
+            os.utime(unrelated, (old_time, old_time))
+
+            removed = service.prune_artifacts(older_than_seconds=24 * hour)
+
+            self.assertEqual(removed, 1)
+            self.assertFalse(aged.exists())
+            self.assertTrue(fresh.exists())
+            self.assertTrue(unrelated.exists())
+
+    async def test_prune_artifacts_rejects_negative_age(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        with tempfile.TemporaryDirectory() as temp:
+            service = LocalMemoryService(
+                db_path=str(Path(temp) / "memory.db"),
+                tenant_id="tenant-a",
+                artifact_dir=Path(temp) / "managed-artifacts",
+            )
+
+            # A negative window would put the cutoff in the future and delete
+            # every artifact, including ones written moments ago.
+            with self.assertRaisesRegex(ValueError, "older_than_seconds"):
+                service.prune_artifacts(older_than_seconds=-1)
+
+    async def test_prune_artifacts_skips_files_deleted_concurrently(self) -> None:
+        import os
+
+        from vexic.service import LocalMemoryService
+
+        with tempfile.TemporaryDirectory() as temp:
+            artifact_dir = Path(temp) / "managed-artifacts"
+            service = LocalMemoryService(
+                db_path=str(Path(temp) / "memory.db"),
+                tenant_id="tenant-a",
+                artifact_dir=artifact_dir,
+            )
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            aged = artifact_dir / "vexic-export-old.json"
+            racer = artifact_dir / "vexic-export-race.json"
+            for path in (aged, racer):
+                path.write_text("{}", encoding="utf-8")
+            old_time = 1_700_000_000
+            os.utime(aged, (old_time, old_time))
+            os.utime(racer, (old_time, old_time))
+
+            original_stat = Path.stat
+
+            def racy_stat(self: Path, *args: object, **kwargs: object) -> object:
+                if self.name == "vexic-export-race.json":
+                    raise FileNotFoundError(str(self))
+                return original_stat(self, *args, **kwargs)
+
+            with patch.object(Path, "stat", racy_stat):
+                removed = service.prune_artifacts(older_than_seconds=3600)
+
+            self.assertEqual(removed, 1)
+            self.assertFalse(aged.exists())
+
+    async def test_pre_existing_artifact_dir_is_tightened_on_posix(self) -> None:
+        import os
+        import stat as stat_module
+
+        if os.name == "nt":
+            self.skipTest("POSIX mode-bit enforcement")
+
+        from vexic.service import LocalMemoryService
+
+        with tempfile.TemporaryDirectory() as temp:
+            artifact_dir = Path(temp) / "managed-artifacts"
+            # Simulates CI: the directory already exists with a default umask
+            # mode, which mkdir(mode=0o700, exist_ok=True) does not repair.
+            artifact_dir.mkdir(parents=True)
+            artifact_dir.chmod(0o755)
+            service = LocalMemoryService(
+                db_path=str(Path(temp) / "memory.db"),
+                tenant_id="tenant-a",
+                artifact_dir=artifact_dir,
+            )
+
+            service.prune_artifacts(older_than_seconds=3600)
+
+            mode = stat_module.S_IMODE(artifact_dir.stat().st_mode)
+            self.assertEqual(mode, 0o700)
+
+
 if __name__ == "__main__":
     unittest.main()

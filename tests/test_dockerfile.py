@@ -57,6 +57,15 @@ def test_hosted_docker_runtime_exposes_src_package(tmp_path: Path) -> None:
     assert str(ROOT / "src") in completed.stdout
 
 
+def test_dockerignore_excludes_env_files() -> None:
+    # Dockerfile COPY is path-selective today; this guards against a future
+    # broad COPY shipping working-tree secrets into the image.
+    dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8")
+    entries = {line.strip() for line in dockerignore.splitlines() if line.strip()}
+    assert ".env" in entries
+    assert ".env.*" in entries
+
+
 def test_hosted_entrypoint_repairs_volume_then_drops_privileges(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

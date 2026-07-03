@@ -67,3 +67,12 @@ to stub data when a URL is configured.
 When `VEXIC_CONTROL_PLANE_URL` is unset outside production, `/api/control-plane/*`
 uses the in-memory store for local smoke testing. In production, a missing URL
 returns an error instead of fabricated project, key, or usage data.
+
+Telemetry:
+
+- `CLERK_TELEMETRY_DISABLED=1`
+
+The Clerk SDK ships its own product telemetry (auth-flow events sent to Clerk).
+The console keeps it disabled by default so the app emits no third-party
+telemetry; unset the variable only if you deliberately want to share usage data
+with Clerk. It never carries Vexic memory content either way.
