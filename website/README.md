@@ -44,8 +44,8 @@ Optional (all have defaults):
 
 - `NEXT_PUBLIC_SITE_URL` — canonical site origin for metadata, robots, and
   sitemap. Defaults to `https://vexic.dev`.
-- `NEXT_PUBLIC_CONSOLE_URL` — target of the "Sign in" links. Defaults to
-  `https://console.vexic.dev`; set this to the deployed Console URL.
+- `NEXT_PUBLIC_CONSOLE_URL` — base URL for the console; "Sign in" links target
+  `<console>/sign-in`. Defaults to `https://console.vexic.dev`; set this to the deployed Console URL.
 
 ## Waitlist
 

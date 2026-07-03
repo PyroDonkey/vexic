@@ -1,7 +1,7 @@
 import Link from "next/link";
 
 import { AmbientCanvas } from "@/components/ambient-canvas";
-import { CONSOLE_URL, GITHUB_URL, NAV_LINKS } from "@/lib/links";
+import { GITHUB_URL, NAV_LINKS, SIGN_IN_URL } from "@/lib/links";
 
 export function SiteFooter() {
   return (
@@ -50,7 +50,7 @@ export function SiteFooter() {
                 </a>
               </li>
               <li>
-                <a href={CONSOLE_URL} className="transition-colors hover:text-foreground">
+                <a href={SIGN_IN_URL} className="transition-colors hover:text-foreground">
                   Sign in
                 </a>
               </li>
