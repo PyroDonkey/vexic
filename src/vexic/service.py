@@ -170,6 +170,11 @@ class LocalMemoryService(MemoryService):
             return Path(tempfile.gettempdir())
         if not self._artifact_dir_prepared:
             self.artifact_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if os.name != "nt":
+                # mkdir's mode only applies at creation; a pre-existing
+                # directory keeps its old bits, so tighten before verifying.
+                # (NT enforcement rewrites the DACL inside ensure_owner_only.)
+                self.artifact_dir.chmod(0o700)
             ensure_owner_only(self.artifact_dir, directory=True)
             self._artifact_dir_prepared = True
         return self.artifact_dir
@@ -183,13 +188,24 @@ class LocalMemoryService(MemoryService):
         Artifacts are plaintext full-content snapshots; they are meant to be
         consumed and discarded, not to accumulate. Returns the removed count.
         """
+        if older_than_seconds < 0:
+            raise ValueError(
+                "older_than_seconds must be >= 0; a negative window would "
+                "delete artifacts written moments ago."
+            )
         root = self._artifact_root()
         if not root.exists():
             return 0
         cutoff = time.time() - older_than_seconds
         removed = 0
         for artifact in root.glob("vexic-*.json"):
-            if artifact.stat().st_mtime < cutoff:
+            try:
+                aged = artifact.stat().st_mtime < cutoff
+            except FileNotFoundError:
+                # Deleted between glob and stat by a concurrent consumer;
+                # already gone is the outcome pruning wanted.
+                continue
+            if aged:
                 artifact.unlink(missing_ok=True)
                 removed += 1
         return removed

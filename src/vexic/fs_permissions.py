@@ -10,7 +10,8 @@ from pathlib import Path
 # mode bits are cosmetic on Windows.
 
 
-def _current_user_sid() -> str:
+def _current_user_identity() -> tuple[str, str]:
+    """Return ``(account_name, sid)`` for the current Windows user."""
     completed = subprocess.run(
         ["whoami", "/user", "/fo", "csv"],
         capture_output=True,
@@ -18,10 +19,12 @@ def _current_user_sid() -> str:
         check=True,
     )
     last_row = completed.stdout.strip().splitlines()[-1]
-    sid = last_row.rsplit(",", 1)[-1].strip().strip('"')
-    if not sid.upper().startswith("S-1-"):
-        raise PermissionError("could not resolve the current user SID")
-    return sid
+    account, _, sid = last_row.rpartition(",")
+    account = account.strip().strip('"')
+    sid = sid.strip().strip('"')
+    if not account or not sid.upper().startswith("S-1-"):
+        raise PermissionError("could not resolve the current user account and SID")
+    return account, sid
 
 
 def _icacls_restrict_args(path: Path, sid: str, *, directory: bool = False) -> list[str]:
@@ -43,8 +46,52 @@ def _icacls_restrict_args(path: Path, sid: str, *, directory: bool = False) -> l
 _NT_PRIVILEGED_ACE_BUDGET = 4
 
 
+def _assert_owner_only_listing(
+    ace_lines: list[str],
+    *,
+    account: str,
+    sid: str,
+    directory: bool,
+    display_name: str,
+) -> None:
+    """Fail closed unless an icacls listing shows an owner-only DACL.
+
+    Files must carry exactly one ACE: the current user with full control.
+    Directories tolerate the privileged principals CPython 3.13 writes for
+    mode-0o700 directories (they bypass per-file DACLs anyway) but still
+    require the current user's inheriting full-control grant.
+    """
+    inherited = [line for line in ace_lines if "(I)" in line]
+    if inherited:
+        raise PermissionError(
+            f"{display_name} still carries inherited access control entries"
+        )
+    budget = _NT_PRIVILEGED_ACE_BUDGET if directory else 1
+    if not ace_lines or len(ace_lines) > budget:
+        raise PermissionError(
+            f"{display_name} carries {len(ace_lines)} access control entries; "
+            f"expected 1-{budget} non-inherited entries"
+        )
+    # icacls prints the resolved account name, or the raw SID when the name
+    # cannot be resolved; match either, case-insensitively for the name.
+    user_lines = [
+        line
+        for line in ace_lines
+        if account.lower() in line.lower() or sid in line
+    ]
+    required_marks = ("(OI)", "(CI)", "(F)") if directory else ("(F)",)
+    if not any(
+        all(mark in line for mark in required_marks) for line in user_lines
+    ):
+        raise PermissionError(
+            f"{display_name} does not grant the current user "
+            f"{'an inheriting ' if directory else ''}full-control entry"
+        )
+
+
 def _ensure_owner_only_nt(path: Path, *, directory: bool) -> None:
-    args = _icacls_restrict_args(path, _current_user_sid(), directory=directory)
+    account, sid = _current_user_identity()
+    args = _icacls_restrict_args(path, sid, directory=directory)
     completed = subprocess.run(args, capture_output=True, text=True)
     if completed.returncode != 0:
         raise PermissionError(
@@ -57,16 +104,13 @@ def _ensure_owner_only_nt(path: Path, *, directory: bool) -> None:
         check=True,
     ).stdout
     ace_lines = [line for line in listing.splitlines() if ":(" in line]
-    inherited = [line for line in ace_lines if "(I)" in line]
-    if inherited:
-        raise PermissionError(
-            f"{path.name} still carries inherited access control entries"
-        )
-    if not ace_lines or len(ace_lines) > _NT_PRIVILEGED_ACE_BUDGET:
-        raise PermissionError(
-            f"{path.name} carries {len(ace_lines)} access control entries; "
-            f"expected 1-{_NT_PRIVILEGED_ACE_BUDGET} non-inherited entries"
-        )
+    _assert_owner_only_listing(
+        ace_lines,
+        account=account,
+        sid=sid,
+        directory=directory,
+        display_name=path.name,
+    )
 
 
 def ensure_owner_only(path: Path, *, directory: bool = False) -> None:

@@ -5,9 +5,78 @@ from pathlib import Path
 import pytest
 
 from vexic.fs_permissions import (
+    _assert_owner_only_listing,
     _icacls_restrict_args,
     ensure_owner_only,
 )
+
+ACCOUNT = "RYAN-DESKTOP\\Ryan"
+SID = "S-1-5-21-1-2-3-1001"
+
+
+def _assert_listing(lines: list[str], *, directory: bool = False) -> None:
+    _assert_owner_only_listing(
+        lines,
+        account=ACCOUNT,
+        sid=SID,
+        directory=directory,
+        display_name="secret.json",
+    )
+
+
+def test_listing_verifier_accepts_single_owner_full_control_file() -> None:
+    _assert_listing([f"C:\\x\\secret.json {ACCOUNT}:(F)"])
+
+
+def test_listing_verifier_rejects_files_with_extra_principals() -> None:
+    with pytest.raises(PermissionError):
+        _assert_listing(
+            [
+                f"C:\\x\\secret.json {ACCOUNT}:(F)",
+                "                  NT AUTHORITY\\SYSTEM:(F)",
+            ]
+        )
+
+
+def test_listing_verifier_rejects_missing_current_user_grant() -> None:
+    with pytest.raises(PermissionError):
+        _assert_listing(["C:\\x\\secret.json OTHERPC\\Mallory:(F)"])
+
+
+def test_listing_verifier_rejects_user_entry_without_full_control() -> None:
+    with pytest.raises(PermissionError):
+        _assert_listing([f"C:\\x\\secret.json {ACCOUNT}:(R)"])
+
+
+def test_listing_verifier_rejects_inherited_entries() -> None:
+    with pytest.raises(PermissionError):
+        _assert_listing([f"C:\\x\\secret.json {ACCOUNT}:(I)(F)"])
+
+
+def test_listing_verifier_accepts_hardened_directory_dacl() -> None:
+    # The CPython 3.13 mode-0o700 directory DACL: owner + privileged
+    # principals that bypass per-file DACLs anyway.
+    _assert_listing(
+        [
+            f"C:\\x\\artifacts {ACCOUNT}:(OI)(CI)(F)",
+            "               NT AUTHORITY\\SYSTEM:(OI)(CI)(F)",
+            "               BUILTIN\\Administrators:(OI)(CI)(F)",
+            "               OWNER RIGHTS:(OI)(CI)(F)",
+        ],
+        directory=True,
+    )
+
+
+def test_listing_verifier_matches_user_by_sid_when_name_unresolved() -> None:
+    _assert_listing([f"C:\\x\\secret.json *{SID}:(F)"])
+
+
+def test_listing_verifier_rejects_directory_without_inheriting_user_grant() -> None:
+    with pytest.raises(PermissionError):
+        _assert_listing(
+            [f"C:\\x\\artifacts {ACCOUNT}:(F)"],
+            directory=True,
+        )
 
 
 def test_icacls_restrict_args_reference_sid_not_account_name() -> None:
@@ -39,6 +108,8 @@ def test_ensure_owner_only_leaves_a_single_owner_ace_on_files(tmp_path: Path) ->
     ace_lines = _ace_lines(secret)
     assert len(ace_lines) == 1, ace_lines
     assert "(F)" in ace_lines[0], ace_lines
+    username = os.environ.get("USERNAME", "")
+    assert username and username.lower() in ace_lines[0].lower(), ace_lines
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows ACL enforcement")
