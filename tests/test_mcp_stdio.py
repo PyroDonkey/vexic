@@ -16,6 +16,7 @@ from unittest.mock import patch
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 from vexic.contract import SearchTranscriptResult, TranscriptHit
+from vexic.mcp_presentation import TOOL_ANNOTATIONS, server_instructions
 from vexic.mcp_stdio import (
     MAX_EXPAND_HISTORY_CHARS,
     MAX_EXPAND_HISTORY_MESSAGES,
@@ -89,7 +90,9 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["protocolVersion"], "2025-11-25")
         self.assertEqual(result["capabilities"], {"tools": {"listChanged": False}})
         self.assertEqual(result["serverInfo"]["name"], "vexic-local-memory")
-        self.assertIn("Read-only Vexic memory", result["instructions"])
+        self.assertEqual(result["instructions"], server_instructions(False))
+        self.assertIn("proactively", result["instructions"])
+        self.assertIn("recall_user_memory", result["instructions"])
         self.assertIn("No transcript append", result["instructions"])
         self.assertIn("verbatim history expansion", result["instructions"])
 
@@ -98,9 +101,13 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
             {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
         )
 
-        tool_names = {tool["name"] for tool in response["result"]["tools"]}
+        tools = response["result"]["tools"]
+        tool_names = {tool["name"] for tool in tools}
 
-        self.assertEqual(tool_names, {"search_transcript", "search_long_term"})
+        self.assertEqual(tool_names, {"recall_conversation_history", "recall_user_memory"})
+        for tool in tools:
+            self.assertEqual(tool["annotations"], TOOL_ANNOTATIONS)
+            self.assertIn("proactively", tool["description"])
 
     async def test_expand_history_is_unavailable_without_privileged_slice(self) -> None:
         response = await self._request(
@@ -136,7 +143,7 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
         tool_names = {tool["name"] for tool in response["result"]["tools"]}
         self.assertEqual(
             tool_names,
-            {"search_transcript", "search_long_term", "expand_history"},
+            {"recall_conversation_history", "recall_user_memory", "expand_history"},
         )
 
     def test_cli_flag_enables_expand_history(self) -> None:
@@ -244,7 +251,7 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
                     "id": 1,
                     "method": "tools/call",
                     "params": {
-                        "name": "search_transcript",
+                        "name": "recall_conversation_history",
                         "arguments": {"query": query},
                     },
                 },
@@ -300,7 +307,7 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
                     "id": 1,
                     "method": "tools/call",
                     "params": {
-                        "name": "search_transcript",
+                        "name": "recall_conversation_history",
                         "arguments": {"query": "cedar"},
                     },
                 }
@@ -344,7 +351,7 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
                     "jsonrpc": "2.0",
                     "id": 1,
                     "method": "tools/call",
-                    "params": {"name": "search_transcript", "arguments": {"query": query}},
+                    "params": {"name": "recall_conversation_history", "arguments": {"query": query}},
                 },
                 ensure_ascii=False,
             )
@@ -574,7 +581,7 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
                     "id": 2,
                     "method": "tools/call",
                     "params": {
-                        "name": "search_transcript",
+                        "name": "recall_conversation_history",
                         "arguments": {"query": "cedar"},
                     },
                 },
@@ -631,7 +638,7 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
                 "id": 2,
                 "method": "tools/call",
                 "params": {
-                    "name": "search_transcript",
+                    "name": "recall_conversation_history",
                     "arguments": {"query": "cedar"},
                 },
             }
@@ -640,6 +647,62 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
         text = response["result"]["content"][0]["text"]
         self.assertIn("session alpha cedar", text)
         self.assertNotIn("session beta cedar", text)
+
+    async def test_search_transcript_renders_prose_without_internal_metadata(self) -> None:
+        save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="prose cedar")])],
+            session_id="session-a",
+        )
+
+        response = await self._request(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "recall_conversation_history",
+                    "arguments": {"query": "cedar"},
+                },
+            }
+        )
+
+        text = response["result"]["content"][0]["text"]
+        self.assertIn("prose cedar", text)
+        self.assertIn("conversation history", text)
+        self.assertNotIn("message_id", text)
+        self.assertNotIn("session_id", text)
+        self.assertNotIn("[message", text)
+        self.assertNotIn('"hits"', text)
+
+    async def test_search_transcript_includes_message_ids_when_expand_enabled(self) -> None:
+        message_ids = save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="expandable cedar")])],
+            session_id="session-a",
+        )
+
+        response = await handle_jsonrpc_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "recall_conversation_history",
+                    "arguments": {"query": "cedar"},
+                },
+            },
+            McpServerConfig(
+                db_path=self.db_path,
+                tenant_id="tenant-a",
+                session_id="session-a",
+                enable_expand_history=True,
+            ),
+        )
+
+        text = response["result"]["content"][0]["text"]
+        self.assertIn(f"[message {message_ids[0]}", text)
+        self.assertIn("expandable cedar", text)
 
     async def test_search_transcript_uses_configured_agent_scope(self) -> None:
         save_messages(
@@ -661,7 +724,7 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
                 "id": 2,
                 "method": "tools/call",
                 "params": {
-                    "name": "search_transcript",
+                    "name": "recall_conversation_history",
                     "arguments": {"query": "cedar"},
                 },
             },
@@ -684,7 +747,7 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
                 "id": 2,
                 "method": "tools/call",
                 "params": {
-                    "name": "search_transcript",
+                    "name": "recall_conversation_history",
                     "arguments": {"query": "cedar", "agent_id": "agent-b"},
                 },
             }
@@ -836,7 +899,7 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
                 "id": 3,
                 "method": "tools/call",
                 "params": {
-                    "name": "search_transcript",
+                    "name": "recall_conversation_history",
                     "arguments": {"query": "cedar-secret"},
                 },
             },
@@ -984,7 +1047,7 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
                 "id": 4,
                 "method": "tools/call",
                 "params": {
-                    "name": "search_long_term",
+                    "name": "recall_user_memory",
                     "arguments": {"query": "compact reports"},
                 },
             }
@@ -995,11 +1058,11 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_invalid_tool_calls_return_tool_errors(self) -> None:
         cases = [
-            ("search_transcript", {"query": ""}, "query must be a non-empty string"),
-            ("search_transcript", {"query": "x" * 1001}, "1000 characters"),
-            ("search_transcript", {"query": "cedar", "limit": 0}, "between 1 and 20"),
-            ("search_transcript", {"query": "cedar", "limit": 21}, "between 1 and 20"),
-            ("search_transcript", {"query": "cedar", "limit": "5"}, "integer"),
+            ("recall_conversation_history", {"query": ""}, "query must be a non-empty string"),
+            ("recall_conversation_history", {"query": "x" * 1001}, "1000 characters"),
+            ("recall_conversation_history", {"query": "cedar", "limit": 0}, "between 1 and 20"),
+            ("recall_conversation_history", {"query": "cedar", "limit": 21}, "between 1 and 20"),
+            ("recall_conversation_history", {"query": "cedar", "limit": "5"}, "integer"),
             ("append_transcript", {"query": "cedar"}, "unknown tool"),
         ]
 

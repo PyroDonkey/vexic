@@ -16,6 +16,13 @@ from vexic.contract import (
     TrustBoundary,
 )
 from vexic.hosted import HostedAuthContext, HostedMemoryService, HostedRateLimitExceeded
+from vexic.mcp_presentation import (
+    RECALL_CONVERSATION_HISTORY,
+    RECALL_USER_MEMORY,
+    render_long_term,
+    render_transcript_hits,
+    server_instructions,
+)
 from vexic.mcp_stdio import (
     BASE_TOOLS,
     MCP_PROTOCOL_VERSION,
@@ -23,10 +30,10 @@ from vexic.mcp_stdio import (
     _query,
     _reject_extra,
     _tool_error,
-    _tool_text,
+    _tool_prose,
 )
 from vexic.ports import HostPortNotConfigured
-from vexic.redaction import assert_no_forbidden_secret_values_in_payload
+from vexic.redaction import assert_no_forbidden_secret_values
 
 
 class JsonRpcRequest(BaseModel):
@@ -194,12 +201,7 @@ async def _handle_message(
                 "title": "Vexic Remote Memory",
                 "version": CONTRACT_VERSION,
             },
-            "instructions": (
-                "Read-only Vexic memory. Use search_transcript for the configured "
-                "session and search_long_term for durable facts. No transcript "
-                "append, verbatim history expansion, export, delete, rebuild, or "
-                "admin tools are available."
-            ),
+            "instructions": server_instructions(False),
         },
     )
 
@@ -221,7 +223,7 @@ async def _call_tool(
     if not isinstance(arguments, dict):
         return _tool_error("arguments must be an object.")
     try:
-        if name == "search_transcript":
+        if name == RECALL_CONVERSATION_HISTORY:
             _reject_extra(arguments, {"query", "limit"})
             result = await service.search_transcript(
                 api_key,
@@ -231,10 +233,10 @@ async def _call_tool(
                     limit=_limit(arguments),
                 ),
             )
-            payload = {"hits": [hit.model_dump(mode="json") for hit in result.hits]}
-            assert_no_forbidden_secret_values_in_payload(forbidden_secret_values, payload)
-            return _tool_text(payload)
-        if name == "search_long_term":
+            text = render_transcript_hits(result.hits)
+            assert_no_forbidden_secret_values(forbidden_secret_values, text)
+            return _tool_prose(text)
+        if name == RECALL_USER_MEMORY:
             _reject_extra(arguments, {"query", "limit"})
             result = await service.search_long_term(
                 api_key,
@@ -244,14 +246,9 @@ async def _call_tool(
                     limit=_limit(arguments),
                 ),
             )
-            payload = {
-                "facts": [fact.model_dump(mode="json") for fact in result.facts],
-                "candidate_notes": [
-                    note.model_dump(mode="json") for note in result.candidate_notes
-                ],
-            }
-            assert_no_forbidden_secret_values_in_payload(forbidden_secret_values, payload)
-            return _tool_text(payload)
+            text = render_long_term(result.facts, result.candidate_notes)
+            assert_no_forbidden_secret_values(forbidden_secret_values, text)
+            return _tool_prose(text)
         return _tool_error(f"unknown tool: {name}")
     except HostedRateLimitExceeded:
         raise

@@ -33,6 +33,7 @@ index (and the reverse).
 | 0018 | Claude Code read path splits SessionStart priming and MCP on-demand pull | accepted |
 | 0019 | Hosted storage cutover starts Turso-only, Neon deferred         | accepted |
 | 0020 | Heuristic REM lowers the dream-phase LLM floor                  | accepted |
+| 0021 | MCP memory surfaces are proactive and prose-first               | accepted |
 
 Notes:
 
@@ -85,6 +86,11 @@ Notes:
   adapter symbol are deleted, and the remaining dream-phase LLM legs are Light
   extraction plus the (deferrable per 0016) Deep contradiction judge on the
   `deepseek/deepseek-v4-pro` hosted default.
+- 0021 governs the model-facing MCP surface introduced in response to observed
+  Claude Code UX failures: renamed recall tools with trigger-first
+  descriptions, shared proactive/presentation server instructions, and prose
+  search results. It affirms the read-only posture of 0010/0014 and extends
+  the 0018 read path.
 - These numbers are the Vexic `docs/adr/` series and are self-contained.
   `src/vexic` source no longer carries any `upstream ADR-00NN` extraction-source
   labels (they were removed when the COA boundary policy was clarified), so there

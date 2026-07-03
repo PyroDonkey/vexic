@@ -49,11 +49,12 @@ entry point can wait for release packaging.
 Pass `--agent-id <id>` to bind the server to one agent-specific memory scope;
 omit it to bind the server to the explicit shared agent scope.
 
-By default, the MVP exposes `search_transcript` and `search_long_term` only.
-Transcript writes, export, delete, rebuild, and admin tools are intentionally
-not registered. Long-term vector search uses a host-supplied embedding adapter
-when one is configured, otherwise it uses the optional local embedding adapter
-from `vexic[local-embed]`. Without that extra, `search_long_term` returns an
+By default, the MVP exposes the `recall_conversation_history` and
+`recall_user_memory` MCP tools only. Transcript writes, export, delete,
+rebuild, and admin tools are intentionally not registered. Long-term vector
+search uses a host-supplied embedding adapter when one is configured,
+otherwise it uses the optional local embedding adapter from
+`vexic[local-embed]`. Without that extra, `recall_user_memory` returns an
 actionable configuration error.
 
 Privileged verbatim history egress is disabled by default. For a local,
@@ -299,7 +300,7 @@ curl.exe -s https://api.vexic.dev/v1/search_long_term `
 The hosted FastAPI app also exposes `POST /mcp` as a stateless, read-only,
 JSON-only Streamable HTTP MCP slice. It requires `Authorization: Bearer
 <vexic-api-key>`, binds project/session/agent scope from `X-Vexic-*` headers,
-and exposes only `search_transcript` and `search_long_term`.
+and exposes only `recall_conversation_history` and `recall_user_memory`.
 
 Minimum smoke request:
 
