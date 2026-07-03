@@ -23,8 +23,11 @@ from vexic.storage.connection import connect
 from vexic.storage.vectors import select_vector_backend
 
 
-def _in_clause(ids: list[int]) -> str:
-    return ",".join("?" * len(ids))
+# Id lists are passed as a single JSON array bound parameter and expanded with
+# json_each, so purge never builds an ``IN (?, ?, ...)`` clause whose bound
+# parameter count could blow past SQLite's SQLITE_MAX_VARIABLE_NUMBER limit
+# (999 by default) on realistic scopes.
+_IN_JSON = "SELECT value FROM json_each(?)"
 
 
 def _collect_message_ids(
@@ -68,10 +71,10 @@ def _collect_derived_ids(
         WHERE agent_id IS ?
             AND EXISTS (
                 SELECT 1 FROM json_each({table}.source_message_ids)
-                WHERE json_each.value IN ({_in_clause(message_ids)})
+                WHERE json_each.value IN ({_IN_JSON})
             )
         """,
-        (target_agent_id, *message_ids),
+        (target_agent_id, json.dumps(message_ids)),
     ).fetchall()
     return [int(row[0]) for row in rows]
 
@@ -79,7 +82,7 @@ def _collect_derived_ids(
 def _delete_by_ids(conn: object, sql_template: str, ids: list[int]) -> int:
     if not ids:
         return 0
-    cursor = conn.execute(sql_template.format(ids=_in_clause(ids)), ids)
+    cursor = conn.execute(sql_template.format(ids=_IN_JSON), (json.dumps(ids),))
     return int(cursor.rowcount)
 
 
@@ -126,7 +129,10 @@ def purge_scope_rows(
 ) -> dict[str, int]:
     """Physically delete every content-bearing row of the tombstoned scope.
 
-    Returns per-table deleted-row counts. ``dry_run`` executes the identical
+    Returns per-table affected-row counts. These are deleted-row counts for
+    every table except ``dream_runs_error_detail_scrubbed``, which counts rows
+    whose ``error_detail`` column was blanked in place (the row survives).
+    ``dry_run`` executes the identical
     transaction and rolls it back, so the counts are exact projections. On
     success the matching tombstones flip ``physical_purge_deferred`` to 0 and
     record ``purged_at`` plus the counts JSON in the same transaction.
@@ -150,9 +156,9 @@ def purge_scope_rows(
                 promoted_rows = conn.execute(
                     f"""
                     SELECT id FROM long_term_memory
-                    WHERE promoted_from_candidate_id IN ({_in_clause(candidate_ids)})
+                    WHERE promoted_from_candidate_id IN ({_IN_JSON})
                     """,
-                    candidate_ids,
+                    (json.dumps(candidate_ids),),
                 ).fetchall()
                 fact_ids = sorted({*fact_ids, *(int(row[0]) for row in promoted_rows)})
 
@@ -175,10 +181,10 @@ def purge_scope_rows(
                 cursor = conn.execute(
                     f"""
                     DELETE FROM memory_dedup_events
-                    WHERE candidate_id IN ({_in_clause(candidate_ids)})
-                        OR matched_candidate_id IN ({_in_clause(candidate_ids)})
+                    WHERE candidate_id IN ({_IN_JSON})
+                        OR matched_candidate_id IN ({_IN_JSON})
                     """,
-                    (*candidate_ids, *candidate_ids),
+                    (json.dumps(candidate_ids), json.dumps(candidate_ids)),
                 )
                 dedup_deleted += int(cursor.rowcount)
             if message_ids:
@@ -187,10 +193,10 @@ def purge_scope_rows(
                     DELETE FROM memory_dedup_events
                     WHERE EXISTS (
                         SELECT 1 FROM json_each(memory_dedup_events.incoming_source_message_ids)
-                        WHERE json_each.value IN ({_in_clause(message_ids)})
+                        WHERE json_each.value IN ({_IN_JSON})
                     )
                     """,
-                    message_ids,
+                    (json.dumps(message_ids),),
                 )
                 dedup_deleted += int(cursor.rowcount)
             counts["memory_dedup_events"] = dedup_deleted
@@ -246,9 +252,9 @@ def purge_scope_rows(
                     SET physical_purge_deferred = 0,
                         purged_at = ?,
                         purged_counts = ?
-                    WHERE id IN ({_in_clause(tombstone_ids)})
+                    WHERE id IN ({_IN_JSON})
                     """,
-                    (purged_at, json.dumps(counts, sort_keys=True), *tombstone_ids),
+                    (purged_at, json.dumps(counts, sort_keys=True), json.dumps(tombstone_ids)),
                 )
             if dry_run:
                 conn.rollback()

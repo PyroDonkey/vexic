@@ -424,12 +424,25 @@ class RetrievalQueryRetentionTests(unittest.TestCase):
         init_db(self.db_path)
         with closing(sqlite3.connect(self.db_path)) as conn:
             with conn:
+                # retrieved_at mirrors the schema CURRENT_TIMESTAMP default
+                # (space-separated 'YYYY-MM-DD HH:MM:SS'), while callers pass an
+                # ISO-8601 'T'-separated cutoff. The boundary row lands on the
+                # cutoff day at a later instant and must survive: a naive string
+                # '<' would sort ' ' before 'T' and wrongly expire it.
                 conn.execute(
                     """
                     INSERT INTO retrieval_events
                         (fact_id, session_id, query, rewritten_query, retrieved_at, used)
                     VALUES (1, 'session-1', 'aged secret query', 'aged rewrite',
-                            '2026-01-01T00:00:00+00:00', 1)
+                            '2026-01-01 00:00:00', 1)
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO retrieval_events
+                        (fact_id, session_id, query, rewritten_query, retrieved_at)
+                    VALUES (1, 'session-1', 'boundary query', 'boundary rewrite',
+                            '2026-06-01 12:00:00')
                     """
                 )
                 conn.execute(
@@ -437,7 +450,7 @@ class RetrievalQueryRetentionTests(unittest.TestCase):
                     INSERT INTO retrieval_events
                         (fact_id, session_id, query, rewritten_query, retrieved_at)
                     VALUES (1, 'session-1', 'fresh query', 'fresh rewrite',
-                            '2026-06-30T00:00:00+00:00')
+                            '2026-06-30 00:00:00')
                     """
                 )
                 conn.execute(
@@ -445,7 +458,7 @@ class RetrievalQueryRetentionTests(unittest.TestCase):
                     INSERT INTO candidate_retrieval_events
                         (candidate_id, session_id, query, retrieved_at)
                     VALUES (7, 'session-1', 'aged candidate query',
-                            '2026-01-01T00:00:00+00:00')
+                            '2026-01-01 00:00:00')
                     """
                 )
 
@@ -473,7 +486,15 @@ class RetrievalQueryRetentionTests(unittest.TestCase):
 
         # Rows survive (retrieved_count/used_count derive from them); only the
         # content-bearing query text is blanked, and the use verdict is kept.
-        self.assertEqual(rows, [("", None, 1), ("fresh query", "fresh rewrite", None)])
+        # The boundary row (cutoff day, later instant) keeps its text.
+        self.assertEqual(
+            rows,
+            [
+                ("", None, 1),
+                ("boundary query", "boundary rewrite", None),
+                ("fresh query", "fresh rewrite", None),
+            ],
+        )
         self.assertEqual(candidate_rows, [("",)])
 
     def test_expiry_is_idempotent(self) -> None:

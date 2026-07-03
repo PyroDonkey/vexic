@@ -23,6 +23,11 @@ def expire_retrieval_queries(db_path: object, *, older_than: str) -> dict[str, i
     """Blank query text on telemetry rows retrieved before ``older_than``.
 
     ``older_than`` is an ISO-8601 timestamp compared against ``retrieved_at``.
+    ``retrieved_at`` is stored via the schema ``CURRENT_TIMESTAMP`` default
+    (``YYYY-MM-DD HH:MM:SS``), so both sides run through SQLite ``datetime()``
+    to compare instants rather than raw strings; a naive ``<`` would mis-order
+    the space-separated stored form against the ``T``-separated ISO cutoff and
+    wrongly expire rows on the boundary day.
     Returns per-table counts of rows whose text was blanked. Idempotent:
     already-blanked rows do not count again. On managed libSQL the two
     UPDATEs auto-commit separately; a crash between them leaves a partially
@@ -35,7 +40,7 @@ def expire_retrieval_queries(db_path: object, *, older_than: str) -> dict[str, i
                 """
                 UPDATE retrieval_events
                 SET query = '', rewritten_query = NULL
-                WHERE retrieved_at < ?
+                WHERE datetime(retrieved_at) < datetime(?)
                     AND (query != '' OR rewritten_query IS NOT NULL)
                 """,
                 (older_than,),
@@ -45,7 +50,7 @@ def expire_retrieval_queries(db_path: object, *, older_than: str) -> dict[str, i
                 """
                 UPDATE candidate_retrieval_events
                 SET query = ''
-                WHERE retrieved_at < ? AND query != ''
+                WHERE datetime(retrieved_at) < datetime(?) AND query != ''
                 """,
                 (older_than,),
             )
