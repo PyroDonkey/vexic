@@ -222,9 +222,14 @@ Without `--allow-live`, the command exits 0 before importing the adapter or
 calling providers. The host-owned OpenRouter adapter reads `OPENROUTER_API_KEY`
 from the process environment and supplies `build_extraction_agent`,
 `build_contradiction_agent`, and `embed_texts`; Vexic core does not read
-provider secrets. REM is a local heuristic and makes no provider calls (ADR
-0020), which is why a `--max-provider-calls 5` budget covers the default
-single-row run. The adapter lives under repo-local `adapters/` by design
+provider secrets. Every adapter request pins the OpenRouter provider
+preference `data_collection: "deny"`, restricting routing to model providers
+that neither retain nor train on prompts (transcript and fact text travel in
+these requests; see the ADR 0009 telemetry boundary). Pair it with
+account-level ZDR in the OpenRouter dashboard for defense in depth; the pin
+can reduce provider availability for exotic models. REM is a local heuristic
+and makes no provider calls (ADR 0020), which is why a
+`--max-provider-calls 5` budget covers the default single-row run. The adapter lives under repo-local `adapters/` by design
 because it is host-owned provider wiring, not package core. Embedding can
 alternatively use the optional local `vexic[local-embed]` adapter.
 
