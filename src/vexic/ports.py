@@ -24,6 +24,23 @@ class AgentFactory(Protocol):
 type EmbedTexts = Callable[[list[str]], list[list[float]]]
 
 
+class ContentCodec(Protocol):
+    """Encode canonical content before storage; decode after reads (ADR 0023).
+
+    No codec means plaintext passthrough -- the local default. Hosted
+    adapters supply an encrypting codec. Codecs own their envelope: encoded
+    values carry a codec-specific version prefix and ``decode`` passes
+    through values without it, so legacy plaintext rows keep reading
+    correctly during migration. AAD binding (table/column context) is fixed
+    at codec construction, not per call, and key material never lives in
+    ``src/vexic``.
+    """
+
+    def encode(self, plaintext: str) -> str: ...
+
+    def decode(self, stored: str) -> str: ...
+
+
 @dataclass(frozen=True)
 class DreamPhasePorts:
     model_group: str

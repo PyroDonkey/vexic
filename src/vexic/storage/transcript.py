@@ -18,6 +18,7 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
+from vexic.ports import ContentCodec
 from vexic.storage.errors import is_operational_error, is_unique_violation
 from vexic.storage.schema import _assert_no_forbidden_secret_values, _fts_match_query
 from vexic.text_utils import estimate_tokens
@@ -29,6 +30,16 @@ from vexic.storage.connection import connect
 
 messages_adapter = TypeAdapter(list[ModelMessage])
 single_message_adapter = TypeAdapter(ModelMessage)
+
+
+def _encode_stored(content_codec: ContentCodec | None, text: str) -> str:
+    # Forbidden-value guards and FTS bodies run on plaintext BEFORE this call;
+    # the codec sees only the final serialized message_json (ADR 0023).
+    return text if content_codec is None else content_codec.encode(text)
+
+
+def _decode_stored(content_codec: ContentCodec | None, stored: str) -> str:
+    return stored if content_codec is None else content_codec.decode(stored)
 
 
 def strip_prompt_payloads(msg: ModelMessage) -> ModelMessage:
@@ -136,13 +147,18 @@ def _ensure_messages_fts(conn: sqlite3.Connection) -> None:
         _rebuild_messages_fts(conn)
 
 
-def _rebuild_messages_fts(conn: sqlite3.Connection) -> None:
+def _rebuild_messages_fts(
+    conn: sqlite3.Connection,
+    content_codec: ContentCodec | None = None,
+) -> None:
     conn.execute("DELETE FROM messages_fts")
     rows = conn.execute(
         "SELECT id, session_id, agent_id, message_json FROM messages ORDER BY id ASC"
     ).fetchall()
     for message_id, session_id, agent_id, message_json in rows:
-        msg = single_message_adapter.validate_python(json.loads(message_json))
+        msg = single_message_adapter.validate_python(
+            json.loads(_decode_stored(content_codec, message_json))
+        )
         body = message_search_text(msg)
         if body:
             conn.execute(
@@ -154,10 +170,14 @@ def _rebuild_messages_fts(conn: sqlite3.Connection) -> None:
             )
 
 
-def rebuild_messages_fts(db_path: str) -> None:
+def rebuild_messages_fts(
+    db_path: str,
+    *,
+    content_codec: ContentCodec | None = None,
+) -> None:
     with closing(connect(db_path)) as conn:
         with conn:
-            _rebuild_messages_fts(conn)
+            _rebuild_messages_fts(conn, content_codec)
 
 
 def load_messages(
@@ -166,6 +186,7 @@ def load_messages(
     *,
     session_id: str = "default",
     agent_id: str | None = None,
+    content_codec: ContentCodec | None = None,
 ) -> list[ModelMessage]:
     with closing(connect(db_path)) as conn:
         if limit is None:
@@ -195,7 +216,9 @@ def load_messages(
                 """,
                 (session_id, agent_id, limit),
             ).fetchall()
-        json_list = [json.loads(row[0]) for row in rows]
+        json_list = [
+            json.loads(_decode_stored(content_codec, row[0])) for row in rows
+        ]
         messages = [
             strip_prompt_payloads(msg)
             for msg in messages_adapter.validate_python(json_list)
@@ -214,6 +237,7 @@ def load_messages_by_token_budget(
     *,
     session_id: str = "default",
     agent_id: str | None = None,
+    content_codec: ContentCodec | None = None,
 ) -> list[ModelMessage]:
     if token_budget < 0:
         raise ValueError("token_budget must be greater than or equal to 0.")
@@ -235,7 +259,9 @@ def load_messages_by_token_budget(
         ).fetchall()
         for row in rows:
             msg = strip_prompt_payloads(
-                single_message_adapter.validate_python(json.loads(row[0]))
+                single_message_adapter.validate_python(
+                    json.loads(_decode_stored(content_codec, row[0]))
+                )
             )
             estimate = _message_token_estimate(msg)
             if selected and total + estimate > token_budget:
@@ -255,6 +281,7 @@ def save_messages(
     agent_id: str | None = None,
     forbidden_secret_values: Iterable[str] = (),
     timestamp: str | None = None,
+    content_codec: ContentCodec | None = None,
 ) -> list[int]:
     message_ids: list[int] = []
     with closing(connect(db_path)) as conn:
@@ -264,13 +291,14 @@ def save_messages(
                 if reason is not None:
                     raise ValueError(f"message is not clean transcript text: {reason}")
                 sanitized_msg = strip_prompt_payloads(msg)
-                msg_json = single_message_adapter.dump_json(sanitized_msg).decode()
+                plain_json = single_message_adapter.dump_json(sanitized_msg).decode()
                 body = message_search_text(sanitized_msg)
                 _assert_no_forbidden_secret_values(
                     forbidden_secret_values,
-                    msg_json,
+                    plain_json,
                     body,
                 )
+                msg_json = _encode_stored(content_codec, plain_json)
                 if timestamp is None:
                     cursor = conn.execute(
                         """
@@ -389,6 +417,7 @@ def ingest_source_messages(
     session_id: str = "default",
     agent_id: str | None = None,
     forbidden_secret_values: Iterable[str] = (),
+    content_codec: ContentCodec | None = None,
 ) -> list[SourceTranscriptIngestResult]:
     results: list[SourceTranscriptIngestResult] = []
     forbidden_values = tuple(forbidden_secret_values)
@@ -473,7 +502,9 @@ def ingest_source_messages(
                     (source_host, source_session_id, source_message_id, agent_id),
                 ).fetchone()
                 if existing is not None:
-                    warning = _source_duplicate_warning(existing[1], msg_json)
+                    warning = _source_duplicate_warning(
+                        _decode_stored(content_codec, str(existing[1])), msg_json
+                    )
                     results.append(
                         SourceTranscriptIngestResult(
                             source_host=source_host,
@@ -493,7 +524,7 @@ def ingest_source_messages(
                         INSERT INTO messages (session_id, agent_id, message_json)
                         VALUES (?, ?, ?)
                         """,
-                        (session_id, agent_id, msg_json),
+                        (session_id, agent_id, _encode_stored(content_codec, msg_json)),
                     )
                     message_id = int(cursor.lastrowid)
                     conn.execute(
@@ -530,7 +561,9 @@ def ingest_source_messages(
                     ).fetchone()
                     if existing is None:
                         raise
-                    warning = _source_duplicate_warning(existing[1], msg_json)
+                    warning = _source_duplicate_warning(
+                        _decode_stored(content_codec, str(existing[1])), msg_json
+                    )
                     results.append(
                         SourceTranscriptIngestResult(
                             source_host=source_host,
@@ -635,6 +668,7 @@ def load_messages_in_id_range(
     session_id: str = "default",
     agent_id: str | None = None,
     max_rows: int | None = None,
+    content_codec: ContentCodec | None = None,
 ) -> list[TranscriptHit]:
     with closing(connect(db_path)) as conn:
         params: list[object] = [session_id, agent_id, first_message_id, last_message_id]
@@ -661,7 +695,9 @@ def load_messages_in_id_range(
     hits: list[TranscriptHit] = []
     for row in rows:
         msg = strip_prompt_payloads(
-            single_message_adapter.validate_python(json.loads(row[2]))
+            single_message_adapter.validate_python(
+                json.loads(_decode_stored(content_codec, row[2]))
+            )
         )
         body = message_search_text(msg)
         if not body:
@@ -683,6 +719,7 @@ def load_messages_since(
     *,
     agent_id: str | None = None,
     exclude_session_prefixes: tuple[str, ...] = (),
+    content_codec: ContentCodec | None = None,
 ) -> list[tuple[int, ModelMessage]]:
     with closing(connect(db_path)) as conn:
         filters = ["id > ?", "agent_id IS ?"]
@@ -713,7 +750,11 @@ def load_messages_since(
         return [
             (
                 row[0],
-                strip_prompt_payloads(single_message_adapter.validate_python(json.loads(row[1]))),
+                strip_prompt_payloads(
+                    single_message_adapter.validate_python(
+                        json.loads(_decode_stored(content_codec, row[1]))
+                    )
+                ),
             )
             for row in rows
         ]

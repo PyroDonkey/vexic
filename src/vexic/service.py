@@ -47,7 +47,7 @@ from vexic.contract import (
     TombstoneRecord,
     require_capability,
 )
-from vexic.ports import DreamPhasePorts, EmbedTexts, missing_host_port
+from vexic.ports import ContentCodec, DreamPhasePorts, EmbedTexts, missing_host_port
 from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage import (
     TranscriptRangeTooLarge,
@@ -103,12 +103,22 @@ class LocalMemoryService(MemoryService):
         forbidden_secret_values: tuple[str, ...] = (),
         embed: EmbedTexts | None = None,
         dream_phase_ports: DreamPhasePorts | None = None,
+        content_codec: ContentCodec | None = None,
     ) -> None:
         self.db_path = db_path
         self.tenant_id = tenant_id
         self.forbidden_secret_values = forbidden_secret_values
         self.embed = embed
         self.dream_phase_ports = dream_phase_ports
+        # ADR 0023: canonical transcript content is encoded through this
+        # codec before storage and decoded after reads. None = plaintext
+        # (the local default); hosted adapters supply an encrypting codec.
+        self.content_codec = content_codec
+
+    def _decode_content(self, stored: str) -> str:
+        if self.content_codec is None:
+            return stored
+        return self.content_codec.decode(stored)
 
     def init_schema(self) -> None:
         init_db(self.db_path)
@@ -195,7 +205,9 @@ class LocalMemoryService(MemoryService):
             ).fetchall()
         hits: list[TranscriptHit] = []
         for row in rows:
-            message = single_message_adapter.validate_python(json.loads(row[2]))
+            message = single_message_adapter.validate_python(
+                json.loads(self._decode_content(row[2]))
+            )
             body = message_search_text(message)
             if body:
                 hits.append(
@@ -305,6 +317,7 @@ class LocalMemoryService(MemoryService):
             session_id=request.scope.session_id or "default",
             agent_id=request.scope.agent_id,
             forbidden_secret_values=self._redaction_values(request.redaction),
+            content_codec=self.content_codec,
         )
         return AppendTranscriptResult(message_ids=message_ids)
 
@@ -327,6 +340,7 @@ class LocalMemoryService(MemoryService):
             session_id=request.scope.session_id or "default",
             agent_id=request.scope.agent_id,
             forbidden_secret_values=self._redaction_values(request.redaction),
+            content_codec=self.content_codec,
         )
         return IngestSourceTranscriptResult(
             items=[
@@ -387,6 +401,7 @@ class LocalMemoryService(MemoryService):
                 session_id=request.scope.session_id or "default",
                 agent_id=request.scope.agent_id,
                 max_rows=row_cap,
+                content_codec=self.content_codec,
             )
         except TranscriptRangeTooLarge:
             return ExpandHistoryResult(text="", truncated=True)
@@ -586,6 +601,7 @@ class LocalMemoryService(MemoryService):
         report = repair_memory_projections(
             self.db_path,
             forbidden_secret_values=self._redaction_values(request.redaction),
+            content_codec=self.content_codec,
         )
         if not request.return_artifacts:
             return RebuildResult()
@@ -688,6 +704,7 @@ async def _run_dream_phase_with_usage(
             extraction_agent_factory=ports.extraction_agent_factory,
             embed=ports.embed,
             forbidden_secret_values=service._redaction_values(request.redaction),
+            content_codec=service.content_codec,
         )
     elif request.phase is DreamPhase.REM:
         from vexic.rem import run_rem_phase

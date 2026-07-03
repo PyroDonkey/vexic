@@ -76,6 +76,9 @@ is a consumer, not a dependency.
   points to `messages`; source columns do not live on `messages`.
 - `messages_fts` is a rebuildable FTS5 projection over clean user/assistant
   text and transcript scope metadata.
+- `message_json` may be codec-encoded at rest when a host supplies a
+  `ContentCodec` (ADR 0023); the FTS projection stays plaintext, derived
+  before encoding, as the documented searchable residue.
 - Session-scoped transcript search maps to `SearchTranscriptRequest`.
 - Verbatim egress maps to `ExpandHistoryRequest` and requires privileged
   capability plus redaction context.
