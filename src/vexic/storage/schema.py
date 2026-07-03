@@ -470,6 +470,10 @@ def _ensure_scope_tombstones(conn: sqlite3.Connection) -> None:
         """
     )
     _ensure_column(conn, "scope_tombstones", "target_agent_id", "target_agent_id TEXT")
+    # Purge audit trail (ADR 0022): when the deferred purge actually runs, the
+    # tombstone keeps the proof -- timestamp plus per-table deleted counts.
+    _ensure_column(conn, "scope_tombstones", "purged_at", "purged_at DATETIME")
+    _ensure_column(conn, "scope_tombstones", "purged_counts", "purged_counts TEXT")
     conn.execute("DROP INDEX IF EXISTS idx_scope_tombstones_target")
     conn.execute(
         """

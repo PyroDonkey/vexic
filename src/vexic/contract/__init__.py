@@ -64,6 +64,7 @@ class LifecycleAction(StrEnum):
     RETIRE = "retire"
     TOMBSTONE_SCOPE = "tombstone_scope"
     PURGE_DEFERRED = "purge_deferred"
+    PURGE = "purge"
 
 
 class MemoryContractModel(BaseModel):
@@ -378,6 +379,35 @@ class DeleteScopeResult(MemoryResult):
     tombstone: TombstoneRecord
 
 
+class PurgeScopeRequest(RedactionRequiredRequest):
+    """Physically erase a previously tombstoned scope (ADR 0022).
+
+    Purge is the second deliberate step after ``delete_scope``: it requires an
+    existing tombstone for exactly this target and irreversibly deletes the
+    scope's canonical rows, projections, and content-bearing telemetry from
+    the primary database. Provider backups persist until their own retention
+    expires.
+    """
+
+    required_capability: ClassVar[MemoryCapability] = MemoryCapability.ADMIN_LIFECYCLE
+    target_scope: MemoryScopeSelector
+    reason: str
+    dry_run: bool = False
+
+    @model_validator(mode="after")
+    def _target_scope_must_match_actor_tenant(self) -> Self:
+        if self.target_scope.tenant_id != self.scope.tenant_id:
+            raise ValueError("target_scope.tenant_id must match scope.tenant_id.")
+        return self
+
+
+class PurgeScopeResult(MemoryResult):
+    tombstone_id: str
+    purged: dict[str, int]
+    dry_run: bool
+    purged_at: str | None = None
+
+
 @runtime_checkable
 class MemoryService(Protocol):
     async def append_transcript(
@@ -439,3 +469,8 @@ class MemoryService(Protocol):
         self,
         request: DeleteScopeRequest,
     ) -> DeleteScopeResult: ...
+
+    async def purge_scope(
+        self,
+        request: PurgeScopeRequest,
+    ) -> PurgeScopeResult: ...

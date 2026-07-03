@@ -650,7 +650,7 @@ class ClaudeCodeRecorderHostedRoundTripTests(unittest.TestCase):
                         "--hook-input",
                         str(hook_payload),
                         "--base-url",
-                        "http://testserver",
+                        "https://testserver",
                         "--api-key",
                         api_key,
                         "--project-id",
@@ -873,6 +873,33 @@ class ClaudeCodeSetupTests(unittest.TestCase):
             )
 
             self.assertEqual(stat.S_IMODE(result.config_path.stat().st_mode), 0o600)
+
+    def test_setup_restricts_config_acl_to_owner_on_windows(self) -> None:
+        if os.name != "nt":
+            self.skipTest("Windows ACL enforcement")
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+
+            result = install_claude_code_setup(
+                home=home,
+                base_url="https://api.example.test",
+                api_key="vx_secret",
+                project_id="project-a",
+                session_id="session-a",
+                agent_id=None,
+                command="python -m vexic.cli recorder ingest",
+            )
+
+            # chmod mode bits are cosmetic on NT; the DACL is the real control.
+            listing = subprocess.run(
+                ["icacls", str(result.config_path)],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            ace_lines = [line for line in listing.splitlines() if ":(" in line]
+            self.assertEqual(len(ace_lines), 1, listing)
+            self.assertIn("(F)", ace_lines[0])
 
     def test_setup_rejects_blank_base_url_before_writing_config(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

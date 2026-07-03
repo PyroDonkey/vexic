@@ -95,6 +95,7 @@ operations:
 - `replay_scope`
 - `rebuild`
 - `delete_scope`
+- `purge_scope`
 
 It also exposes `init_schema()` as a local adapter helper. `init_schema()` is
 not part of the public `MemoryService` Protocol.

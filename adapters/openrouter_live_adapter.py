@@ -20,6 +20,13 @@ from vexic.models import ContradictionJudgment, FactCandidate
 
 PROVIDER = "openrouter"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+# OpenRouter provider preference: route only to model providers that neither
+# retain nor train on prompts. Transcript text and stored fact text travel in
+# these requests, so data handling is pinned per request instead of inheriting
+# the OpenRouter account default.
+OPENROUTER_PROVIDER_PREFERENCES: dict[str, Any] = {
+    "provider": {"data_collection": "deny"},
+}
 # ponytail: single embedding worker; add a pool only if live runs need parallel embeddings.
 _EMBED_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 
@@ -111,6 +118,7 @@ def _model_settings() -> ModelSettings:
     return {
         "max_tokens": _int_env("VEXIC_LIVE_MAX_OUTPUT_TOKENS", 512),
         "timeout": _float_env("VEXIC_LIVE_REQUEST_TIMEOUT_SECONDS", 60.0),
+        "extra_body": OPENROUTER_PROVIDER_PREFERENCES,
     }
 
 
@@ -155,7 +163,10 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
             OpenAIEmbeddingModel(model, provider=_provider())
         ).embed_documents_sync(
             texts,
-            settings={"dimensions": EMBEDDING_DIM},
+            settings={
+                "dimensions": EMBEDDING_DIM,
+                "extra_body": OPENROUTER_PROVIDER_PREFERENCES,
+            },
         )
     ).result()
     embeddings = [list(embedding) for embedding in result.embeddings]

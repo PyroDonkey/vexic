@@ -15,6 +15,11 @@ The v1 production vocabulary is intentionally small: `HostedAuditEvent`,
 payloads, prompt payloads, hidden instructions, thinking traces, tool bodies,
 raw API keys, provider secrets, database tokens, or configured forbidden values.
 
+The same default-off posture extends to model-provider egress: dream-phase
+requests through the OpenRouter adapter pin the provider preference
+`data_collection: "deny"` so transcript and fact text is routed only to
+providers that neither retain nor train on prompts (see `docs/usage.md`).
+
 Product-improvement data collection is default off for customer-data-derived
 content. Non-content operational aggregates may be used for capacity, reliability,
 and product planning. Any use of content-bearing memory telemetry, including

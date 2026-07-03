@@ -1,6 +1,5 @@
 import asyncio
 from collections.abc import Mapping
-import traceback
 from typing import Any
 
 from pydantic_ai.messages import (
@@ -12,6 +11,7 @@ from pydantic_ai.messages import (
 )
 
 from vexic.embeddings import embed_texts, ensure_local_embeddings_available
+from vexic.error_reporting import format_error_detail
 from vexic.models import FactCandidate
 from vexic.ports import (
     AgentFactory,
@@ -81,17 +81,19 @@ def validate_candidate_source_ids(
     allowed_message_ids: list[int],
 ) -> None:
     allowed = set(allowed_message_ids)
-    for candidate in candidates:
+    for index, candidate in enumerate(candidates):
         candidate_ids = set(candidate.source_message_ids)
         if not candidate_ids:
+            # Identify candidates by position, never by fact_text: these
+            # messages end up in tracebacks and persisted error diagnostics.
             raise ValueError(
-                f"Candidate source_message_ids must be non-empty: {candidate.fact_text!r}"
+                f"Candidate #{index} source_message_ids must be non-empty."
             )
         invalid_ids = sorted(candidate_ids - allowed)
         if invalid_ids:
             raise ValueError(
                 "Candidate source_message_ids must refer to messages in the current window. "
-                f"Invalid IDs for {candidate.fact_text!r}: {invalid_ids}"
+                f"Invalid IDs for candidate #{index}: {invalid_ids}"
             )
         candidate.source_message_ids = sorted(candidate_ids)
 
@@ -230,12 +232,14 @@ async def run_light_phase(
                 finished_at=utc_now_iso(),
                 messages_processed=0,
                 last_processed_message_id=watermark,
-                error_detail=traceback.format_exc(),
+                error_detail=format_error_detail(exc),
                 forbidden_secret_values=forbidden,
             )
         except Exception:
             pass
-        print(f"Light phase: ERROR -- {exc}. Watermark held; will retry.")
+        print(
+            f"Light phase: ERROR -- {type(exc).__name__}. Watermark held; will retry."
+        )
         raise
 
 

@@ -158,6 +158,11 @@ source, the documented RPO remains the true data-loss bound.
 
 ## Compromised Credentials
 
+The rotation procedure lives in `docs/runbooks/secret-rotation.md`. Database
+tokens are minted short-lived with an `exp` claim; a token without `exp` is
+itself a rotation trigger. Live secrets live in deploy-platform secret
+management, never in a working-tree file.
+
 The v1 compromised-credential response is runbook-driven:
 
 - revoke affected Vexic API keys;
@@ -183,6 +188,12 @@ payload dumps.
 Exports are privileged egress. Export jobs and restore drills must use
 redaction fail-closed behavior where forbidden values are configured. Failed
 redaction checks should block artifact persistence or return.
+
+Export/replay/rebuild artifacts are plaintext full-content snapshots written
+owner-only. `LocalMemoryService` accepts an `artifact_dir` so hosts can route
+them to a managed location instead of the OS temp dir, and exposes
+`prune_artifacts` for lifecycle cleanup; artifacts are consumed and discarded,
+not retained.
 
 ## Timing
 
