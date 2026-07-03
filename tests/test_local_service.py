@@ -1670,5 +1670,67 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             )
 
 
+class ArtifactLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_export_writes_artifacts_under_configured_artifact_dir(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        with tempfile.TemporaryDirectory() as temp:
+            db_path = str(Path(temp) / "memory.db")
+            artifact_dir = Path(temp) / "managed-artifacts"
+            service = LocalMemoryService(
+                db_path=db_path,
+                tenant_id="tenant-a",
+                artifact_dir=artifact_dir,
+            )
+            service.init_schema()
+            save_messages(
+                db_path,
+                [ModelRequest(parts=[UserPromptPart(content="cedar transcript")])],
+            )
+
+            export = await service.export_scope(
+                ExportScopeRequest(
+                    scope=_scope(capabilities={MemoryCapability.EXPORT}),
+                    redaction=RedactionContext(forbidden_values=()),
+                )
+            )
+
+            artifact = Path(export.artifact_ref)
+            self.assertEqual(artifact.parent, artifact_dir)
+            self.assertIn("cedar transcript", artifact.read_text(encoding="utf-8"))
+
+    async def test_prune_artifacts_removes_only_aged_vexic_artifacts(self) -> None:
+        import os
+
+        from vexic.service import LocalMemoryService
+
+        with tempfile.TemporaryDirectory() as temp:
+            db_path = str(Path(temp) / "memory.db")
+            artifact_dir = Path(temp) / "managed-artifacts"
+            service = LocalMemoryService(
+                db_path=db_path,
+                tenant_id="tenant-a",
+                artifact_dir=artifact_dir,
+            )
+            service.init_schema()
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            aged = artifact_dir / "vexic-export-old.json"
+            fresh = artifact_dir / "vexic-export-new.json"
+            unrelated = artifact_dir / "notes.txt"
+            for path in (aged, fresh, unrelated):
+                path.write_text("{}", encoding="utf-8")
+            hour = 3600
+            old_time = 1_700_000_000
+            os.utime(aged, (old_time, old_time))
+            os.utime(unrelated, (old_time, old_time))
+
+            removed = service.prune_artifacts(older_than_seconds=24 * hour)
+
+            self.assertEqual(removed, 1)
+            self.assertFalse(aged.exists())
+            self.assertTrue(fresh.exists())
+            self.assertTrue(unrelated.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
