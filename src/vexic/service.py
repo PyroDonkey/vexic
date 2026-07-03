@@ -52,7 +52,7 @@ from vexic.contract import (
     TombstoneRecord,
     require_capability,
 )
-from vexic.ports import DreamPhasePorts, EmbedTexts, missing_host_port
+from vexic.ports import ContentCodec, DreamPhasePorts, EmbedTexts, missing_host_port
 from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage import (
     TranscriptRangeTooLarge,
@@ -110,6 +110,7 @@ class LocalMemoryService(MemoryService):
         forbidden_secret_values: tuple[str, ...] = (),
         embed: EmbedTexts | None = None,
         dream_phase_ports: DreamPhasePorts | None = None,
+        content_codec: ContentCodec | None = None,
         artifact_dir: str | Path | None = None,
     ) -> None:
         self.db_path = db_path
@@ -117,14 +118,25 @@ class LocalMemoryService(MemoryService):
         self.forbidden_secret_values = forbidden_secret_values
         self.embed = embed
         self.dream_phase_ports = dream_phase_ports
+        # ADR 0023: canonical transcript content is encoded through this
+        # codec before storage and decoded after reads. None = plaintext
+        # (the local default); hosted adapters supply an encrypting codec.
+        self.content_codec = content_codec
         # Export/replay/rebuild artifacts hold full memory content. The
         # default stays the OS temp dir for compatibility; hosts should point
         # this at a managed, owner-only location and schedule prune_artifacts.
         self.artifact_dir = None if artifact_dir is None else Path(artifact_dir)
         self._artifact_dir_prepared = False
 
+    def _decode_content(self, stored: str) -> str:
+        if self.content_codec is None:
+            return stored
+        return self.content_codec.decode(stored)
+
     def init_schema(self) -> None:
-        init_db(self.db_path)
+        # Thread the codec so a first-init FTS rebuild decodes encoded rows;
+        # every service entrypoint routes through here (ADR 0023).
+        init_db(self.db_path, content_codec=self.content_codec)
 
     def _authorize(self, scope: MemoryScope, capability: MemoryCapability) -> None:
         if scope.tenant_id != self.tenant_id:
@@ -250,7 +262,9 @@ class LocalMemoryService(MemoryService):
             ).fetchall()
         hits: list[TranscriptHit] = []
         for row in rows:
-            message = single_message_adapter.validate_python(json.loads(row[2]))
+            message = single_message_adapter.validate_python(
+                json.loads(self._decode_content(row[2]))
+            )
             body = message_search_text(message)
             if body:
                 hits.append(
@@ -360,6 +374,7 @@ class LocalMemoryService(MemoryService):
             session_id=request.scope.session_id or "default",
             agent_id=request.scope.agent_id,
             forbidden_secret_values=self._redaction_values(request.redaction),
+            content_codec=self.content_codec,
         )
         return AppendTranscriptResult(message_ids=message_ids)
 
@@ -382,6 +397,7 @@ class LocalMemoryService(MemoryService):
             session_id=request.scope.session_id or "default",
             agent_id=request.scope.agent_id,
             forbidden_secret_values=self._redaction_values(request.redaction),
+            content_codec=self.content_codec,
         )
         return IngestSourceTranscriptResult(
             items=[
@@ -442,6 +458,7 @@ class LocalMemoryService(MemoryService):
                 session_id=request.scope.session_id or "default",
                 agent_id=request.scope.agent_id,
                 max_rows=row_cap,
+                content_codec=self.content_codec,
             )
         except TranscriptRangeTooLarge:
             return ExpandHistoryResult(text="", truncated=True)
@@ -518,7 +535,7 @@ class LocalMemoryService(MemoryService):
         self,
         request: RecordRetrievalEventRequest,
     ) -> RecordRetrievalEventResult:
-        init_db(self.db_path)
+        self.init_schema()
         self._authorize(request.scope, request.required_capability)
         if (
             request.scope.session_id is not None
@@ -555,7 +572,7 @@ class LocalMemoryService(MemoryService):
         self,
         request: RetireFactRequest,
     ) -> RetireFactResult:
-        init_db(self.db_path)
+        self.init_schema()
         self._authorize(request.scope, request.required_capability)
         self._assert_not_tombstoned(
             self._with_default_session(request.scope),
@@ -604,7 +621,7 @@ class LocalMemoryService(MemoryService):
         self,
         request: ExportScopeRequest,
     ) -> ExportScopeResult:
-        init_db(self.db_path)
+        self.init_schema()
         self._authorize(request.scope, request.required_capability)
         scoped = self._with_default_session(request.scope)
         self._assert_not_tombstoned(scoped, "export")
@@ -619,7 +636,7 @@ class LocalMemoryService(MemoryService):
         self,
         request: ReplayScopeRequest,
     ) -> ReplayScopeResult:
-        init_db(self.db_path)
+        self.init_schema()
         self._authorize(request.scope, request.required_capability)
         scoped = self._with_default_session(request.scope)
         self._assert_not_tombstoned(scoped, "replay")
@@ -634,13 +651,14 @@ class LocalMemoryService(MemoryService):
         self,
         request: RebuildRequest,
     ) -> RebuildResult:
-        init_db(self.db_path)
+        self.init_schema()
         self._authorize(request.scope, request.required_capability)
         scoped = self._with_default_session(request.scope)
         self._assert_not_tombstoned(scoped, "rebuild")
         report = repair_memory_projections(
             self.db_path,
             forbidden_secret_values=self._redaction_values(request.redaction),
+            content_codec=self.content_codec,
         )
         if not request.return_artifacts:
             return RebuildResult()
@@ -671,7 +689,7 @@ class LocalMemoryService(MemoryService):
         self,
         request: DeleteScopeRequest,
     ) -> DeleteScopeResult:
-        init_db(self.db_path)
+        self.init_schema()
         self._authorize(request.scope, request.required_capability)
         if request.target_scope.tenant_id != self.tenant_id:
             raise PermissionError("target_scope tenant_id does not match opened database.")
@@ -774,7 +792,7 @@ async def _run_dream_phase_with_usage(
     service: LocalMemoryService,
     request: RunDreamPhaseRequest,
 ) -> tuple[RunDreamPhaseResult, UsageSummary]:
-    init_db(service.db_path)
+    service.init_schema()
     service._authorize(request.scope, request.required_capability)
     service._assert_not_tombstoned(
         service._with_default_session(request.scope),
@@ -795,6 +813,7 @@ async def _run_dream_phase_with_usage(
             extraction_agent_factory=ports.extraction_agent_factory,
             embed=ports.embed,
             forbidden_secret_values=service._redaction_values(request.redaction),
+            content_codec=service.content_codec,
         )
     elif request.phase is DreamPhase.REM:
         from vexic.rem import run_rem_phase

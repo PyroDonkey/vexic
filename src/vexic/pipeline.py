@@ -13,7 +13,13 @@ from pydantic_ai.messages import (
 from vexic.embeddings import embed_texts, ensure_local_embeddings_available
 from vexic.error_reporting import format_error_detail
 from vexic.models import FactCandidate
-from vexic.ports import AgentFactory, EmbedTexts, HostPortNotConfigured, missing_host_port
+from vexic.ports import (
+    AgentFactory,
+    ContentCodec,
+    EmbedTexts,
+    HostPortNotConfigured,
+    missing_host_port,
+)
 from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage import (
     backfill_missing_candidate_embeddings,
@@ -109,6 +115,7 @@ async def run_light_phase(
     extraction_agent_factory: AgentFactory | None = None,
     embed: EmbedTexts | None = None,
     forbidden_secret_values: tuple[str, ...] = (),
+    content_codec: ContentCodec | None = None,
 ) -> UsageSummary:
     started_at = utc_now_iso()
     watermark = 0
@@ -117,7 +124,7 @@ async def run_light_phase(
     embedder = embed or embed_texts
 
     try:
-        init_db(db_path)
+        init_db(db_path, content_codec=content_codec)
         watermark = get_watermark(db_path, agent_id=agent_id)
 
         rows = load_messages_since(
@@ -126,6 +133,7 @@ async def run_light_phase(
             limit=batch_size,
             agent_id=agent_id,
             exclude_session_prefixes=("onboarding:",),
+            content_codec=content_codec,
         )
         if not rows:
             missing_embeddings = load_candidates_missing_embeddings(

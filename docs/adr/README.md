@@ -35,6 +35,7 @@ index (and the reverse).
 | 0020 | Heuristic REM lowers the dream-phase LLM floor                  | accepted |
 | 0021 | MCP memory surfaces are proactive and prose-first               | accepted |
 | 0022 | Physical purge erases tombstoned scopes from the primary database | accepted |
+| 0023 | Hosted content encryption flows through a core ContentCodec port | accepted |
 
 Notes:
 
