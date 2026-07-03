@@ -18,10 +18,17 @@ const PHASES = ["light", "rem", "deep"] as const;
    the corrected fact, and provenance shows exactly why. */
 const SOURCE_IDS: readonly string[] = ["msg_0184", "msg_0192"];
 
-/* Timeline: 0 reset · 1-4 transcript rows · 5-7 extraction phases ·
-   8 candidate staged · 9 fact promoted + provenance drawn. */
-const STEP_STAGED = 8;
-const STEP_PROMOTED = 9;
+/* Timeline: 0 reset · 1-4 intake rows · 5 source rows light up ·
+   6 their curves braid toward the extraction stage · 7 tier 2 animates in ·
+   8-10 extraction phases · 11 candidate staged · 12 arrow draws toward
+   durable memory · 13 tier 3 animates in · 14 fact promoted (glow). */
+const STEP_HIGHLIGHT = 5;
+const STEP_CURVES = 6;
+const STEP_TIER2 = 7;
+const STEP_STAGED = 11;
+const STEP_ARROW = 12;
+const STEP_TIER3 = 13;
+const STEP_PROMOTED = 14;
 const FINAL_STEP = STEP_PROMOTED;
 
 /* One full run, then park on the completed state: replays would wipe the
@@ -30,24 +37,21 @@ const FINAL_STEP = STEP_PROMOTED;
 const MAX_RUNS = 1;
 
 /** ms to hold on each step before advancing (index = step). */
-const STEP_HOLDS = [1000, 620, 620, 620, 860, 430, 430, 640, 1100, 6500];
+const STEP_HOLDS = [900, 520, 520, 520, 620, 700, 800, 550, 430, 430, 550, 800, 650, 600, 1300];
 
-function statusFor(step: number): string {
-  if (step === 0) return "session open · listening";
-  if (step <= 4) return "ingesting transcript";
-  if (step <= 7) return "extraction pass running";
-  if (step === STEP_STAGED) return "candidate staged";
-  return "fact promoted · provenance linked";
-}
+type FlowPaths = { curves: string[]; arrow: string | null; arrowHead: string | null };
 
 /**
- * Hero visual: one truthful run of the pipeline. Transcript rows stream in,
- * the extraction phases fire, a candidate is staged, and a durable fact is
- * promoted with provenance lines drawn back to its source rows — including
- * the correction that superseded the original claim. Rendered as real HTML
- * text (wraps on any viewport); provenance connectors are an SVG overlay
- * measured from the DOM. Under prefers-reduced-motion the completed state
- * renders statically. The panel is aria-hidden with an sr-only description.
+ * Hero visual: one truthful run of the pipeline, laid out as a left-to-right
+ * flow. Intake rows stream in on the left, their connector curves braid into
+ * the extraction phases, a candidate is staged, and a durable fact lands on
+ * the right with its source rows lit. A separate recall panel then expands
+ * below: the agent asks, memory answers with the corrected fact and cites
+ * both sources. Rendered as real HTML text; connectors are an SVG overlay
+ * measured from the DOM, desktop-only (the stacked mobile layout reads
+ * top-to-bottom without them). Under prefers-reduced-motion the completed
+ * state renders statically. The panels are aria-hidden with an sr-only
+ * description.
  */
 export function HeroMachine() {
   const reduceMotion = useReducedMotion();
@@ -57,10 +61,11 @@ export function HeroMachine() {
 
   const panelRef = useRef<HTMLDivElement | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
+  const chipsRef = useRef<HTMLDivElement | null>(null);
+  const deepChipRef = useRef<HTMLSpanElement | null>(null);
   const factRef = useRef<HTMLDivElement | null>(null);
-  const sourcesRef = useRef<HTMLDivElement | null>(null);
   const rowRefs = useRef(new Map<string, HTMLDivElement>());
-  const [paths, setPaths] = useState<string[]>([]);
+  const [paths, setPaths] = useState<FlowPaths>({ curves: [], arrow: null, arrowHead: null });
 
   useEffect(() => {
     const panel = panelRef.current;
@@ -102,28 +107,53 @@ export function HeroMachine() {
     };
   }, [reduceMotion, inView, done]);
 
+  /* Connector geometry, measured from the DOM. Curves start at each intake
+     row's right edge and braid to a single point on the extraction stage's
+     left edge; the arrow runs from the deep chip to the fact card. Skipped
+     when the layout is stacked (mobile) — detected by the chips sitting
+     below the intake rows instead of beside them. */
   const measure = useCallback(() => {
     const content = contentRef.current;
+    const chips = chipsRef.current;
+    const deep = deepChipRef.current;
     const fact = factRef.current;
-    const sources = sourcesRef.current;
-    if (!content || !fact || !sources) return;
+    if (!content || !chips || !deep || !fact) return;
     const base = content.getBoundingClientRect();
-    const sx = fact.getBoundingClientRect().left - base.left;
-    const sourcesRect = sources.getBoundingClientRect();
-    const sy = sourcesRect.top - base.top + sourcesRect.height / 2;
-    const gx = 10;
-    const next: string[] = [];
-    for (const id of SOURCE_IDS) {
-      const row = rowRefs.current.get(id);
-      if (!row) continue;
-      const rect = row.getBoundingClientRect();
-      const ex = rect.left - base.left - 4;
-      const ey = rect.top - base.top + rect.height / 2;
-      next.push(
-        `M ${sx} ${sy} L ${gx + 8} ${sy} Q ${gx} ${sy} ${gx} ${sy - 8} L ${gx} ${ey + 8} Q ${gx} ${ey} ${gx + 8} ${ey} L ${ex} ${ey}`
-      );
+    const chipsRect = chips.getBoundingClientRect();
+    const firstRow = rowRefs.current.get(TRANSCRIPT[0].id);
+    if (!firstRow) return;
+    /* Side-by-side when the chips column starts right of the intake column;
+       in the stacked mobile layout they share a left edge. */
+    const stacked = chipsRect.left <= firstRow.getBoundingClientRect().right;
+    if (stacked) {
+      setPaths({ curves: [], arrow: null, arrowHead: null });
+      return;
     }
-    setPaths(next);
+    /* Curves reach to the visible chip rail (chips are centered inside the
+       column, so the column's left edge would stop the braid short). */
+    const deepRect = deep.getBoundingClientRect();
+    const tx = deepRect.left - base.left - 10;
+    const ty = chipsRect.top - base.top + chipsRect.height / 2;
+    const curves: string[] = [];
+    for (const row of TRANSCRIPT) {
+      const node = rowRefs.current.get(row.id);
+      if (!node) continue;
+      const rect = node.getBoundingClientRect();
+      const sx = rect.right - base.left + 4;
+      const sy = rect.top - base.top + rect.height / 2;
+      curves.push(`M ${sx} ${sy} C ${sx + 36} ${sy}, ${tx - 36} ${ty}, ${tx} ${ty}`);
+    }
+    const factRect = fact.getBoundingClientRect();
+    const ax = deepRect.right - base.left + 8;
+    const ay = deepRect.top - base.top + deepRect.height / 2;
+    const bx = factRect.left - base.left - 8;
+    const by = factRect.top - base.top + factRect.height / 2;
+    /* Head is a separate path so the line can draw with pathLength and the
+       head can land after it — one combined multi-subpath path dash-draws
+       across both and reads as a fade instead of a draw. */
+    const arrow = `M ${ax} ${ay} C ${ax + 28} ${ay}, ${bx - 28} ${by}, ${bx} ${by}`;
+    const arrowHead = `M ${bx - 6.5} ${by - 4.5} L ${bx} ${by} L ${bx - 6.5} ${by + 4.5}`;
+    setPaths({ curves, arrow, arrowHead });
   }, []);
 
   useLayoutEffect(() => {
@@ -136,6 +166,8 @@ export function HeroMachine() {
   }, [measure]);
 
   const shown = (from: number) => step >= from;
+  const highlighted = shown(STEP_HIGHLIGHT);
+  const curvesShown = shown(STEP_CURVES);
   const promoted = shown(STEP_PROMOTED);
   const fade = (visible: boolean, y = 6) => ({
     opacity: visible ? 1 : 0,
@@ -150,11 +182,14 @@ export function HeroMachine() {
   return (
     <div>
       <p className="sr-only">
-        Diagram: transcript messages are ingested losslessly, pass through light, REM, and deep
+        Diagram: transcript messages are ingested losslessly, flow into light, REM, and deep
         extraction phases, and become durable facts. Each promoted fact links back to its exact
         source messages, including corrections that superseded earlier statements.
       </p>
       <div className="relative" aria-hidden>
+        {/* Shrink-to-fit on desktop so the card hugs the flow content instead
+           of leaving dead space either side of the centered grid. */}
+        <div className="relative mx-auto w-full max-w-xl lg:w-fit lg:max-w-none">
         {/* Promotion glow: a static token-derived shadow whose opacity is
            animated (composited) instead of animating box-shadow (paint). */}
         <motion.div
@@ -168,100 +203,139 @@ export function HeroMachine() {
           transition={{ duration: reduceMotion ? 0 : 0.8, ease: EASE_OUT }}
         />
         <div ref={panelRef} className="overflow-hidden rounded-xl border border-border bg-card">
-          <div className="flex items-center justify-between gap-4 border-b border-border px-4 py-2.5 font-mono text-[11px] sm:text-xs">
-            <span className="flex items-center gap-2 text-muted-foreground">
-              <motion.span
-                className="h-1.5 w-1.5 rounded-full bg-primary"
-                initial={false}
-                animate={reduceMotion || !inView || done ? { opacity: 1 } : { opacity: [1, 0.3, 1] }}
-                transition={
-                  reduceMotion || !inView || done
-                    ? { duration: 0 }
-                    : { duration: 2.4, repeat: Infinity }
-                }
-              />
-              vexic ingest · sess_a41
-            </span>
-            <motion.span
-              key={statusFor(step)}
-              className="text-muted-foreground"
-              initial={false}
-              animate={{ opacity: 1 }}
-              transition={{ duration: reduceMotion ? 0 : 0.3 }}
-            >
-              {statusFor(step)}
-            </motion.span>
-          </div>
-
-          <div ref={contentRef} className="relative flex flex-col gap-5 p-4 pl-8 sm:p-5 sm:pl-9">
-            {/* Provenance connectors, measured from the DOM */}
-            <svg className="pointer-events-none absolute inset-0 h-full w-full overflow-visible">
-              {paths.map((d, index) => (
+          <div
+            ref={contentRef}
+            className="relative grid gap-8 p-4 sm:p-6 lg:grid-cols-[auto_auto_auto] lg:items-stretch lg:justify-center lg:gap-6"
+          >
+            {/* Flow connectors: intake curves braid into the extraction stage,
+               the arrow hands the staged candidate to durable memory. */}
+            <svg className="pointer-events-none absolute inset-0 hidden h-full w-full overflow-visible lg:block">
+              {paths.curves.map((d, index) => {
+                const isSource = SOURCE_IDS.includes(TRANSCRIPT[index]?.id ?? "");
+                return (
+                  <motion.path
+                    key={d}
+                    d={d}
+                    fill="none"
+                    strokeWidth="1.2"
+                    className="stroke-[var(--primary)]"
+                    initial={false}
+                    animate={{
+                      pathLength: curvesShown ? 1 : 0,
+                      opacity: curvesShown ? (isSource ? 0.85 : 0.35) : 0
+                    }}
+                    transition={{
+                      pathLength: {
+                        duration: reduceMotion ? 0 : 0.7,
+                        ease: EASE_OUT,
+                        delay: reduceMotion ? 0 : index * 0.08
+                      },
+                      opacity: { duration: reduceMotion ? 0 : 0.5 }
+                    }}
+                  />
+                );
+              })}
+              {paths.arrow && (
                 <motion.path
-                  key={d}
-                  d={d}
+                  key={paths.arrow}
+                  d={paths.arrow}
                   fill="none"
                   strokeWidth="1.2"
                   className="stroke-[var(--primary)]"
                   initial={false}
-                  animate={{ pathLength: promoted ? 1 : 0, opacity: promoted ? 0.75 : 0 }}
+                  animate={{ pathLength: shown(STEP_ARROW) ? 1 : 0, opacity: shown(STEP_ARROW) ? 0.8 : 0 }}
                   transition={{
-                    pathLength: { duration: reduceMotion ? 0 : 0.9, ease: EASE_OUT, delay: reduceMotion ? 0 : 0.25 + index * 0.18 },
-                    opacity: { duration: reduceMotion ? 0 : 0.3, delay: reduceMotion ? 0 : promoted ? 0.25 : 0 }
+                    pathLength: { duration: reduceMotion ? 0 : 0.45, ease: EASE_OUT },
+                    opacity: { duration: reduceMotion ? 0 : 0.15 }
                   }}
                 />
-              ))}
+              )}
+              {paths.arrowHead && (
+                <motion.path
+                  d={paths.arrowHead}
+                  fill="none"
+                  strokeWidth="1.2"
+                  className="stroke-[var(--primary)]"
+                  initial={false}
+                  animate={{ opacity: shown(STEP_ARROW) ? 0.8 : 0 }}
+                  transition={{
+                    duration: reduceMotion ? 0 : 0.2,
+                    delay: reduceMotion || !shown(STEP_ARROW) ? 0 : 0.38
+                  }}
+                />
+              )}
             </svg>
 
-            {/* Tier 1: canonical transcript */}
-            <div>
-              <p className="mb-2 font-mono text-[10px] tracking-wide text-muted-foreground">
-                tier 1 · transcript (canonical)
+            {/* Intake: canonical transcript rows */}
+            <div className="min-w-0">
+              <p className="mb-2.5 font-mono text-xs tracking-wide text-muted-foreground lg:text-center">
+                Transcript
               </p>
-              <div className="flex flex-col">
+              <div className="flex flex-col gap-2">
                 {TRANSCRIPT.map((row, index) => {
-                  const isSource = SOURCE_IDS.includes(row.id);
-                  const active = promoted && isSource;
+                  const active = highlighted && SOURCE_IDS.includes(row.id);
                   return (
                     <motion.div
                       key={row.id}
                       ref={(node) => {
                         if (node) rowRefs.current.set(row.id, node);
                       }}
-                      className={`flex items-baseline gap-3 rounded px-2 py-1 font-mono text-[11px] leading-5 transition-colors duration-500 sm:text-xs ${
-                        active ? "bg-primary/10" : "bg-transparent"
+                      className={`rounded-lg border px-3 py-2 font-mono text-[11px] leading-5 transition-colors duration-500 sm:text-xs ${
+                        active ? "border-primary/40 bg-primary/10" : "border-border bg-background/60"
                       }`}
                       initial={false}
                       animate={fade(shown(index + 1))}
                       transition={spring()}
                     >
-                      <span
-                        className={`shrink-0 transition-colors duration-500 ${
-                          active ? "text-primary" : "text-muted-foreground"
-                        }`}
-                      >
-                        {row.id}
-                      </span>
-                      <span className="w-11 shrink-0 text-muted-foreground">{row.role}</span>
-                      <span className="min-w-0 text-foreground/90">{row.text}</span>
+                      <p className="flex gap-3">
+                        <span
+                          className={`transition-colors duration-500 ${
+                            active ? "text-primary" : "text-muted-foreground"
+                          }`}
+                        >
+                          {row.id}
+                        </span>
+                        <span className="text-muted-foreground">{row.role}</span>
+                      </p>
+                      <p className="mt-0.5 text-foreground/90">{row.text}</p>
                     </motion.div>
                   );
                 })}
               </div>
             </div>
 
-            {/* Tier 2: extraction pass */}
-            <div>
-              <p className="mb-2 font-mono text-[10px] tracking-wide text-muted-foreground">
-                tier 2 · extraction
+            {/* Extraction: staged in the middle of the flow. The zone fades
+               in only after the intake curves have reached it — the machine
+               builds strictly left to right. */}
+            <motion.div
+              className="lg:flex lg:flex-col lg:px-1"
+              initial={false}
+              animate={fade(shown(STEP_TIER2), 4)}
+              transition={spring()}
+            >
+              <p className="mb-2.5 font-mono text-xs tracking-wide text-muted-foreground lg:text-center">
+                Fact Extraction
               </p>
-              <div className="flex flex-wrap items-center gap-2 px-2">
+              {/* Horizontal row on mobile, vertical rail on desktop — the
+                 stacked chips keep the middle column narrow so the intake
+                 and fact columns get the width. */}
+              <div className="lg:my-auto">
+              <div
+                ref={chipsRef}
+                className="flex flex-wrap items-center gap-2 lg:flex-col lg:gap-1.5"
+              >
                 {PHASES.map((phase, index) => {
-                  const active = shown(5 + index);
+                  const active = shown(8 + index);
                   return (
-                    <span key={phase} className="flex items-center gap-2">
-                      {index > 0 && <span className="font-mono text-[10px] text-muted-foreground">→</span>}
+                    <span key={phase} className="flex items-center gap-2 lg:flex-col lg:gap-1.5">
+                      {index > 0 && (
+                        <span className="font-mono text-[10px] text-muted-foreground">
+                          <span className="lg:hidden">→</span>
+                          <span className="hidden lg:inline">↓</span>
+                        </span>
+                      )}
                       <span
+                        ref={phase === "deep" ? deepChipRef : undefined}
                         className={`rounded-md border px-2.5 py-1 font-mono text-[11px] transition-colors duration-300 sm:text-xs ${
                           active ? "border-primary/60 text-primary" : "border-border text-muted-foreground"
                         }`}
@@ -271,23 +345,30 @@ export function HeroMachine() {
                     </span>
                   );
                 })}
-                <motion.span
-                  className="ml-1 font-mono text-[11px] text-muted-foreground sm:text-xs"
-                  initial={false}
-                  animate={fade(shown(STEP_STAGED), 4)}
-                  transition={spring()}
-                >
-                  candidate staged · confidence 0.96
-                </motion.span>
               </div>
-            </div>
+              <motion.p
+                className="mt-2.5 font-mono text-[10px] text-muted-foreground sm:text-[11px] lg:mx-auto lg:max-w-[9.5rem] lg:text-center"
+                initial={false}
+                animate={fade(shown(STEP_STAGED), 4)}
+                transition={spring()}
+              >
+                candidate staged confidence 0.96
+              </motion.p>
+              </div>
+            </motion.div>
 
-            {/* Tier 3: durable fact with provenance */}
-            <div>
-              <p className="mb-2 font-mono text-[10px] tracking-wide text-muted-foreground">
-                tier 3 · durable facts
+            {/* Durable memory: the zone appears once the arrow has drawn
+               (awaiting promotion), then the promoted fact lands in it. */}
+            <motion.div
+              className="min-w-0 lg:flex lg:flex-col"
+              initial={false}
+              animate={fade(shown(STEP_TIER3), 4)}
+              transition={spring()}
+            >
+              <p className="mb-2.5 font-mono text-xs tracking-wide text-muted-foreground lg:text-center">
+                Durable Facts
               </p>
-              <div className="relative">
+              <div className="relative lg:my-auto lg:max-w-xs">
                 <motion.div
                   className="absolute inset-0 flex items-center justify-center rounded-lg border border-dashed border-border font-mono text-[10px] text-muted-foreground"
                   initial={false}
@@ -310,19 +391,20 @@ export function HeroMachine() {
                   <p className="mt-1 text-foreground">
                     deploy region is us-west-1, the us-east-2 migration was cancelled
                   </p>
-                  <div ref={sourcesRef} className="mt-1.5 flex flex-wrap items-baseline gap-x-2 text-muted-foreground">
+                  <div className="mt-1.5 flex flex-wrap items-baseline gap-x-2 text-muted-foreground">
                     <span>sources</span>
                     {SOURCE_IDS.map((id) => (
                       <span key={id} className="text-primary">
                         {id}
                       </span>
                     ))}
-                    <span>· category infra · confidence 0.96</span>
+                    <span>category infra · confidence 0.96</span>
                   </div>
                 </motion.div>
               </div>
-            </div>
+            </motion.div>
           </div>
+        </div>
         </div>
       </div>
     </div>

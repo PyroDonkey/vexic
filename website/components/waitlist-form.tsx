@@ -10,7 +10,13 @@ type FormState =
   | { status: "success" }
   | { status: "error"; message: string };
 
-export function WaitlistForm({ source = "hero" }: { source?: string }) {
+export function WaitlistForm({
+  source = "hero",
+  showNote = true
+}: {
+  source?: string;
+  showNote?: boolean;
+}) {
   const [email, setEmail] = useState("");
   const [state, setState] = useState<FormState>({ status: "idle" });
   const successRef = useRef<HTMLDivElement | null>(null);
@@ -71,7 +77,10 @@ export function WaitlistForm({ source = "hero" }: { source?: string }) {
         </div>
       ) : (
         <form onSubmit={handleSubmit}>
-          <div className="flex flex-col gap-2 sm:flex-row">
+          {/* flex-wrap instead of a breakpoint: the form drops to two rows
+             whenever its container is too narrow for input + button, which
+             also covers the md-range hero split column. */}
+          <div className="flex flex-wrap gap-2">
             <label htmlFor={`waitlist-email-${source}`} className="sr-only">
               Email address
             </label>
@@ -83,19 +92,21 @@ export function WaitlistForm({ source = "hero" }: { source?: string }) {
               placeholder="you@company.com"
               value={email}
               onChange={(event) => setEmail(event.target.value)}
-              className="h-11 w-full rounded-md border border-input bg-background px-3.5 font-mono text-sm placeholder:text-muted-foreground focus:ring-2 focus:ring-ring focus:outline-none sm:w-auto sm:flex-1"
+              className="h-11 min-w-[14rem] flex-1 rounded-md border border-input bg-background px-3.5 font-mono text-sm placeholder:text-muted-foreground focus:ring-2 focus:ring-ring focus:outline-none"
             />
             <button
               type="submit"
               disabled={state.status === "submitting"}
-              className="h-11 rounded-md bg-primary px-5 font-mono text-sm font-semibold text-primary-foreground transition-[filter,translate] hover:brightness-110 active:translate-y-px active:brightness-95 disabled:opacity-60"
+              className="h-11 w-full rounded-md bg-primary px-5 font-mono text-sm font-semibold whitespace-nowrap text-primary-foreground sm:w-auto transition-[filter,translate] hover:brightness-110 active:translate-y-px active:brightness-95 disabled:opacity-60"
             >
-              {state.status === "submitting" ? "Joining…" : "Join the waitlist"}
+              {state.status === "submitting" ? "Requesting…" : "Request early access"}
             </button>
           </div>
-          <p className="mt-2 text-xs text-muted-foreground">
-            Early access rolls out gradually. We&apos;ll send one email when it&apos;s your turn, and nothing else.
-          </p>
+          {showNote && (
+            <p className="mt-2 text-xs text-muted-foreground">
+              Early access rolls out gradually. We&apos;ll send one email when it&apos;s your turn, and nothing else.
+            </p>
+          )}
         </form>
       )}
       {/* Persistent live region: mounted from first render so screen readers

@@ -38,7 +38,7 @@ const FEATURE_GROUPS = [
       },
       {
         title: "Retrieval telemetry",
-        body: "Every surfaced fact logs a retrieval_events row and increments its retrieved counter in the same transaction, and used counts record which facts actually informed an answer. Audit what your agents recall, not just what they store."
+        body: "Every surfaced fact logs a retrieval_events row and increments its retrieved counter in the same transaction, and used counts record which facts informed an answer. Audit what your agents recall, not only what they store."
       },
       {
         title: "Replayable indexes",
@@ -88,7 +88,7 @@ export default function HomePage() {
   return (
     <>
       {/* Hero: one truthful run of the pipeline is the visual; the headline serves it. */}
-      <section className="relative overflow-hidden px-5 pt-14 pb-20 sm:pt-20 lg:pt-24">
+      <section className="relative overflow-hidden px-5 pt-14 pb-12 sm:pt-20 sm:pb-16 lg:pt-24">
         <AmbientCanvas
           color="var(--primary)"
           maxOpacity={0.6}
@@ -97,30 +97,23 @@ export default function HomePage() {
           fadeDirection="to-bottom"
           className="mix-blend-screen"
         />
-        <div className="relative mx-auto grid w-full max-w-6xl items-center gap-12 lg:grid-cols-[minmax(0,10fr)_minmax(0,11fr)] lg:gap-14">
-          <div className="flex flex-col items-start">
-            <p className="mb-5 flex items-center gap-2 font-mono text-xs text-muted-foreground">
-              <span className="h-1.5 w-1.5 rounded-full bg-primary" aria-hidden />
-              hosted memory service · early access waitlist open
-            </p>
+        {/* Centered copy above a full-width machine: the copy is a title
+            block for the pipeline, which reads left-to-right and needs the
+            whole container. */}
+        {/* Mid-size windows (md..lg) get a side-by-side split — centered copy
+           beside the stacked machine — instead of a full-width stacked column
+           that leaves the graphic looking stretched. */}
+        <div className="relative mx-auto flex w-full max-w-6xl flex-col gap-10 sm:gap-12 md:max-lg:grid md:max-lg:grid-cols-[minmax(0,5fr)_minmax(0,6fr)] md:max-lg:items-center md:max-lg:gap-10">
+          <div className="mx-auto flex max-w-2xl flex-col items-center text-center md:max-lg:mx-0 md:max-lg:items-start md:max-lg:text-left lg:max-w-none">
             <h1 className="text-4xl font-semibold tracking-tight text-balance sm:text-5xl">
-              Memory your agents can trust
+              Agent memory you can trust
             </h1>
-            <p className="mt-5 max-w-xl text-lg leading-relaxed text-muted-foreground">
-              Vexic is a hosted, provenance-first memory engine for long-running AI agents. Point
-              your agents at one endpoint. Lossless transcripts go in, durable facts come out, and
-              every memory records where it came from.
+            <p className="mt-5 max-w-xl text-lg leading-relaxed text-pretty text-muted-foreground lg:max-w-none lg:whitespace-nowrap">
+              One endpoint. Lossless transcripts in, durable facts out. Every recall traced to its
+              source.
             </p>
-            <div id="waitlist" className="mt-8 flex w-full scroll-mt-24 flex-col items-start gap-3">
-              <WaitlistForm source="hero" />
-              <a
-                href={GITHUB_URL}
-                target="_blank"
-                rel="noreferrer"
-                className="rounded-md border border-border px-4 py-2 text-sm text-muted-foreground transition-colors hover:border-primary/50 hover:text-foreground"
-              >
-                Read the source on GitHub →
-              </a>
+            <div id="waitlist" className="mt-8 flex w-full scroll-mt-24 flex-col items-center md:max-lg:items-start">
+              <WaitlistForm source="hero" showNote={false} />
             </div>
           </div>
           <HeroMachine />
