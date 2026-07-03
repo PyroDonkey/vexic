@@ -1864,6 +1864,7 @@ class ClaudeCodeRecorderPrimeCommandTests(unittest.TestCase):
 
         self.assertIn("Durable cedar preference", context)
         self.assertIn("vexic memory search tools", context)
+        self.assertIn("Use this memory silently", context)
 
     def test_prime_context_stays_empty_without_memory(self) -> None:
         context = build_prime_context(
