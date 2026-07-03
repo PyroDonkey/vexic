@@ -28,3 +28,18 @@ test("auth notify styles use the literal marketing palette", () => {
   assert.match(css, /\.auth-notify\s*\{[^}]*color:\s*#9aa89e/s);
   assert.match(css, /\.auth-notify-link\s*\{[^}]*color:\s*#e5e2e1/s);
 });
+
+test("sign-in page renders the ambient canvas behind a layered content wrapper", () => {
+  const source = pageSource();
+  assert.match(source, /import \{ AmbientCanvas \} from "@\/components\/ambient-canvas";/);
+  assert.match(source, /<AmbientCanvas[^>]*color="#10b981"/s);
+  assert.match(source, /fadeDirection="to-bottom"/);
+  assert.match(source, /className="auth-content"/);
+});
+
+test("auth page positions content above the canvas", () => {
+  const css = cssSource();
+  assert.match(css, /\.auth-page\s*\{[^}]*position:\s*relative/s);
+  assert.match(css, /\.auth-page\s*\{[^}]*overflow:\s*hidden/s);
+  assert.match(css, /\.auth-content\s*\{[^}]*z-index:\s*1/s);
+});

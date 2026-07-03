@@ -1,6 +1,7 @@
 import { SignIn } from "@clerk/nextjs";
 import { dark } from "@clerk/themes";
 
+import { AmbientCanvas } from "@/components/ambient-canvas";
 import { isClerkConfigured } from "@/lib/clerk-config";
 
 // Marketing site root; the sign-in page borrows its waitlist for
@@ -38,20 +39,31 @@ const signInAppearance = {
 export default function SignInPage() {
   return (
     <main className="auth-page">
-      <p className="auth-wordmark">
-        Vexic <span className="auth-wordmark-product">Console</span>
-      </p>
-      {isClerkConfigured() ? (
-        <SignIn routing="path" path="/sign-in" appearance={signInAppearance} />
-      ) : (
-        <AuthConfigNotice />
-      )}
-      <p className="auth-notify">
-        Don&apos;t have an account yet?{" "}
-        <a className="auth-notify-link" href={`${SITE_URL}/#waitlist`}>
-          Get notified when access opens →
-        </a>
-      </p>
+      {/* Same lattice as the vexic.dev hero; content layers above via .auth-content. */}
+      <AmbientCanvas
+        color="#10b981"
+        maxOpacity={0.5}
+        speed={1}
+        density={1}
+        fadeDirection="to-bottom"
+        className="mix-blend-screen"
+      />
+      <div className="auth-content">
+        <p className="auth-wordmark">
+          Vexic <span className="auth-wordmark-product">Console</span>
+        </p>
+        {isClerkConfigured() ? (
+          <SignIn routing="path" path="/sign-in" appearance={signInAppearance} />
+        ) : (
+          <AuthConfigNotice />
+        )}
+        <p className="auth-notify">
+          Don&apos;t have an account yet?{" "}
+          <a className="auth-notify-link" href={`${SITE_URL}/#waitlist`}>
+            Get notified when access opens →
+          </a>
+        </p>
+      </div>
     </main>
   );
 }

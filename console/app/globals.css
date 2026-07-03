@@ -143,15 +143,23 @@
    literal rather than console tokens so the page matches vexic.dev in either
    console theme. */
 .auth-page {
-  align-items: center;
   background: #131313;
   color: #e5e2e1;
+  display: grid;
+  min-height: 100vh;
+  overflow: hidden;
+  padding: 48px 20px;
+  place-items: center;
+  position: relative;
+}
+
+.auth-content {
+  align-items: center;
   display: flex;
   flex-direction: column;
   gap: 36px;
-  justify-content: center;
-  min-height: 100vh;
-  padding: 48px 20px;
+  position: relative;
+  z-index: 1;
 }
 
 .auth-wordmark {
