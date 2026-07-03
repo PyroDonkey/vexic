@@ -102,9 +102,6 @@ _FAKE_DREAM_ADAPTER_SOURCE = textwrap.dedent(
     def build_extraction_agent(model_group, secrets=None):
         return _ExtractionAgent()
 
-    def build_rem_agent(model_group, secrets=None):
-        raise AssertionError("REM should not run in this test")
-
     def build_contradiction_agent(model_group, secrets=None):
         raise AssertionError("Deep should not run in this test")
 
@@ -1867,7 +1864,6 @@ class DreamPhasePortsFromEnvTests(unittest.TestCase):
         self.assertEqual(ports.model_group, "hosted-dream")
         self.assertEqual(len(ports.embed(["one"])), 1)
         self.assertIsNotNone(ports.extraction_agent_factory)
-        self.assertIsNotNone(ports.rem_agent_factory)
         self.assertIsNotNone(ports.contradiction_agent_factory)
         self.assertIsNone(ports.secrets)
 

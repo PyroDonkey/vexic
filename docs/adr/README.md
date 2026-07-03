@@ -32,6 +32,7 @@ index (and the reverse).
 | 0017 | Claude Code setup scaffolds a disabled Vexic MCP entry           | accepted |
 | 0018 | Claude Code read path splits SessionStart priming and MCP on-demand pull | accepted |
 | 0019 | Hosted storage cutover starts Turso-only, Neon deferred         | accepted |
+| 0020 | Heuristic REM lowers the dream-phase LLM floor                  | accepted |
 
 Notes:
 
@@ -79,6 +80,11 @@ Notes:
   priming from the existing recorder config plus an opt-in MCP on-demand pull
   leg. UserPromptSubmit relevance injection and a dedicated no-query priming
   endpoint stay deferred.
+- 0020 settles COA-275 and extends 0016's LLM-floor reduction: REM becomes a
+  local deterministic embedding-centrality heuristic, the REM agent port and
+  adapter symbol are deleted, and the remaining dream-phase LLM legs are Light
+  extraction plus the (deferrable per 0016) Deep contradiction judge on the
+  `deepseek/deepseek-v4-pro` hosted default.
 - These numbers are the Vexic `docs/adr/` series and are self-contained.
   `src/vexic` source no longer carries any `upstream ADR-00NN` extraction-source
   labels (they were removed when the COA boundary policy was clarified), so there

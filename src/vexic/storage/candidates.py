@@ -87,11 +87,12 @@ class CandidateNote:
 
 @dataclass(frozen=True)
 class RemCandidate:
-    # Minimal REM input. The clustering agent gets only the id and classification
-    # surface it needs, not provenance, counters, embeddings, or lifecycle flags.
+    # Minimal REM input: the id and the stored embedding the centrality
+    # heuristic scores against -- None when the vector is missing (e.g. an
+    # interrupted Light repair), which scores 0.0 and resets any stale boost.
+    # No text, provenance, counters, or lifecycle flags.
     candidate_id: int
-    fact_text: str
-    category: str
+    embedding: list[float] | None = None
 
 
 @dataclass(frozen=True)
@@ -815,18 +816,23 @@ def load_promotion_candidates(
 
 
 def load_rem_candidates(db_path: str, *, agent_id: str | None) -> list[RemCandidate]:
-    init_db(db_path)
+    init_vector_memory(db_path)
     with closing(connect(db_path)) as conn:
+        _ensure_vector_memory_schema(conn)
+        # LEFT JOIN, not INNER: a candidate whose embedding is missing must
+        # still be returned so REM writes it a 0.0 boost, resetting any stale
+        # boost from an earlier cycle.
         rows = conn.execute(
             """
-            SELECT id, fact_text, category
-            FROM memory_candidates
-            WHERE promoted = 0
-                AND retired = 0
-                AND stale = 0
-                AND needs_review = 0
-                AND agent_id IS ?
-            ORDER BY id ASC
+            SELECT c.id, e.embedding
+            FROM memory_candidates AS c
+            LEFT JOIN memory_candidate_embeddings AS e ON e.candidate_id = c.id
+            WHERE c.promoted = 0
+                AND c.retired = 0
+                AND c.stale = 0
+                AND c.needs_review = 0
+                AND c.agent_id IS ?
+            ORDER BY c.id ASC
             """,
             (agent_id,),
         ).fetchall()
@@ -834,8 +840,7 @@ def load_rem_candidates(db_path: str, *, agent_id: str | None) -> list[RemCandid
     return [
         RemCandidate(
             candidate_id=int(row[0]),
-            fact_text=str(row[1]),
-            category=str(row[2]),
+            embedding=None if row[1] is None else _embedding_blob_to_list(row[1]),
         )
         for row in rows
     ]

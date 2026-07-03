@@ -31,15 +31,6 @@ class ContradictionJudgment(BaseModel):
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
-class RemBoost(BaseModel):
-    candidate_id: int
-    boost: float = Field(ge=0.0, le=1.0)
-
-
-class RemBoostPlan(BaseModel):
-    boosts: list[RemBoost] = Field(default_factory=list)
-
-
 class QueryRewrite(BaseModel):
     search_terms: str
 

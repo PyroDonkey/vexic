@@ -1,9 +1,10 @@
 """Deep phase: score Tier 2 candidates, promote the top-N to Tier 3, and
 retire any Tier 3 fact a promotion contradicts.
 
-`rem_boost` is written by the REM phase. Retrieval-side scoring signals
-(`relevance` and `query_diversity`) are fixed at 0 until those inputs exist
-(MEMORY_ARCHITECTURE.md allows 0 for unimplemented signals).
+`rem_boost` is the local embedding-centrality signal written by the REM phase
+(docs/adr/0020-heuristic-rem-lowers-dream-phase-llm-floor.md). Retrieval-side
+scoring signals (`relevance` and `query_diversity`) are fixed at 0 until those
+inputs exist; 0 is the accepted value for unimplemented signals.
 """
 
 import asyncio
@@ -125,7 +126,7 @@ def select_promotions(
     """Score every eligible candidate and return the top-N, highest first.
 
     Top-N self-normalizes against score-scale drift, so there is no absolute
-    score floor (MEMORY_ARCHITECTURE.md §Scoring).
+    score floor (see the Deep section of docs/architecture.md).
     """
     if not candidates:
         return []

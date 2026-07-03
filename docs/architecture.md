@@ -19,7 +19,7 @@ Key modules:
 - `vexic.storage` - schema, transcript, candidates, long-term facts,
   promotion, labels, and summaries
 - `vexic.pipeline` - Light extraction phase
-- `vexic.rem` - REM boost phase
+- `vexic.rem` - REM boost phase (local embedding-centrality heuristic)
 - `vexic.deep` - Deep promotion/supersession phase
 - `vexic.subagents.retrieval` - hybrid Tier 3 retrieval and candidate fallback
 - `vexic.mcp_stdio` - read-only local stdio MCP MVP
@@ -110,8 +110,10 @@ never as durable memory.
 ## Dream Pipeline
 
 The memory pipeline has three named phases. The phase functions exist in the
-package, but model-backed agent work requires host-supplied agents through
-ports. Embedding can use a host port or the optional local adapter.
+package, but model-backed agent work (Light extraction and the optional Deep
+contradiction judge) requires host-supplied agents through ports. Embedding
+can use a host port or the optional local adapter. REM is local and
+deterministic and uses no model port (ADR 0020).
 
 ### Light
 
@@ -126,9 +128,13 @@ Existing `NULL` dream-run rows are shared agent-scope progress rows.
 
 ### REM
 
-`vexic.rem.run_rem_phase` loads active unpromoted candidates and asks a
-host-supplied clustering/boost agent for bounded boost values. REM writes
-`rem_boost` only. It does not promote, retire, or insert durable facts.
+`vexic.rem.run_rem_phase` loads active unpromoted candidates and computes a
+local deterministic embedding-centrality boost per candidate: the mean cosine
+similarity to its top-3 most similar embedded same-scope peers, clamped to
+[0, 1], read from the embeddings the Light phase already stored. Candidates
+without an embedding score 0.0, which also resets any stale boost from an
+earlier cycle. REM makes no model calls and writes `rem_boost` only. It does
+not promote, retire, or insert durable facts. See ADR 0020.
 
 ### Deep
 
@@ -217,8 +223,10 @@ orchestration is deliberately port-backed: the local adapter authorizes and
 checks lifecycle state, executes Light, REM, or Deep only when explicit dream
 phase ports are supplied, and fails closed with `HostPortNotConfigured` when no
 host execution adapter is supplied. Within those ports, embedding may fall back
-to the optional local adapter and Deep contradiction may be deferred. This is
-not an invitation to import private host runtime code.
+to the optional local adapter and Deep contradiction may be deferred; REM runs
+entirely locally and consumes no model port, but still sits inside the same
+fail-closed gate (ADR 0020). This is not an invitation to import private host
+runtime code.
 
 ## Data Flow
 
