@@ -14,6 +14,7 @@ from vexic.contract import (
     EgressKind,
     ExpandHistoryRequest,
     IngestSourceTranscriptRequest,
+    LifecycleAction,
     LongTermFact,
     MemoryCapability,
     MemoryCategory,
@@ -22,6 +23,7 @@ from vexic.contract import (
     MemoryService,
     Principal,
     PrincipalType,
+    PurgeScopeRequest,
     RedactionContext,
     RedactionRequiredRequest,
     RetireFactRequest,
@@ -463,6 +465,47 @@ class MemoryContractModelTests(unittest.TestCase):
             {"light", "rem", "deep"},
         )
 
+    def _lifecycle_scope(self) -> MemoryScope:
+        return MemoryScope(
+            tenant_id="tenant-a",
+            session_id="session-a",
+            principal=Principal(
+                principal_id="operator-1",
+                principal_type=PrincipalType.OPERATOR,
+            ),
+            trust_boundary=TrustBoundary.LOCAL_TRUSTED,
+            capabilities={MemoryCapability.ADMIN_LIFECYCLE},
+        )
+
+    def test_purge_scope_request_mirrors_delete_scope_lifecycle_shape(self) -> None:
+        request = PurgeScopeRequest(
+            scope=self._lifecycle_scope(),
+            target_scope=MemoryScopeSelector(
+                tenant_id="tenant-a",
+                session_id="session-a",
+            ),
+            reason="tenant-requested erasure",
+            redaction=RedactionContext(forbidden_values=()),
+        )
+
+        self.assertIs(
+            request.required_capability, MemoryCapability.ADMIN_LIFECYCLE
+        )
+        self.assertFalse(request.dry_run)
+        self.assertEqual(LifecycleAction.PURGE.value, "purge")
+
+    def test_purge_scope_target_tenant_must_match_actor_scope_tenant(self) -> None:
+        with self.assertRaises(ValidationError):
+            PurgeScopeRequest(
+                scope=self._lifecycle_scope(),
+                target_scope=MemoryScopeSelector(
+                    tenant_id="tenant-b",
+                    session_id="session-a",
+                ),
+                reason="tenant-requested erasure",
+                redaction=RedactionContext(forbidden_values=()),
+            )
+
 
 class MemoryContractProtocolTests(unittest.TestCase):
     def test_protocol_methods_accept_scope_and_return_typed_results(self) -> None:
@@ -475,6 +518,7 @@ class MemoryContractProtocolTests(unittest.TestCase):
             "run_dream_phase",
             "export_scope",
             "delete_scope",
+            "purge_scope",
         ):
             method = getattr(MemoryService, method_name)
             signature = inspect.signature(method)

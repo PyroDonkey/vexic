@@ -29,6 +29,8 @@ from vexic.contract import (
     MemoryCategory,
     MemoryScope,
     MemoryService,
+    PurgeScopeRequest,
+    PurgeScopeResult,
     RecordRetrievalEventRequest,
     RecordRetrievalEventResult,
     RedactionContext,
@@ -65,6 +67,8 @@ from vexic.storage import (
 )
 from vexic.storage.longterm import record_fact_use_verdict, record_long_term_retrieval
 from vexic.storage.operators import repair_memory_projections
+from vexic.storage.purge import purge_scope_rows
+from vexic.timeutil import utc_now_iso
 from vexic.subagents.retrieval import retrieve_candidate_fallback, retrieve_long_term_facts
 from vexic.usage import UsageSummary
 from vexic.storage.connection import StorageTarget, connect, rows_as_dicts
@@ -711,6 +715,58 @@ class LocalMemoryService(MemoryService):
                 rebuild_blocked=True,
                 physical_purge_deferred=True,
             )
+        )
+
+    async def purge_scope(
+        self,
+        request: PurgeScopeRequest,
+    ) -> PurgeScopeResult:
+        init_db(self.db_path)
+        self._authorize(request.scope, request.required_capability)
+        if request.target_scope.tenant_id != self.tenant_id:
+            raise PermissionError("target_scope tenant_id does not match opened database.")
+        assert_no_forbidden_secret_values(
+            self._redaction_values(request.redaction),
+            request.reason,
+        )
+        with closing(connect(self.db_path)) as conn:
+            tombstone_rows = conn.execute(
+                """
+                SELECT id FROM scope_tombstones
+                WHERE target_tenant_id = ?
+                    AND target_project_id IS ?
+                    AND target_user_id IS ?
+                    AND target_session_id IS ?
+                    AND target_agent_id IS ?
+                """,
+                (
+                    request.target_scope.tenant_id,
+                    request.target_scope.project_id,
+                    request.target_scope.user_id,
+                    request.target_scope.session_id,
+                    request.target_scope.agent_id,
+                ),
+            ).fetchall()
+        tombstone_ids = [int(row[0]) for row in tombstone_rows]
+        if not tombstone_ids:
+            raise ValueError(
+                "No tombstone matches the target scope; run delete_scope first. "
+                "Purge is the second deliberate step of erasure."
+            )
+        purged_at = utc_now_iso()
+        counts = purge_scope_rows(
+            self.db_path,
+            target_session_id=request.target_scope.session_id,
+            target_agent_id=request.target_scope.agent_id,
+            tombstone_ids=tombstone_ids,
+            purged_at=purged_at,
+            dry_run=request.dry_run,
+        )
+        return PurgeScopeResult(
+            tombstone_id=str(max(tombstone_ids)),
+            purged=counts,
+            dry_run=request.dry_run,
+            purged_at=None if request.dry_run else purged_at,
         )
 
 
