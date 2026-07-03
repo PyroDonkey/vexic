@@ -858,15 +858,15 @@ class HostedHttpTests(unittest.TestCase):
                 "id": 3,
                 "method": "tools/call",
                 "params": {
-                    "name": "search_transcript",
+                    "name": "recall_conversation_history",
                     "arguments": {"query": "cedar"},
                 },
             },
         )
 
         self.assertEqual(response.status_code, 200)
-        payload = json.loads(response.json()["result"]["content"][0]["text"])
-        self.assertEqual([hit["body"] for hit in payload["hits"]], ["User: mcp cedar"])
+        text = response.json()["result"]["content"][0]["text"]
+        self.assertIn("User: mcp cedar", text)
 
     def test_control_plane_key_appends_without_body_tenant_and_reads_through_mcp(self) -> None:
         client = TestClient(
@@ -916,15 +916,15 @@ class HostedHttpTests(unittest.TestCase):
                 "id": 3,
                 "method": "tools/call",
                 "params": {
-                    "name": "search_transcript",
+                    "name": "recall_conversation_history",
                     "arguments": {"query": "cedar"},
                 },
             },
         )
 
         self.assertEqual(append_response.status_code, 200)
-        payload = json.loads(response.json()["result"]["content"][0]["text"])
-        self.assertEqual([hit["body"] for hit in payload["hits"]], ["User: header-bound cedar"])
+        text = response.json()["result"]["content"][0]["text"]
+        self.assertIn("User: header-bound cedar", text)
 
     def test_control_plane_key_ingests_source_rows_without_body_tenant(self) -> None:
         client = TestClient(
@@ -980,7 +980,7 @@ class HostedHttpTests(unittest.TestCase):
                 "id": 3,
                 "method": "tools/call",
                 "params": {
-                    "name": "search_transcript",
+                    "name": "recall_conversation_history",
                     "arguments": {"query": "cedar"},
                 },
             },
@@ -988,8 +988,8 @@ class HostedHttpTests(unittest.TestCase):
 
         self.assertEqual(ingest_response.status_code, 200)
         self.assertEqual(ingest_response.json()["items"][0]["status"], "inserted")
-        payload = json.loads(response.json()["result"]["content"][0]["text"])
-        self.assertEqual([hit["body"] for hit in payload["hits"]], ["User: ingested cedar"])
+        text = response.json()["result"]["content"][0]["text"]
+        self.assertIn("User: ingested cedar", text)
 
     def test_hosted_writes_reject_unsupported_scope_inputs(self) -> None:
         api_key = self._api_key(capabilities={MemoryCapability.WRITE})

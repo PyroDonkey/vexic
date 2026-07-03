@@ -46,7 +46,7 @@ this boundary without changing the memory contract.
   that MCP process at the hosted HTTP API.
 - `vexic.mcp_http` exposes a native read-only Streamable HTTP MCP `/mcp`
   route on the hosted FastAPI app. It is stateless, JSON-only, Bearer-auth
-  only, and exposes `search_transcript` and `search_long_term`.
+  only, and exposes `recall_conversation_history` and `recall_user_memory`.
 - `vexic setup claude-code` installs a SessionStart primer that reuses the
   recorder config and hosted read endpoints to inject capped memory context on
   new/cleared Claude Code sessions.
@@ -156,7 +156,7 @@ the `/v1/*` routes deliberately:
   are not listed in `VEXIC_MCP_ALLOWED_ORIGINS`;
 - it binds `project_id`, `session_id`, and optional `agent_id` from
   `X-Vexic-Project-Id`, `X-Vexic-Session-Id`, and `X-Vexic-Agent-Id`;
-- it exposes only `search_transcript` and `search_long_term`.
+- it exposes only `recall_conversation_history` and `recall_user_memory`.
 
 Native HTTP MCP explicitly defers OAuth discovery/PKCE/audience handling,
 redirect/SSRF hardening, SSE/resumability, stateful sessions, write/admin
@@ -245,10 +245,12 @@ recorder flow is documented in
 Smoke each configured client with the same sequence:
 
 1. `initialize` succeeds and returns protocol version `2025-11-25`.
-2. `tools/list` returns exactly `search_transcript` and `search_long_term`.
-3. `tools/call search_transcript` returns scoped transcript hits.
-4. `tools/call search_long_term` returns facts or a configuration tool error
-   if no embedding port is configured.
+2. `tools/list` returns exactly `recall_conversation_history` and
+   `recall_user_memory`.
+3. `tools/call recall_conversation_history` returns scoped transcript hits as
+   prose.
+4. `tools/call recall_user_memory` returns facts as prose or a configuration
+   tool error if no embedding port is configured.
 5. Missing or invalid Bearer key returns `401`.
 6. `expand_history`, write, and admin tools are absent and unreachable.
 

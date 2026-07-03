@@ -32,7 +32,11 @@ from vexic.recorders.claude_setup import (
     uninstall_claude_code_setup,
 )
 from vexic.recorders.hosted_ingest import HostedIngestConfig, post_source_messages
-from vexic.recorders.hosted_prime import HostedPrimeConfig, fetch_prime_context
+from vexic.recorders.hosted_prime import (
+    HostedPrimeConfig,
+    build_prime_context,
+    fetch_prime_context,
+)
 from vexic.recorders.status import RecorderStatus, write_status
 
 
@@ -1850,6 +1854,25 @@ class ClaudeCodeRecorderPrimeCommandTests(unittest.TestCase):
                 self.assertEqual(request.get_header("X-vexic-project-id"), "project-a")
                 self.assertEqual(request.get_header("X-vexic-session-id"), "session-a")
                 self.assertEqual(request.get_header("X-vexic-agent-id"), "agent-a")
+
+    def test_prime_context_advertises_memory_search_tools(self) -> None:
+        context = build_prime_context(
+            {"facts": [{"fact_text": "Durable cedar preference"}], "candidate_notes": []},
+            {"hits": []},
+            max_chars=6_000,
+        )
+
+        self.assertIn("Durable cedar preference", context)
+        self.assertIn("vexic memory search tools", context)
+
+    def test_prime_context_stays_empty_without_memory(self) -> None:
+        context = build_prime_context(
+            {"facts": [], "candidate_notes": []},
+            {"hits": []},
+            max_chars=6_000,
+        )
+
+        self.assertEqual(context, "")
 
     def test_prime_uses_transcript_when_long_term_search_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

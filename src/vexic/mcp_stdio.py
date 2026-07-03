@@ -24,10 +24,19 @@ from vexic.contract import (
     SearchTranscriptRequest,
     TrustBoundary,
 )
-from vexic.redaction import (
-    assert_no_forbidden_secret_values,
-    assert_no_forbidden_secret_values_in_payload,
+from vexic.mcp_presentation import (
+    EXPAND_HISTORY,
+    EXPAND_HISTORY_DESCRIPTION,
+    RECALL_CONVERSATION_HISTORY,
+    RECALL_CONVERSATION_HISTORY_DESCRIPTION,
+    RECALL_USER_MEMORY,
+    RECALL_USER_MEMORY_DESCRIPTION,
+    TOOL_ANNOTATIONS,
+    render_long_term,
+    render_transcript_hits,
+    server_instructions,
 )
+from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.service import LocalMemoryService
 
 MCP_PROTOCOL_VERSION = "2025-11-25"
@@ -109,12 +118,10 @@ class McpServerConfig:
 
 BASE_TOOLS: tuple[dict[str, Any], ...] = (
     {
-        "name": "search_transcript",
-        "title": "Search Transcript",
-        "description": (
-            "Read-only search over the configured session transcript. "
-            "Does not expose verbatim history expansion or write memory."
-        ),
+        "name": RECALL_CONVERSATION_HISTORY,
+        "title": "Recall Conversation History",
+        "description": RECALL_CONVERSATION_HISTORY_DESCRIPTION,
+        "annotations": TOOL_ANNOTATIONS,
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -126,12 +133,10 @@ BASE_TOOLS: tuple[dict[str, Any], ...] = (
         },
     },
     {
-        "name": "search_long_term",
-        "title": "Search Long-Term Memory",
-        "description": (
-            "Read-only search over durable long-term facts, with tentative "
-            "candidate notes only when no durable facts match."
-        ),
+        "name": RECALL_USER_MEMORY,
+        "title": "Recall User Memory",
+        "description": RECALL_USER_MEMORY_DESCRIPTION,
+        "annotations": TOOL_ANNOTATIONS,
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -145,12 +150,10 @@ BASE_TOOLS: tuple[dict[str, Any], ...] = (
 )
 
 EXPAND_HISTORY_TOOL: dict[str, Any] = {
-    "name": "expand_history",
+    "name": EXPAND_HISTORY,
     "title": "Expand History",
-    "description": (
-        "Privileged verbatim expansion of a bounded range in the configured "
-        "session transcript. Requires explicit local server opt-in."
-    ),
+    "description": EXPAND_HISTORY_DESCRIPTION,
+    "annotations": TOOL_ANNOTATIONS,
     "inputSchema": {
         "type": "object",
         "properties": {
@@ -193,23 +196,15 @@ def _tool_error(message: str) -> dict[str, Any]:
     return _tool_text({"error": message}, is_error=True)
 
 
+def _tool_prose(text: str) -> dict[str, Any]:
+    return {
+        "content": [{"type": "text", "text": text}],
+        "isError": False,
+    }
+
+
 def _instructions(config: McpServerConfig) -> str:
-    unavailable = (
-        "No transcript append, export, delete, rebuild, or admin tools are available."
-    )
-    if config.enable_expand_history:
-        return (
-            "Read-only Vexic memory. Use search_transcript for the configured "
-            "session, search_long_term for durable facts, and expand_history "
-            "only for bounded privileged verbatim history egress. "
-            f"{unavailable}"
-        )
-    return (
-        "Read-only Vexic memory. Use search_transcript for the "
-        "configured session and search_long_term for durable facts. "
-        "No transcript append, verbatim history expansion, export, "
-        "delete, rebuild, or admin tools are available."
-    )
+    return server_instructions(config.enable_expand_history)
 
 
 def _query(arguments: dict[str, Any]) -> str:
@@ -274,9 +269,12 @@ async def _search_transcript(
             limit=_limit(arguments),
         )
     )
-    payload = {"hits": [hit.model_dump(mode="json") for hit in result.hits]}
-    assert_no_forbidden_secret_values_in_payload(config.forbidden_secret_values, payload)
-    return _tool_text(payload)
+    text = render_transcript_hits(
+        result.hits,
+        include_message_ids=config.enable_expand_history,
+    )
+    assert_no_forbidden_secret_values(config.forbidden_secret_values, text)
+    return _tool_prose(text)
 
 
 async def _expand_history(
@@ -324,14 +322,9 @@ async def _search_long_term(
             limit=_limit(arguments),
         )
     )
-    payload = {
-        "facts": [fact.model_dump(mode="json") for fact in result.facts],
-        "candidate_notes": [
-            note.model_dump(mode="json") for note in result.candidate_notes
-        ],
-    }
-    assert_no_forbidden_secret_values_in_payload(config.forbidden_secret_values, payload)
-    return _tool_text(payload)
+    text = render_long_term(result.facts, result.candidate_notes)
+    assert_no_forbidden_secret_values(config.forbidden_secret_values, text)
+    return _tool_prose(text)
 
 
 async def _call_tool(
@@ -344,11 +337,11 @@ async def _call_tool(
         return _tool_error("arguments must be an object.")
 
     try:
-        if name == "search_transcript":
+        if name == RECALL_CONVERSATION_HISTORY:
             return await _search_transcript(arguments, config)
-        if name == "search_long_term":
+        if name == RECALL_USER_MEMORY:
             return await _search_long_term(arguments, config)
-        if name == "expand_history" and config.enable_expand_history:
+        if name == EXPAND_HISTORY and config.enable_expand_history:
             return await _expand_history(arguments, config)
         return _tool_error(f"unknown tool: {name}")
     except Exception as exc:

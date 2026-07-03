@@ -123,6 +123,10 @@ def build_prime_context(
 
     if len(lines) == 1:
         return ""
+    lines.append(
+        "If vexic memory search tools are available, use them to look up more "
+        "preferences, facts, and past conversation when relevant."
+    )
     return _cap("\n".join(lines), max_chars)
 
 

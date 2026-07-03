@@ -15,6 +15,7 @@ from vexic.contract import (
 )
 from vexic.hosted import HostedInMemoryRateLimiter, HostedMemoryService, HostedRateLimitRule
 from vexic.hosted_http import MAX_BODY_BYTES, create_app
+from vexic.mcp_presentation import server_instructions
 from vexic.mcp_stdio import MCP_PROTOCOL_VERSION
 from vexic.storage import single_message_adapter
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
@@ -122,6 +123,10 @@ class McpHttpTests(unittest.TestCase):
             {"tools": {"listChanged": False}},
         )
         self.assertEqual(response.json()["result"]["serverInfo"]["name"], "vexic-remote-memory")
+        self.assertEqual(
+            response.json()["result"]["instructions"],
+            server_instructions(False),
+        )
 
     def test_tools_list_is_read_only(self) -> None:
         api_key = self._api_key()
@@ -134,7 +139,7 @@ class McpHttpTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         tool_names = {tool["name"] for tool in response.json()["result"]["tools"]}
-        self.assertEqual(tool_names, {"search_transcript", "search_long_term"})
+        self.assertEqual(tool_names, {"recall_conversation_history", "recall_user_memory"})
         self.assertNotIn("expand_history", response.text)
 
     def test_search_transcript_uses_header_bound_session_scope(self) -> None:
@@ -152,7 +157,7 @@ class McpHttpTests(unittest.TestCase):
                 "id": 3,
                 "method": "tools/call",
                 "params": {
-                    "name": "search_transcript",
+                    "name": "recall_conversation_history",
                     "arguments": {"query": "cedar"},
                 },
             },
@@ -160,9 +165,11 @@ class McpHttpTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         text = response.json()["result"]["content"][0]["text"]
-        payload = json.loads(text)
-        self.assertEqual([hit["body"] for hit in payload["hits"]], ["User: session alpha cedar"])
+        self.assertIn("User: session alpha cedar", text)
         self.assertNotIn("session beta cedar", response.text)
+        self.assertNotIn("message_id", text)
+        self.assertNotIn("session_id", text)
+        self.assertNotIn('"hits"', text)
 
     def test_search_long_term_without_embedder_returns_tool_error(self) -> None:
         api_key = self._api_key()
@@ -175,7 +182,7 @@ class McpHttpTests(unittest.TestCase):
                 "id": 4,
                 "method": "tools/call",
                 "params": {
-                    "name": "search_long_term",
+                    "name": "recall_user_memory",
                     "arguments": {"query": "compact reports"},
                 },
             },
@@ -335,7 +342,7 @@ class McpHttpTests(unittest.TestCase):
                 "id": 12,
                 "method": "tools/call",
                 "params": {
-                    "name": "search_transcript",
+                    "name": "recall_conversation_history",
                     "arguments": {"query": "cedar"},
                 },
             },
@@ -357,7 +364,7 @@ class McpHttpTests(unittest.TestCase):
                 "id": 13,
                 "method": "tools/call",
                 "params": {
-                    "name": "search_transcript",
+                    "name": "recall_conversation_history",
                     "arguments": {"query": "cedar", "session_id": "session-b"},
                 },
             },
@@ -381,7 +388,7 @@ class McpHttpTests(unittest.TestCase):
                 "id": 17,
                 "method": "tools/call",
                 "params": {
-                    "name": "search_transcript",
+                    "name": "recall_conversation_history",
                     "arguments": {"query": "cedar') OR 1=1 --"},
                 },
             },
@@ -444,7 +451,7 @@ class McpHttpTests(unittest.TestCase):
                 "id": 15,
                 "method": "tools/call",
                 "params": {
-                    "name": "search_transcript",
+                    "name": "recall_conversation_history",
                     "arguments": {"query": "cedar-secret"},
                 },
             },
@@ -472,7 +479,7 @@ class McpHttpTests(unittest.TestCase):
             "id": 16,
             "method": "tools/call",
             "params": {
-                "name": "search_transcript",
+                "name": "recall_conversation_history",
                 "arguments": {"query": "cedar-secret"},
             },
         }
@@ -495,7 +502,7 @@ class McpHttpTests(unittest.TestCase):
     def test_search_requires_session_header_and_fails_closed(self) -> None:
         api_key = self._api_key()
 
-        for tool in ("search_transcript", "search_long_term"):
+        for tool in ("recall_conversation_history", "recall_user_memory"):
             with self.subTest(tool=tool):
                 response = self.client.post(
                     "/mcp",
