@@ -108,8 +108,10 @@ state, then executes Light, REM, or Deep only when a host supplies explicit
 dream-phase ports. Without those ports it fails closed with
 `HostPortNotConfigured` through `missing_host_port`. Inside supplied ports,
 embedding may fall back to the optional `vexic[local-embed]` adapter and Deep
-contradiction may be deferred. Do not wire this by importing private host
-runtime code.
+contradiction may be deferred; REM runs locally as a deterministic
+embedding-centrality heuristic and consumes none of the supplied ports, but
+still executes only inside the same gate (ADR 0020). Do not wire this by
+importing private host runtime code.
 
 ## Redaction
 
@@ -217,7 +219,7 @@ not runtime dependencies.
 | `search_memory` transcript behavior | `SearchTranscriptRequest` / `search_transcript` over scoped clean Transcript |
 | `search_long_term` | `SearchLongTermRequest` / `search_long_term` with durable facts first and candidate fallback on zero Tier 3 hits |
 | `expand_history` | `ExpandHistoryRequest` / privileged, session-scoped verbatim egress |
-| Light, REM, Deep | `vexic.pipeline`, `vexic.rem`, and `vexic.deep` primitives with host-supplied agent ports, optional local embeddings, and deferrable Deep contradiction |
+| Light, REM, Deep | `vexic.pipeline`, `vexic.rem`, and `vexic.deep` primitives; host-supplied agent ports cover Light extraction and Deep contradiction only (REM is a local heuristic), with optional local embeddings and deferrable Deep contradiction |
 | Per-tenant SQLite `memory.db` | local SQLite adapter opened through validated scope/context |
 
 Coalescent remains a private host and first-party consumer. Vexic must stay

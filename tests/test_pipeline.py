@@ -15,16 +15,18 @@ from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 from vexic.embeddings import EMBEDDING_DIM
 from vexic.deep import run_deep_phase
-from vexic.models import ContradictionJudgment, FactCandidate, RemBoost, RemBoostPlan
+from vexic.models import ContradictionJudgment, FactCandidate
 from vexic.pipeline import _main, run_light_phase
 from vexic.ports import HostPortNotConfigured
-from vexic.rem import run_rem_phase
+from vexic.rem import REM_TOP_K, compute_centrality_boosts, run_rem_phase
 from vexic.storage import (
     CandidateRetirementDecision,
     PromotionDecision,
+    RemCandidate,
     commit_deep_cycle,
     commit_dream_cycle,
     init_db,
+    load_rem_candidates,
     save_messages,
 )
 from vexic.storage.schema import _load_vec_extension
@@ -32,6 +34,14 @@ from vexic.storage.schema import _load_vec_extension
 
 def _unit_vector(first: float) -> list[float]:
     return [first] + [0.0] * (EMBEDDING_DIM - 1)
+
+
+def _padded_vector(*components: float) -> list[float]:
+    return [*components] + [0.0] * (EMBEDDING_DIM - len(components))
+
+
+def _rem_candidate(candidate_id: int, embedding: list[float] | None) -> RemCandidate:
+    return RemCandidate(candidate_id=candidate_id, embedding=embedding)
 
 
 class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
@@ -330,10 +340,15 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = str(Path(temp_dir) / "memory.db")
             init_db(db_path)
-            for agent_id, fact_text in (
-                ("agent-a", "Ryan agent a cedar candidate."),
-                ("agent-b", "Ryan agent b cedar candidate."),
-                (None, "Ryan shared cedar candidate."),
+            # agent-a gets two candidates with identical unit-vector embeddings
+            # (centrality 1.0). Their categories differ so commit-time dedup
+            # does not merge them. agent-b and the shared scope each hold a
+            # single candidate, whose centrality is 0.0 by definition.
+            for agent_id, fact_text, category in (
+                ("agent-a", "Ryan agent a cedar candidate.", "fact"),
+                ("agent-a", "Ryan agent a cedar twin.", "preference"),
+                ("agent-b", "Ryan agent b cedar candidate.", "fact"),
+                (None, "Ryan shared cedar candidate.", "fact"),
             ):
                 commit_dream_cycle(
                     db_path,
@@ -341,7 +356,7 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                         FactCandidate(
                             fact_text=fact_text,
                             subject="Ryan",
-                            category="fact",
+                            category=category,
                             importance=5,
                             confidence=0.8,
                             source_message_ids=[1],
@@ -355,31 +370,6 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                     messages_processed=0,
                     last_processed_message_id=0,
                 )
-            prompts: list[str] = []
-
-            class RemAgent:
-                async def run(self, prompt: str) -> object:
-                    prompts.append(prompt)
-                    candidate_ids = [
-                        int(candidate_id)
-                        for candidate_id in re.findall(r"candidate_id=(\d+)", prompt)
-                    ]
-                    if not candidate_ids:
-                        raise AssertionError("REM prompt did not include scoped candidates.")
-                    return SimpleNamespace(
-                        output=RemBoostPlan(
-                            boosts=[
-                                RemBoost(candidate_id=candidate_id, boost=0.5)
-                                for candidate_id in candidate_ids
-                            ]
-                        ),
-                        usage=lambda: SimpleNamespace(
-                            requests=1,
-                            input_tokens=1,
-                            output_tokens=1,
-                            total_tokens=2,
-                        ),
-                    )
 
             def rem_state() -> tuple[list[tuple[str | None, str, float]], list[tuple[str | None, int]]]:
                 with closing(sqlite3.connect(db_path)) as conn:
@@ -390,6 +380,9 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                         ORDER BY id
                         """
                     ).fetchall()
+                    # candidates_boosted counts UPDATE rowcount, so 0.0 writes
+                    # count too: the > 0 filter keeps every REM run that touched
+                    # at least one candidate in its scope.
                     rem_runs = conn.execute(
                         """
                         SELECT agent_id, candidates_boosted
@@ -400,53 +393,40 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                     ).fetchall()
                 return candidates, rem_runs
 
-            await run_rem_phase(
-                db_path,
-                "glm",
-                agent_id="agent-a",
-                rem_agent_factory=lambda *_args, **_kwargs: RemAgent(),
-            )
+            await run_rem_phase(db_path, agent_id="agent-a")
             after_agent_a = rem_state()
 
-            await run_rem_phase(
-                db_path,
-                "glm",
-                agent_id=None,
-                rem_agent_factory=lambda *_args, **_kwargs: RemAgent(),
-            )
+            await run_rem_phase(db_path, agent_id=None)
             after_shared = rem_state()
 
-        self.assertEqual(len(prompts), 2)
-        self.assertIn("Ryan agent a cedar candidate.", prompts[0])
-        self.assertNotIn("Ryan agent b cedar candidate.", prompts[0])
-        self.assertNotIn("Ryan shared cedar candidate.", prompts[0])
-        self.assertIn("Ryan shared cedar candidate.", prompts[1])
-        self.assertNotIn("Ryan agent a cedar candidate.", prompts[1])
-        self.assertNotIn("Ryan agent b cedar candidate.", prompts[1])
         self.assertEqual(
             after_agent_a,
             (
                 [
-                    ("agent-a", "Ryan agent a cedar candidate.", 0.5),
+                    ("agent-a", "Ryan agent a cedar candidate.", 1.0),
+                    ("agent-a", "Ryan agent a cedar twin.", 1.0),
                     ("agent-b", "Ryan agent b cedar candidate.", 0.0),
                     (None, "Ryan shared cedar candidate.", 0.0),
                 ],
-                [("agent-a", 1)],
+                [("agent-a", 2)],
             ),
         )
         self.assertEqual(
             after_shared,
             (
                 [
-                    ("agent-a", "Ryan agent a cedar candidate.", 0.5),
+                    ("agent-a", "Ryan agent a cedar candidate.", 1.0),
+                    ("agent-a", "Ryan agent a cedar twin.", 1.0),
                     ("agent-b", "Ryan agent b cedar candidate.", 0.0),
-                    (None, "Ryan shared cedar candidate.", 0.5),
+                    (None, "Ryan shared cedar candidate.", 0.0),
                 ],
-                [("agent-a", 1), (None, 1)],
+                [("agent-a", 2), (None, 1)],
             ),
         )
 
-    async def test_rem_phase_redaction_failure_does_not_call_model(self) -> None:
+    async def test_rem_phase_succeeds_when_fact_text_contains_forbidden_value(self) -> None:
+        # REM builds no prompts and calls no model, so a forbidden secret in a
+        # candidate's fact text is never egressed and must not fail the phase.
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = str(Path(temp_dir) / "memory.db")
             init_db(db_path)
@@ -470,22 +450,111 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                 messages_processed=1,
                 last_processed_message_id=1,
             )
-            factory_calls = 0
 
-            def rem_agent_factory(*_args: object, **_kwargs: object) -> object:
-                nonlocal factory_calls
-                factory_calls += 1
-                return SimpleNamespace()
+            await run_rem_phase(db_path, forbidden_secret_values=("cedar-secret",))
 
-            with self.assertRaises(ValueError):
-                await run_rem_phase(
-                    db_path,
-                    "glm",
-                    rem_agent_factory=rem_agent_factory,
-                    forbidden_secret_values=("cedar-secret",),
-                )
+            with closing(sqlite3.connect(db_path)) as conn:
+                boost = conn.execute(
+                    "SELECT rem_boost FROM memory_candidates"
+                ).fetchone()[0]
+                rem_status = conn.execute(
+                    "SELECT status FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()[0]
 
-        self.assertEqual(factory_calls, 0)
+        self.assertEqual(boost, 0.0)
+        self.assertEqual(rem_status, "ok")
+
+    async def test_rem_phase_resets_stale_boost_when_embedding_disappears(self) -> None:
+        # A candidate boosted in an earlier cycle whose embedding later goes
+        # missing (e.g. an interrupted repair) must be reset to 0.0, not keep
+        # its stale boost -- the reason the loader LEFT JOINs embeddings.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            commit_dream_cycle(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="Ryan cedar stale boost candidate.",
+                        subject="Ryan",
+                        category="fact",
+                        importance=5,
+                        confidence=0.8,
+                        source_message_ids=[1],
+                    )
+                ],
+                candidate_embeddings=[_unit_vector(1.0)],
+                agent_id=None,
+                status="ok",
+                started_at="2026-01-01T00:00:00Z",
+                finished_at="2026-01-01T00:00:01Z",
+                messages_processed=1,
+                last_processed_message_id=1,
+            )
+            with closing(sqlite3.connect(db_path)) as conn:
+                _load_vec_extension(conn)
+                conn.execute("UPDATE memory_candidates SET rem_boost = 0.7")
+                conn.execute("DELETE FROM memory_candidate_embeddings")
+                conn.commit()
+
+            await run_rem_phase(db_path)
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                boost = conn.execute(
+                    "SELECT rem_boost FROM memory_candidates"
+                ).fetchone()[0]
+
+        self.assertEqual(boost, 0.0)
+
+    async def test_rem_phase_commits_error_run_and_reraises_on_failure(self) -> None:
+        # A failing cycle must leave boosts untouched, record an error
+        # dream_run with no boosts, and re-raise.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            commit_dream_cycle(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="Ryan cedar error path candidate.",
+                        subject="Ryan",
+                        category="fact",
+                        importance=5,
+                        confidence=0.8,
+                        source_message_ids=[1],
+                    )
+                ],
+                candidate_embeddings=[_unit_vector(1.0)],
+                agent_id=None,
+                status="ok",
+                started_at="2026-01-01T00:00:00Z",
+                finished_at="2026-01-01T00:00:01Z",
+                messages_processed=1,
+                last_processed_message_id=1,
+            )
+            with closing(sqlite3.connect(db_path)) as conn:
+                _load_vec_extension(conn)
+                conn.execute("UPDATE memory_candidates SET rem_boost = 0.7")
+                conn.commit()
+
+            with patch(
+                "vexic.rem.compute_centrality_boosts",
+                side_effect=RuntimeError("boom"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    await run_rem_phase(db_path)
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                boost = conn.execute(
+                    "SELECT rem_boost FROM memory_candidates"
+                ).fetchone()[0]
+                status, boosted = conn.execute(
+                    "SELECT status, candidates_boosted FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+
+        self.assertEqual(boost, 0.7)
+        self.assertEqual(status, "error")
+        self.assertEqual(boosted, 0)
 
     async def test_deep_phase_promotes_only_requested_agent_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -862,6 +931,195 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(invalid_run_count, 0)
         self.assertEqual(agent_a_promoted, 0)
+
+
+class RemCentralityBoostTests(unittest.TestCase):
+    def test_empty_candidates_return_empty_dict(self) -> None:
+        self.assertEqual(compute_centrality_boosts([]), {})
+
+    def test_single_candidate_gets_zero_boost(self) -> None:
+        boosts = compute_centrality_boosts([_rem_candidate(1, _unit_vector(1.0))])
+
+        self.assertEqual(boosts, {1: 0.0})
+
+    def test_candidate_without_embedding_scores_zero_and_is_not_a_neighbor(self) -> None:
+        # If the missing embedding leaked in as a zero-similarity neighbor, the
+        # two identical candidates would average (1.0 + 0.0) / 2 instead of 1.0.
+        boosts = compute_centrality_boosts(
+            [
+                _rem_candidate(1, _unit_vector(1.0)),
+                _rem_candidate(2, _unit_vector(1.0)),
+                _rem_candidate(3, None),
+            ]
+        )
+
+        self.assertEqual(boosts, {1: 1.0, 2: 1.0, 3: 0.0})
+
+    def test_fewer_neighbors_than_top_k_means_over_available_only(self) -> None:
+        # Three embedded candidates leave each with two neighbors, fewer than
+        # REM_TOP_K + 1 embedded overall. Zero-padding to top_k would yield
+        # (1.0 + 0.0 + 0.0) / 3 instead of (1.0 + 0.0) / 2.
+        self.assertLess(3, REM_TOP_K + 1)
+        boosts = compute_centrality_boosts(
+            [
+                _rem_candidate(1, _unit_vector(1.0)),
+                _rem_candidate(2, _unit_vector(1.0)),
+                _rem_candidate(3, _padded_vector(0.0, 1.0)),
+            ]
+        )
+
+        self.assertAlmostEqual(boosts[1], 0.5)
+        self.assertAlmostEqual(boosts[2], 0.5)
+        self.assertAlmostEqual(boosts[3], 0.0)
+
+    def test_identical_unit_vectors_boost_to_one(self) -> None:
+        boosts = compute_centrality_boosts(
+            [
+                _rem_candidate(1, _unit_vector(1.0)),
+                _rem_candidate(2, _unit_vector(1.0)),
+            ]
+        )
+
+        self.assertEqual(boosts, {1: 1.0, 2: 1.0})
+
+    def test_orthogonal_vectors_boost_to_zero(self) -> None:
+        boosts = compute_centrality_boosts(
+            [
+                _rem_candidate(1, _unit_vector(1.0)),
+                _rem_candidate(2, _padded_vector(0.0, 1.0)),
+            ]
+        )
+
+        self.assertEqual(boosts, {1: 0.0, 2: 0.0})
+
+    def test_negative_cosine_is_clamped_to_zero(self) -> None:
+        boosts = compute_centrality_boosts(
+            [
+                _rem_candidate(1, _unit_vector(1.0)),
+                _rem_candidate(2, _unit_vector(-1.0)),
+            ]
+        )
+
+        self.assertEqual(boosts, {1: 0.0, 2: 0.0})
+
+    def test_two_candidate_pair_scores_single_cosine_not_topk_dilution(self) -> None:
+        # A pair has one neighbor each, so the boost is that single cosine.
+        # Dividing by top_k instead of available neighbors would report 0.2
+        # (0.6 / 3) and silently punish small scopes.
+        boosts = compute_centrality_boosts(
+            [
+                _rem_candidate(1, _unit_vector(1.0)),
+                _rem_candidate(2, _padded_vector(0.6, 0.8)),
+            ]
+        )
+
+        self.assertAlmostEqual(boosts[1], 0.6)
+        self.assertAlmostEqual(boosts[2], 0.6)
+
+    def test_clustered_candidates_outrank_isolated_candidate(self) -> None:
+        # Centrality rewards tight clusters -- including near-duplicates that
+        # survived commit-time dedup (which only merges same subject+category).
+        # That inflation is intentional and pinned here: the cluster maxes out
+        # while the orthogonal outsider gets nothing.
+        boosts = compute_centrality_boosts(
+            [
+                _rem_candidate(1, _unit_vector(1.0)),
+                _rem_candidate(2, _unit_vector(1.0)),
+                _rem_candidate(3, _unit_vector(1.0)),
+                _rem_candidate(4, _unit_vector(1.0)),
+                _rem_candidate(5, _padded_vector(0.0, 1.0)),
+            ]
+        )
+
+        self.assertEqual(
+            boosts, {1: 1.0, 2: 1.0, 3: 1.0, 4: 1.0, 5: 0.0}
+        )
+
+    def test_mismatched_embedding_dimensions_raise(self) -> None:
+        # zip(..., strict=True) fails loudly on corrupt vectors instead of
+        # silently truncating the dot product.
+        with self.assertRaises(ValueError):
+            compute_centrality_boosts(
+                [
+                    _rem_candidate(1, [1.0, 0.0]),
+                    _rem_candidate(2, [0.0, 1.0, 0.0]),
+                ]
+            )
+
+    def test_same_input_yields_identical_boosts(self) -> None:
+        candidates = [
+            _rem_candidate(1, _padded_vector(0.6, 0.8)),
+            _rem_candidate(2, _padded_vector(0.8, 0.6)),
+            _rem_candidate(3, _padded_vector(0.0, 1.0)),
+            _rem_candidate(4, _unit_vector(-1.0)),
+            _rem_candidate(5, None),
+        ]
+
+        self.assertEqual(
+            compute_centrality_boosts(candidates),
+            compute_centrality_boosts(candidates),
+        )
+
+    def test_boosts_cover_every_candidate_and_stay_in_range(self) -> None:
+        candidates = [
+            _rem_candidate(1, _padded_vector(0.6, 0.8)),
+            _rem_candidate(2, _padded_vector(0.8, 0.6)),
+            _rem_candidate(3, _padded_vector(0.0, 1.0)),
+            _rem_candidate(4, _unit_vector(1.0)),
+            _rem_candidate(5, _unit_vector(-1.0)),
+            _rem_candidate(6, None),
+        ]
+
+        boosts = compute_centrality_boosts(candidates)
+
+        self.assertEqual(set(boosts), {candidate.candidate_id for candidate in candidates})
+        for candidate_id, boost in boosts.items():
+            with self.subTest(candidate_id=candidate_id):
+                self.assertGreaterEqual(boost, 0.0)
+                self.assertLessEqual(boost, 1.0)
+
+
+class RemCandidateLoaderTests(unittest.TestCase):
+    def test_load_rem_candidates_keeps_candidates_without_embeddings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            for fact_text, embedding in (
+                ("Ryan cedar fact one.", _unit_vector(1.0)),
+                ("Ryan cedar fact two.", _padded_vector(0.0, 1.0)),
+            ):
+                commit_dream_cycle(
+                    db_path,
+                    [
+                        FactCandidate(
+                            fact_text=fact_text,
+                            subject="Ryan",
+                            category="fact",
+                            importance=5,
+                            confidence=0.8,
+                            source_message_ids=[1],
+                        )
+                    ],
+                    candidate_embeddings=[embedding],
+                    agent_id=None,
+                    status="ok",
+                    started_at="2026-01-01T00:00:00Z",
+                    finished_at="2026-01-01T00:00:01Z",
+                    messages_processed=1,
+                    last_processed_message_id=1,
+                )
+            with closing(sqlite3.connect(db_path)) as conn:
+                _load_vec_extension(conn)
+                conn.execute("DELETE FROM memory_candidate_embeddings WHERE candidate_id = 2")
+                conn.commit()
+
+            candidates = load_rem_candidates(db_path, agent_id=None)
+
+        self.assertEqual(
+            [candidate.candidate_id for candidate in candidates], [1, 2]
+        )
+        self.assertEqual(candidates[0].embedding, _unit_vector(1.0))
+        self.assertIsNone(candidates[1].embedding)
 
 
 class PipelineCliTests(unittest.TestCase):

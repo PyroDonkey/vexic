@@ -24,7 +24,9 @@ this boundary without changing the memory contract.
   constant-time hash comparison, and can revoke keys for local staging.
 - `HostedBackgroundJobRunner` runs Light/REM/Deep dream phases when explicit
   host model ports are supplied, records job lifecycle and usage events, and
-  fails closed with `HostPortNotConfigured` while ports are absent.
+  fails closed with `HostPortNotConfigured` while ports are absent. REM itself
+  is a local heuristic that makes no model calls (ADR 0020) but runs inside
+  the same ports gate.
 - `HostedMemoryService` can send sanitized request audit and usage metadata to
   a telemetry sink without storing tenant metadata in shared service lists.
 - The local staging adapter stores sanitized request audit, usage, and
@@ -104,7 +106,8 @@ For one internal hosted environment:
 - replace the repo-local SQLite control-plane with a production control-plane
   store for tenant routing, key hashes, and revocation state;
 - keep audit and usage ledgers durable outside the tenant memory database;
-- supply model-backed host ports before enabling real Light, REM, or Deep jobs.
+- supply model-backed host ports before enabling real Light or Deep jobs (REM
+  is a local heuristic but rides the same ports gate).
 
 ## Internal Alpha HTTP API
 
@@ -412,6 +415,26 @@ Required Railway config:
 - Persistent volume mounted at `/data/vexic`
 - Health check path: `/health`
 
+Dream-phase / embedding model port config (optional; unset keeps every
+model-backed operation, including the `search_long_term` vector path, failing
+closed with `HostPortNotConfigured`):
+
+- `VEXIC_DREAM_PHASE_ADAPTER=/app/adapters/openrouter_live_adapter.py` — path
+  to a host adapter module baked into the image; loading it wires
+  `DreamPhasePorts` (embedding plus the Light extraction and Deep
+  contradiction agents; REM needs no agent) into the deployed service at
+  startup. A configured-but-unloadable adapter fails the deploy loudly at app
+  startup.
+- `VEXIC_DREAM_PHASE_MODEL_GROUP` — optional model group name, default
+  `hosted-dream`.
+- `OPENROUTER_API_KEY=<platform key>` — read only by the adapter module,
+  never by `src/vexic`.
+- Optional model selection read by the adapter: `VEXIC_LIVE_EMBEDDING_MODEL`
+  (default `openai/text-embedding-3-small`), `VEXIC_LIVE_MODEL` (default
+  `deepseek/deepseek-v4-pro`, which is also the value the deployed Railway
+  alpha uses), or a per-group override such as
+  `VEXIC_LIVE_HOSTED_DREAM_MODEL` for the `hosted-dream` group.
+
 GitHub Actions deploy trigger:
 
 - `.github/workflows/deploy-hosted.yml` runs on pushes to `main` and manual
@@ -450,7 +473,9 @@ Verified internal-alpha evidence through 2026-06-25:
   `search_long_term` returned the promoted marker fact, tenant B search did
   not expose it, and hosted job usage counters were recorded for all three
   phases. The throwaway Vexic API keys and temporary provider key were revoked
-  after the smoke.
+  after the smoke. (Note, 2026-07-02: that smoke ran REM as a model-backed
+  phase. REM is now a local heuristic per ADR 0020, so a fresh smoke would
+  record zero REM model usage.)
 - Tester keys are alpha-only and should be revoked after each check.
 
 One-off key issuance can run against the same volume:
@@ -463,13 +488,24 @@ Run one hosted dream phase through a host-owned adapter:
 
 ```powershell
 $env:VEXIC_API_KEY = "<raw-key>"
-uv run --no-sync python -m vexic.hosted_http run-dream-phase --root /data/vexic --api-key-env VEXIC_API_KEY --adapter /data/vexic/dream_phase_adapter.py --model-group hosted-alpha --tenant-id tenant-a --project-id project-a --session-id session-a --agent-id agent-a --phase light
+uv run --no-sync python -m vexic.hosted_http run-dream-phase --root /data/vexic --api-key-env VEXIC_API_KEY --adapter /app/adapters/openrouter_live_adapter.py --model-group hosted-dream --tenant-id tenant-a --project-id project-a --session-id session-a --agent-id agent-a --phase light
 ```
 
-The adapter file must define `embed_texts`, `build_extraction_agent`,
-`build_rem_agent`, and `build_contradiction_agent`. Provider secrets stay in
-the host environment; pass secret variable names with `--secret-env NAME` when
-Vexic should include those values in redaction checks.
+`--adapter` defaults to `VEXIC_DREAM_PHASE_ADAPTER` and `--model-group` to
+`VEXIC_DREAM_PHASE_MODEL_GROUP` (then `hosted-dream`), so in a deployed
+environment that already carries the dream-phase env config both flags may be
+omitted. The adapter file must define `embed_texts`, `build_extraction_agent`,
+and `build_contradiction_agent`. Provider secrets stay in the host
+environment; pass secret variable names with `--secret-env NAME` when Vexic
+should include those values in redaction checks.
+
+Dream-phase trigger, recorded: the current trigger is this documented manual
+CLI run, executed in the deployed environment (Railway one-off command against
+the same volume/env) per scope and phase after transcripts have been recorded.
+A scheduled background worker remains the target and is deliberately deferred
+until the dream-phase concurrency lock and the tenant model-credential
+strategy land; running unattended on the platform key without spend caps is
+not acceptable yet.
 
 Revoke a throwaway key by key id, not by raw key:
 
@@ -496,7 +532,7 @@ Internal-only today:
 - single-process in-memory authenticated request limiter;
 - one `LocalMemoryService` instance is created per hosted request;
 - hosted Light/REM/Deep jobs run only with injected host model ports and fail
-  closed without them.
+  closed without them (REM itself makes no model calls; see ADR 0020).
 
 ### Production Telemetry Policy
 

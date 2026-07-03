@@ -105,10 +105,12 @@ Dream phase requires a host-supplied model port. Vexic core does not read
 provider secrets or build models directly.
 ```
 
-This is the intended outcome, not a bug to patch. The same fail-closed posture
-applies to other model-backed needs such as embeddings: a missing embedding
-adapter fails with `HostPortNotConfigured` rather than reading provider secrets
-from the environment. Do not replace host ports with ambient environment reads,
+This is the intended outcome, not a bug to patch. The gate covers all three
+dream phases, including REM, even though REM itself is a local heuristic that
+makes no model calls (ADR 0020). The same fail-closed posture applies to other
+model-backed needs such as embeddings: a missing embedding adapter fails with
+`HostPortNotConfigured` rather than reading provider secrets from the
+environment. Do not replace host ports with ambient environment reads,
 provider SDK wiring, process globals, or private host runtime imports. Implement
 a scoped Vexic dream-phase adapter slice only when the project maintainer starts
 that work.

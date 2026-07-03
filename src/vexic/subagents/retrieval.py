@@ -24,8 +24,9 @@ from vexic.storage import (
     record_long_term_retrieval,
 )
 
-# Reciprocal Rank Fusion constant (MEMORY_ARCHITECTURE.md §Retrieval): BM25 and
-# cosine scores are not on the same scale, so ranks fuse instead of raw scores.
+# Reciprocal Rank Fusion constant (docs/architecture.md, Long-term Search):
+# BM25 and cosine scores are not on the same scale, so ranks fuse instead of
+# raw scores.
 RRF_K = 60
 # Retrieve internally / return to the requester (tunable per call).
 RETRIEVE_K = 20

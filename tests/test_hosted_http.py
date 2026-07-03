@@ -32,9 +32,10 @@ from vexic.hosted import (
     HostedMemoryService,
     HostedRateLimitRule,
     HostedUsageEvent,
+    dream_phase_ports_from_env,
 )
 from vexic.embeddings import EMBEDDING_DIM
-from vexic.ports import DreamPhasePorts
+from vexic.ports import DreamPhasePorts, HostPortNotConfigured
 from vexic.storage import single_message_adapter
 from vexic.hosted_http import create_app
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
@@ -57,6 +58,63 @@ def _scope(
         trust_boundary=TrustBoundary.LOCAL_TRUSTED,
         capabilities=capabilities,
     )
+
+
+_FAKE_DREAM_ADAPTER_SOURCE = textwrap.dedent(
+    """
+    import re
+
+    from vexic.embeddings import EMBEDDING_DIM
+    from vexic.models import FactCandidate
+
+    class _Result:
+        def __init__(self, output):
+            self.output = output
+
+        def usage(self):
+            return type(
+                "Usage",
+                (),
+                {
+                    "requests": 1,
+                    "input_tokens": 3,
+                    "output_tokens": 2,
+                    "total_tokens": 5,
+                },
+            )()
+
+    class _ExtractionAgent:
+        async def run(self, transcript):
+            message_id = int(re.search(r"message_id=(\\d+)", transcript).group(1))
+            return _Result(
+                [
+                    FactCandidate(
+                        fact_text="Ryan's favorite color is ultraviolet.",
+                        subject="Ryan",
+                        category="preference",
+                        importance=7,
+                        confidence=0.9,
+                        source_message_ids=[message_id],
+                    )
+                ]
+            )
+
+    def build_extraction_agent(model_group, secrets=None):
+        return _ExtractionAgent()
+
+    def build_contradiction_agent(model_group, secrets=None):
+        raise AssertionError("Deep should not run in this test")
+
+    def embed_texts(texts):
+        return [[1.0] + [0.0] * (EMBEDDING_DIM - 1) for _ in texts]
+    """
+)
+
+
+def _write_fake_dream_adapter(directory: Path) -> Path:
+    adapter = directory / "adapter.py"
+    adapter.write_text(_FAKE_DREAM_ADAPTER_SOURCE)
+    return adapter
 
 
 class HostedHttpTests(unittest.TestCase):
@@ -1604,7 +1662,11 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"]["code"], "request_too_large")
 
-    def test_run_dream_phase_cli_uses_host_supplied_adapter(self) -> None:
+    def _prepare_dream_phase_run(self) -> tuple[str, Path]:
+        """Provision a tenant with one appended message and a fake adapter file.
+
+        Returns the raw admin API key and the adapter path.
+        """
         self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
         api_key = self.keys.create_key(
             tenant_id="tenant-a",
@@ -1620,61 +1682,7 @@ class HostedHttpTests(unittest.TestCase):
         message_json = single_message_adapter.dump_json(
             ModelRequest(parts=[UserPromptPart(content="hosted worker ultraviolet")])
         )
-        adapter = Path(self.temp_dir.name) / "adapter.py"
-        adapter.write_text(
-            textwrap.dedent(
-                """
-                import re
-
-                from vexic.embeddings import EMBEDDING_DIM
-                from vexic.models import FactCandidate
-
-                class _Result:
-                    def __init__(self, output):
-                        self.output = output
-
-                    def usage(self):
-                        return type(
-                            "Usage",
-                            (),
-                            {
-                                "requests": 1,
-                                "input_tokens": 3,
-                                "output_tokens": 2,
-                                "total_tokens": 5,
-                            },
-                        )()
-
-                class _ExtractionAgent:
-                    async def run(self, transcript):
-                        message_id = int(re.search(r"message_id=(\\d+)", transcript).group(1))
-                        return _Result(
-                            [
-                                FactCandidate(
-                                    fact_text="Ryan's favorite color is ultraviolet.",
-                                    subject="Ryan",
-                                    category="preference",
-                                    importance=7,
-                                    confidence=0.9,
-                                    source_message_ids=[message_id],
-                                )
-                            ]
-                        )
-
-                def build_extraction_agent(model_group, secrets=None):
-                    return _ExtractionAgent()
-
-                def build_rem_agent(model_group, secrets=None):
-                    raise AssertionError("REM should not run in this test")
-
-                def build_contradiction_agent(model_group, secrets=None):
-                    raise AssertionError("Deep should not run in this test")
-
-                def embed_texts(texts):
-                    return [[1.0] + [0.0] * (EMBEDDING_DIM - 1) for _ in texts]
-                """
-            )
-        )
+        adapter = _write_fake_dream_adapter(Path(self.temp_dir.name))
 
         async def append() -> None:
             await service.append_transcript(
@@ -1689,9 +1697,13 @@ class HostedHttpTests(unittest.TestCase):
         import asyncio
 
         asyncio.run(append())
+        return api_key.raw_key, adapter
+
+    def test_run_dream_phase_cli_uses_host_supplied_adapter(self) -> None:
+        raw_key, adapter = self._prepare_dream_phase_run()
         stdout = io.StringIO()
 
-        with patch.dict(os.environ, {"VEXIC_TEST_API_KEY": f"{api_key.raw_key}\n"}):
+        with patch.dict(os.environ, {"VEXIC_TEST_API_KEY": f"{raw_key}\n"}):
             with contextlib.redirect_stdout(stdout):
                 exit_code = _main_result(
                     [
@@ -1761,6 +1773,144 @@ class HostedHttpTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 2)
         self.assertIn("requires a host-supplied model port", stderr.getvalue())
+
+    def test_run_dream_phase_cli_defaults_adapter_and_model_group_from_env(self) -> None:
+        raw_key, adapter = self._prepare_dream_phase_run()
+        stdout = io.StringIO()
+
+        with patch.dict(
+            os.environ,
+            {
+                "VEXIC_TEST_API_KEY": raw_key,
+                "VEXIC_DREAM_PHASE_ADAPTER": str(adapter),
+                "VEXIC_DREAM_PHASE_MODEL_GROUP": "hosted-dream",
+            },
+        ):
+            with contextlib.redirect_stdout(stdout):
+                exit_code = _main_result(
+                    [
+                        "run-dream-phase",
+                        "--root",
+                        self.temp_dir.name,
+                        "--api-key-env",
+                        "VEXIC_TEST_API_KEY",
+                        "--tenant-id",
+                        "tenant-a",
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "session-a",
+                        "--agent-id",
+                        "agent-a",
+                        "--phase",
+                        "light",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["result"]["status"], "ok")
+
+    def test_run_dream_phase_cli_without_adapter_flag_or_env_fails_closed(self) -> None:
+        stderr = io.StringIO()
+        env = {key: value for key, value in os.environ.items()}
+        env.pop("VEXIC_DREAM_PHASE_ADAPTER", None)
+        env["VEXIC_TEST_API_KEY"] = "vx_fake_secret"
+
+        with patch.dict(os.environ, env, clear=True):
+            with contextlib.redirect_stderr(stderr):
+                exit_code = _main_result(
+                    [
+                        "run-dream-phase",
+                        "--root",
+                        self.temp_dir.name,
+                        "--api-key-env",
+                        "VEXIC_TEST_API_KEY",
+                        "--tenant-id",
+                        "tenant-a",
+                        "--phase",
+                        "light",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("requires a host-supplied model port", stderr.getvalue())
+        self.assertIn("VEXIC_DREAM_PHASE_ADAPTER", stderr.getvalue())
+
+
+class DreamPhasePortsFromEnvTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_unset_adapter_returns_none(self) -> None:
+        self.assertIsNone(dream_phase_ports_from_env({}))
+
+    def test_blank_adapter_returns_none(self) -> None:
+        self.assertIsNone(
+            dream_phase_ports_from_env({"VEXIC_DREAM_PHASE_ADAPTER": "   "})
+        )
+
+    def test_valid_adapter_wires_all_ports_with_default_model_group(self) -> None:
+        adapter = _write_fake_dream_adapter(Path(self.temp_dir.name))
+
+        ports = dream_phase_ports_from_env(
+            {"VEXIC_DREAM_PHASE_ADAPTER": str(adapter)}
+        )
+
+        self.assertIsNotNone(ports)
+        self.assertEqual(ports.model_group, "hosted-dream")
+        self.assertEqual(len(ports.embed(["one"])), 1)
+        self.assertIsNotNone(ports.extraction_agent_factory)
+        self.assertIsNotNone(ports.contradiction_agent_factory)
+        self.assertIsNone(ports.secrets)
+
+    def test_model_group_env_overrides_default(self) -> None:
+        adapter = _write_fake_dream_adapter(Path(self.temp_dir.name))
+
+        ports = dream_phase_ports_from_env(
+            {
+                "VEXIC_DREAM_PHASE_ADAPTER": str(adapter),
+                "VEXIC_DREAM_PHASE_MODEL_GROUP": "alpha-group",
+            }
+        )
+
+        self.assertEqual(ports.model_group, "alpha-group")
+
+    def test_configured_but_missing_adapter_fails_loudly(self) -> None:
+        missing = Path(self.temp_dir.name) / "missing.py"
+
+        with self.assertRaises(HostPortNotConfigured):
+            dream_phase_ports_from_env({"VEXIC_DREAM_PHASE_ADAPTER": str(missing)})
+
+    def test_create_service_from_env_wires_dream_phase_ports(self) -> None:
+        adapter = _write_fake_dream_adapter(Path(self.temp_dir.name))
+
+        with patch.dict(
+            os.environ,
+            {
+                "VEXIC_HOSTED_ROOT": self.temp_dir.name,
+                "VEXIC_STORAGE_BACKEND": "local",
+                "VEXIC_DREAM_PHASE_ADAPTER": str(adapter),
+            },
+        ):
+            service = hosted_http.create_service_from_env()
+
+        self.assertIsNotNone(service.dream_phase_ports)
+        self.assertEqual(service.dream_phase_ports.model_group, "hosted-dream")
+
+    def test_create_service_from_env_without_adapter_keeps_ports_none(self) -> None:
+        env = {key: value for key, value in os.environ.items()}
+        env.pop("VEXIC_DREAM_PHASE_ADAPTER", None)
+        env["VEXIC_HOSTED_ROOT"] = self.temp_dir.name
+        env["VEXIC_STORAGE_BACKEND"] = "local"
+
+        with patch.dict(os.environ, env, clear=True):
+            service = hosted_http.create_service_from_env()
+
+        self.assertIsNone(service.dream_phase_ports)
 
 
 def _main_result(argv: list[str]) -> int:
