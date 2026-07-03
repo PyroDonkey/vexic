@@ -1138,5 +1138,62 @@ class PipelineCliTests(unittest.TestCase):
         self.assertIn("Light phase: no new messages. No-op.", stdout.getvalue())
 
 
+class LightPhaseErrorDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_error_diagnostics_never_record_candidate_content(self) -> None:
+        # dream_runs.error_detail and the operator print are diagnostics; a
+        # failing extraction must not copy user memory text into either.
+        sentinel = "secret-medical-fact-sentinel"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            save_messages(
+                db_path,
+                [ModelRequest(parts=[UserPromptPart(content="hello there")])],
+            )
+
+            class ExtractionAgent:
+                async def run(self, transcript: str) -> object:
+                    return SimpleNamespace(
+                        output=[
+                            FactCandidate(
+                                fact_text=sentinel,
+                                subject="Ryan",
+                                category="fact",
+                                importance=5,
+                                confidence=0.8,
+                                source_message_ids=[999_999],
+                            )
+                        ],
+                        usage=lambda: SimpleNamespace(
+                            requests=1,
+                            input_tokens=1,
+                            output_tokens=1,
+                            total_tokens=2,
+                        ),
+                    )
+
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                with self.assertRaises(ValueError):
+                    await run_light_phase(
+                        db_path,
+                        "glm",
+                        extraction_agent_factory=lambda group, secrets=None: ExtractionAgent(),
+                        embed=lambda texts: [
+                            [1.0] + [0.0] * (EMBEDDING_DIM - 1) for _ in texts
+                        ],
+                    )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                status, error_detail = conn.execute(
+                    "SELECT status, error_detail FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+
+        self.assertEqual(status, "error")
+        self.assertIn("ValueError", error_detail)
+        self.assertNotIn(sentinel, error_detail)
+        self.assertNotIn(sentinel, stdout.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

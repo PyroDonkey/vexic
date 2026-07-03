@@ -21,6 +21,27 @@ def test_vexic_runtime_does_not_import_coalescent_engine() -> None:
     assert offenders == []
 
 
+def test_core_carries_no_kms_or_crypto_provider_sdks() -> None:
+    # ADR 0023: the ContentCodec port lives in core, but key material and
+    # KMS/crypto SDK wiring belong to adapters/hosts (ADR 0008 boundary).
+    forbidden = (
+        "import boto3",
+        "import botocore",
+        "from cryptography",
+        "import cryptography",
+        "google.cloud.kms",
+        "azure.keyvault",
+    )
+    offenders: list[str] = []
+    for path in (ROOT / "src" / "vexic").rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        for needle in forbidden:
+            if needle in text:
+                offenders.append(f"{path.relative_to(ROOT)}: {needle}")
+
+    assert offenders == []
+
+
 def test_hosted_core_does_not_own_infrastructure_provisioning() -> None:
     text = (ROOT / "src" / "vexic" / "hosted.py").read_text(encoding="utf-8")
     mcp_stdio_text = (ROOT / "src" / "vexic" / "mcp_stdio.py").read_text(

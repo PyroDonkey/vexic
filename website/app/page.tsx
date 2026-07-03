@@ -22,30 +22,50 @@ const PROBLEMS = [
   }
 ] as const;
 
-const FEATURES = [
+/* Eight rows read as a wall; two labeled clusters keep the spec-sheet scannable.
+   The first group is exactly what the JSON artifact beside it proves. */
+const FEATURE_GROUPS = [
   {
-    title: "Provenance on every fact",
-    body: "Each durable memory carries source message ids, confidence, and category. Trace any recall back to the exact transcript rows it came from."
+    label: "glass-box memory",
+    features: [
+      {
+        title: "Provenance on every fact",
+        body: "Each durable memory carries source message ids, confidence, and category. Trace any recall back to the exact transcript rows it came from."
+      },
+      {
+        title: "Candidates earn promotion",
+        body: "Unlike vector-store memory that ingests everything it sees, every extracted fact starts as a Tier 2 candidate and must earn promotion through reinforcement and review. When recall falls back to a candidate, it is labeled an unverified note, never passed off as durable memory."
+      },
+      {
+        title: "Retrieval telemetry",
+        body: "Every surfaced fact logs a retrieval_events row and increments its retrieved counter in the same transaction, and used counts record which facts actually informed an answer. Audit what your agents recall, not just what they store."
+      },
+      {
+        title: "Replayable indexes",
+        body: "FTS and vector indexes are rebuildable projections over canonical rows. Blow them away and rebuild. The transcript stays the source of truth."
+      }
+    ]
   },
   {
-    title: "Replayable indexes",
-    body: "FTS and vector indexes are rebuildable projections over canonical rows. Blow them away and rebuild. The transcript stays the source of truth."
-  },
-  {
-    title: "Scoped memory",
-    body: "Explicit MemoryScope binds every request to tenant, project, session, and agent. A null agent scope means shared, not a wildcard match."
-  },
-  {
-    title: "Redaction guard",
-    body: "A persistence and egress secret guard applies forbidden-value redaction before anything is stored or leaves the boundary."
-  },
-  {
-    title: "Managed pipeline",
-    body: "Ingestion, extraction passes, and index rebuilds run as a service. Your agents call one endpoint, and Vexic handles durability, migrations, and reindexing."
-  },
-  {
-    title: "Read-only MCP",
-    body: "Expose transcript and long-term search to agents over hosted HTTP MCP. Write, export, and admin tools are deliberately left out."
+    label: "operational boundary",
+    features: [
+      {
+        title: "Scoped memory",
+        body: "Explicit MemoryScope binds every request to tenant, project, session, and agent. A null agent scope means shared, not a wildcard match."
+      },
+      {
+        title: "Redaction guard",
+        body: "A persistence and egress secret guard applies forbidden-value redaction before anything is stored or leaves the boundary."
+      },
+      {
+        title: "Read-only MCP",
+        body: "Expose transcript and long-term search to agents over hosted HTTP MCP. Write, export, and admin tools are deliberately left out."
+      },
+      {
+        title: "Managed pipeline",
+        body: "Ingestion, extraction passes, and index rebuilds run as a service, rolling out now through the early-access waitlist. Your agents call one endpoint, and Vexic handles durability, migrations, and reindexing."
+      }
+    ]
   }
 ] as const;
 
@@ -140,10 +160,15 @@ export default function HomePage() {
       >
         <div className="mx-auto grid max-w-5xl gap-12 lg:grid-cols-[1fr_26rem] lg:gap-16">
           <div className="min-w-0">
-            {FEATURES.map((feature) => (
-              <div key={feature.title} className="border-t border-border py-6 first:border-t-0 first:pt-0">
-                <h3 className="mb-1.5 font-semibold">{feature.title}</h3>
-                <p className="max-w-prose text-sm leading-relaxed text-muted-foreground">{feature.body}</p>
+            {FEATURE_GROUPS.map((group, groupIndex) => (
+              <div key={group.label} className={groupIndex > 0 ? "mt-14" : undefined}>
+                <h3 className="mb-3 font-mono text-xs text-primary">{group.label}</h3>
+                {group.features.map((feature) => (
+                  <div key={feature.title} className="border-t border-border py-5">
+                    <h4 className="mb-1.5 font-semibold">{feature.title}</h4>
+                    <p className="max-w-prose text-sm leading-relaxed text-muted-foreground">{feature.body}</p>
+                  </div>
+                ))}
               </div>
             ))}
           </div>

@@ -51,6 +51,52 @@ def test_live_adapter_rejects_non_finite_timeout(
         adapter.build_extraction_agent("retrieval-smoke")
 
 
+def test_live_adapter_pins_no_data_collection_on_model_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Transcript text and stored fact text travel in these requests; routing
+    # must be pinned to providers that do not retain or train on them rather
+    # than inheriting whatever the OpenRouter account default allows.
+    adapter = _load_adapter()
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
+    monkeypatch.delenv("VEXIC_LIVE_MODEL", raising=False)
+    monkeypatch.delenv("VEXIC_LIVE_RETRIEVAL_SMOKE_MODEL", raising=False)
+
+    for build in (adapter.build_extraction_agent, adapter.build_contradiction_agent):
+        agent = build("retrieval-smoke")
+        extra_body = agent.model_settings["extra_body"]
+        assert extra_body["provider"]["data_collection"] == "deny"
+
+
+def test_live_adapter_pins_no_data_collection_on_embedding_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _load_adapter()
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
+    monkeypatch.delenv("VEXIC_LIVE_EMBEDDING_MODEL", raising=False)
+    captured: dict[str, object] = {}
+
+    class FakeEmbedder:
+        def __init__(self, model: object) -> None:
+            captured["model"] = model
+
+        def embed_documents_sync(self, texts: list[str], *, settings: dict) -> object:
+            captured["settings"] = settings
+
+            class _Result:
+                embeddings = [[0.0] * adapter.EMBEDDING_DIM for _ in texts]
+
+            return _Result()
+
+    monkeypatch.setattr(adapter, "Embedder", FakeEmbedder)
+
+    adapter.embed_texts(["hello"])
+
+    settings = captured["settings"]
+    assert settings["extra_body"]["provider"]["data_collection"] == "deny"
+    assert settings["dimensions"] == adapter.EMBEDDING_DIM
+
+
 def test_live_adapter_rejects_openai_provider_model_prefix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

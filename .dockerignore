@@ -1,6 +1,8 @@
 .git
 .pytest_cache
 .venv
+.env
+.env.*
 .hosted-memory
 build
 dist

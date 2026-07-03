@@ -31,6 +31,11 @@ The initial tool surface is closed to:
 `expand_history`, transcript writes, export, replay, rebuild, delete, and dream
 tools are not exposed through native HTTP MCP.
 
+> Note: the model-facing MCP tool names were later renamed — see ADR 0021
+> (`search_transcript` → `recall_conversation_history`, `search_long_term` →
+> `recall_user_memory`). The `/v1/` HTTP endpoint names in this ADR are
+> unchanged.
+
 Every `/mcp` request requires `Authorization: Bearer <vexic-api-key>`. Query
 string tokens and `X-Vexic-Api-Key` are rejected on `/mcp`; the older
 `X-Vexic-Api-Key` compatibility path remains limited to the `/v1/*` hosted API

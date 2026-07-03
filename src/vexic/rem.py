@@ -8,8 +8,8 @@ Deep phase consumes are unchanged -- a value in [0, 1] per candidate.
 """
 
 import asyncio
-import traceback
 
+from vexic.error_reporting import format_error_detail
 from vexic.storage import RemCandidate, commit_rem_cycle, load_rem_candidates
 from vexic.timeutil import utc_now_iso
 from vexic.usage import UsageSummary
@@ -113,13 +113,13 @@ async def run_rem_phase(
                 started_at=started_at,
                 finished_at=utc_now_iso(),
                 status="error",
-                error_detail=traceback.format_exc(),
+                error_detail=format_error_detail(exc),
                 forbidden_secret_values=forbidden_secret_values,
             )
         except Exception:
             pass
         print(
-            f"REM phase: ERROR -- {exc}. "
+            f"REM phase: ERROR -- {type(exc).__name__}. "
             "Boosts unchanged; Deep phase also skipped this cycle."
         )
         raise

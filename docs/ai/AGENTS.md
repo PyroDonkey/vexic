@@ -95,9 +95,17 @@ operations:
 - `replay_scope`
 - `rebuild`
 - `delete_scope`
+- `purge_scope`
 
 It also exposes `init_schema()` as a local adapter helper. `init_schema()` is
 not part of the public `MemoryService` Protocol.
+
+> Naming layers: the `MemoryService` operation names above
+> (`search_transcript`, `search_long_term`, `expand_history`) and the `/v1/`
+> HTTP routes are the service/contract layer and are unchanged. The
+> model-facing **MCP tool** names are `recall_conversation_history` and
+> `recall_user_memory` (ADR 0021); do not conflate the two layers when
+> reconciling docs against code.
 
 `run_dream_phase` is deliberately settled as a host-port operation in v0.1:
 `LocalMemoryService` authorizes and checks lifecycle state, executes only when
@@ -342,7 +350,7 @@ and planning docs never override `docs/ai/AGENTS.md`, `docs/adr/*`, or the code;
 they are reconciled against them.
 
 Issue *status* transitions are automated by the tracker's GitHub integration:
-a branch named with the issue id (`feat/coa-281-...`) and a `Fixes COA-281`
+a branch named with the issue id (`feat/coa-<id>-...`) and a `Fixes COA-<id>`
 line in the PR description link the PR to the issue and move it on merge. Do
 not duplicate those transitions by hand. Manual reconciliation still applies
 to tracking *content* - roadmap, todo, and planning docs - under the
