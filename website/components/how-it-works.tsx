@@ -15,7 +15,7 @@ const STEPS = [
   {
     tag: "02 · stage",
     title: "Extraction pipeline",
-    body: "Light extraction stages candidate memories in Tier 2, a REM pass clusters and reinforces what repeats, and deep review promotes or supersedes them. A memory only becomes durable after it passes review.",
+    body: "Light extraction stages candidate memories in Tier 2. A model-free REM pass reinforces what repeats, scoring candidates by embedding centrality with zero LLM calls. Deep review then promotes or supersedes them, and a memory only becomes durable after it passes review.",
     detail: "tier 2 · light → rem → deep"
   },
   {

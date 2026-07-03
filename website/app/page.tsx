@@ -28,6 +28,14 @@ const FEATURES = [
     body: "Each durable memory carries source message ids, confidence, and category. Trace any recall back to the exact transcript rows it came from."
   },
   {
+    title: "Candidates earn promotion",
+    body: "Unlike vector-store memory that ingests everything it sees, every extracted fact starts as a Tier 2 candidate and must earn promotion through reinforcement and review. When recall falls back to a candidate, it is labeled an unverified note, never passed off as durable memory."
+  },
+  {
+    title: "Retrieval telemetry",
+    body: "Every surfaced fact logs a retrieval_events row and increments its retrieved counter in the same transaction, and used counts record which facts actually informed an answer. Audit what your agents recall, not just what they store."
+  },
+  {
     title: "Replayable indexes",
     body: "FTS and vector indexes are rebuildable projections over canonical rows. Blow them away and rebuild. The transcript stays the source of truth."
   },
@@ -41,7 +49,7 @@ const FEATURES = [
   },
   {
     title: "Managed pipeline",
-    body: "Ingestion, extraction passes, and index rebuilds run as a service. Your agents call one endpoint, and Vexic handles durability, migrations, and reindexing."
+    body: "Ingestion, extraction passes, and index rebuilds run as a service, rolling out now through the early-access waitlist. Your agents call one endpoint, and Vexic handles durability, migrations, and reindexing."
   },
   {
     title: "Read-only MCP",
