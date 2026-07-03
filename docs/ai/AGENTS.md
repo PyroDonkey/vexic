@@ -349,7 +349,7 @@ and planning docs never override `docs/ai/AGENTS.md`, `docs/adr/*`, or the code;
 they are reconciled against them.
 
 Issue *status* transitions are automated by the tracker's GitHub integration:
-a branch named with the issue id (`feat/coa-281-...`) and a `Fixes COA-281`
+a branch named with the issue id (`feat/coa-<id>-...`) and a `Fixes COA-<id>`
 line in the PR description link the PR to the issue and move it on merge. Do
 not duplicate those transitions by hand. Manual reconciliation still applies
 to tracking *content* - roadmap, todo, and planning docs - under the
