@@ -3,6 +3,7 @@ import unittest
 from vexic.contract import CandidateNote, LongTermFact, MemoryCategory, TranscriptHit
 from vexic.formatting import UNVERIFIED_NOTES_PREAMBLE
 from vexic.mcp_presentation import (
+    PRESENTATION_REMINDER,
     render_long_term,
     render_transcript_hits,
     server_instructions,
@@ -50,6 +51,8 @@ class ServerInstructionsTests(unittest.TestCase):
         self.assertIn("recall_user_memory", instructions)
         self.assertIn("recall_conversation_history", instructions)
         self.assertIn("answer naturally", instructions)
+        self.assertIn("Never mention that you searched", instructions)
+        self.assertIn("prior turns", instructions)
         self.assertIn("No transcript append", instructions)
         self.assertIn("verbatim history expansion", instructions)
         self.assertNotIn("expand_history", instructions)
@@ -68,6 +71,7 @@ class RenderTranscriptHitsTests(unittest.TestCase):
 
         self.assertIn("my favourite pizza is pineapple", text)
         self.assertIn("(2026-07-01T00:00:00Z)", text)
+        self.assertIn(PRESENTATION_REMINDER, text)
         self.assertNotIn("message_id", text)
         self.assertNotIn("session_id", text)
         self.assertNotIn("session-a", text)
@@ -105,6 +109,7 @@ class RenderLongTermTests(unittest.TestCase):
 
         self.assertIn("Long-term memory about the user:", text)
         self.assertIn("- The user's favourite pizza is pineapple (preference)", text)
+        self.assertIn(PRESENTATION_REMINDER, text)
         self.assertNotIn("fact_id", text)
         self.assertNotIn("confidence", text)
         self.assertNotIn("0.9", text)
@@ -116,6 +121,7 @@ class RenderLongTermTests(unittest.TestCase):
 
         self.assertIn(UNVERIFIED_NOTES_PREAMBLE, text)
         self.assertIn("- tentative: might prefer thin crust (preference)", text)
+        self.assertIn(PRESENTATION_REMINDER, text)
         self.assertNotIn("candidate_id", text)
         self.assertNotIn("301", text)
 

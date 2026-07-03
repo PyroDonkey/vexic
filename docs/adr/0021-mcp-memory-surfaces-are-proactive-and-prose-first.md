@@ -42,10 +42,14 @@ and hosted HTTP servers so the two cannot drift:
   read-only constraint. All tools carry MCP annotations
   (`readOnlyHint`, `idempotentHint`, `openWorldHint: false`).
 - Server instructions direct proactive search and natural presentation:
-  answer in the model's own words, never surface tool names, message ids,
-  fact ids, raw timestamps, or confidence scores; phrase timing as natural
-  prose when it matters; give provenance only when the user asks; treat
-  tentative/unverified notes as uncertain.
+  answer in the model's own words as if it simply remembers, never narrate
+  the retrieval (searching, transcripts, memory systems, prior turns, or
+  save status), never surface tool names, message ids, fact ids, raw
+  timestamps, or confidence scores; phrase timing as natural prose when it
+  matters; give provenance only when the user asks; treat
+  tentative/unverified notes as uncertain. Because models attend more to
+  tool results than to server instructions, every rendered search result
+  ends with a one-line presentation reminder restating this.
 - Search results are rendered as prose, not JSON. Transcript hits keep their
   timestamps (for recency judgment) but omit message and session ids; long-term
   facts render as fact text plus category, dropping ids, confidence,
