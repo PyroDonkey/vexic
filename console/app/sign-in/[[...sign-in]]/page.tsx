@@ -3,6 +3,10 @@ import { dark } from "@clerk/themes";
 
 import { isClerkConfigured } from "@/lib/clerk-config";
 
+// Marketing site root; the sign-in page borrows its waitlist for
+// "get notified" requests instead of exposing self-serve sign-up.
+const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL ?? "https://vexic.dev";
+
 // Mirrors the marketing site palette (website/DESIGN.md) regardless of the
 // console's resolved light/dark theme, since visitors arrive from vexic.dev.
 const signInAppearance = {
@@ -24,7 +28,10 @@ const signInAppearance = {
       boxShadow: "none",
       fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
       fontWeight: 600
-    }
+    },
+    // Access is waitlist-gated for now; the sign-up prompt row is hidden and
+    // replaced by the notify link rendered below the panel.
+    footerAction: { display: "none" }
   }
 };
 
@@ -39,6 +46,12 @@ export default function SignInPage() {
       ) : (
         <AuthConfigNotice />
       )}
+      <p className="auth-notify">
+        Don&apos;t have an account yet?{" "}
+        <a className="auth-notify-link" href={`${SITE_URL}/#waitlist`}>
+          Get notified when access opens →
+        </a>
+      </p>
     </main>
   );
 }

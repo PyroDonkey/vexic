@@ -197,3 +197,19 @@
   background: #131313;
   color: #e5e2e1;
 }
+
+.auth-notify {
+  color: #9aa89e;
+  font-size: 0.875rem;
+}
+
+.auth-notify-link {
+  color: #e5e2e1;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  transition: color 150ms ease;
+}
+
+.auth-notify-link:hover {
+  color: #10b981;
+}
