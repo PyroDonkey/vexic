@@ -17,11 +17,15 @@ from vexic import CONTRACT_VERSION
 from vexic.contract import (
     ExpandHistoryResult,
     ExpandHistoryRequest,
+    FreshContextRequest,
     MemoryCapability,
     MemoryRequest,
     MemoryResult,
+    MemoryScope,
+    RedactionContext,
     SearchLongTermRequest,
     SearchTranscriptRequest,
+    TrustBoundary,
 )
 from vexic.hosted import (
     HostedAuthContext,
@@ -72,6 +76,8 @@ MAX_QUERY_CHARS = 1_000
 MAX_LIMIT = 20
 MAX_EXPAND_HISTORY_MESSAGES = 100
 MAX_EXPAND_HISTORY_CHARS = 20_000
+MIN_FRESH_CONTEXT_TOKEN_BUDGET = 1
+MAX_FRESH_CONTEXT_TOKEN_BUDGET = 24_000
 
 _RequestT = TypeVar("_RequestT", bound=MemoryRequest)
 _ResultT = TypeVar("_ResultT", bound=MemoryResult)
@@ -83,6 +89,12 @@ class _HeaderBoundSearchBody(BaseModel):
 
     query: str
     limit: int = 5
+
+
+class _HeaderBoundFreshContextBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token_budget: int = 6_000
 
 
 def create_app(
@@ -163,6 +175,10 @@ def create_app(
                 max_rows=MAX_EXPAND_HISTORY_MESSAGES,
             ),
         )
+
+    @app.post("/v1/fresh_context")
+    async def fresh_context(request: Request, payload: dict[str, Any]) -> JSONResponse:
+        return await _handle_fresh_context(request, payload, service)
 
     return app
 
@@ -309,6 +325,63 @@ async def _handle_search(
     return await _handle_payload(api_key, payload, call)
 
 
+async def _handle_fresh_context(
+    request: Request,
+    body: dict[str, Any],
+    service: HostedMemoryService,
+) -> JSONResponse:
+    api_key = _api_key(request)
+    if api_key is None:
+        return _error_response(401, "unauthorized", "Missing hosted API key.")
+    try:
+        if "scope" in body:
+            payload = FreshContextRequest.model_validate(body)
+        else:
+            auth = _authenticate_for_header_scope(service, api_key)
+            fresh = _HeaderBoundFreshContextBody.model_validate(body)
+            payload = FreshContextRequest(
+                scope=_fresh_context_scope_from_headers(request, auth),
+                token_budget=fresh.token_budget,
+                redaction=RedactionContext(forbidden_values=()),
+            )
+    except ValidationError:
+        return _error_response(
+            422,
+            "invalid_request",
+            "Request body does not match the Vexic contract.",
+        )
+    except PermissionError as exc:
+        if str(exc) == "Invalid hosted API key.":
+            return _error_response(401, "unauthorized", "Invalid hosted API key.")
+        return _error_response(403, "permission_denied", str(exc))
+    except ValueError as exc:
+        return _error_response(400, "invalid_request", str(exc))
+    except Exception:
+        return _error_response(500, "internal_error", "Hosted memory request failed.")
+    return await _handle_payload(api_key, payload, service.fresh_context)
+
+
+def _fresh_context_scope_from_headers(request: Request, auth: HostedAuthContext) -> MemoryScope:
+    project_id = request.headers.get("x-vexic-project-id")
+    if project_id is None or not project_id.strip():
+        raise ValueError("X-Vexic-Project-Id header is required.")
+    session_id = request.headers.get("x-vexic-session-id")
+    if session_id is None or not session_id.strip():
+        raise ValueError("X-Vexic-Session-Id header is required.")
+    agent_id = request.headers.get("x-vexic-agent-id")
+    if agent_id is not None:
+        agent_id = agent_id.strip() or None
+    return MemoryScope(
+        tenant_id=auth.tenant_id,
+        project_id=project_id.strip(),
+        session_id=session_id.strip(),
+        agent_id=agent_id,
+        principal=auth.principal,
+        trust_boundary=TrustBoundary.NETWORKED,
+        capabilities={MemoryCapability.FRESH_CONTEXT},
+    )
+
+
 def _authenticate_for_header_scope(
     service: HostedMemoryService,
     api_key: str,
@@ -374,6 +447,18 @@ def _cap_error(payload: MemoryRequest) -> JSONResponse | None:
                 400,
                 "invalid_request",
                 "first_message_id must be less than or equal to last_message_id.",
+            )
+    if isinstance(payload, FreshContextRequest):
+        if not (
+            MIN_FRESH_CONTEXT_TOKEN_BUDGET
+            <= payload.token_budget
+            <= MAX_FRESH_CONTEXT_TOKEN_BUDGET
+        ):
+            return _error_response(
+                400,
+                "invalid_request",
+                f"token_budget must be between {MIN_FRESH_CONTEXT_TOKEN_BUDGET} and "
+                f"{MAX_FRESH_CONTEXT_TOKEN_BUDGET}.",
             )
     return None
 

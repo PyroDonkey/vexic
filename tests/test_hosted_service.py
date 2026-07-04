@@ -18,6 +18,7 @@ from vexic.embeddings import EMBEDDING_DIM
 from vexic.contract import (
     AppendTranscriptRequest,
     DreamPhase,
+    FreshContextRequest,
     MemoryCapability,
     MemoryScope,
     Principal,
@@ -133,6 +134,7 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             "ingest_source_transcript",
             "search_transcript",
             "expand_history",
+            "fresh_context",
             "search_long_term",
             "record_retrieval_event",
             "retire_fact",
@@ -176,6 +178,81 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual([hit.body for hit in result.hits], ["User: hosted cedar memory"])
+
+    async def test_fresh_context_dispatches_to_local_service_with_bound_scope(self) -> None:
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.WRITE, MemoryCapability.FRESH_CONTEXT},
+            project_ids={"project-a"},
+        )
+        message_json = single_message_adapter.dump_json(
+            ModelRequest(parts=[UserPromptPart(content="fresh context cedar")])
+        )
+        await self.service.append_transcript(
+            api_key.raw_key,
+            AppendTranscriptRequest(
+                scope=_scope(capabilities={MemoryCapability.WRITE}),
+                messages_json=[message_json],
+                redaction=RedactionContext(forbidden_values=()),
+            ),
+        )
+
+        result = await self.service.fresh_context(
+            api_key.raw_key,
+            FreshContextRequest(
+                scope=_scope(capabilities={MemoryCapability.FRESH_CONTEXT}),
+                redaction=RedactionContext(forbidden_values=()),
+            ),
+        )
+
+        self.assertEqual([hit.body for hit in result.recent], ["User: fresh context cedar"])
+
+    async def test_fresh_context_requires_capability(self) -> None:
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.WRITE},
+            project_ids={"project-a"},
+        )
+
+        with self.assertRaises(PermissionError):
+            await self.service.fresh_context(
+                api_key.raw_key,
+                FreshContextRequest(
+                    scope=_scope(capabilities={MemoryCapability.FRESH_CONTEXT}),
+                    redaction=RedactionContext(forbidden_values=()),
+                ),
+            )
+
+    async def test_fresh_context_has_rate_limit_rule(self) -> None:
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.FRESH_CONTEXT},
+            project_ids={"project-a"},
+        )
+        service = HostedMemoryService(
+            self.catalog,
+            self.keys,
+            telemetry=self.catalog,
+            rate_limiter=HostedInMemoryRateLimiter(
+                operation_rules={
+                    "fresh_context": HostedRateLimitRule(limit=1, window_seconds=60),
+                },
+            ),
+        )
+        request = FreshContextRequest(
+            scope=_scope(capabilities={MemoryCapability.FRESH_CONTEXT}),
+            redaction=RedactionContext(forbidden_values=()),
+        )
+
+        await service.fresh_context(api_key.raw_key, request)
+        with self.assertRaises(HostedRateLimitExceeded):
+            await service.fresh_context(api_key.raw_key, request)
 
     async def test_catalog_reload_preserves_routing_projects_and_isolation(self) -> None:
         tenant_a = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
