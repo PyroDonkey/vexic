@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from vexic import CONTRACT_VERSION
 from vexic.contract import (
+    DreamPhase,
     ExpandHistoryResult,
     ExpandHistoryRequest,
     FreshContextRequest,
@@ -25,6 +26,7 @@ from vexic.contract import (
     RedactionContext,
     SearchLongTermRequest,
     SearchTranscriptRequest,
+    TriggerDreamPhaseRequest,
     TrustBoundary,
 )
 from vexic.hosted import (
@@ -180,6 +182,10 @@ def create_app(
     @app.post("/v1/fresh_context")
     async def fresh_context(request: Request, payload: dict[str, Any]) -> JSONResponse:
         return await _handle_fresh_context(request, payload, service)
+
+    @app.post("/v1/trigger_dream_phase")
+    async def trigger_dream_phase(request: Request, payload: dict[str, Any]) -> JSONResponse:
+        return await _handle_trigger_dream_phase(request, payload, service)
 
     return app
 
@@ -380,6 +386,101 @@ def _fresh_context_scope_from_headers(request: Request, auth: HostedAuthContext)
         principal=auth.principal,
         trust_boundary=TrustBoundary.NETWORKED,
         capabilities={MemoryCapability.FRESH_CONTEXT},
+    )
+
+
+class _TriggerDreamPhaseBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    phase: str
+
+
+async def _handle_trigger_dream_phase(
+    request: Request,
+    body: dict[str, Any],
+    service: HostedMemoryService,
+) -> JSONResponse:
+    """``POST /v1/trigger_dream_phase`` -- schedule a summarize sweep.
+
+    Body-shape errors (wrong types, unknown fields) are 422, matching the
+    other header-bound routes. An unsupported `phase` (v1 hard-restricts to
+    `"summarize"`) is a business-rule rejection, not a shape error, so it is
+    surfaced as 400 -- deliberately split from the 422 branch below.
+    """
+    api_key = _api_key(request)
+    if api_key is None:
+        return _error_response(401, "unauthorized", "Missing hosted API key.")
+    try:
+        auth = _authenticate_for_header_scope(service, api_key)
+        trigger_body = _TriggerDreamPhaseBody.model_validate(body)
+    except ValidationError:
+        return _error_response(
+            422,
+            "invalid_request",
+            "Request body does not match the Vexic contract.",
+        )
+    except PermissionError as exc:
+        if str(exc) == "Invalid hosted API key.":
+            return _error_response(401, "unauthorized", "Invalid hosted API key.")
+        return _error_response(403, "permission_denied", str(exc))
+    except Exception:
+        return _error_response(500, "internal_error", "Hosted memory request failed.")
+
+    try:
+        phase = DreamPhase(trigger_body.phase)
+    except ValueError:
+        return _error_response(
+            400,
+            "invalid_request",
+            f"Unsupported dream phase: {trigger_body.phase!r}",
+        )
+
+    try:
+        payload = TriggerDreamPhaseRequest(
+            scope=_trigger_dream_phase_scope_from_headers(request, auth),
+            phase=phase,
+        )
+    except ValidationError as exc:
+        return _error_response(400, "invalid_request", str(exc))
+    except ValueError as exc:
+        return _error_response(400, "invalid_request", str(exc))
+
+    try:
+        result = await service.trigger_dream_phase(api_key, payload)
+    except HostedRateLimitExceeded as exc:
+        return _error_response(
+            429,
+            "rate_limited",
+            "Hosted rate limit exceeded.",
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        )
+    except HostPortNotConfigured:
+        return _error_response(503, "host_port_not_configured", "Required host port is not configured.")
+    except PermissionError as exc:
+        if str(exc) == "Invalid hosted API key.":
+            return _error_response(401, "unauthorized", "Invalid hosted API key.")
+        return _error_response(403, "permission_denied", str(exc))
+    except ValueError as exc:
+        return _error_response(400, "invalid_request", str(exc))
+    except Exception:
+        return _error_response(500, "internal_error", "Hosted memory request failed.")
+    return JSONResponse(result.model_dump(mode="json"), status_code=202)
+
+
+def _trigger_dream_phase_scope_from_headers(request: Request, auth: HostedAuthContext) -> MemoryScope:
+    project_id = request.headers.get("x-vexic-project-id")
+    if project_id is None or not project_id.strip():
+        raise ValueError("X-Vexic-Project-Id header is required.")
+    agent_id = request.headers.get("x-vexic-agent-id")
+    if agent_id is not None:
+        agent_id = agent_id.strip() or None
+    return MemoryScope(
+        tenant_id=auth.tenant_id,
+        project_id=project_id.strip(),
+        agent_id=agent_id,
+        principal=auth.principal,
+        trust_boundary=TrustBoundary.NETWORKED,
+        capabilities={MemoryCapability.DREAM_TRIGGER},
     )
 
 
