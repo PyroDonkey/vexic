@@ -184,6 +184,7 @@ class _HostedApiKey:
     revoked_at: str | None = None
     revoked_by: str | None = None
     active: bool = True
+    last_used_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1060,6 +1061,7 @@ class HostedApiKeyStore:
         key_hash = self._hash(raw_key)
         stored = self._load_key(key_id)
         if hmac.compare_digest(stored.key_hash, key_hash) and stored.active:
+            self._touch_last_used(stored)
             return HostedAuthContext(
                 key_id=stored.key_id,
                 tenant_id=stored.tenant_id,
@@ -1072,6 +1074,34 @@ class HostedApiKeyStore:
                 agent_ids=stored.agent_ids,
             )
         raise PermissionError("Invalid hosted API key.")
+
+    _LAST_USED_MIN_INTERVAL_DAYS = 60.0 / 86400.0  # one minute, in julianday units
+
+    def _touch_last_used(self, stored: _HostedApiKey) -> None:
+        now = _now()
+        if self._control_target is None:
+            if _last_used_is_fresh(stored.last_used_at, now):
+                return
+            self._keys[stored.key_id] = replace(stored, last_used_at=now)
+            return
+        try:
+            with closing(self._connect_control()) as conn:
+                conn.execute(
+                    """
+                    UPDATE hosted_api_keys
+                    SET last_used_at = ?
+                    WHERE key_id = ?
+                      AND (
+                        last_used_at IS NULL
+                        OR julianday(?) - julianday(last_used_at) >= ?
+                      )
+                    """,
+                    (now, stored.key_id, now, self._LAST_USED_MIN_INTERVAL_DAYS),
+                )
+                conn.commit()
+        except Exception:
+            # Last-used telemetry must never break the auth hot path.
+            pass
 
     def revoke_key(self, key_id: str, *, revoked_by: str | None = None) -> None:
         if self._control_target is None:
@@ -1302,6 +1332,12 @@ class HostedApiKeyStore:
                 )
                 """
             )
+            columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(hosted_api_keys)").fetchall()
+            }
+            if "last_used_at" not in columns:
+                conn.execute("ALTER TABLE hosted_api_keys ADD COLUMN last_used_at TEXT")
             conn.commit()
 
     def _load_key(self, key_id: str) -> _HostedApiKey:
@@ -1315,7 +1351,8 @@ class HostedApiKeyStore:
                 """
                 SELECT
                     key_id, key_hash, tenant_id, principal_id, capabilities,
-                    project_ids, agent_ids, created_at, revoked_at, revoked_by
+                    project_ids, agent_ids, created_at, revoked_at, revoked_by,
+                    last_used_at
                 FROM hosted_api_keys
                 WHERE key_id = ?
                 """,
@@ -1339,6 +1376,7 @@ class HostedApiKeyStore:
                 revoked_at=revoked_at,
                 revoked_by=row[9],
                 active=revoked_at is None,
+                last_used_at=row[10],
             )
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
             raise PermissionError("Invalid hosted API key.") from exc
@@ -1399,3 +1437,13 @@ def _load_json_list(raw: str, *, allow_none: bool = False) -> list[str | None]:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _last_used_is_fresh(previous: str | None, now: str) -> bool:
+    if previous is None:
+        return False
+    parse = lambda value: datetime.fromisoformat(value.replace("Z", "+00:00"))
+    try:
+        return (parse(now) - parse(previous)).total_seconds() < 60
+    except ValueError:
+        return False
