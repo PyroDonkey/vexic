@@ -36,6 +36,7 @@ index (and the reverse).
 | 0021 | MCP memory surfaces are proactive and prose-first               | accepted |
 | 0022 | Physical purge erases tombstoned scopes from the primary database | accepted |
 | 0023 | Hosted content encryption flows through a core ContentCodec port | accepted |
+| 0024 | Hosted fresh-conversation context ships as a Summarize dream phase plus a dedicated fresh_context capability | accepted |
 
 Notes:
 
@@ -93,6 +94,14 @@ Notes:
   descriptions, shared proactive/presentation server instructions, and prose
   search results. It affirms the read-only posture of 0010/0014 and extends
   the 0018 read path.
+- 0024 settles COA-254 and implements the "dedicated no-query fresh-context
+  endpoint" ADR 0018 deferred: a `summarize` dream phase compacts Tier 1 spans
+  into `session_summaries` rows, `fresh_context`/`memory:fresh-context` reads
+  a bounded recap-plus-tail for SessionStart priming, and a two-layer guard
+  (recorder skip plus `ingest_source_transcript` rejection on
+  `PRIME_CONTEXT_HEADER`) keeps the injected recap out of Tier 1. Tagging
+  fresh-context-sourced rows with `source == "compact"` and threshold tuning
+  is COA-268.
 - These numbers are the Vexic `docs/adr/` series and are self-contained.
   `src/vexic` source no longer carries any `upstream ADR-00NN` extraction-source
   labels (they were removed when the COA boundary policy was clarified), so there

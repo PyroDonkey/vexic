@@ -271,10 +271,12 @@ installs a SessionStart priming hook that injects capped hosted memory context
 on new/cleared sessions. It also scaffolds a project MCP entry that, once
 approved in Claude Code, proxies targeted read-only search to hosted `/mcp`.
 
-Likewise, the hosted fresh-conversation context API and agent-side recap
-injection - assembling new hosted sessions from session summaries plus recent
-messages - are not built yet. The local `vexic.storage` summary, active-context,
-and recap helpers exist, but that hosted product slice is separate work.
+The SessionStart primer now leads that injected context with a recap built
+from `POST /v1/fresh_context`: a bounded assembly of the session's summary
+frontier (produced by the `summarize` dream phase) plus a token-budgeted raw
+tail. That call requires the priming key to carry the `memory:fresh-context`
+capability; without it, priming falls back to the existing search-only
+context. See `docs/hosted-mvp.md` and `docs/adr/0024-hosted-fresh-conversation-context.md`.
 
 ```powershell
 curl.exe -s https://api.vexic.dev/v1/append_transcript `

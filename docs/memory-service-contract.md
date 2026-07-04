@@ -76,6 +76,7 @@ Capabilities are explicit strings through `MemoryCapability`.
 | `memory:write` | Transcript writes and write-side telemetry. |
 | `memory:search` | Transcript and long-term search. |
 | `memory:expand` | Privileged verbatim transcript egress. |
+| `memory:fresh-context` | No-query session priming: bounded summary recap plus raw tail, not arbitrary-range verbatim reads. |
 | `memory:export` | Privileged export egress. |
 | `memory:replay` | Privileged replay egress. |
 | `memory:admin:rebuild` | Admin rebuild or dream-phase operations. |
@@ -94,6 +95,7 @@ behavioral contract and the current `LocalMemoryService` v0.1 surface.
 | Ingest source transcript | `IngestSourceTranscriptRequest` | `memory:write` | Implemented |
 | Search transcript | `SearchTranscriptRequest` | `memory:search` | Implemented |
 | Expand history | `ExpandHistoryRequest` | `memory:expand` | Implemented |
+| Fresh context | `FreshContextRequest` | `memory:fresh-context` | Implemented |
 | Search long-term | `SearchLongTermRequest` | `memory:search` | Implemented |
 | Record retrieval event | `RecordRetrievalEventRequest` | `memory:write` | Implemented |
 | Retire fact | `RetireFactRequest` | `memory:write` | Implemented |
@@ -112,6 +114,30 @@ contradiction may be deferred; REM runs locally as a deterministic
 embedding-centrality heuristic and consumes none of the supplied ports, but
 still executes only inside the same gate (ADR 0020). Do not wire this by
 importing private host runtime code.
+
+`DreamPhase` has four values: `light`, `rem`, `deep`, and `summarize`.
+`DreamPhase.SUMMARIZE` compacts Tier 1 spans into `session_summaries` rows
+that back fresh context (ADR 0024); it needs a host-supplied
+`build_summary_agent` port and fails closed with `HostPortNotConfigured`
+without one, the same gate as Light and Deep.
+
+## Fresh Context
+
+`FreshContextRequest` is session-scoped and redaction-required, with a
+`token_budget` (default `6_000`). It requires `memory:fresh-context` rather
+than `memory:expand`: fresh context returns a bounded recap plus tail for
+priming a new conversation, not an arbitrary-range verbatim read. Result
+`FreshContextResult` carries `summaries` (the `SessionSummary` frontier read),
+`recent` (the raw tail `TranscriptHit`s past the frontier's covered prefix),
+the assembled `text`, and `truncated`.
+
+`PRIME_CONTEXT_HEADER = "Vexic memory priming:"` marks host-injected priming
+context (fresh-context recap plus any long-term/transcript search results) so
+recorders can recognize and skip it. A host recorder must not re-ingest text
+containing this header as Tier 1 transcript; `ingest_source_transcript`
+independently rejects any row containing it
+(`reason="prime context is not transcript text"`), so injected priming never
+re-enters Tier 1 and is never re-summarized or re-extracted.
 
 ## Redaction
 

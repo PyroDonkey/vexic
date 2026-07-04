@@ -139,3 +139,22 @@ _Avoid_: Shared tenant rows, control-plane database
 A migration that preserves source memory records and provenance through Vexic
 export/import, while rebuilding derived projections after import.
 _Avoid_: Semantic replay, re-dream migration
+
+**Summary Frontier**:
+The set of a session's most recent, non-superseded `session_summaries` rows
+(leaf or condensed) that together cover the oldest portion of that session's
+transcript without gaps, oldest-first.
+_Avoid_: All summaries, summary history
+
+**Fresh Context**:
+The bounded, no-query recap-plus-tail read (summary frontier plus a
+token-budgeted raw transcript tail) that primes a new or resumed conversation,
+distinct from a targeted search query.
+_Avoid_: Search results, expand_history output
+
+**Prime Context Header**:
+The literal marker prefixed to host-injected SessionStart priming text so
+recorders and ingest can recognize and exclude it from Tier 1 transcript,
+keeping injected memory context from re-entering memory as if it were new
+conversation.
+_Avoid_: Transcript marker, system message
