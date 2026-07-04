@@ -731,9 +731,9 @@ class HostedTenantCatalog:
                 INSERT INTO hosted_usage_events (
                     kind, operation, tenant_id, principal_id, status, recorded_at,
                     model_requests, input_tokens, output_tokens, total_tokens,
-                    estimated_cost_micros, error_type, project_id
+                    estimated_cost_micros, error_type, project_id, key_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.kind,
@@ -749,6 +749,7 @@ class HostedTenantCatalog:
                     event.estimated_cost_micros,
                     event.error_type,
                     event.project_id,
+                    event.key_id,
                 ),
             )
             conn.commit()
@@ -829,7 +830,7 @@ class HostedTenantCatalog:
                 f"""
                 SELECT kind, operation, tenant_id, principal_id, status, recorded_at,
                        model_requests, input_tokens, output_tokens, total_tokens,
-                       estimated_cost_micros, error_type, project_id
+                       estimated_cost_micros, error_type, project_id, key_id
                 FROM hosted_usage_events
                 WHERE {where_clause}
                 ORDER BY id
@@ -882,6 +883,8 @@ class HostedTenantCatalog:
             }
             if "project_id" not in columns:
                 conn.execute("ALTER TABLE hosted_usage_events ADD COLUMN project_id TEXT")
+            if "key_id" not in columns:
+                conn.execute("ALTER TABLE hosted_usage_events ADD COLUMN key_id TEXT")
             tenant_columns = {
                 str(row[1])
                 for row in conn.execute("PRAGMA table_info(tenants)").fetchall()

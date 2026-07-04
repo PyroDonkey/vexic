@@ -156,5 +156,41 @@ class KeyListLifecycleTests(ConsoleOpsDepthHarness):
             self.assertNotIn(forbidden, keys[0])
 
 
+class UsageKeyAttributionTests(ConsoleOpsDepthHarness):
+    def test_usage_events_carry_key_id(self) -> None:
+        self.catalog.record_usage_event(
+            HostedUsageEvent(
+                kind="request",
+                operation="append_transcript",
+                tenant_id="tenant-a",
+                principal_id="shared",
+                status="ok",
+                recorded_at="2026-07-01T00:00:00Z",
+                project_id="proj_a",
+                key_id="key_abc",
+            )
+        )
+
+        events = self.catalog.usage_events("tenant-a")
+
+        self.assertEqual(events[0].key_id, "key_abc")
+
+    def test_usage_events_without_key_id_load_as_none(self) -> None:
+        self.catalog.record_usage_event(
+            HostedUsageEvent(
+                kind="request",
+                operation="append_transcript",
+                tenant_id="tenant-a",
+                principal_id="shared",
+                status="ok",
+                recorded_at="2026-07-01T00:00:00Z",
+            )
+        )
+
+        events = self.catalog.usage_events("tenant-a")
+
+        self.assertIsNone(events[0].key_id)
+
+
 if __name__ == "__main__":
     unittest.main()
