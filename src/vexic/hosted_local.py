@@ -839,6 +839,61 @@ class HostedTenantCatalog:
             ).fetchall()
         return [HostedUsageEvent(*row) for row in rows]
 
+    _WRITE_OPERATIONS = ("append_transcript",)
+    _RETRIEVAL_OPERATIONS = ("search_transcript", "search_long_term")
+
+    def usage_daily(
+        self,
+        tenant_id: str,
+        *,
+        project_id: str,
+        recorded_at_gte: str,
+        recorded_at_lt: str,
+    ) -> list[dict[str, object]]:
+        events = self.usage_events(
+            tenant_id,
+            project_id=project_id,
+            recorded_at_gte=recorded_at_gte,
+            recorded_at_lt=recorded_at_lt,
+        )
+        buckets: dict[str, dict[str, object]] = {}
+        for event in events:
+            date = event.recorded_at[:10]
+            bucket = buckets.setdefault(
+                date, {"date": date, "writes": 0, "retrievals": 0, "other": 0}
+            )
+            if event.operation in self._WRITE_OPERATIONS:
+                bucket["writes"] += 1
+            elif event.operation in self._RETRIEVAL_OPERATIONS:
+                bucket["retrievals"] += 1
+            else:
+                bucket["other"] += 1
+        return [buckets[date] for date in sorted(buckets)]
+
+    def usage_by_key(
+        self,
+        tenant_id: str,
+        *,
+        project_id: str,
+        recorded_at_gte: str,
+        recorded_at_lt: str,
+    ) -> list[dict[str, object]]:
+        events = self.usage_events(
+            tenant_id,
+            project_id=project_id,
+            recorded_at_gte=recorded_at_gte,
+            recorded_at_lt=recorded_at_lt,
+        )
+        counts: dict[str | None, int] = {}
+        for event in events:
+            counts[event.key_id] = counts.get(event.key_id, 0) + 1
+        return [
+            {"keyId": key_id, "requests": count}
+            for key_id, count in sorted(
+                counts.items(), key=lambda item: (-item[1], item[0] or "")
+            )
+        ]
+
     def job_events(self, tenant_id: str) -> list[HostedJobEvent]:
         with closing(self._connect_control()) as conn:
             rows = conn.execute(

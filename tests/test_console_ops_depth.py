@@ -192,5 +192,96 @@ class UsageKeyAttributionTests(ConsoleOpsDepthHarness):
         self.assertIsNone(events[0].key_id)
 
 
+class UsageAnalyticsEndpointTests(ConsoleOpsDepthHarness):
+    def _seed_usage(self, project_id: str) -> tuple[str, str]:
+        from datetime import UTC, datetime, timedelta
+
+        day1 = (datetime.now(UTC) - timedelta(days=2)).strftime("%Y-%m-%dT10:00:00Z")
+        day2 = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%dT09:00:00Z")
+        rows = [
+            ("append_transcript", day1, "key_a"),
+            ("append_transcript", day1, "key_a"),
+            ("search_long_term", day1, "key_b"),
+            ("search_transcript", day2, "key_b"),
+            ("expand_history", day2, None),
+        ]
+        for operation, recorded_at, key_id in rows:
+            self.catalog.record_usage_event(
+                HostedUsageEvent(
+                    kind="request",
+                    operation=operation,
+                    tenant_id=self.tenant_id,
+                    principal_id="shared",
+                    status="ok",
+                    recorded_at=recorded_at,
+                    project_id=project_id,
+                    key_id=key_id,
+                )
+            )
+        return day1[:10], day2[:10]
+
+    def _provisioned_project(self) -> dict:
+        project = self._create_project()
+        tenant = self.client.post(
+            "/control/v1/clerk-orgs/org_123/tenant",
+            headers=self._control_auth(),
+        ).json()["tenant"]
+        self.tenant_id = tenant["tenantId"]
+        return project
+
+    def test_daily_granularity_returns_bucketed_rows(self) -> None:
+        project = self._provisioned_project()
+        day1, day2 = self._seed_usage(project["id"])
+
+        response = self.client.get(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/usage"
+            "?granularity=day&days=30",
+            headers=self._control_auth(),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        daily = response.json()["usage"]["daily"]
+        by_date = {row["date"]: row for row in daily}
+        self.assertEqual(by_date[day1]["writes"], 2)
+        self.assertEqual(by_date[day1]["retrievals"], 1)
+        self.assertEqual(by_date[day2]["retrievals"], 1)
+        self.assertEqual(by_date[day2]["other"], 1)
+
+    def test_usage_without_granularity_has_no_daily_array(self) -> None:
+        project = self._provisioned_project()
+
+        response = self.client.get(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/usage",
+            headers=self._control_auth(),
+        )
+
+        self.assertNotIn("daily", response.json()["usage"])
+
+    def test_by_key_endpoint_aggregates_per_key(self) -> None:
+        project = self._provisioned_project()
+        day1, day2 = self._seed_usage(project["id"])
+
+        response = self.client.get(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/usage/by-key"
+            "?days=30",
+            headers=self._control_auth(),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        by_key = {row["keyId"]: row["requests"] for row in response.json()["byKey"]}
+        self.assertEqual(by_key["key_a"], 2)
+        self.assertEqual(by_key["key_b"], 2)
+        self.assertEqual(by_key[None], 1)
+
+    def test_by_key_requires_control_credential(self) -> None:
+        project = self._provisioned_project()
+
+        response = self.client.get(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/usage/by-key",
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+
 if __name__ == "__main__":
     unittest.main()

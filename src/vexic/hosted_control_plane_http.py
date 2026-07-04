@@ -5,7 +5,7 @@ import logging
 import os
 import sqlite3
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from functools import wraps
 from typing import NoReturn, ParamSpec, TypeVar
 
@@ -269,6 +269,34 @@ def register_control_plane_routes(
             }
         )
 
+    @app.get("/control/v1/clerk-orgs/{clerk_org_id}/projects/{project_id}/usage/by-key")
+    @_control_plane_storage_boundary
+    async def get_control_plane_project_usage_by_key(
+        clerk_org_id: str,
+        project_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        if not _has_control_plane_credential(request, control_plane_tokens):
+            return _error_response(401, "unauthorized", "Invalid control-plane credential.")
+        tenant_id = _resolve_control_tenant(service, clerk_org_id)
+        if tenant_id is None:
+            return _error_response(404, "not_found", "Project not found.")
+        try:
+            service.catalog.get_control_project(tenant_id, project_id)
+        except PermissionError:
+            return _error_response(404, "not_found", "Project not found.")
+        window_start, window_end = _days_window(request)
+        return JSONResponse(
+            {
+                "byKey": service.catalog.usage_by_key(
+                    tenant_id,
+                    project_id=project_id,
+                    recorded_at_gte=window_start,
+                    recorded_at_lt=window_end,
+                )
+            }
+        )
+
     @app.get("/control/v1/clerk-orgs/{clerk_org_id}/projects/{project_id}/usage")
     @_control_plane_storage_boundary
     async def get_control_plane_project_usage(
@@ -292,16 +320,21 @@ def register_control_plane_routes(
             recorded_at_gte=period_start,
             recorded_at_lt=period_end,
         )
-        return JSONResponse(
-            {
-                "usage": _usage_payload(
-                    events,
-                    period_start=period_start,
-                    period_end=period_end,
-                    project_id=project_id,
-                )
-            }
+        usage = _usage_payload(
+            events,
+            period_start=period_start,
+            period_end=period_end,
+            project_id=project_id,
         )
+        if request.query_params.get("granularity") == "day":
+            window_start, window_end = _days_window(request)
+            usage["daily"] = service.catalog.usage_daily(
+                tenant_id,
+                project_id=project_id,
+                recorded_at_gte=window_start,
+                recorded_at_lt=window_end,
+            )
+        return JSONResponse({"usage": usage})
 
 
 def _api_key(request: Request) -> str | None:
@@ -537,6 +570,17 @@ def _usage_period() -> tuple[str, str]:
     now = datetime.now(UTC)
     period_start = datetime(now.year, now.month, 1, tzinfo=UTC)
     return _utc_iso(period_start), _utc_iso(now)
+
+
+def _days_window(request: Request, *, default_days: int = 30) -> tuple[str, str]:
+    raw = request.query_params.get("days", str(default_days))
+    try:
+        days = max(1, min(90, int(raw)))
+    except ValueError:
+        days = default_days
+    now = datetime.now(UTC)
+    start = now - timedelta(days=days)
+    return _utc_iso(start), _utc_iso(now)
 
 
 def _utc_iso(value: datetime) -> str:
