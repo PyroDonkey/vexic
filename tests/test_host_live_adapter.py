@@ -160,6 +160,89 @@ def test_live_adapter_defaults_to_deepseek_v4_pro(
     assert captured["model_name"] == "deepseek/deepseek-v4-pro"
 
 
+def test_live_adapter_exposes_all_four_symbols() -> None:
+    adapter = _load_adapter()
+    for name in (
+        "embed_texts",
+        "build_extraction_agent",
+        "build_contradiction_agent",
+        "build_summary_agent",
+    ):
+        assert callable(getattr(adapter, name, None)), name
+
+
+def test_live_adapter_build_summary_agent_returns_agent_like_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _load_adapter()
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
+
+    agent = adapter.build_summary_agent("summarize")
+
+    assert agent.model_settings["extra_body"]["provider"]["data_collection"] == "deny"
+
+
+def test_live_adapter_build_summary_agent_respects_env_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _load_adapter()
+    captured: dict[str, str] = {}
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
+    monkeypatch.setenv("VEXIC_SUMMARY_MODEL", "  anthropic/claude-haiku-4.5\n")
+
+    class _ChatModel:
+        def __init__(self, model_name: str, *, provider: object) -> None:
+            captured["model_name"] = model_name
+
+    class _Agent:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+    monkeypatch.setattr(adapter, "Agent", _Agent)
+    monkeypatch.setattr(adapter, "OpenAIChatModel", _ChatModel)
+
+    adapter.build_summary_agent("summarize")
+
+    assert captured["model_name"] == "anthropic/claude-haiku-4.5"
+
+
+def test_live_adapter_build_summary_agent_defaults_to_haiku(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _load_adapter()
+    captured: dict[str, str] = {}
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
+    monkeypatch.delenv("VEXIC_SUMMARY_MODEL", raising=False)
+
+    class _ChatModel:
+        def __init__(self, model_name: str, *, provider: object) -> None:
+            captured["model_name"] = model_name
+
+    class _Agent:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+    monkeypatch.setattr(adapter, "Agent", _Agent)
+    monkeypatch.setattr(adapter, "OpenAIChatModel", _ChatModel)
+
+    adapter.build_summary_agent("summarize")
+
+    assert captured["model_name"] == "anthropic/claude-haiku-4.5"
+
+
+def test_live_adapter_build_summary_agent_rejects_passed_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _load_adapter()
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
+
+    with pytest.raises(
+        RuntimeError,
+        match="openrouter_live_adapter.py reads provider secrets from environment variables only.",
+    ):
+        adapter.build_summary_agent("summarize", secrets={"OPENROUTER_API_KEY": "x"})
+
+
 def test_live_adapter_embedding_can_run_inside_active_event_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
