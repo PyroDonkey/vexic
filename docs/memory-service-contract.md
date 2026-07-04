@@ -81,6 +81,7 @@ Capabilities are explicit strings through `MemoryCapability`.
 | `memory:replay` | Privileged replay egress. |
 | `memory:admin:rebuild` | Admin rebuild or dream-phase operations. |
 | `memory:admin:lifecycle` | Scope tombstone and lifecycle operations. |
+| `memory:dream:trigger` | Schedule a Summarize dream-phase sweep without granting admin rebuild. |
 
 Use `require_capability(scope, capability)` for the common fail-closed check.
 
@@ -100,6 +101,7 @@ behavioral contract and the current `LocalMemoryService` v0.1 surface.
 | Record retrieval event | `RecordRetrievalEventRequest` | `memory:write` | Implemented |
 | Retire fact | `RetireFactRequest` | `memory:write` | Implemented |
 | Run dream phase | `RunDreamPhaseRequest` | `memory:admin:rebuild` | Host-port backed |
+| Trigger dream phase | `TriggerDreamPhaseRequest` | `memory:dream:trigger` | Host-port backed (async, summarize-only in v1) |
 | Export scope | `ExportScopeRequest` | `memory:export` | Implemented |
 | Replay scope | `ReplayScopeRequest` | `memory:replay` | Implemented |
 | Rebuild | `RebuildRequest` | `memory:admin:rebuild` | Implemented |
@@ -120,6 +122,43 @@ importing private host runtime code.
 that back fresh context (ADR 0024); it needs a host-supplied
 `build_summary_agent` port and fails closed with `HostPortNotConfigured`
 without one, the same gate as Light and Deep.
+
+### Trigger Dream Phase
+
+`TriggerDreamPhaseRequest` is a thin boundary request that carries its own
+capability (`memory:dream:trigger`), not `memory:admin:rebuild`, so a
+trigger-only key (the recorder or a cron caller) never needs admin-rebuild
+just to kick off a sweep. It hard-restricts `phase` to `DreamPhase.SUMMARIZE`
+in v1 -- any other value fails validation (surfaced as `400` over HTTP).
+`scope.session_id` is not required: the sweep is not scoped to one session.
+
+The service authenticates, binds, and rate-checks this request exactly once
+at the trigger boundary, then internally mints a fully-scoped
+`RunDreamPhaseRequest` (server-side `memory:admin:rebuild`) and executes it
+directly rather than re-entering the ordinary `run_dream_phase` call path --
+re-entering would strip the minted capability during capability
+intersection and double-count the shared rate bucket. `TriggerDreamPhaseResult`
+carries `status` (`"scheduled"` or `"skipped"`) and an optional `reason`
+(e.g. `"already_running"` when a sweep for the same tenant+agent is already
+in flight -- an in-process, per-(tenant_id, agent_id) lock). The scheduled
+sweep runs asynchronously; the caller gets `202` back immediately and does
+not await phase completion.
+
+**Scope is tenant(+agent)-wide, not project-scoped.** The request's
+authenticated project header binds and authorizes the call the same as any
+other route, but `messages` and `session_summaries` carry no `project_id`
+column, so the sweep itself (`list_compactable_session_ids`) walks every
+compactable session for the tenant (and agent, if scoped) regardless of
+which project triggered it. A tenant whose projects share one database get
+one shared sweep and one shared daily span budget, not per-project
+isolation.
+
+A daily span budget (`VEXIC_SUMMARIZE_DAILY_SPAN_BUDGET`, default `50`)
+caps `session_summaries` writes (leaf and condense both count) per
+tenant(+agent) per UTC calendar day, counted against each row's explicit
+`created_at`. The budget window (UTC-day) is a distinct clock from the
+phase's own 2h-idle/3am-local ripeness heuristic -- spend accounting and
+ripeness evaluation are independent concerns on independent clocks.
 
 ## Fresh Context
 
