@@ -63,7 +63,7 @@ test("project workspace route remounts client state per project", () => {
 test("project workspace clears one-time key reveal state when project changes", () => {
   const source = readFileSync(path.join(root, "app/console/projects/[projectId]/project-workspace.tsx"), "utf8");
 
-  assert.match(source, /useEffect\(\(\) => \{\s+setRawKey\(""\);\s+setCreatedKey\(null\);\s+void loadProject\(\);/);
+  assert.match(source, /useEffect\(\(\) => \{\s+workspaceRequestSeq\.current \+= 1;\s+setRawKey\(""\);\s+setCreatedKey\(null\);\s+void loadProject\(\);/);
 });
 
 test("active organization creation redirects through a fresh server render", () => {
