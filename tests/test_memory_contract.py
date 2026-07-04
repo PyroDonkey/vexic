@@ -514,6 +514,7 @@ class MemoryContractProtocolTests(unittest.TestCase):
             "ingest_source_transcript",
             "search_transcript",
             "expand_history",
+            "fresh_context",
             "search_long_term",
             "run_dream_phase",
             "export_scope",

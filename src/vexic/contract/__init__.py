@@ -41,6 +41,7 @@ class MemoryCapability(StrEnum):
     WRITE = "memory:write"
     SEARCH = "memory:search"
     EXPAND_HISTORY = "memory:expand"
+    FRESH_CONTEXT = "memory:fresh-context"
     EXPORT = "memory:export"
     REPLAY = "memory:replay"
     ADMIN_REBUILD = "memory:admin:rebuild"
@@ -284,6 +285,18 @@ class ExpandHistoryResult(MemoryResult):
     truncated: bool = False
 
 
+class FreshContextRequest(SessionScopedRedactionRequiredRequest):
+    required_capability: ClassVar[MemoryCapability] = MemoryCapability.FRESH_CONTEXT
+    token_budget: int = 6_000
+
+
+class FreshContextResult(MemoryResult):
+    summaries: list[SummaryNode] = Field(default_factory=list)
+    recent: list[TranscriptHit] = Field(default_factory=list)
+    text: str
+    truncated: bool = False
+
+
 class SearchLongTermRequest(MemoryRequest):
     required_capability: ClassVar[MemoryCapability] = MemoryCapability.SEARCH
     query: str
@@ -430,6 +443,11 @@ class MemoryService(Protocol):
         self,
         request: ExpandHistoryRequest,
     ) -> ExpandHistoryResult: ...
+
+    async def fresh_context(
+        self,
+        request: FreshContextRequest,
+    ) -> FreshContextResult: ...
 
     async def search_long_term(
         self,

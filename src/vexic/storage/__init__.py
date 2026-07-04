@@ -71,8 +71,10 @@ from vexic.storage.session_summaries import (
     find_session_compaction_span,
     list_compactable_session_ids,
     load_active_context_messages,
+    load_fresh_context_rows,
     record_session_summary,
     render_session_recap,
+    render_recap_blocks,
     render_compaction_source,
 )
 from vexic.storage.transcript import (
@@ -150,6 +152,7 @@ __all__ = [
     "load_candidates_missing_embeddings",
     "list_compactable_session_ids",
     "load_active_context_messages",
+    "load_fresh_context_rows",
     "load_messages",
     "load_messages_by_token_budget",
     "load_messages_in_id_range",
@@ -167,6 +170,7 @@ __all__ = [
     "record_promotion_label",
     "record_session_summary",
     "render_compaction_source",
+    "render_recap_blocks",
     "render_session_recap",
     "record_long_term_use",
     "repair_memory_projections",

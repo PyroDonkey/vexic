@@ -23,6 +23,7 @@ from vexic.contract import (
     DeleteScopeRequest,
     DreamPhase,
     ExportScopeRequest,
+    FreshContextRequest,
     IngestSourceTranscriptRequest,
     RecordRetrievalEventRequest,
     RebuildRequest,
@@ -1805,6 +1806,290 @@ class ArtifactLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
             mode = stat_module.S_IMODE(artifact_dir.stat().st_mode)
             self.assertEqual(mode, 0o700)
+
+
+class FreshContextTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.temp_dir.name) / "memory.db")
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _save(
+        self,
+        text: str,
+        *,
+        session_id: str = "default",
+        agent_id: str | None = None,
+    ) -> int:
+        return save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content=text)])],
+            session_id=session_id,
+            agent_id=agent_id,
+        )[0]
+
+    def _summary(
+        self,
+        *,
+        session_id: str = "default",
+        agent_id: str | None = None,
+        kind: str,
+        first_message_id: int,
+        last_message_id: int,
+        summary_text: str,
+        replaces_summary_ids: tuple[int, ...] = (),
+    ) -> int:
+        from vexic.storage import record_session_summary
+
+        return record_session_summary(
+            self.db_path,
+            session_id=session_id,
+            agent_id=agent_id,
+            kind=kind,
+            first_message_id=first_message_id,
+            last_message_id=last_message_id,
+            summary_text=summary_text,
+            replaces_summary_ids=replaces_summary_ids,
+        )
+
+    async def test_frontier_selection_is_condensed_plus_unreplaced_leaves(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        for text in ("m1", "m2", "m3", "m4", "m5", "m6"):
+            self._save(text)
+        leaf_a = self._summary(
+            kind="leaf", first_message_id=1, last_message_id=2, summary_text="leaf a"
+        )
+        leaf_b = self._summary(
+            kind="leaf", first_message_id=3, last_message_id=4, summary_text="leaf b"
+        )
+        self._summary(
+            kind="condensed",
+            first_message_id=1,
+            last_message_id=4,
+            summary_text="condensed a+b",
+            replaces_summary_ids=(leaf_a, leaf_b),
+        )
+        self._summary(
+            kind="leaf", first_message_id=5, last_message_id=6, summary_text="leaf c"
+        )
+
+        result = await service.fresh_context(
+            FreshContextRequest(
+                scope=_scope().model_copy(
+                    update={"capabilities": {MemoryCapability.FRESH_CONTEXT}}
+                ),
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+
+        self.assertEqual(
+            [summary.summary_text for summary in result.summaries],
+            ["condensed a+b", "leaf c"],
+        )
+        self.assertEqual(
+            [(s.first_message_id, s.last_message_id) for s in result.summaries],
+            [(1, 4), (5, 6)],
+        )
+
+    async def test_tail_starts_after_frontier_covered_prefix(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        for text in ("m1", "m2", "m3", "m4"):
+            self._save(text)
+        self._summary(
+            kind="leaf", first_message_id=1, last_message_id=2, summary_text="leaf a"
+        )
+
+        result = await service.fresh_context(
+            FreshContextRequest(
+                scope=_scope().model_copy(
+                    update={"capabilities": {MemoryCapability.FRESH_CONTEXT}}
+                ),
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+
+        self.assertEqual([hit.body for hit in result.recent], ["User: m3", "User: m4"])
+        self.assertIn(
+            "[Recap of messages 1-2 -- verbatim via expand_history]", result.text
+        )
+        self.assertIn("User: m3", result.text)
+
+    async def test_first_message_included_even_when_over_token_budget(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        long_text = "x" * 4000
+        self._save(long_text)
+        self._save(long_text)
+
+        result = await service.fresh_context(
+            FreshContextRequest(
+                scope=_scope().model_copy(
+                    update={"capabilities": {MemoryCapability.FRESH_CONTEXT}}
+                ),
+                redaction=RedactionContext(forbidden_values=()),
+                token_budget=1,
+            )
+        )
+
+        # The walk always keeps at least the most recent message even when it
+        # alone exceeds the budget (matches existing walk semantics).
+        self.assertEqual(len(result.recent), 1)
+        self.assertEqual(result.recent[0].body, f"User: {long_text}")
+
+    async def test_missing_summary_fallback_returns_budgeted_tail_from_start(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        for text in ("m1", "m2", "m3"):
+            self._save(text)
+
+        result = await service.fresh_context(
+            FreshContextRequest(
+                scope=_scope().model_copy(
+                    update={"capabilities": {MemoryCapability.FRESH_CONTEXT}}
+                ),
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+
+        self.assertEqual(result.summaries, [])
+        self.assertEqual(
+            [hit.body for hit in result.recent], ["User: m1", "User: m2", "User: m3"]
+        )
+        self.assertTrue(result.text)
+
+    async def test_empty_database_returns_empty_result_without_error(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+
+        result = await service.fresh_context(
+            FreshContextRequest(
+                scope=_scope().model_copy(
+                    update={"capabilities": {MemoryCapability.FRESH_CONTEXT}}
+                ),
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+
+        self.assertEqual(result.summaries, [])
+        self.assertEqual(result.recent, [])
+        self.assertEqual(result.text, "")
+
+    async def test_scope_isolation_across_sessions_and_agents(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        self._save("session-a agent-a text", session_id="session-a", agent_id="agent-a")
+        self._save("session-a agent-b text", session_id="session-a", agent_id="agent-b")
+        self._save("session-b agent-a text", session_id="session-b", agent_id="agent-a")
+        self._summary(
+            session_id="session-a",
+            agent_id="agent-a",
+            kind="leaf",
+            first_message_id=1,
+            last_message_id=1,
+            summary_text="summary session-a agent-a",
+        )
+
+        result = await service.fresh_context(
+            FreshContextRequest(
+                scope=_scope(session_id="session-a", agent_id="agent-a").model_copy(
+                    update={"capabilities": {MemoryCapability.FRESH_CONTEXT}}
+                ),
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+
+        self.assertEqual(
+            [s.summary_text for s in result.summaries], ["summary session-a agent-a"]
+        )
+        self.assertNotIn("agent-b", result.text)
+        self.assertNotIn("session-b", result.text)
+        for hit in result.recent:
+            self.assertNotIn("agent-b", hit.body)
+            self.assertNotIn("session-b", hit.body)
+
+    async def test_missing_capability_raises_permission_error(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        self._save("m1")
+
+        with self.assertRaises(PermissionError):
+            await service.fresh_context(
+                FreshContextRequest(
+                    scope=_scope(),
+                    redaction=RedactionContext(forbidden_values=()),
+                )
+            )
+
+    async def test_redaction_blocks_egress_of_forbidden_value(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        self._save("cedar-secret raw detail")
+        self._summary(
+            kind="leaf",
+            first_message_id=1,
+            last_message_id=1,
+            summary_text="a summary mentioning cedar-secret",
+        )
+
+        with self.assertRaisesRegex(ValueError, "forbidden secret"):
+            await service.fresh_context(
+                FreshContextRequest(
+                    scope=_scope().model_copy(
+                        update={"capabilities": {MemoryCapability.FRESH_CONTEXT}}
+                    ),
+                    redaction=RedactionContext(forbidden_values=("cedar-secret",)),
+                )
+            )
+
+    async def test_tombstoned_scope_is_rejected(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        self._save("m1", agent_id="agent-a")
+
+        redaction = RedactionContext(forbidden_values=())
+        scope = _scope(agent_id="agent-a").model_copy(
+            update={
+                "capabilities": {
+                    MemoryCapability.FRESH_CONTEXT,
+                    MemoryCapability.ADMIN_LIFECYCLE,
+                }
+            }
+        )
+        await service.delete_scope(
+            DeleteScopeRequest(
+                scope=scope,
+                target_scope=MemoryScopeSelector(tenant_id="tenant-a", agent_id="agent-a"),
+                reason="test tombstone",
+                redaction=redaction,
+            )
+        )
+
+        with self.assertRaisesRegex(PermissionError, "tombstoned"):
+            await service.fresh_context(
+                FreshContextRequest(scope=scope, redaction=redaction)
+            )
 
 
 if __name__ == "__main__":
