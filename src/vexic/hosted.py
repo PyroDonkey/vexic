@@ -715,24 +715,33 @@ class HostedMemoryService:
         lock_key = (request.scope.tenant_id, request.scope.agent_id)
         if not self._acquire_dream_trigger_lock(lock_key):
             return TriggerDreamPhaseResult(status="skipped", reason="already_running")
-        minted_scope = request.scope.model_copy(
-            update={"capabilities": {MemoryCapability.ADMIN_REBUILD}}
-        )
-        minted_request = RunDreamPhaseRequest(
-            scope=minted_scope,
-            phase=DreamPhase.SUMMARIZE,
-            # Deliberate: matches the fresh_context header-bound precedent
-            # (hosted_http.py). The phase still receives adapter-level
-            # `forbidden_secret_values` via `ports.secrets`.
-            redaction=RedactionContext(forbidden_values=()),
-        )
-        job_id = secrets.token_hex(8)
-        self._record_dream_trigger_job(job_id, minted_request, auth, status="running")
-        task = asyncio.create_task(
-            self._run_dream_trigger_job(job_id, minted_request, tenant, auth, lock_key)
-        )
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        try:
+            minted_scope = request.scope.model_copy(
+                update={"capabilities": {MemoryCapability.ADMIN_REBUILD}}
+            )
+            minted_request = RunDreamPhaseRequest(
+                scope=minted_scope,
+                phase=DreamPhase.SUMMARIZE,
+                # Deliberate: matches the fresh_context header-bound precedent
+                # (hosted_http.py). The phase still receives adapter-level
+                # `forbidden_secret_values` via `ports.secrets`.
+                redaction=RedactionContext(forbidden_values=()),
+            )
+            job_id = secrets.token_hex(8)
+            self._record_dream_trigger_job(job_id, minted_request, auth, status="running")
+            task = asyncio.create_task(
+                self._run_dream_trigger_job(job_id, minted_request, tenant, auth, lock_key)
+            )
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        except BaseException:
+            # Anything raised between acquiring the lock and successfully
+            # handing the job off to `asyncio.create_task` must release the
+            # lock -- otherwise it wedges forever: this trigger 500s and
+            # every subsequent trigger for the same (tenant, agent) silently
+            # returns `skipped`/`already_running` until process restart.
+            self._release_dream_trigger_lock(lock_key)
+            raise
         return TriggerDreamPhaseResult(status="scheduled")
 
     def _acquire_dream_trigger_lock(self, key: tuple[str, str | None]) -> bool:

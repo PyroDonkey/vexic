@@ -17,6 +17,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+import unittest.mock
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -24,6 +25,7 @@ from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
+import vexic.hosted as vexic_hosted
 from vexic.contract import (
     DreamPhase,
     FreshContextRequest,
@@ -246,6 +248,52 @@ class TriggerDreamPhaseServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.reason, "already_running")
 
         gate.set()
+        await self._await_only_task(service)
+
+    async def test_lock_is_released_when_scheduling_raises_after_acquire(self) -> None:
+        """Regression test: a post-acquire exception must not wedge the lock.
+
+        Before the fix, nothing between `_acquire_dream_trigger_lock` and
+        `asyncio.create_task` was guarded by try/except, so an exception
+        raised while minting the background request (e.g. a future
+        validation change) would leak the in-flight lock forever: the first
+        trigger 500s, and every subsequent trigger for that (tenant, agent)
+        returns `skipped`/`already_running` until process restart.
+        """
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.DREAM_TRIGGER},
+            project_ids={"project-a"},
+        )
+        _seed_compactable_span(tenant.db_path)
+        service = self._make_service(ports=self._fake_ports())
+        request = TriggerDreamPhaseRequest(
+            scope=_scope(capabilities={MemoryCapability.DREAM_TRIGGER}),
+            phase=DreamPhase.SUMMARIZE,
+        )
+
+        real_run_dream_phase_request = vexic_hosted.RunDreamPhaseRequest
+        call_count = {"n": 0}
+
+        def _boom_once(*args: object, **kwargs: object) -> object:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError("boom while minting request")
+            return real_run_dream_phase_request(*args, **kwargs)
+
+        with unittest.mock.patch.object(
+            vexic_hosted, "RunDreamPhaseRequest", side_effect=_boom_once
+        ):
+            with self.assertRaises(RuntimeError):
+                await service.trigger_dream_phase(api_key.raw_key, request)
+
+        # The lock must have been released by the failed attempt: a
+        # subsequent trigger schedules normally instead of being skipped.
+        second = await service.trigger_dream_phase(api_key.raw_key, request)
+        self.assertEqual(second.status, "scheduled")
+
         await self._await_only_task(service)
 
     async def test_missing_summary_agent_factory_fails_closed_synchronously(self) -> None:
