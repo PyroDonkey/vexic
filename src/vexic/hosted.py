@@ -1104,6 +1104,7 @@ class HostedMemoryService:
                 )
             )
         except Exception:
+            # Best-effort telemetry; recording must never fail the job itself.
             pass
 
 
@@ -1185,6 +1186,7 @@ class HostedBackgroundJobRunner:
         try:
             self.telemetry.record_job_event(event)
         except Exception:
+            # Best-effort telemetry; recording must never fail the job itself.
             pass
 
 

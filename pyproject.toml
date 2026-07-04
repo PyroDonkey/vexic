@@ -9,14 +9,25 @@ description = "Provenance-first memory core for long-running agents."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.13"
+authors = [{ name = "PyroDonkey" }]
+keywords = ["memory", "agents", "llm", "mcp", "sqlite", "retrieval"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+]
 dependencies = [
     "pydantic-ai==1.102.0",
     "sqlite-vec>=0.1.9",
 ]
 
 [project.urls]
+Homepage = "https://vexic.dev"
 Repository = "https://github.com/PyroDonkey/vexic"
 Issues = "https://github.com/PyroDonkey/vexic/issues"
+Changelog = "https://github.com/PyroDonkey/vexic/blob/main/CHANGELOG.md"
 
 [project.scripts]
 vexic = "vexic.cli:main"
