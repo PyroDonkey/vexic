@@ -349,6 +349,110 @@ class SummarizePhaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(len(session_b_frontier) >= 1)
             self.assertGreater(usage.total_tokens, 0)
 
+    async def test_leaf_pass_never_invokes_agent_on_forbidden_input(self) -> None:
+        # Fail-closed on the *input* side: a forbidden secret value present
+        # in the source transcript must be caught before `agent.run` is ever
+        # called for that session -- not merely scrubbed from the output.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            _save_session(
+                db_path,
+                "leaky-session",
+                count=3,
+                start=start,
+                text="s3cr3t-value body padding to add tokens " * 3,
+            )
+            _save_session(
+                db_path,
+                "clean-session",
+                count=3,
+                start=start + timedelta(hours=1),
+                text="CLEANMARKER body padding to add tokens " * 3,
+            )
+
+            leaky_agent = FakeSummaryAgent()
+            clean_agent = FakeSummaryAgent()
+
+            # Route by marker text instead of session id, since the rendered
+            # transcript source does not literally include the session id.
+            class MarkerRoutingAgent:
+                async def run(self, prompt: str):
+                    if "s3cr3t-value" in prompt:
+                        return await leaky_agent.run(prompt)
+                    return await clean_agent.run(prompt)
+
+            def factory(model_group: str, secrets=None):
+                return MarkerRoutingAgent()
+
+            usage = await run_summarize_phase(
+                db_path,
+                "glm",
+                summary_agent_factory=factory,
+                forbidden_secret_values=("s3cr3t-value",),
+                now_utc=start + timedelta(hours=6),
+            )
+
+            self.assertEqual(leaky_agent.calls, [])
+            leaky_frontier = fetch_session_summary_frontier(db_path, session_id="leaky-session")
+            clean_frontier = fetch_session_summary_frontier(db_path, session_id="clean-session")
+            self.assertEqual(leaky_frontier, [])
+            self.assertTrue(len(clean_frontier) >= 1)
+            self.assertGreater(usage.total_tokens, 0)
+
+    async def test_condense_pass_never_invokes_agent_on_forbidden_input(self) -> None:
+        # Same fail-closed guarantee for the condense pass: a forbidden
+        # secret value already present in a frontier summary's text must
+        # stop the condense agent from ever being called.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+            leaf_count = CONDENSE_MAX_FRONTIER_LEAVES + 1
+            message_ids = _save_session(
+                db_path,
+                "default",
+                count=leaf_count,
+                start=start,
+            )
+            # Seed the frontier with *no* forbidden values present (the
+            # write-side guard on record_session_summary would otherwise
+            # reject this setup), then run condense with forbidden set so
+            # the violation is only visible when building the condense
+            # source from the previously recorded summaries.
+            for index, message_id in enumerate(message_ids):
+                summary_text = (
+                    "s3cr3t-value leaf summary" if index == 0 else f"leaf summary for message {message_id}"
+                )
+                record_session_summary(
+                    db_path,
+                    session_id="default",
+                    kind="leaf",
+                    first_message_id=message_id,
+                    last_message_id=message_id,
+                    summary_text=summary_text,
+                )
+
+            agent = FakeSummaryAgent()
+
+            def factory(model_group: str, secrets=None):
+                return agent
+
+            await run_summarize_phase(
+                db_path,
+                "glm",
+                summary_agent_factory=factory,
+                forbidden_secret_values=("s3cr3t-value",),
+                now_utc=start + timedelta(hours=1),
+            )
+
+            self.assertEqual(agent.calls, [])
+            frontier = fetch_session_summary_frontier(db_path, session_id="default")
+            self.assertEqual(len(frontier), leaf_count)
+            self.assertTrue(all(s.kind == "leaf" for s in frontier))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -26,6 +26,7 @@ from collections.abc import Mapping
 from datetime import datetime
 
 from vexic.ports import AgentFactory, ContentCodec, missing_host_port
+from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage import (
     SessionSummary,
     fetch_session_summary_frontier,
@@ -106,6 +107,7 @@ async def _run_leaf_pass(
             last_message_id=last_message_id,
             content_codec=content_codec,
         )
+        assert_no_forbidden_secret_values(forbidden, source)
         result = await agent.run(source)
         span_usage = summarize_agent_usage(result)
         record_session_summary(
@@ -151,7 +153,9 @@ async def _run_condense_pass(
     # transcript messages that no summary in the run actually covers.
     run = _oldest_contiguous_run(frontier)
     condense_source = _render_condense_source(run)
-    result = await agent.run(f"Condense the following summaries:\n{condense_source}")
+    condense_prompt = f"Condense the following summaries:\n{condense_source}"
+    assert_no_forbidden_secret_values(forbidden, condense_prompt)
+    result = await agent.run(condense_prompt)
     condense_usage = summarize_agent_usage(result)
     record_session_summary(
         db_path,
