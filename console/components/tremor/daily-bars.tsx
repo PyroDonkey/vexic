@@ -26,7 +26,7 @@ export function DailyBars({ rows }: { rows: DailyRow[] }) {
           return (
             <div
               key={row.date}
-              className="flex flex-1 flex-col justify-end"
+              className="flex h-full flex-1 flex-col justify-end"
               title={`${row.date}: ${row.writes} writes, ${row.retrievals} retrievals, ${row.other} other`}
             >
               {SEGMENTS.map(({ key, className }) =>
