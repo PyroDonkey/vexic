@@ -2,7 +2,7 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DREAM_MODULES = ("pipeline.py", "rem.py", "deep.py")
+DREAM_MODULES = ("pipeline.py", "rem.py", "deep.py", "summarize.py")
 
 # dream_runs.error_detail and dream-phase prints are diagnostics. They must
 # record what failed (exception type, stack shape) and never what the user

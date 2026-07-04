@@ -126,3 +126,74 @@ $ uv run pytest -q
 - `summarize.py` is not added to `test_dream_error_policy.py`'s `DREAM_MODULES`
   tuple; the brief didn't ask for that file to be touched, and the module already
   independently follows the same content-free error-print convention.
+
+---
+
+## Fix round 1 (reviewer findings)
+
+### 1. Untested condense token-threshold branch — FIXED
+
+Added `test_condense_pass_triggers_on_frontier_token_threshold`: 3 leaves
+(well under the count threshold of 8), each with a 10,000-char summary_text
+(~2,500 tokens each, ~7,500 total > TAU_SOFT // 3 = 6,000), asserting the
+condense pass fires and replaces all 3 leaves.
+
+RED evidence — verified the test genuinely exercises the token branch by
+temporarily disabling it (`and frontier_tokens <= TAU_SOFT // 3` -> `and True`):
+
+```
+$ uv run pytest tests/test_summarize.py::SummarizePhaseTests::test_condense_pass_triggers_on_frontier_token_threshold -q
+FAILED tests/test_summarize.py::SummarizePhaseTests::test_condense_pass_triggers_on_frontier_token_threshold
+1 failed in 0.47s
+```
+
+Branch restored (git checkout); test passes against the real code.
+
+### 2. `summarize.py` added to `DREAM_MODULES` — FIXED
+
+`tests/test_dream_error_policy.py:5` now reads
+`DREAM_MODULES = ("pipeline.py", "rem.py", "deep.py", "summarize.py")`.
+All three guardrail tests pass against the new module unchanged (it already
+follows the content-free-error-print convention).
+
+### 3. Condense pass now condenses only the oldest contiguous run — FIXED
+
+`src/vexic/summarize.py`: new `_oldest_contiguous_run(frontier)` helper takes
+the longest frontier prefix whose message-id ranges are adjacent
+(`next.first_message_id == prev.last_message_id + 1`), stopping at the first
+gap. `_run_condense_pass` condenses only that run; `first_message_id` /
+`last_message_id` / `replaces_summary_ids` come from the run, not the whole
+frontier, so a condensed row can never span an uncovered transcript gap.
+Module docstring updated to drop the old whole-frontier contiguity claim.
+
+RED evidence — `test_condense_pass_condenses_only_oldest_contiguous_run`
+(synthetic gapped frontier: leaves over messages 0..8, gap at 9, leaves at
+10 and 11) against the pre-fix implementation:
+
+```
+$ uv run pytest tests/test_summarize.py -q
+E   AssertionError: Lists differ: ['condensed'] != ['condensed', 'leaf', 'leaf']
+1 failed, 6 passed in 0.80s
+```
+
+(The pre-fix code condensed the entire gapped frontier into one row spanning
+the uncovered message — exactly the bug the reviewer flagged.)
+
+### GREEN
+
+```
+$ uv run pytest tests/test_summarize.py tests/test_dream_error_policy.py -q
+10 passed in 0.57s
+
+$ uv run pytest -q
+631 passed, 16 skipped, 78 subtests passed in 13.49s
+```
+
+### Note on trigger vs. selection
+
+The condense *trigger* still evaluates the whole frontier (count > 8 or
+tokens > TAU_SOFT // 3, per brief), while the *selection* is the oldest
+contiguous run. With a gapped frontier a single pass may therefore leave the
+frontier still over-threshold; subsequent summarize runs converge as later
+gaps close. This matches the brief's wording (trigger on frontier, condense
+the oldest contiguous run).

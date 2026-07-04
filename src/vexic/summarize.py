@@ -11,9 +11,9 @@ access (see `vexic.pipeline.run_light_phase`):
   plain-text summary (`result.output`), recorded as a `leaf` row.
 - Condense pass: once the session's summary frontier gets too large (more
   than `CONDENSE_MAX_FRONTIER_LEAVES` entries, or more than a third of
-  `TAU_SOFT` tokens), the whole frontier -- which is always one contiguous
-  message-id run by construction (each leaf starts where the last coverage
-  left off) -- is condensed into a single `condensed` row that replaces it.
+  `TAU_SOFT` tokens), the oldest contiguous run of frontier summaries --
+  the prefix whose message-id ranges are adjacent, ending at the first gap
+  -- is condensed into a single `condensed` row that replaces it.
 
 Per-session error isolation: a failure summarizing one session (including a
 redaction violation) is swallowed and reported via a content-free print; the
@@ -56,6 +56,21 @@ def _forbidden_secret_values(
 
 def _render_condense_source(summaries: list[SessionSummary]) -> str:
     return "\n---\n".join(summary.summary_text for summary in summaries)
+
+
+def _oldest_contiguous_run(frontier: list[SessionSummary]) -> list[SessionSummary]:
+    """Longest prefix of the frontier whose message-id ranges are adjacent.
+
+    The frontier is ordered by ``first_message_id``; the run ends at the
+    first summary that does not start exactly one past the previous
+    summary's ``last_message_id``.
+    """
+    run = [frontier[0]]
+    for summary in frontier[1:]:
+        if summary.first_message_id != run[-1].last_message_id + 1:
+            break
+        run.append(summary)
+    return run
 
 
 async def _run_leaf_pass(
@@ -124,10 +139,12 @@ async def _run_condense_pass(
     ):
         return UsageSummary()
 
-    # The frontier is always one contiguous message-id run: each leaf starts
-    # where the previous coverage left off, so there is nothing to select --
-    # condensing the whole run collapses it back under both thresholds.
-    condense_source = _render_condense_source(frontier)
+    # Condense only the oldest contiguous run of frontier summaries: walk
+    # the frontier (ordered by message-id range) from the front and stop at
+    # the first gap in message-id adjacency. A condensed row must never span
+    # transcript messages that no summary in the run actually covers.
+    run = _oldest_contiguous_run(frontier)
+    condense_source = _render_condense_source(run)
     result = await agent.run(f"Condense the following summaries:\n{condense_source}")
     condense_usage = summarize_agent_usage(result)
     record_session_summary(
@@ -135,9 +152,9 @@ async def _run_condense_pass(
         session_id=session_id,
         agent_id=agent_id,
         kind="condensed",
-        first_message_id=frontier[0].first_message_id,
-        last_message_id=frontier[-1].last_message_id,
-        replaces_summary_ids=[summary.id for summary in frontier],
+        first_message_id=run[0].first_message_id,
+        last_message_id=run[-1].last_message_id,
+        replaces_summary_ids=[summary.id for summary in run],
         summary_text=result.output,
         usage=condense_usage,
         forbidden_secret_values=forbidden,

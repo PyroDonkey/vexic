@@ -155,6 +155,109 @@ class SummarizePhaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(frontier[0].first_message_id, message_ids[0])
             self.assertEqual(frontier[0].last_message_id, message_ids[-1])
 
+    async def test_condense_pass_triggers_on_frontier_token_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            start = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
+
+            # Few leaves (well under CONDENSE_MAX_FRONTIER_LEAVES) but each
+            # with a huge summary_text so the frontier's token_estimate total
+            # exceeds TAU_SOFT // 3 (6000 tokens): 3 leaves x 10_000 chars
+            # ~= 7500 tokens. Only the token branch can trigger condense here.
+            leaf_count = 3
+            message_ids = _save_session(
+                db_path,
+                "default",
+                count=leaf_count,
+                start=start,
+            )
+            for message_id in message_ids:
+                record_session_summary(
+                    db_path,
+                    session_id="default",
+                    kind="leaf",
+                    first_message_id=message_id,
+                    last_message_id=message_id,
+                    summary_text="verbose summary " * 625,  # 10_000 chars
+                )
+
+            agent = FakeSummaryAgent()
+
+            def factory(model_group: str, secrets=None):
+                return agent
+
+            await run_summarize_phase(
+                db_path,
+                "glm",
+                summary_agent_factory=factory,
+                now_utc=start + timedelta(hours=1),
+            )
+
+            frontier = fetch_session_summary_frontier(db_path, session_id="default")
+            self.assertEqual(len(frontier), 1)
+            self.assertEqual(frontier[0].kind, "condensed")
+            self.assertEqual(len(frontier[0].replaces_summary_ids), leaf_count)
+            self.assertEqual(frontier[0].first_message_id, message_ids[0])
+            self.assertEqual(frontier[0].last_message_id, message_ids[-1])
+
+    async def test_condense_pass_condenses_only_oldest_contiguous_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            start = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
+
+            # 12 messages; leaves cover messages 0..8 contiguously, then a
+            # gap (message index 9 uncovered), then leaves for 10 and 11.
+            # The uncovered gap is small (no time boundary, well under
+            # tau_soft), so no new leaf span fires and the gapped frontier
+            # persists into the condense pass. The frontier count (11)
+            # exceeds CONDENSE_MAX_FRONTIER_LEAVES, but only the oldest
+            # contiguous run (the first 9 leaves) may be condensed -- the
+            # condensed row must never span the uncovered gap.
+            message_ids = _save_session(
+                db_path,
+                "default",
+                count=12,
+                start=start,
+            )
+            covered_indices = [*range(9), 10, 11]
+            for index in covered_indices:
+                record_session_summary(
+                    db_path,
+                    session_id="default",
+                    kind="leaf",
+                    first_message_id=message_ids[index],
+                    last_message_id=message_ids[index],
+                    summary_text=f"leaf summary for message {message_ids[index]}",
+                )
+
+            agent = FakeSummaryAgent()
+
+            def factory(model_group: str, secrets=None):
+                return agent
+
+            await run_summarize_phase(
+                db_path,
+                "glm",
+                summary_agent_factory=factory,
+                now_utc=start + timedelta(hours=1),
+            )
+
+            frontier = fetch_session_summary_frontier(db_path, session_id="default")
+            self.assertEqual(
+                [summary.kind for summary in frontier],
+                ["condensed", "leaf", "leaf"],
+            )
+            condensed = frontier[0]
+            self.assertEqual(condensed.first_message_id, message_ids[0])
+            self.assertEqual(condensed.last_message_id, message_ids[8])
+            self.assertEqual(len(condensed.replaces_summary_ids), 9)
+            self.assertEqual(
+                [summary.first_message_id for summary in frontier[1:]],
+                [message_ids[10], message_ids[11]],
+            )
+
     async def test_redaction_failure_records_error_and_continues_other_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = str(Path(temp_dir) / "memory.db")
