@@ -95,6 +95,7 @@ class _HeaderBoundFreshContextBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     token_budget: int = 6_000
+    redaction: RedactionContext = RedactionContext(forbidden_values=())
 
 
 def create_app(
@@ -342,7 +343,7 @@ async def _handle_fresh_context(
             payload = FreshContextRequest(
                 scope=_fresh_context_scope_from_headers(request, auth),
                 token_budget=fresh.token_budget,
-                redaction=RedactionContext(forbidden_values=()),
+                redaction=fresh.redaction,
             )
     except ValidationError:
         return _error_response(

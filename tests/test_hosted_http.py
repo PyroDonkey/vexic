@@ -1817,6 +1817,45 @@ class HostedHttpTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
 
+    def test_fresh_context_header_bound_redaction_rejects_forbidden_value(self) -> None:
+        api_key = self._api_key(
+            capabilities={MemoryCapability.WRITE, MemoryCapability.FRESH_CONTEXT}
+        )
+        self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key),
+            json=self._append_body("contains cedar-secret value"),
+        )
+
+        response = self.client.post(
+            "/v1/fresh_context",
+            headers=self._write_headers(api_key),
+            json={"redaction": {"forbidden_values": ["cedar-secret"]}},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], "invalid_request")
+        self.assertNotIn("cedar-secret value", response.text)
+
+    def test_fresh_context_header_bound_redaction_allows_clean_result(self) -> None:
+        api_key = self._api_key(
+            capabilities={MemoryCapability.WRITE, MemoryCapability.FRESH_CONTEXT}
+        )
+        self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key),
+            json=self._append_body("harmless cedar"),
+        )
+
+        response = self.client.post(
+            "/v1/fresh_context",
+            headers=self._write_headers(api_key),
+            json={"redaction": {"forbidden_values": ["unrelated-secret"]}},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("harmless cedar", response.json()["text"])
+
     def test_fresh_context_truncates_oversized_text(self) -> None:
         api_key = self._api_key(
             capabilities={MemoryCapability.WRITE, MemoryCapability.FRESH_CONTEXT}
