@@ -44,6 +44,20 @@ export async function usageSummary(orgId, projectId) {
   return normalizeUsage(data.usage);
 }
 
+export async function usageDaily(orgId, projectId) {
+  const data = await request(
+    orgId,
+    "GET",
+    `/projects/${encodeURIComponent(projectId)}/usage?granularity=day&days=30`
+  );
+  return data.usage?.daily ?? [];
+}
+
+export async function usageByKey(orgId, projectId) {
+  const data = await request(orgId, "GET", `/projects/${encodeURIComponent(projectId)}/usage/by-key?days=30`);
+  return data.byKey ?? [];
+}
+
 export async function supportMetadata(_orgId) {
   return [];
 }

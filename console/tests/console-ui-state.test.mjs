@@ -7,7 +7,13 @@ import { fileURLToPath } from "node:url";
 import { dark } from "@clerk/themes";
 
 import { clerkBaseThemeFor } from "../lib/clerk-theme.mjs";
-import { keyFreshness, projectCreateFailureMessage, usageMeterDisplay, usageRows } from "../lib/console-ui-state.mjs";
+import {
+  capStatus,
+  keyFreshness,
+  projectCreateFailureMessage,
+  usageMeterDisplay,
+  usageRows
+} from "../lib/console-ui-state.mjs";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 
@@ -100,4 +106,12 @@ test("keyFreshness flags keys unused for more than 30 days as stale", () => {
   const stale = keyFreshness("2026-05-01T00:00:00Z", "2026-07-03T00:00:00Z");
   assert.equal(stale.stale, true);
   assert.match(stale.label, /May 1|2026/);
+});
+
+test("capStatus thresholds: ok below 80, warn at 80, alert at 95, none without cap", () => {
+  assert.equal(capStatus(50, 100).level, "ok");
+  assert.equal(capStatus(80, 100).level, "warn");
+  assert.equal(capStatus(95, 100).level, "alert");
+  assert.equal(capStatus(120, 100).level, "alert");
+  assert.equal(capStatus(50, 0).level, "none");
 });

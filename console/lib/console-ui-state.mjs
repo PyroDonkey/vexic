@@ -55,6 +55,16 @@ export function keyFreshness(lastUsedAt, nowIso = new Date().toISOString()) {
   };
 }
 
+export function capStatus(value, max) {
+  if (!max || max <= 0) {
+    return { level: "none" };
+  }
+  const ratio = value / max;
+  if (ratio >= 0.95) return { level: "alert" };
+  if (ratio >= 0.8) return { level: "warn" };
+  return { level: "ok" };
+}
+
 function formatLabel(value) {
   return value.replace(/([A-Z])/g, " $1").replace(/^./, (match) => match.toUpperCase());
 }

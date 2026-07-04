@@ -67,6 +67,14 @@ export function supportMetadata(orgId) {
   return selectedStore().supportMetadata(orgId);
 }
 
+export function usageDaily(orgId, projectId) {
+  return selectedStore().usageDaily(orgId, projectId);
+}
+
+export function usageByKey(orgId, projectId) {
+  return selectedStore().usageByKey(orgId, projectId);
+}
+
 function stubCreateProject(orgId, input = {}) {
   const timestamp = now();
   const project = {
@@ -178,6 +186,33 @@ function stubUsageSummary(orgId, projectId) {
   };
 }
 
+function stubUsageDaily(orgId, projectId) {
+  if (!stubGetProject(orgId, projectId)) {
+    return null;
+  }
+  const rows = [];
+  for (let back = 13; back >= 0; back -= 1) {
+    const day = new Date(Date.now() - back * 86_400_000);
+    rows.push({
+      date: day.toISOString().slice(0, 10),
+      writes: 3 + ((back * 7) % 9),
+      retrievals: 20 + ((back * 13) % 31),
+      other: (back * 3) % 5
+    });
+  }
+  return rows;
+}
+
+function stubUsageByKey(orgId, projectId) {
+  const keys = stubListAgentKeys(orgId, projectId, { includeRevoked: false });
+  if (keys === null) {
+    return null;
+  }
+  const rows = keys.map((key, index) => ({ keyId: key.id, requests: 240 - index * 60 }));
+  rows.push({ keyId: null, requests: 12 });
+  return rows;
+}
+
 function stubSupportMetadata(orgId) {
   const projects = stubListProjects(orgId);
   const timestamp = now();
@@ -247,7 +282,9 @@ const stubStore = {
   listAgentKeys: stubListAgentKeys,
   revokeAgentKey: stubRevokeAgentKey,
   usageSummary: stubUsageSummary,
-  supportMetadata: stubSupportMetadata
+  supportMetadata: stubSupportMetadata,
+  usageDaily: stubUsageDaily,
+  usageByKey: stubUsageByKey
 };
 
 const failClosedStore = {
@@ -258,7 +295,9 @@ const failClosedStore = {
   listAgentKeys: notConfigured,
   revokeAgentKey: notConfigured,
   usageSummary: notConfigured,
-  supportMetadata: notConfigured
+  supportMetadata: notConfigured,
+  usageDaily: notConfigured,
+  usageByKey: notConfigured
 };
 
 function notConfigured() {
