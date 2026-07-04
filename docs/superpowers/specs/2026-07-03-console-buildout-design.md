@@ -113,7 +113,7 @@ carry the console.
   `UPDATE ... SET last_used_at = now WHERE key_id = ? AND (last_used_at IS
   NULL OR last_used_at < now - 60s)` — the guard lives in the database, not
   in process memory, so it stays correct across restarts and across multiple
-  adapter processes if the ADR 0013/COA-263 process split ever lands.
+  adapter processes if the ADR 0013 process split ever lands.
 - Revoked-key history: key list endpoint gains `?include=revoked`. The
   current store query hardcodes revoked-exclusion in its SQL, so this is a
   new store query variant, not a parameter pass-through. Console shows a
