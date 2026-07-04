@@ -52,7 +52,7 @@ export function SiteNav() {
             onClick={() => setOpen(false)}
             className="rounded-md bg-primary px-3.5 py-2 font-mono text-sm font-semibold text-primary-foreground transition-[filter,translate] hover:brightness-110 active:translate-y-px active:brightness-95"
           >
-            Get early access
+            Join the waitlist
           </a>
           <button
             type="button"

@@ -99,7 +99,7 @@ export function WaitlistForm({
               disabled={state.status === "submitting"}
               className="h-11 w-full rounded-md bg-primary px-5 font-mono text-sm font-semibold whitespace-nowrap text-primary-foreground sm:w-auto transition-[filter,translate] hover:brightness-110 active:translate-y-px active:brightness-95 disabled:opacity-60"
             >
-              {state.status === "submitting" ? "Requesting…" : "Request early access"}
+              {state.status === "submitting" ? "Joining…" : "Join the waitlist"}
             </button>
           </div>
           {showNote && (
