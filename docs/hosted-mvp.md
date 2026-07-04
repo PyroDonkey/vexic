@@ -510,9 +510,12 @@ environment that already carries the dream-phase env config both flags may be
 omitted. The adapter file must define `embed_texts`, `build_extraction_agent`,
 and `build_contradiction_agent`. `build_summary_agent` is optional: an
 adapter that omits it can still run `light`/`rem`/`deep`, but
-`run-dream-phase --phase summarize` fails closed with `HostPortNotConfigured`
-(a CLI error locally, a `503` over the hosted HTTP dream-phase route) until
-the adapter exposes it. Provider secrets stay in the host environment; pass
+`run-dream-phase --phase summarize` fails closed with a `HostPortNotConfigured`
+CLI error until the adapter exposes it. (There is no HTTP route for dream
+phases today -- `run-dream-phase` is CLI-only -- but if one is added later,
+`HostPortNotConfigured` maps to `503` via the shared hosted-error mapping,
+same as other missing-port failures.) Provider secrets stay in the host
+environment; pass
 secret variable names with `--secret-env NAME` when Vexic should include those
 values in redaction checks.
 

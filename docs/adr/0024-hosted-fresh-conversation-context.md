@@ -173,9 +173,9 @@ ADR 0018 posture that a hosted outage must not block Claude Code startup.
 - Extends the Dream Pipeline from three phases to four; `docs/architecture.md`
   and `docs/memory-service-contract.md` document `DreamPhase.SUMMARIZE`
   alongside Light/REM/Deep.
-- Adds a fourth retrieval family (transcript search, long-term search,
-  candidate fallback, and now fresh context) with its own capability, rather
-  than overloading `memory:search` or `memory:expand`.
+- Adds a third retrieval family (transcript search, long-term search --
+  which includes candidate fallback -- and now fresh context) with its own
+  capability, rather than overloading `memory:search` or `memory:expand`.
 - `session_summaries` becomes load-bearing for the hosted read path, not just
   a standalone helper table; it stays a rebuildable projection, so a
   corrupted or missing frontier degrades to the raw-tail fallback rather than
