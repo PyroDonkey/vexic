@@ -82,6 +82,7 @@ async def _run_leaf_pass(
     timezone_name: str,
     now_utc: datetime | None,
     forbidden: list[str],
+    content_codec: ContentCodec | None,
 ) -> UsageSummary:
     usage = UsageSummary()
     while True:
@@ -91,6 +92,7 @@ async def _run_leaf_pass(
             agent_id=agent_id,
             timezone_name=timezone_name,
             now_utc=now_utc,
+            content_codec=content_codec,
         )
         if span is None:
             return usage
@@ -102,6 +104,7 @@ async def _run_leaf_pass(
             agent_id=agent_id,
             first_message_id=first_message_id,
             last_message_id=last_message_id,
+            content_codec=content_codec,
         )
         result = await agent.run(source)
         span_usage = summarize_agent_usage(result)
@@ -115,6 +118,7 @@ async def _run_leaf_pass(
             summary_text=result.output,
             usage=span_usage,
             forbidden_secret_values=forbidden,
+            content_codec=content_codec,
         )
         usage = usage.plus(span_usage)
 
@@ -126,11 +130,13 @@ async def _run_condense_pass(
     session_id: str,
     agent_id: str | None,
     forbidden: list[str],
+    content_codec: ContentCodec | None,
 ) -> UsageSummary:
     frontier = fetch_session_summary_frontier(
         db_path,
         session_id=session_id,
         agent_id=agent_id,
+        content_codec=content_codec,
     )
     frontier_tokens = sum(summary.token_estimate for summary in frontier)
     if (
@@ -158,6 +164,7 @@ async def _run_condense_pass(
         summary_text=result.output,
         usage=condense_usage,
         forbidden_secret_values=forbidden,
+        content_codec=content_codec,
     )
     return condense_usage
 
@@ -197,6 +204,7 @@ async def run_summarize_phase(
                 timezone_name=timezone_name,
                 now_utc=now_utc,
                 forbidden=forbidden,
+                content_codec=content_codec,
             )
             condense_usage = await _run_condense_pass(
                 db_path,
@@ -204,6 +212,7 @@ async def run_summarize_phase(
                 session_id=session_id,
                 agent_id=agent_id,
                 forbidden=forbidden,
+                content_codec=content_codec,
             )
             usage = usage.plus(leaf_usage).plus(condense_usage)
         except Exception as exc:

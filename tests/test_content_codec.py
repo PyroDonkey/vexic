@@ -22,7 +22,15 @@ from vexic.contract import (
     TrustBoundary,
 )
 from vexic.service import LocalMemoryService
-from vexic.storage import init_db, single_message_adapter
+from vexic.storage import (
+    fetch_session_summary_frontier,
+    init_db,
+    record_session_summary,
+    render_session_recap,
+    save_messages,
+    single_message_adapter,
+)
+from vexic.summarize import run_summarize_phase
 
 SENTINEL = "cedarcodecsecret"
 PREFIX = "vxtest:"
@@ -223,6 +231,171 @@ class ContentCodecTests(unittest.IsolatedAsyncioTestCase):
             ).fetchone()[0]
         self.assertIn("plain default", stored)
         json.loads(stored)
+
+
+class _EchoSummaryAgent:
+    """Fake AgentFactory-compatible agent that records the plaintext prompt
+    it was handed, proving the summarize phase decodes compaction source
+    before invoking the agent even when the transcript is codec-encoded."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def run(self, prompt: str):
+        from types import SimpleNamespace
+
+        self.calls.append(prompt)
+        return SimpleNamespace(
+            output=f"summary of: {prompt}",
+            usage=lambda: SimpleNamespace(
+                requests=1, input_tokens=5, output_tokens=3, total_tokens=8
+            ),
+        )
+
+
+class SessionSummaryContentCodecTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.temp_dir.name) / "memory.db")
+        init_db(self.db_path)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_record_and_fetch_session_summary_round_trips_through_codec(self) -> None:
+        codec = Base64Codec()
+        record_session_summary(
+            self.db_path,
+            session_id="session-1",
+            kind="leaf",
+            first_message_id=1,
+            last_message_id=1,
+            summary_text=f"{SENTINEL} plaintext summary",
+            content_codec=codec,
+        )
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            stored = conn.execute(
+                "SELECT summary_text FROM session_summaries WHERE session_id = ?",
+                ("session-1",),
+            ).fetchone()[0]
+        self.assertNotIn(SENTINEL, stored)
+        self.assertTrue(stored.startswith(PREFIX))
+
+        frontier = fetch_session_summary_frontier(
+            self.db_path, session_id="session-1", content_codec=codec
+        )
+        self.assertEqual(len(frontier), 1)
+        self.assertIn(SENTINEL, frontier[0].summary_text)
+
+    def test_render_session_recap_decodes_with_codec(self) -> None:
+        codec = Base64Codec()
+        record_session_summary(
+            self.db_path,
+            session_id="session-1",
+            kind="leaf",
+            first_message_id=1,
+            last_message_id=1,
+            summary_text=f"{SENTINEL} recap body",
+            content_codec=codec,
+        )
+
+        recap = render_session_recap(
+            self.db_path, session_id="session-1", content_codec=codec
+        )
+        self.assertIn(SENTINEL, recap)
+
+    def test_record_session_summary_redaction_runs_on_plaintext_before_encode(
+        self,
+    ) -> None:
+        codec = Base64Codec()
+        with self.assertRaises(ValueError):
+            record_session_summary(
+                self.db_path,
+                session_id="session-1",
+                kind="leaf",
+                first_message_id=1,
+                last_message_id=1,
+                summary_text="the secret is s3cr3t-value",
+                forbidden_secret_values=("s3cr3t-value",),
+                content_codec=codec,
+            )
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM session_summaries WHERE session_id = ?",
+                ("session-1",),
+            ).fetchone()
+        self.assertEqual(row[0], 0)
+
+    async def test_run_summarize_phase_encodes_storage_and_decodes_agent_input(
+        self,
+    ) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        codec = Base64Codec()
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        save_messages(
+            self.db_path,
+            [
+                single_message_adapter.validate_python(
+                    {
+                        "parts": [
+                            {
+                                "part_kind": "user-prompt",
+                                "content": f"{SENTINEL} message body padding to add tokens #{i}",
+                            }
+                        ],
+                        "kind": "request",
+                    }
+                )
+                for i in range(3)
+            ],
+            session_id="default",
+            content_codec=codec,
+            timestamp=start.isoformat(),
+        )
+
+        agent = _EchoSummaryAgent()
+
+        def factory(model_group: str, secrets=None):
+            return agent
+
+        await run_summarize_phase(
+            self.db_path,
+            "glm",
+            summary_agent_factory=factory,
+            now_utc=start + timedelta(hours=6),
+            content_codec=codec,
+        )
+
+        # The agent must have seen decoded plaintext compaction source.
+        self.assertTrue(agent.calls)
+        self.assertTrue(any(SENTINEL in call for call in agent.calls))
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            stored_messages = conn.execute(
+                "SELECT message_json FROM messages WHERE session_id = ?",
+                ("default",),
+            ).fetchall()
+            stored_summaries = conn.execute(
+                "SELECT summary_text FROM session_summaries WHERE session_id = ?",
+                ("default",),
+            ).fetchall()
+        self.assertTrue(stored_messages)
+        for (message_json,) in stored_messages:
+            self.assertNotIn(SENTINEL, message_json)
+            self.assertTrue(message_json.startswith(PREFIX))
+        self.assertTrue(stored_summaries)
+        for (summary_text,) in stored_summaries:
+            self.assertNotIn(SENTINEL, summary_text)
+            self.assertTrue(summary_text.startswith(PREFIX))
+
+        frontier = fetch_session_summary_frontier(
+            self.db_path, session_id="default", content_codec=codec
+        )
+        self.assertTrue(frontier)
+        self.assertTrue(any(SENTINEL in summary.summary_text for summary in frontier))
 
 
 if __name__ == "__main__":

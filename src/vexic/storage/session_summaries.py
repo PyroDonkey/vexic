@@ -12,7 +12,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic_ai.messages import ModelMessage
 
+from vexic.ports import ContentCodec
 from vexic.storage.transcript import (
+    _decode_stored,
+    _encode_stored,
     _message_token_estimate,
     _trim_unpaired_tool_messages,
     load_messages_in_id_range,
@@ -59,14 +62,17 @@ def _parse_replaces_summary_ids(raw: str) -> tuple[int, ...]:
     return tuple(int(value) for value in values)
 
 
-def _summary_from_row(row: Sequence[object]) -> SessionSummary:
+def _summary_from_row(
+    row: Sequence[object],
+    content_codec: ContentCodec | None = None,
+) -> SessionSummary:
     return SessionSummary(
         id=int(row[0]),
         session_id=str(row[1]),
         kind=str(row[2]),  # type: ignore[arg-type]
         first_message_id=int(row[3]),
         last_message_id=int(row[4]),
-        summary_text=str(row[5]),
+        summary_text=_decode_stored(content_codec, str(row[5])),
         token_estimate=int(row[6]),
         replaces_summary_ids=_parse_replaces_summary_ids(str(row[7])),
         model_requests=int(row[8]),
@@ -89,9 +95,11 @@ def record_session_summary(
     replaces_summary_ids: list[int] | tuple[int, ...] = (),
     usage: UsageSummary = UsageSummary(),
     forbidden_secret_values: tuple[str, ...] = (),
+    content_codec: ContentCodec | None = None,
 ) -> int:
     assert_no_forbidden_secret_values(forbidden_secret_values, summary_text)
     token_estimate = estimate_tokens(summary_text)
+    stored_summary_text = _encode_stored(content_codec, summary_text)
     replaces_json = json.dumps(list(replaces_summary_ids))
     with closing(connect(db_path)) as conn:
         with conn:
@@ -110,7 +118,7 @@ def record_session_summary(
                     kind,
                     first_message_id,
                     last_message_id,
-                    summary_text,
+                    stored_summary_text,
                     token_estimate,
                     replaces_json,
                     usage.model_requests,
@@ -128,6 +136,7 @@ def fetch_session_summary_frontier(
     *,
     session_id: str,
     agent_id: str | None = None,
+    content_codec: ContentCodec | None = None,
 ) -> list[SessionSummary]:
     with closing(connect(db_path)) as conn:
         rows = conn.execute(
@@ -144,7 +153,7 @@ def fetch_session_summary_frontier(
             (session_id, agent_id),
         ).fetchall()
 
-    summaries = [_summary_from_row(row) for row in rows]
+    summaries = [_summary_from_row(row, content_codec) for row in rows]
     replaced = {
         summary_id
         for summary in summaries
@@ -297,12 +306,14 @@ def estimate_session_tokens(
     *,
     session_id: str,
     agent_id: str | None = None,
+    content_codec: ContentCodec | None = None,
 ) -> int:
     return _estimate_session_tokens_from_id(
         db_path,
         session_id=session_id,
         agent_id=agent_id,
         first_message_id=None,
+        content_codec=content_codec,
     )
 
 
@@ -312,6 +323,7 @@ def _estimate_session_tokens_from_id(
     session_id: str,
     agent_id: str | None,
     first_message_id: int | None,
+    content_codec: ContentCodec | None = None,
 ) -> int:
     total = 0
     where_clause = "session_id = ? AND agent_id IS ?"
@@ -332,7 +344,9 @@ def _estimate_session_tokens_from_id(
         ).fetchall()
         for row in rows:
             msg = strip_prompt_payloads(
-                single_message_adapter.validate_python(json.loads(row[0]))
+                single_message_adapter.validate_python(
+                    json.loads(_decode_stored(content_codec, row[0]))
+                )
             )
             total += _message_token_estimate(msg)
     return total
@@ -346,6 +360,7 @@ def find_session_compaction_span(
     timezone_name: str,
     now_utc: datetime | None = None,
     tau_soft: int = TAU_SOFT,
+    content_codec: ContentCodec | None = None,
 ) -> tuple[int, int] | None:
     if session_id.startswith("onboarding:"):
         return None
@@ -359,6 +374,7 @@ def find_session_compaction_span(
         db_path,
         session_id=session_id,
         agent_id=agent_id,
+        content_codec=content_codec,
     )
     covered_until = _frontier_covered_prefix(
         frontier,
@@ -381,6 +397,7 @@ def find_session_compaction_span(
         session_id=session_id,
         agent_id=agent_id,
         first_message_id=next_uncovered,
+        content_codec=content_codec,
     )
     if uncovered_tokens > tau_soft:
         return next_uncovered, last_message_id
@@ -394,6 +411,7 @@ def render_compaction_source(
     agent_id: str | None = None,
     first_message_id: int,
     last_message_id: int,
+    content_codec: ContentCodec | None = None,
 ) -> str:
     hits = load_messages_in_id_range(
         db_path,
@@ -401,6 +419,7 @@ def render_compaction_source(
         last_message_id,
         session_id=session_id,
         agent_id=agent_id,
+        content_codec=content_codec,
     )
     return "\n---\n".join(hit.body for hit in hits)
 
@@ -431,6 +450,7 @@ def _load_messages_after_id_by_token_budget(
     session_id: str,
     agent_id: str | None,
     after_id: int,
+    content_codec: ContentCodec | None = None,
 ) -> list[ModelMessage]:
     rows = _load_active_context_rows_by_token_budget(
         db_path,
@@ -438,6 +458,7 @@ def _load_messages_after_id_by_token_budget(
         session_id=session_id,
         agent_id=agent_id,
         after_id=after_id,
+        content_codec=content_codec,
     )
     return _trim_unpaired_tool_messages([row.message for row in rows])
 
@@ -449,6 +470,7 @@ def _load_active_context_rows_by_token_budget(
     session_id: str,
     agent_id: str | None = None,
     after_id: int | None = None,
+    content_codec: ContentCodec | None = None,
 ) -> list[_ActiveContextRow]:
     if token_budget < 0:
         raise ValueError("token_budget must be greater than or equal to 0.")
@@ -475,7 +497,9 @@ def _load_active_context_rows_by_token_budget(
         ).fetchall()
         for row in rows:
             msg = strip_prompt_payloads(
-                single_message_adapter.validate_python(json.loads(row[2]))
+                single_message_adapter.validate_python(
+                    json.loads(_decode_stored(content_codec, row[2]))
+                )
             )
             estimate = _message_token_estimate(msg)
             if selected and total + estimate > token_budget:
@@ -501,12 +525,14 @@ def load_active_context_messages(
     agent_id: str | None = None,
     timezone_name: str = "UTC",
     now_utc: datetime | None = None,
+    content_codec: ContentCodec | None = None,
 ) -> list[ModelMessage]:
     tail_rows = _load_active_context_rows_by_token_budget(
         db_path,
         token_budget=token_budget,
         session_id=session_id,
         agent_id=agent_id,
+        content_codec=content_codec,
     )
     if not tail_rows:
         return []
@@ -531,6 +557,7 @@ def load_active_context_messages(
         db_path,
         session_id=session_id,
         agent_id=agent_id,
+        content_codec=content_codec,
     )
     if not _frontier_covers(
         frontier,
@@ -545,6 +572,7 @@ def load_active_context_messages(
         session_id=session_id,
         agent_id=agent_id,
         after_id=boundary_id,
+        content_codec=content_codec,
     )
 
 
@@ -554,6 +582,7 @@ def render_session_recap(
     session_id: str,
     agent_id: str | None = None,
     forbidden_secret_values: tuple[str, ...] = (),
+    content_codec: ContentCodec | None = None,
 ) -> str:
     if session_id.startswith("onboarding:"):
         return ""
@@ -564,6 +593,7 @@ def render_session_recap(
             db_path,
             session_id=session_id,
             agent_id=agent_id,
+            content_codec=content_codec,
         )
     except sqlite3.Error:
         return ""
