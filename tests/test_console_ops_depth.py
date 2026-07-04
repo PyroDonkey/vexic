@@ -112,5 +112,49 @@ class LastUsedAtTests(ConsoleOpsDepthHarness):
         self.assertIsNone(row[0])
 
 
+class KeyListLifecycleTests(ConsoleOpsDepthHarness):
+    def test_key_list_includes_last_used_at(self) -> None:
+        project = self._create_project()
+        created = self._create_key("org_123", project["id"])
+        self.keys.authenticate(created["rawKey"])
+
+        response = self.client.get(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/keys",
+            headers=self._control_auth(),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        key = response.json()["keys"][0]
+        self.assertIn("lastUsedAt", key)
+        self.assertIsNotNone(key["lastUsedAt"])
+
+    def test_key_list_excludes_revoked_by_default_and_includes_on_request(self) -> None:
+        project = self._create_project()
+        created = self._create_key("org_123", project["id"])
+        key_id = created["key"]["id"]
+        revoke = self.client.post(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/keys/{key_id}/revoke",
+            headers=self._control_auth(),
+        )
+        self.assertEqual(revoke.status_code, 204)
+
+        default = self.client.get(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/keys",
+            headers=self._control_auth(),
+        )
+        self.assertEqual(default.json()["keys"], [])
+
+        included = self.client.get(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/keys?include=revoked",
+            headers=self._control_auth(),
+        )
+        keys = included.json()["keys"]
+        self.assertEqual(len(keys), 1)
+        self.assertEqual(keys[0]["id"], key_id)
+        self.assertIsNotNone(keys[0]["revokedAt"])
+        for forbidden in ("keyHash", "key_hash", "rawKey"):
+            self.assertNotIn(forbidden, keys[0])
+
+
 if __name__ == "__main__":
     unittest.main()

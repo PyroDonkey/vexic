@@ -169,6 +169,7 @@ class HostedApiKeyRecord:
     display: str
     created_at: str
     revoked_at: str | None = None
+    last_used_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1214,25 +1215,36 @@ class HostedApiKeyStore:
         *,
         tenant_id: str,
         project_id: str,
+        include_revoked: bool = False,
     ) -> list[HostedApiKeyRecord]:
         if self._control_target is None:
-            return [
-                replace(record, revoked_at=self._keys[record.key_id].revoked_at)
-                for record in self._control_metadata.values()
-                if record.tenant_id == tenant_id
-                and record.project_id == project_id
-                and self._keys[record.key_id].revoked_at is None
-            ]
+            records = []
+            for record in self._control_metadata.values():
+                if record.tenant_id != tenant_id or record.project_id != project_id:
+                    continue
+                stored = self._keys[record.key_id]
+                if stored.revoked_at is not None and not include_revoked:
+                    continue
+                records.append(
+                    replace(
+                        record,
+                        revoked_at=stored.revoked_at,
+                        last_used_at=stored.last_used_at,
+                    )
+                )
+            return records
+        revoked_filter = "" if include_revoked else "AND keys.revoked_at IS NULL"
         with closing(self._connect_control()) as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT
                     meta.key_id, meta.tenant_id, meta.project_id, meta.name,
                     meta.capability, meta.agent_scope, meta.key_prefix,
-                    meta.last4, meta.display, meta.created_at, keys.revoked_at
+                    meta.last4, meta.display, meta.created_at, keys.revoked_at,
+                    keys.last_used_at
                 FROM hosted_api_key_metadata AS meta
                 JOIN hosted_api_keys AS keys ON keys.key_id = meta.key_id
-                WHERE meta.tenant_id = ? AND meta.project_id = ? AND keys.revoked_at IS NULL
+                WHERE meta.tenant_id = ? AND meta.project_id = ? {revoked_filter}
                 ORDER BY meta.created_at, meta.key_id
                 """,
                 (tenant_id, project_id),
@@ -1250,6 +1262,7 @@ class HostedApiKeyStore:
                 display=row[8],
                 created_at=row[9],
                 revoked_at=row[10],
+                last_used_at=row[11],
             )
             for row in rows
         ]

@@ -174,6 +174,7 @@ def register_control_plane_routes(
         keys = service.api_keys.list_control_plane_keys(
             tenant_id=tenant_id,
             project_id=project_id,
+            include_revoked=request.query_params.get("include") == "revoked",
         )
         return JSONResponse({"keys": [_key_payload(key) for key in keys]})
 
@@ -509,6 +510,7 @@ def _key_payload(key) -> dict[str, object]:
         "display": key.display,
         "createdAt": key.created_at,
         "revokedAt": key.revoked_at,
+        "lastUsedAt": key.last_used_at,
     }
 
 
