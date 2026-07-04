@@ -18,6 +18,7 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
+from vexic.contract import PRIME_CONTEXT_HEADER
 from vexic.ports import ContentCodec
 from vexic.storage.errors import is_operational_error, is_unique_violation
 from vexic.storage.schema import _assert_no_forbidden_secret_values, _fts_match_query
@@ -472,6 +473,12 @@ def ingest_source_messages(
                 msg_json = single_message_adapter.dump_json(message).decode()
                 body = message_search_text(message)
                 reason = _polluted_transcript_reason(message)
+                if reason is None and PRIME_CONTEXT_HEADER in body:
+                    # Recorder-injected SessionStart priming recap must never
+                    # re-enter Tier 1 (and, downstream, Light extraction);
+                    # this is the ingest-side backstop for WI-6's layer-1
+                    # recorder guard.
+                    reason = "prime context is not transcript text"
                 if reason is None:
                     try:
                         _assert_no_forbidden_secret_values(

@@ -47,6 +47,7 @@ class DreamPhasePorts:
     embed: EmbedTexts | None = None
     extraction_agent_factory: AgentFactory | None = None
     contradiction_agent_factory: AgentFactory | None = None
+    summary_agent_factory: AgentFactory | None = None
     defer_contradiction: bool = True
     secrets: Mapping[str, str] | None = None
 

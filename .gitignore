@@ -40,6 +40,7 @@ node_modules/
 .claude/
 .mcp.json
 .codex/
+.superpowers/
 .impeccable/
 website/.impeccable/
 .github/hooks/impeccable.json

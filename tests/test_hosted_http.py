@@ -17,11 +17,13 @@ from vexic import hosted_http
 from vexic.contract import (
     AppendTranscriptRequest,
     ExpandHistoryRequest,
+    FreshContextRequest,
     MemoryCapability,
     MemoryScope,
     Principal,
     PrincipalType,
     RedactionContext,
+    RunDreamPhaseRequest,
     SearchLongTermRequest,
     SearchTranscriptRequest,
     SourceTranscriptMessage,
@@ -36,7 +38,7 @@ from vexic.hosted import (
 )
 from vexic.embeddings import EMBEDDING_DIM
 from vexic.ports import DreamPhasePorts, HostPortNotConfigured
-from vexic.storage import single_message_adapter
+from vexic.storage import record_session_summary, single_message_adapter
 from vexic.hosted_http import create_app
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 
@@ -1662,6 +1664,252 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"]["code"], "request_too_large")
 
+    def test_fresh_context_requires_api_key(self) -> None:
+        response = self.client.post("/v1/fresh_context", json={})
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_fresh_context_rejects_key_without_capability(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
+
+        response = self.client.post(
+            "/v1/fresh_context",
+            headers=self._write_headers(api_key),
+            json={},
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_fresh_context_returns_recap_text_summaries_and_recent(self) -> None:
+        api_key = self._api_key(
+            capabilities={MemoryCapability.WRITE, MemoryCapability.FRESH_CONTEXT}
+        )
+        first_ids = self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key),
+            json=self._append_body("summarized alpha"),
+        ).json()["message_ids"]
+        self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key),
+            json=self._append_body("tail beta"),
+        )
+        tenant = self.catalog.get_tenant("tenant-a")
+        record_session_summary(
+            tenant.db_path,
+            session_id="session-a",
+            agent_id=None,
+            kind="leaf",
+            first_message_id=first_ids[0],
+            last_message_id=first_ids[0],
+            summary_text="alpha recap",
+        )
+
+        response = self.client.post(
+            "/v1/fresh_context",
+            headers=self._write_headers(api_key),
+            json={},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual([s["summary_text"] for s in body["summaries"]], ["alpha recap"])
+        self.assertEqual([hit["body"] for hit in body["recent"]], ["User: tail beta"])
+        self.assertIn("alpha recap", body["text"])
+        self.assertIn("User: tail beta", body["text"])
+
+    def test_fresh_context_isolates_tenants(self) -> None:
+        api_key_a = self._api_key(
+            capabilities={MemoryCapability.WRITE, MemoryCapability.FRESH_CONTEXT},
+            tenant_id="tenant-a",
+        )
+        api_key_b = self._api_key(
+            capabilities={MemoryCapability.WRITE, MemoryCapability.FRESH_CONTEXT},
+            tenant_id="tenant-b",
+            project_ids={"project-b"},
+        )
+        self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key_a),
+            json=self._append_body("tenant a secret"),
+        )
+
+        response = self.client.post(
+            "/v1/fresh_context",
+            headers=self._write_headers(api_key_b, project_id="project-b"),
+            json={},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["recent"], [])
+        self.assertNotIn("tenant a secret", response.text)
+
+    def test_fresh_context_session_scoping_excludes_other_sessions(self) -> None:
+        api_key = self._api_key(
+            capabilities={MemoryCapability.WRITE, MemoryCapability.FRESH_CONTEXT}
+        )
+        self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key, session_id="session-a"),
+            json=self._append_body("session alpha msg"),
+        )
+        self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key, session_id="session-b"),
+            json=self._append_body("session beta msg"),
+        )
+
+        response = self.client.post(
+            "/v1/fresh_context",
+            headers=self._write_headers(api_key, session_id="session-b"),
+            json={},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [hit["body"] for hit in response.json()["recent"]],
+            ["User: session beta msg"],
+        )
+        self.assertNotIn("session alpha msg", response.text)
+
+    def test_fresh_context_missing_summary_fallback_returns_tail_only(self) -> None:
+        api_key = self._api_key(
+            capabilities={MemoryCapability.WRITE, MemoryCapability.FRESH_CONTEXT}
+        )
+        self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key),
+            json=self._append_body("no summary yet"),
+        )
+
+        response = self.client.post(
+            "/v1/fresh_context",
+            headers=self._write_headers(api_key),
+            json={},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["summaries"], [])
+        self.assertEqual([hit["body"] for hit in body["recent"]], ["User: no summary yet"])
+
+    def test_fresh_context_validates_token_budget_range(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.FRESH_CONTEXT})
+
+        for token_budget in (0, 24_001):
+            with self.subTest(token_budget=token_budget):
+                response = self.client.post(
+                    "/v1/fresh_context",
+                    headers=self._write_headers(api_key),
+                    json={"token_budget": token_budget},
+                )
+
+                self.assertEqual(response.status_code, 400)
+
+    def test_fresh_context_defaults_token_budget_when_omitted(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.FRESH_CONTEXT})
+
+        response = self.client.post(
+            "/v1/fresh_context",
+            headers=self._write_headers(api_key),
+            json={},
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_fresh_context_header_bound_redaction_rejects_forbidden_value(self) -> None:
+        api_key = self._api_key(
+            capabilities={MemoryCapability.WRITE, MemoryCapability.FRESH_CONTEXT}
+        )
+        self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key),
+            json=self._append_body("contains cedar-secret value"),
+        )
+
+        response = self.client.post(
+            "/v1/fresh_context",
+            headers=self._write_headers(api_key),
+            json={"redaction": {"forbidden_values": ["cedar-secret"]}},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], "invalid_request")
+        self.assertNotIn("cedar-secret value", response.text)
+
+    def test_fresh_context_header_bound_redaction_allows_clean_result(self) -> None:
+        api_key = self._api_key(
+            capabilities={MemoryCapability.WRITE, MemoryCapability.FRESH_CONTEXT}
+        )
+        self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key),
+            json=self._append_body("harmless cedar"),
+        )
+
+        response = self.client.post(
+            "/v1/fresh_context",
+            headers=self._write_headers(api_key),
+            json={"redaction": {"forbidden_values": ["unrelated-secret"]}},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("harmless cedar", response.json()["text"])
+
+    def test_fresh_context_truncates_oversized_text(self) -> None:
+        api_key = self._api_key(
+            capabilities={MemoryCapability.WRITE, MemoryCapability.FRESH_CONTEXT}
+        )
+        long_text = "x" * 25_000
+        self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key),
+            json=self._append_body(long_text),
+        )
+
+        response = self.client.post(
+            "/v1/fresh_context",
+            headers=self._write_headers(api_key),
+            json={"token_budget": 24_000},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["truncated"])
+        self.assertEqual(len(body["text"]), hosted_http.MAX_EXPAND_HISTORY_CHARS)
+        # The structured fields (recoverable via expand_history) must not
+        # bypass the same cap that bounds `.text`.
+        self.assertEqual(body["recent"], [])
+        self.assertEqual(body["summaries"], [])
+
+    def test_fresh_context_has_rate_limit_rule(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.FRESH_CONTEXT})
+        service = HostedMemoryService(
+            self.catalog,
+            self.keys,
+            telemetry=self.catalog,
+            rate_limiter=HostedInMemoryRateLimiter(
+                operation_rules={
+                    "fresh_context": HostedRateLimitRule(limit=1, window_seconds=60),
+                },
+            ),
+        )
+        client = TestClient(create_app(service))
+
+        client.post(
+            "/v1/fresh_context",
+            headers=self._write_headers(api_key),
+            json={},
+        )
+        response = client.post(
+            "/v1/fresh_context",
+            headers=self._write_headers(api_key),
+            json={},
+        )
+
+        self.assertEqual(response.status_code, 429)
+        self.assertIn("Retry-After", response.headers)
+
     def _prepare_dream_phase_run(self) -> tuple[str, Path]:
         """Provision a tenant with one appended message and a fake adapter file.
 
@@ -1774,6 +2022,68 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(exit_code, 2)
         self.assertIn("requires a host-supplied model port", stderr.getvalue())
 
+    def test_run_dream_phase_cli_summarize_without_build_summary_agent_fails_closed(
+        self,
+    ) -> None:
+        raw_key, adapter = self._prepare_dream_phase_run()
+        stderr = io.StringIO()
+
+        with patch.dict(os.environ, {"VEXIC_TEST_API_KEY": f"{raw_key}\n"}):
+            with contextlib.redirect_stderr(stderr):
+                exit_code = _main_result(
+                    [
+                        "run-dream-phase",
+                        "--root",
+                        self.temp_dir.name,
+                        "--api-key-env",
+                        "VEXIC_TEST_API_KEY",
+                        "--adapter",
+                        str(adapter),
+                        "--model-group",
+                        "fake",
+                        "--tenant-id",
+                        "tenant-a",
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "session-a",
+                        "--agent-id",
+                        "agent-a",
+                        "--phase",
+                        "summarize",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("requires a host-supplied model port", stderr.getvalue())
+        self.assertIn("build_summary_agent", stderr.getvalue())
+
+    def test_handle_payload_maps_host_port_not_configured_to_503(self) -> None:
+        # Generic contract: _handle_payload is the shared HTTP mapping every
+        # hosted operation goes through (including run_dream_phase once it is
+        # wired to a request handler). It must already map
+        # HostPortNotConfigured -> 503 host_port_not_configured without any
+        # phase-specific error handling.
+        import asyncio
+
+        async def call(_api_key: str, _payload: object) -> None:
+            raise HostPortNotConfigured("Session summarization requires a host port.")
+
+        response = asyncio.run(
+            hosted_http._handle_payload(
+                "vx_fake_secret",
+                RunDreamPhaseRequest(
+                    scope=_scope(capabilities={MemoryCapability.ADMIN_REBUILD}),
+                    phase="summarize",
+                    redaction=RedactionContext(forbidden_values=()),
+                ),
+                call,
+            )
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(json.loads(response.body)["error"]["code"], "host_port_not_configured")
+
     def test_run_dream_phase_cli_defaults_adapter_and_model_group_from_env(self) -> None:
         raw_key, adapter = self._prepare_dream_phase_run()
         stdout = io.StringIO()
@@ -1866,6 +2176,29 @@ class DreamPhasePortsFromEnvTests(unittest.TestCase):
         self.assertIsNotNone(ports.extraction_agent_factory)
         self.assertIsNotNone(ports.contradiction_agent_factory)
         self.assertIsNone(ports.secrets)
+        # Regression: an adapter exposing only the required three (no
+        # build_summary_agent) must still load, with the optional summarize
+        # port left unset rather than failing adapter load.
+        self.assertIsNone(ports.summary_agent_factory)
+
+    def test_adapter_with_build_summary_agent_wires_summary_agent_factory(self) -> None:
+        adapter_path = Path(self.temp_dir.name) / "adapter_with_summary.py"
+        adapter_path.write_text(
+            _FAKE_DREAM_ADAPTER_SOURCE
+            + textwrap.dedent(
+                """
+                def build_summary_agent(model_group, secrets=None):
+                    return "fake-summary-agent"
+                """
+            )
+        )
+
+        ports = dream_phase_ports_from_env(
+            {"VEXIC_DREAM_PHASE_ADAPTER": str(adapter_path)}
+        )
+
+        self.assertIsNotNone(ports.summary_agent_factory)
+        self.assertEqual(ports.summary_agent_factory("model-group"), "fake-summary-agent")
 
     def test_model_group_env_overrides_default(self) -> None:
         adapter = _write_fake_dream_adapter(Path(self.temp_dir.name))

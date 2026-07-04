@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import re
@@ -17,6 +18,7 @@ from vexic.embeddings import EMBEDDING_DIM
 from vexic.contract import (
     AppendTranscriptRequest,
     DreamPhase,
+    FreshContextRequest,
     MemoryCapability,
     MemoryScope,
     Principal,
@@ -40,7 +42,7 @@ from vexic.hosted import (
 from vexic.models import ContradictionJudgment, FactCandidate
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 from vexic.ports import DreamPhasePorts, HostPortNotConfigured
-from vexic.storage import single_message_adapter
+from vexic.storage import save_messages, single_message_adapter
 
 
 def _unit_vector(first: float = 1.0) -> list[float]:
@@ -132,6 +134,7 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             "ingest_source_transcript",
             "search_transcript",
             "expand_history",
+            "fresh_context",
             "search_long_term",
             "record_retrieval_event",
             "retire_fact",
@@ -175,6 +178,81 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual([hit.body for hit in result.hits], ["User: hosted cedar memory"])
+
+    async def test_fresh_context_dispatches_to_local_service_with_bound_scope(self) -> None:
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.WRITE, MemoryCapability.FRESH_CONTEXT},
+            project_ids={"project-a"},
+        )
+        message_json = single_message_adapter.dump_json(
+            ModelRequest(parts=[UserPromptPart(content="fresh context cedar")])
+        )
+        await self.service.append_transcript(
+            api_key.raw_key,
+            AppendTranscriptRequest(
+                scope=_scope(capabilities={MemoryCapability.WRITE}),
+                messages_json=[message_json],
+                redaction=RedactionContext(forbidden_values=()),
+            ),
+        )
+
+        result = await self.service.fresh_context(
+            api_key.raw_key,
+            FreshContextRequest(
+                scope=_scope(capabilities={MemoryCapability.FRESH_CONTEXT}),
+                redaction=RedactionContext(forbidden_values=()),
+            ),
+        )
+
+        self.assertEqual([hit.body for hit in result.recent], ["User: fresh context cedar"])
+
+    async def test_fresh_context_requires_capability(self) -> None:
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.WRITE},
+            project_ids={"project-a"},
+        )
+
+        with self.assertRaises(PermissionError):
+            await self.service.fresh_context(
+                api_key.raw_key,
+                FreshContextRequest(
+                    scope=_scope(capabilities={MemoryCapability.FRESH_CONTEXT}),
+                    redaction=RedactionContext(forbidden_values=()),
+                ),
+            )
+
+    async def test_fresh_context_has_rate_limit_rule(self) -> None:
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.FRESH_CONTEXT},
+            project_ids={"project-a"},
+        )
+        service = HostedMemoryService(
+            self.catalog,
+            self.keys,
+            telemetry=self.catalog,
+            rate_limiter=HostedInMemoryRateLimiter(
+                operation_rules={
+                    "fresh_context": HostedRateLimitRule(limit=1, window_seconds=60),
+                },
+            ),
+        )
+        request = FreshContextRequest(
+            scope=_scope(capabilities={MemoryCapability.FRESH_CONTEXT}),
+            redaction=RedactionContext(forbidden_values=()),
+        )
+
+        await service.fresh_context(api_key.raw_key, request)
+        with self.assertRaises(HostedRateLimitExceeded):
+            await service.fresh_context(api_key.raw_key, request)
 
     async def test_catalog_reload_preserves_routing_projects_and_isolation(self) -> None:
         tenant_a = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
@@ -1540,6 +1618,77 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job_usage[1].input_tokens, 0)
         self.assertEqual(job_usage[1].output_tokens, 0)
         self.assertEqual(job_usage[1].total_tokens, 0)
+
+    async def test_hosted_dream_worker_runs_summarize_phase_with_fake_summary_agent(
+        self,
+    ) -> None:
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.ADMIN_REBUILD},
+            project_ids={"project-a"},
+        )
+
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        save_messages(
+            tenant.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="first summarize span")])],
+            session_id="default",
+            timestamp=start.isoformat(),
+        )
+        save_messages(
+            tenant.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="second summarize span")])],
+            session_id="default",
+            # A > 2h gap creates a compaction boundary so the summarize
+            # phase's leaf pass has a span to summarize.
+            timestamp=(start + timedelta(hours=3)).isoformat(),
+        )
+
+        class SummaryAgent:
+            async def run(self, prompt: str) -> object:
+                return SimpleNamespace(
+                    output="a fake summary",
+                    usage=lambda: SimpleNamespace(
+                        requests=1,
+                        input_tokens=6,
+                        output_tokens=4,
+                        total_tokens=10,
+                    ),
+                )
+
+        service = HostedMemoryService(
+            self.catalog,
+            self.keys,
+            telemetry=self.catalog,
+            dream_phase_ports=DreamPhasePorts(
+                model_group="fake",
+                summary_agent_factory=lambda *_args, **_kwargs: SummaryAgent(),
+            ),
+        )
+        jobs = HostedBackgroundJobRunner(service)
+
+        result = await jobs.run_dream_phase(
+            api_key.raw_key,
+            RunDreamPhaseRequest(
+                scope=_scope(capabilities={MemoryCapability.ADMIN_REBUILD}),
+                phase=DreamPhase.SUMMARIZE,
+                redaction=RedactionContext(forbidden_values=()),
+            ),
+        )
+
+        self.assertEqual(result.status, "ok")
+        self.assertEqual([event.status for event in jobs.job_events], ["running", "ok"])
+        self.assertEqual([event.phase for event in jobs.job_events], ["summarize", "summarize"])
+        job_usage = [
+            event
+            for event in self.catalog.usage_events("tenant-a")
+            if event.kind == "job"
+        ]
+        self.assertEqual(job_usage[-1].status, "ok")
+        self.assertEqual(job_usage[-1].model_requests, 1)
+        self.assertEqual(job_usage[-1].total_tokens, 10)
 
     async def test_hosted_dream_worker_redaction_failure_does_not_call_model(
         self,

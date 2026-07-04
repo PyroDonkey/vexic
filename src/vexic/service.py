@@ -23,6 +23,8 @@ from vexic.contract import (
     ExpandHistoryResult,
     ExportScopeRequest,
     ExportScopeResult,
+    FreshContextRequest,
+    FreshContextResult,
     IngestSourceTranscriptRequest,
     IngestSourceTranscriptResult,
     MemoryCapability,
@@ -47,6 +49,7 @@ from vexic.contract import (
     SearchTranscriptRequest,
     SearchTranscriptResult,
     SourceTranscriptIngestItemResult,
+    SummaryNode,
     TranscriptHit,
     LongTermFact as ContractLongTermFact,
     TombstoneRecord,
@@ -59,8 +62,10 @@ from vexic.storage import (
     SourceTranscriptInput,
     ingest_source_messages,
     init_db,
+    load_fresh_context_rows,
     load_messages_in_id_range,
     message_search_text,
+    render_recap_blocks,
     save_messages,
     search_messages,
     single_message_adapter,
@@ -473,6 +478,63 @@ class LocalMemoryService(MemoryService):
         )
         return ExpandHistoryResult(text=text)
 
+    async def fresh_context(
+        self,
+        request: FreshContextRequest,
+    ) -> FreshContextResult:
+        self._authorize(request.scope, request.required_capability)
+        self._assert_not_tombstoned(request.scope, "retrieval")
+        session_id = request.scope.session_id or "default"
+        # After trimming, the surviving frontier may start mid-session; the
+        # covered-prefix then collapses to zero and the tail re-walks from the
+        # session start, which can duplicate trimmed ranges as raw text --
+        # acceptable because the token ceiling still bounds the total.
+        frontier, tail_hits = load_fresh_context_rows(
+            self.db_path,
+            token_budget=request.token_budget,
+            session_id=session_id,
+            agent_id=request.scope.agent_id,
+            content_codec=self.content_codec,
+        )
+
+        summaries = [
+            SummaryNode(
+                summary_id=summary.id,
+                session_id=summary.session_id,
+                first_message_id=summary.first_message_id,
+                last_message_id=summary.last_message_id,
+                summary_text=summary.summary_text,
+                token_estimate=summary.token_estimate,
+                created_at=summary.created_at,
+            )
+            for summary in frontier
+        ]
+        recent = [
+            TranscriptHit(
+                message_id=hit.message_id,
+                session_id=session_id,
+                timestamp=hit.timestamp,
+                body=hit.body,
+            )
+            for hit in tail_hits
+        ]
+
+        redaction_values = self._redaction_values(request.redaction)
+        recap_blocks = render_recap_blocks(
+            frontier,
+            forbidden_secret_values=redaction_values,
+        )
+        recent_block = "\n\n".join(
+            f"[message {hit.message_id} @ {hit.timestamp}]\n{hit.body}"
+            if hit.timestamp
+            else f"[message {hit.message_id}]\n{hit.body}"
+            for hit in recent
+        )
+        sections = [block for block in (*recap_blocks, recent_block) if block]
+        text = "\n\n".join(sections)
+        assert_no_forbidden_secret_values(redaction_values, text)
+        return FreshContextResult(summaries=summaries, recent=recent, text=text)
+
     async def search_long_term(
         self,
         request: SearchLongTermRequest,
@@ -823,7 +885,7 @@ async def _run_dream_phase_with_usage(
             agent_id=request.scope.agent_id,
             forbidden_secret_values=service._redaction_values(request.redaction),
         )
-    else:
+    elif request.phase is DreamPhase.DEEP:
         from vexic.deep import run_deep_phase
 
         usage = await run_deep_phase(
@@ -835,5 +897,19 @@ async def _run_dream_phase_with_usage(
             defer_contradiction=ports.defer_contradiction,
             forbidden_secret_values=service._redaction_values(request.redaction),
         )
+    elif request.phase is DreamPhase.SUMMARIZE:
+        from vexic.summarize import run_summarize_phase
+
+        usage = await run_summarize_phase(
+            service.db_path,
+            ports.model_group,
+            agent_id=request.scope.agent_id,
+            secrets=ports.secrets,
+            summary_agent_factory=ports.summary_agent_factory,
+            forbidden_secret_values=service._redaction_values(request.redaction),
+            content_codec=service.content_codec,
+        )
+    else:
+        raise ValueError(f"Unsupported dream phase: {request.phase!r}")
 
     return RunDreamPhaseResult(phase=request.phase, status="ok"), usage

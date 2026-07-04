@@ -7,6 +7,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 CONTRACT_VERSION = "0.1.0"
 
+# Marker prefix stamped on every recorder-injected priming block (SessionStart
+# recap/search context). Recorders and ingest paths use this as a substring
+# guard so injected priming text can never re-enter Tier 1 transcript storage
+# and, downstream, Light extraction (WI-6).
+PRIME_CONTEXT_HEADER = "Vexic memory priming:"
+
 
 class ContractVersion(StrEnum):
     V0_1 = CONTRACT_VERSION
@@ -41,6 +47,7 @@ class MemoryCapability(StrEnum):
     WRITE = "memory:write"
     SEARCH = "memory:search"
     EXPAND_HISTORY = "memory:expand"
+    FRESH_CONTEXT = "memory:fresh-context"
     EXPORT = "memory:export"
     REPLAY = "memory:replay"
     ADMIN_REBUILD = "memory:admin:rebuild"
@@ -58,6 +65,7 @@ class DreamPhase(StrEnum):
     LIGHT = "light"
     REM = "rem"
     DEEP = "deep"
+    SUMMARIZE = "summarize"
 
 
 class LifecycleAction(StrEnum):
@@ -283,6 +291,18 @@ class ExpandHistoryResult(MemoryResult):
     truncated: bool = False
 
 
+class FreshContextRequest(SessionScopedRedactionRequiredRequest):
+    required_capability: ClassVar[MemoryCapability] = MemoryCapability.FRESH_CONTEXT
+    token_budget: int = 6_000
+
+
+class FreshContextResult(MemoryResult):
+    summaries: list[SummaryNode] = Field(default_factory=list)
+    recent: list[TranscriptHit] = Field(default_factory=list)
+    text: str
+    truncated: bool = False
+
+
 class SearchLongTermRequest(MemoryRequest):
     required_capability: ClassVar[MemoryCapability] = MemoryCapability.SEARCH
     query: str
@@ -429,6 +449,11 @@ class MemoryService(Protocol):
         self,
         request: ExpandHistoryRequest,
     ) -> ExpandHistoryResult: ...
+
+    async def fresh_context(
+        self,
+        request: FreshContextRequest,
+    ) -> FreshContextResult: ...
 
     async def search_long_term(
         self,

@@ -22,9 +22,10 @@ this boundary without changing the memory contract.
   persists only SHA-256 hashes, scope, and revocation metadata in the local
   SQLite control-plane database, authenticates by non-secret key id with
   constant-time hash comparison, and can revoke keys for local staging.
-- `HostedBackgroundJobRunner` runs Light/REM/Deep dream phases when explicit
-  host model ports are supplied, records job lifecycle and usage events, and
-  fails closed with `HostPortNotConfigured` while ports are absent. REM itself
+- `HostedBackgroundJobRunner` runs Light/REM/Deep/Summarize dream phases when
+  explicit host model ports are supplied, records job lifecycle and usage
+  events, and fails closed with `HostPortNotConfigured` while ports (or, for
+  Summarize, `build_summary_agent` specifically) are absent. REM itself
   is a local heuristic that makes no model calls (ADR 0020) but runs inside
   the same ports gate.
 - `HostedMemoryService` can send sanitized request audit and usage metadata to
@@ -50,9 +51,18 @@ this boundary without changing the memory contract.
 - `vexic setup claude-code` installs a SessionStart primer that reuses the
   recorder config and hosted read endpoints to inject capped memory context on
   new/cleared Claude Code sessions.
-- Session summary and active-context helpers exist in the local core. A
-  dedicated hosted fresh-conversation context API and agent-side recap
-  injection are not built yet.
+- `vexic.hosted_http` exposes `POST /v1/fresh_context`, a dedicated hosted
+  fresh-conversation context endpoint (capability `memory:fresh-context`,
+  `token_budget` validated 1-24,000, rate-limited 30/min, results capped like
+  `expand_history`). `vexic setup claude-code`'s SessionStart primer calls it
+  first and leads the injected context with a "Prior conversation recap:"
+  section when the key carries that capability; keys without it fail open to
+  the existing search-only priming.
+- The `summarize` dream phase (`vexic.summarize`) compacts Tier 1 transcript
+  spans into `session_summaries` rows that back fresh context. Like Light and
+  Deep, it needs a host-supplied `build_summary_agent` port and fails closed
+  with `HostPortNotConfigured` without one; `run-dream-phase --phase
+  summarize` is the CLI entry point.
 
 ## Local Staging
 
@@ -142,6 +152,7 @@ The HTTP API accepts `Authorization: Bearer <raw-key>` or `X-Vexic-Api-Key` on
 - `POST /v1/search_transcript`
 - `POST /v1/search_long_term`
 - `POST /v1/expand_history`
+- `POST /v1/fresh_context`
 - `POST /mcp`
 - `/control/v1/*` when started through `vexic.hosted_control_plane_http`
 
@@ -497,9 +508,24 @@ uv run --no-sync python -m vexic.hosted_http run-dream-phase --root /data/vexic 
 `VEXIC_DREAM_PHASE_MODEL_GROUP` (then `hosted-dream`), so in a deployed
 environment that already carries the dream-phase env config both flags may be
 omitted. The adapter file must define `embed_texts`, `build_extraction_agent`,
-and `build_contradiction_agent`. Provider secrets stay in the host
-environment; pass secret variable names with `--secret-env NAME` when Vexic
-should include those values in redaction checks.
+and `build_contradiction_agent`. `build_summary_agent` is optional: an
+adapter that omits it can still run `light`/`rem`/`deep`, but
+`run-dream-phase --phase summarize` fails closed with a `HostPortNotConfigured`
+CLI error until the adapter exposes it. (There is no HTTP route for dream
+phases today -- `run-dream-phase` is CLI-only -- but if one is added later,
+`HostPortNotConfigured` maps to `503` via the shared hosted-error mapping,
+same as other missing-port failures.) Provider secrets stay in the host
+environment; pass
+secret variable names with `--secret-env NAME` when Vexic should include those
+values in redaction checks.
+
+Priming keys need the fresh-context capability to get the recap leg of
+`vexic setup claude-code`'s SessionStart priming: add `--capability
+memory:fresh-context` to `issue-key` (repeatable per capability, alongside
+`--capability memory:search`). A key issued without it still authenticates
+against `/v1/fresh_context` calls made by the primer, gets a `403`, and the
+primer falls back to its existing search-only priming -- it does not fail the
+session.
 
 Dream-phase trigger, recorded: the current trigger is this documented manual
 CLI run, executed in the deployed environment (Railway one-off command against
@@ -533,8 +559,9 @@ Internal-only today:
 - sanitized local SQLite control-plane audit, usage, and job lifecycle ledgers;
 - single-process in-memory authenticated request limiter;
 - one `LocalMemoryService` instance is created per hosted request;
-- hosted Light/REM/Deep jobs run only with injected host model ports and fail
-  closed without them (REM itself makes no model calls; see ADR 0020).
+- hosted Light/REM/Deep/Summarize jobs run only with injected host model
+  ports and fail closed without them (REM itself makes no model calls; see
+  ADR 0020).
 
 ### Production Telemetry Policy
 

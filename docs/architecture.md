@@ -27,9 +27,14 @@ Key modules:
 - `vexic.ports` - host-supplied model-agent ports
 - `vexic.redaction` - persistence and egress secret guard
 
-Session summary and active-context helpers are local storage primitives. They
-do not yet expose a hosted fresh-conversation context API, and Vexic does not
-yet inject summary recaps into new hosted Claude Code sessions.
+Session summaries and the fresh-context read path are core memory behavior.
+The `Summarize` dream phase (`vexic.summarize`) compacts Tier 1 spans into
+`session_summaries` rows, and `LocalMemoryService.fresh_context` reads that
+summary frontier plus a token-budgeted raw tail into one bounded recap
+(`FreshContextRequest`/`FreshContextResult`, capability `memory:fresh-context`,
+see "Dream Pipeline" and "Retrieval" below). Hosted Claude Code SessionStart
+priming (an adapter-side concern, documented in `docs/hosted-mvp.md`) is what
+injects that recap into new sessions; the core only builds the bounded text.
 
 The package must not import legacy `engine.*` modules. The private source host
 is a consumer, not a dependency.
@@ -117,11 +122,11 @@ never as durable memory.
 
 ## Dream Pipeline
 
-The memory pipeline has three named phases. The phase functions exist in the
-package, but model-backed agent work (Light extraction and the optional Deep
-contradiction judge) requires host-supplied agents through ports. Embedding
-can use a host port or the optional local adapter. REM is local and
-deterministic and uses no model port (ADR 0020).
+The memory pipeline has four named phases. The phase functions exist in the
+package, but model-backed agent work (Light extraction, the optional Deep
+contradiction judge, and Summarize) requires host-supplied agents through
+ports. Embedding can use a host port or the optional local adapter. REM is
+local and deterministic and uses no model port (ADR 0020).
 
 ### Light
 
@@ -153,9 +158,32 @@ is deferred, selected candidates promote without judging; Tier 3 may
 temporarily contain contradictory active facts until a later audit runs.
 Promotion is idempotent and non-destructive.
 
+### Summarize
+
+`vexic.summarize.run_summarize_phase` compacts Tier 1 transcript spans into
+`session_summaries` rows (ADR 0024). It runs two passes per compactable
+session, mirroring Light's usage-accumulation and fail-closed host-agent
+conventions:
+
+- Leaf pass: walks `find_session_compaction_span` until no span remains,
+  rendering each span and asking a host-supplied summary agent for a
+  plain-text summary, recorded as a `leaf` row.
+- Condense pass: once the session's summary frontier exceeds
+  `CONDENSE_MAX_FRONTIER_LEAVES` (8) entries or `TAU_SOFT // 3` tokens, the
+  oldest contiguous run of frontier summaries (the prefix whose message-id
+  ranges are adjacent, stopping at the first gap) is condensed into one
+  `condensed` row that replaces it.
+
+Summarize requires a host-supplied `build_summary_agent` port; without it the
+phase fails closed with `HostPortNotConfigured`, matching Light and Deep. A
+per-session failure (including a redaction violation) is isolated and logged;
+the phase continues with the next session. `session_summaries` rows are a
+rebuildable derived projection, not source of truth -- they can be
+regenerated from Tier 1.
+
 ## Retrieval
 
-Vexic has two retrieval families.
+Vexic has two query-driven retrieval families, plus a no-query fresh-context family described below.
 
 ### Transcript Search
 
@@ -179,6 +207,23 @@ Long-term search uses hybrid retrieval:
 If no durable Tier 3 facts match, candidate fallback searches active unpromoted
 Tier 2 candidates and logs `candidate_retrieval_events`. Candidate fallback
 does not write Tier 3 retrieval events.
+
+### Fresh Context
+
+Fresh context is a third, no-query retrieval family for priming a new
+conversation rather than answering a targeted query (ADR 0024, deferred by
+ADR 0018). `FreshContextRequest` is session-scoped, redaction-required, and
+carries a `token_budget` (default 6,000). `LocalMemoryService.fresh_context`
+requires capability `memory:fresh-context` -- a dedicated capability, not
+`memory:expand`, because it returns a bounded recap plus tail rather than
+arbitrary-range verbatim transcript. It reads the session's summary frontier
+up to a covered-prefix boundary, then fills the remaining token budget with
+the most recent raw transcript tail; an empty frontier falls back to a
+full-budget raw tail. The shared `render_recap_blocks` renderer formats each
+frontier summary as `[Recap of messages N-M -- verbatim via expand_history]`,
+and the egress redaction guard applies to the assembled text before it
+returns. `FreshContextResult` carries `summaries`, `recent`, the assembled
+`text`, and a `truncated` flag.
 
 ## Redaction
 

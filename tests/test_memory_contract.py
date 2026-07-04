@@ -462,7 +462,7 @@ class MemoryContractModelTests(unittest.TestCase):
     def test_dream_phase_contract_uses_existing_light_rem_deep_names(self) -> None:
         self.assertEqual(
             {phase.value for phase in DreamPhase},
-            {"light", "rem", "deep"},
+            {"light", "rem", "deep", "summarize"},
         )
 
     def _lifecycle_scope(self) -> MemoryScope:
@@ -514,6 +514,7 @@ class MemoryContractProtocolTests(unittest.TestCase):
             "ingest_source_transcript",
             "search_transcript",
             "expand_history",
+            "fresh_context",
             "search_long_term",
             "run_dream_phase",
             "export_scope",

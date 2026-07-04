@@ -12,10 +12,15 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic_ai.messages import ModelMessage
 
+from vexic.ports import ContentCodec
 from vexic.storage.transcript import (
+    TranscriptHit,
+    _decode_stored,
+    _encode_stored,
     _message_token_estimate,
     _trim_unpaired_tool_messages,
     load_messages_in_id_range,
+    message_search_text,
     single_message_adapter,
     strip_prompt_payloads,
 )
@@ -38,6 +43,7 @@ class SessionSummary:
     summary_text: str
     token_estimate: int
     replaces_summary_ids: tuple[int, ...]
+    created_at: str = ""
     model_requests: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
@@ -59,14 +65,17 @@ def _parse_replaces_summary_ids(raw: str) -> tuple[int, ...]:
     return tuple(int(value) for value in values)
 
 
-def _summary_from_row(row: Sequence[object]) -> SessionSummary:
+def _summary_from_row(
+    row: Sequence[object],
+    content_codec: ContentCodec | None = None,
+) -> SessionSummary:
     return SessionSummary(
         id=int(row[0]),
         session_id=str(row[1]),
         kind=str(row[2]),  # type: ignore[arg-type]
         first_message_id=int(row[3]),
         last_message_id=int(row[4]),
-        summary_text=str(row[5]),
+        summary_text=_decode_stored(content_codec, str(row[5])),
         token_estimate=int(row[6]),
         replaces_summary_ids=_parse_replaces_summary_ids(str(row[7])),
         model_requests=int(row[8]),
@@ -74,6 +83,7 @@ def _summary_from_row(row: Sequence[object]) -> SessionSummary:
         output_tokens=int(row[10]),
         total_tokens=int(row[11]),
         estimated_cost_micros=int(row[12]),
+        created_at=str(row[13]) if len(row) > 13 and row[13] is not None else "",
     )
 
 
@@ -89,9 +99,11 @@ def record_session_summary(
     replaces_summary_ids: list[int] | tuple[int, ...] = (),
     usage: UsageSummary = UsageSummary(),
     forbidden_secret_values: tuple[str, ...] = (),
+    content_codec: ContentCodec | None = None,
 ) -> int:
     assert_no_forbidden_secret_values(forbidden_secret_values, summary_text)
     token_estimate = estimate_tokens(summary_text)
+    stored_summary_text = _encode_stored(content_codec, summary_text)
     replaces_json = json.dumps(list(replaces_summary_ids))
     with closing(connect(db_path)) as conn:
         with conn:
@@ -110,7 +122,7 @@ def record_session_summary(
                     kind,
                     first_message_id,
                     last_message_id,
-                    summary_text,
+                    stored_summary_text,
                     token_estimate,
                     replaces_json,
                     usage.model_requests,
@@ -128,6 +140,7 @@ def fetch_session_summary_frontier(
     *,
     session_id: str,
     agent_id: str | None = None,
+    content_codec: ContentCodec | None = None,
 ) -> list[SessionSummary]:
     with closing(connect(db_path)) as conn:
         rows = conn.execute(
@@ -135,7 +148,7 @@ def fetch_session_summary_frontier(
             SELECT id, session_id, kind, first_message_id, last_message_id,
                    summary_text, token_estimate, replaces_summary_ids,
                    model_requests, input_tokens, output_tokens, total_tokens,
-                   estimated_cost_micros
+                   estimated_cost_micros, created_at
             FROM session_summaries
             WHERE session_id = ?
                 AND agent_id IS ?
@@ -144,7 +157,7 @@ def fetch_session_summary_frontier(
             (session_id, agent_id),
         ).fetchall()
 
-    summaries = [_summary_from_row(row) for row in rows]
+    summaries = [_summary_from_row(row, content_codec) for row in rows]
     replaced = {
         summary_id
         for summary in summaries
@@ -297,12 +310,14 @@ def estimate_session_tokens(
     *,
     session_id: str,
     agent_id: str | None = None,
+    content_codec: ContentCodec | None = None,
 ) -> int:
     return _estimate_session_tokens_from_id(
         db_path,
         session_id=session_id,
         agent_id=agent_id,
         first_message_id=None,
+        content_codec=content_codec,
     )
 
 
@@ -312,6 +327,7 @@ def _estimate_session_tokens_from_id(
     session_id: str,
     agent_id: str | None,
     first_message_id: int | None,
+    content_codec: ContentCodec | None = None,
 ) -> int:
     total = 0
     where_clause = "session_id = ? AND agent_id IS ?"
@@ -332,7 +348,9 @@ def _estimate_session_tokens_from_id(
         ).fetchall()
         for row in rows:
             msg = strip_prompt_payloads(
-                single_message_adapter.validate_python(json.loads(row[0]))
+                single_message_adapter.validate_python(
+                    json.loads(_decode_stored(content_codec, row[0]))
+                )
             )
             total += _message_token_estimate(msg)
     return total
@@ -346,6 +364,7 @@ def find_session_compaction_span(
     timezone_name: str,
     now_utc: datetime | None = None,
     tau_soft: int = TAU_SOFT,
+    content_codec: ContentCodec | None = None,
 ) -> tuple[int, int] | None:
     if session_id.startswith("onboarding:"):
         return None
@@ -359,6 +378,7 @@ def find_session_compaction_span(
         db_path,
         session_id=session_id,
         agent_id=agent_id,
+        content_codec=content_codec,
     )
     covered_until = _frontier_covered_prefix(
         frontier,
@@ -381,6 +401,7 @@ def find_session_compaction_span(
         session_id=session_id,
         agent_id=agent_id,
         first_message_id=next_uncovered,
+        content_codec=content_codec,
     )
     if uncovered_tokens > tau_soft:
         return next_uncovered, last_message_id
@@ -394,6 +415,7 @@ def render_compaction_source(
     agent_id: str | None = None,
     first_message_id: int,
     last_message_id: int,
+    content_codec: ContentCodec | None = None,
 ) -> str:
     hits = load_messages_in_id_range(
         db_path,
@@ -401,6 +423,7 @@ def render_compaction_source(
         last_message_id,
         session_id=session_id,
         agent_id=agent_id,
+        content_codec=content_codec,
     )
     return "\n---\n".join(hit.body for hit in hits)
 
@@ -431,6 +454,7 @@ def _load_messages_after_id_by_token_budget(
     session_id: str,
     agent_id: str | None,
     after_id: int,
+    content_codec: ContentCodec | None = None,
 ) -> list[ModelMessage]:
     rows = _load_active_context_rows_by_token_budget(
         db_path,
@@ -438,6 +462,7 @@ def _load_messages_after_id_by_token_budget(
         session_id=session_id,
         agent_id=agent_id,
         after_id=after_id,
+        content_codec=content_codec,
     )
     return _trim_unpaired_tool_messages([row.message for row in rows])
 
@@ -449,6 +474,7 @@ def _load_active_context_rows_by_token_budget(
     session_id: str,
     agent_id: str | None = None,
     after_id: int | None = None,
+    content_codec: ContentCodec | None = None,
 ) -> list[_ActiveContextRow]:
     if token_budget < 0:
         raise ValueError("token_budget must be greater than or equal to 0.")
@@ -475,7 +501,9 @@ def _load_active_context_rows_by_token_budget(
         ).fetchall()
         for row in rows:
             msg = strip_prompt_payloads(
-                single_message_adapter.validate_python(json.loads(row[2]))
+                single_message_adapter.validate_python(
+                    json.loads(_decode_stored(content_codec, row[2]))
+                )
             )
             estimate = _message_token_estimate(msg)
             if selected and total + estimate > token_budget:
@@ -501,12 +529,14 @@ def load_active_context_messages(
     agent_id: str | None = None,
     timezone_name: str = "UTC",
     now_utc: datetime | None = None,
+    content_codec: ContentCodec | None = None,
 ) -> list[ModelMessage]:
     tail_rows = _load_active_context_rows_by_token_budget(
         db_path,
         token_budget=token_budget,
         session_id=session_id,
         agent_id=agent_id,
+        content_codec=content_codec,
     )
     if not tail_rows:
         return []
@@ -531,6 +561,7 @@ def load_active_context_messages(
         db_path,
         session_id=session_id,
         agent_id=agent_id,
+        content_codec=content_codec,
     )
     if not _frontier_covers(
         frontier,
@@ -545,7 +576,33 @@ def load_active_context_messages(
         session_id=session_id,
         agent_id=agent_id,
         after_id=boundary_id,
+        content_codec=content_codec,
     )
+
+
+def render_recap_blocks(
+    frontier: list[SessionSummary],
+    *,
+    forbidden_secret_values: tuple[str, ...] = (),
+) -> list[str]:
+    """Render each frontier summary as an `expand_history`-compatible block.
+
+    The `[Recap of messages N-M -- verbatim via expand_history]` header format
+    is load-bearing: drill-down tooling parses it to recover the message range
+    to hand to `expand_history`. Keep `render_session_recap` and
+    `fresh_context` sharing this one renderer instead of duplicating the
+    format string.
+    """
+    blocks: list[str] = []
+    for summary in frontier:
+        block = (
+            f"[Recap of messages {summary.first_message_id}-{summary.last_message_id} "
+            "-- verbatim via expand_history]\n"
+            f"{summary.summary_text}"
+        )
+        assert_no_forbidden_secret_values(forbidden_secret_values, block)
+        blocks.append(block)
+    return blocks
 
 
 def render_session_recap(
@@ -554,6 +611,7 @@ def render_session_recap(
     session_id: str,
     agent_id: str | None = None,
     forbidden_secret_values: tuple[str, ...] = (),
+    content_codec: ContentCodec | None = None,
 ) -> str:
     if session_id.startswith("onboarding:"):
         return ""
@@ -564,19 +622,108 @@ def render_session_recap(
             db_path,
             session_id=session_id,
             agent_id=agent_id,
+            content_codec=content_codec,
         )
     except sqlite3.Error:
         return ""
     if not frontier:
         return ""
 
-    blocks: list[str] = []
-    for summary in frontier:
-        block = (
-            f"[Recap of messages {summary.first_message_id}-{summary.last_message_id} "
-            "-- verbatim via expand_history]\n"
-            f"{summary.summary_text}"
-        )
-        assert_no_forbidden_secret_values(forbidden_secret_values, block)
-        blocks.append(block)
+    blocks = render_recap_blocks(
+        frontier,
+        forbidden_secret_values=forbidden_secret_values,
+    )
     return "\n\n".join(blocks)
+
+
+# A floor on the raw-tail budget so a very large frontier recap never fully
+# starves the recent-messages tail in `load_fresh_context_rows`.
+_MIN_TAIL_TOKEN_BUDGET = 200
+
+
+def load_fresh_context_rows(
+    db_path: str,
+    *,
+    token_budget: int,
+    session_id: str,
+    agent_id: str | None = None,
+    content_codec: ContentCodec | None = None,
+) -> tuple[list[SessionSummary], list[TranscriptHit]]:
+    """Assemble the fresh-context frontier + token-budgeted raw tail.
+
+    Returns the summary recap frontier (oldest-first) alongside the raw
+    message tail strictly after the frontier's covered prefix, budgeted so
+    the combined recap + tail fits within `token_budget`.
+
+    The frontier is a ceiling, not a bonus on top of the budget: if the
+    frontier alone would leave less than `_MIN_TAIL_TOKEN_BUDGET` for the
+    tail, the oldest frontier entries are dropped (oldest-first) until the
+    remainder fits within `token_budget - _MIN_TAIL_TOKEN_BUDGET`. If no
+    frontier entry fits even alone, the frontier is dropped entirely and the
+    tail is budgeted over the full `token_budget`, matching the no-summaries
+    fallback below. With no summaries (or an emptied-out frontier), the tail
+    is budgeted over the full `token_budget` from the start of the session
+    (boundary 0).
+    """
+    frontier = fetch_session_summary_frontier(
+        db_path,
+        session_id=session_id,
+        agent_id=agent_id,
+        content_codec=content_codec,
+    )
+
+    first_message_id = _first_message_id(db_path, session_id=session_id, agent_id=agent_id)
+    if first_message_id is None:
+        return frontier, []
+
+    if frontier:
+        frontier_tokens = sum(
+            estimate_tokens(summary.summary_text) for summary in frontier
+        )
+        frontier_ceiling = token_budget - _MIN_TAIL_TOKEN_BUDGET
+        while frontier and frontier_tokens > frontier_ceiling:
+            oldest = frontier.pop(0)
+            frontier_tokens -= estimate_tokens(oldest.summary_text)
+
+    if frontier:
+        covered_until = _frontier_covered_prefix(
+            frontier,
+            first_message_id=first_message_id,
+        )
+        tail_budget = token_budget - frontier_tokens
+        after_id: int | None = covered_until
+    else:
+        tail_budget = token_budget
+        after_id = None
+
+    tail_rows = _load_active_context_rows_by_token_budget(
+        db_path,
+        token_budget=tail_budget,
+        session_id=session_id,
+        agent_id=agent_id,
+        after_id=after_id,
+        content_codec=content_codec,
+    )
+    tail_rows = _trim_unpaired_tool_rows(tail_rows)
+
+    hits: list[TranscriptHit] = []
+    for row in tail_rows:
+        body = message_search_text(row.message)
+        if not body:
+            continue
+        hits.append(
+            TranscriptHit(
+                message_id=row.id,
+                timestamp=row.timestamp.isoformat() if row.timestamp else None,
+                body=body,
+            )
+        )
+    return frontier, hits
+
+
+def _trim_unpaired_tool_rows(
+    rows: list[_ActiveContextRow],
+) -> list[_ActiveContextRow]:
+    messages = _trim_unpaired_tool_messages([row.message for row in rows])
+    kept_ids = {id(message) for message in messages}
+    return [row for row in rows if id(row.message) in kept_ids]

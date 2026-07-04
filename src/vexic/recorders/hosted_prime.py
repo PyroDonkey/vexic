@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
+from vexic.contract import PRIME_CONTEXT_HEADER
 from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.url_policy import require_http_url
 
@@ -24,6 +26,22 @@ class HostedPrimeConfig:
     timeout_seconds: float = 15.0
 
 
+def fetch_fresh_context(
+    config: HostedPrimeConfig,
+    *,
+    token_budget: int,
+) -> dict[str, object] | None:
+    try:
+        return _post_search(
+            config,
+            "fresh_context",
+            {"token_budget": token_budget},
+        )
+    except RuntimeError as exc:
+        print(f"warning: {exc}", file=sys.stderr)
+        return None
+
+
 def fetch_prime_context(
     config: HostedPrimeConfig,
     *,
@@ -31,6 +49,19 @@ def fetch_prime_context(
     long_term_limit: int = 5,
     transcript_limit: int = 5,
 ) -> str:
+    # The recap is one of several prime sections (long-term facts, transcript
+    # hits, and the trailing footer also need room). Cap the token_budget we
+    # request AND the char budget we accept for the recap to ~1/4 of
+    # max_chars, so a hosted endpoint that ignores token_budget (or whose
+    # token estimate undershoots ours) can't crowd out the other sections.
+    fresh_context = fetch_fresh_context(config, token_budget=max_chars // 16)
+    recap_text = None
+    if fresh_context is not None:
+        recap_text = _str(fresh_context.get("text"))
+        if recap_text is not None:
+            recap_cap = max_chars // 4
+            if len(recap_text) > recap_cap:
+                recap_text = recap_text[:recap_cap].rstrip()
     long_term = _safe_post_search(
         config,
         "search_long_term",
@@ -41,7 +72,9 @@ def fetch_prime_context(
         "search_transcript",
         {"query": TRANSCRIPT_PRIME_QUERY, "limit": transcript_limit},
     )
-    context = build_prime_context(long_term, transcript, max_chars=max_chars)
+    context = build_prime_context(
+        long_term, transcript, recap_text=recap_text, max_chars=max_chars
+    )
     try:
         assert_no_forbidden_secret_values((config.api_key,), context)
     except ValueError:
@@ -96,12 +129,17 @@ def build_prime_context(
     long_term: dict[str, object],
     transcript: dict[str, object],
     *,
+    recap_text: str | None = None,
     max_chars: int,
 ) -> str:
-    lines: list[str] = ["Vexic memory priming:"]
+    lines: list[str] = [PRIME_CONTEXT_HEADER]
     facts = _items(long_term.get("facts"))
     notes = _items(long_term.get("candidate_notes"))
     hits = _items(transcript.get("hits"))
+
+    if recap_text:
+        lines.append("Prior conversation recap:")
+        lines.append(recap_text)
 
     if facts or notes:
         lines.append("Long-term memory:")

@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 
 from fastapi.testclient import TestClient
@@ -1814,6 +1814,10 @@ class ClaudeCodeRecorderPrimeCommandTests(unittest.TestCase):
 
             def fake_urlopen(request, timeout):
                 calls.append((request, timeout))
+                if request.full_url.endswith("/v1/fresh_context"):
+                    return _Response(
+                        {"summaries": [], "recent": [], "text": "", "truncated": False}
+                    )
                 if request.full_url.endswith("/v1/search_long_term"):
                     return _Response(
                         {
@@ -1873,7 +1877,7 @@ class ClaudeCodeRecorderPrimeCommandTests(unittest.TestCase):
             self.assertNotIn("vx_secret", stdout.getvalue())
             self.assertEqual(
                 [urlsplit(call[0].full_url).path for call in calls],
-                ["/v1/search_long_term", "/v1/search_transcript"],
+                ["/v1/fresh_context", "/v1/search_long_term", "/v1/search_transcript"],
             )
             for request, timeout in calls:
                 self.assertEqual(timeout, 15.0)
@@ -1901,6 +1905,352 @@ class ClaudeCodeRecorderPrimeCommandTests(unittest.TestCase):
         )
 
         self.assertEqual(context, "")
+
+    def test_prime_includes_prior_conversation_recap_from_fresh_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            calls = []
+
+            class _Response:
+                def __init__(self, payload: dict[str, object]) -> None:
+                    self._payload = payload
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc):
+                    return False
+
+                def read(self) -> bytes:
+                    return json.dumps(self._payload).encode("utf-8")
+
+            def fake_urlopen(request, timeout):
+                calls.append(request)
+                if request.full_url.endswith("/v1/fresh_context"):
+                    return _Response(
+                        {
+                            "summaries": [],
+                            "recent": [],
+                            "text": "Recap: discussed cedar roadmap",
+                            "truncated": False,
+                        }
+                    )
+                return _Response({})
+
+            stdout = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            context = json.loads(stdout.getvalue())["hookSpecificOutput"]["additionalContext"]
+            self.assertIn("Prior conversation recap:", context)
+            self.assertIn("Recap: discussed cedar roadmap", context)
+            fresh_context_call = next(
+                request
+                for request in calls
+                if request.full_url.endswith("/v1/fresh_context")
+            )
+            body = json.loads(fresh_context_call.data.decode("utf-8"))
+            self.assertEqual(body, {"token_budget": 6_000 // 16})
+
+    def test_prime_fresh_context_failure_falls_back_to_search_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+
+            class _Response:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc):
+                    return False
+
+                def read(self) -> bytes:
+                    return json.dumps(
+                        {
+                            "hits": [
+                                {
+                                    "message_id": 1,
+                                    "session_id": "session-a",
+                                    "body": "User: remember search-only cedar",
+                                }
+                            ]
+                        }
+                    ).encode("utf-8")
+
+            def fake_urlopen(request, timeout):
+                if request.full_url.endswith("/v1/fresh_context"):
+                    raise HTTPError(request.full_url, 403, "forbidden", hdrs={}, fp=None)
+                return _Response()
+
+            stdout = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            context = json.loads(stdout.getvalue())["hookSpecificOutput"]["additionalContext"]
+            self.assertNotIn("Prior conversation recap:", context)
+            self.assertIn("remember search-only cedar", context)
+
+    def test_prime_fresh_context_timeout_falls_back_to_search_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+
+            class _Response:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc):
+                    return False
+
+                def read(self) -> bytes:
+                    return json.dumps(
+                        {
+                            "hits": [
+                                {
+                                    "message_id": 1,
+                                    "session_id": "session-a",
+                                    "body": "User: remember timeout-fallback cedar",
+                                }
+                            ]
+                        }
+                    ).encode("utf-8")
+
+            def fake_urlopen(request, timeout):
+                if request.full_url.endswith("/v1/fresh_context"):
+                    raise URLError(TimeoutError("timed out"))
+                return _Response()
+
+            stdout = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            context = json.loads(stdout.getvalue())["hookSpecificOutput"]["additionalContext"]
+            self.assertNotIn("Prior conversation recap:", context)
+            self.assertIn("remember timeout-fallback cedar", context)
+
+    def test_prime_max_chars_cap_enforced_with_recap_present(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+
+            class _Response:
+                def __init__(self, payload: dict[str, object]) -> None:
+                    self._payload = payload
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc):
+                    return False
+
+                def read(self) -> bytes:
+                    return json.dumps(self._payload).encode("utf-8")
+
+            def fake_urlopen(request, timeout):
+                if request.full_url.endswith("/v1/fresh_context"):
+                    return _Response(
+                        {
+                            "summaries": [],
+                            "recent": [],
+                            "text": "Recap cedar " * 200,
+                            "truncated": False,
+                        }
+                    )
+                if request.full_url.endswith("/v1/search_long_term"):
+                    return _Response(
+                        {
+                            "facts": [
+                                {"fact_text": "Durable cedar preference " * 50}
+                            ],
+                            "candidate_notes": [],
+                        }
+                    )
+                return _Response({"hits": []})
+
+            stdout = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--max-chars",
+                        "200",
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            context = json.loads(stdout.getvalue())["hookSpecificOutput"]["additionalContext"]
+            self.assertLessEqual(len(context), 200)
+
+    def test_prime_huge_recap_does_not_starve_long_term_and_transcript_sections(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+
+            class _Response:
+                def __init__(self, payload: dict[str, object]) -> None:
+                    self._payload = payload
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc):
+                    return False
+
+                def read(self) -> bytes:
+                    return json.dumps(self._payload).encode("utf-8")
+
+            def fake_urlopen(request, timeout):
+                if request.full_url.endswith("/v1/fresh_context"):
+                    # Simulate a hosted endpoint that ignores token_budget and
+                    # returns a recap large enough to fill the entire prime
+                    # budget on its own if left uncapped.
+                    return _Response(
+                        {
+                            "summaries": [],
+                            "recent": [],
+                            "text": "huge recap " * 2_000,
+                            "truncated": False,
+                        }
+                    )
+                if request.full_url.endswith("/v1/search_long_term"):
+                    return _Response(
+                        {
+                            "facts": [{"fact_text": "Durable cedar preference"}],
+                            "candidate_notes": [],
+                        }
+                    )
+                return _Response(
+                    {
+                        "hits": [
+                            {
+                                "message_id": 1,
+                                "session_id": "session-a",
+                                "body": "User: recent cedar note",
+                            }
+                        ]
+                    }
+                )
+
+            stdout = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--max-chars",
+                        "6000",
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            context = json.loads(stdout.getvalue())["hookSpecificOutput"]["additionalContext"]
+            self.assertLessEqual(len(context), 6000)
+            self.assertIn("Durable cedar preference", context)
+            self.assertIn("recent cedar note", context)
+            self.assertIn(
+                "Use this memory silently",
+                context,
+                "trailing footer instruction must survive a huge recap",
+            )
 
     def test_prime_uses_transcript_when_long_term_search_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -2003,6 +2353,65 @@ class ClaudeCodeRecorderPrimeCommandTests(unittest.TestCase):
                 if request.full_url.endswith("/v1/search_long_term"):
                     return _Response()
                 return _Response()
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("forbidden secret", stderr.getvalue())
+            self.assertNotIn("vx_secret", stderr.getvalue())
+
+    def test_prime_fresh_context_secret_warns_without_injection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+
+            class _Response:
+                def __init__(self, payload: dict[str, object]) -> None:
+                    self._payload = payload
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc):
+                    return False
+
+                def read(self) -> bytes:
+                    return json.dumps(self._payload).encode("utf-8")
+
+            def fake_urlopen(request, timeout):
+                if request.full_url.endswith("/v1/fresh_context"):
+                    return _Response(
+                        {
+                            "summaries": [],
+                            "recent": [],
+                            "text": "Recap: vx_secret leaked",
+                            "truncated": False,
+                        }
+                    )
+                return _Response({})
 
             stdout = io.StringIO()
             stderr = io.StringIO()
