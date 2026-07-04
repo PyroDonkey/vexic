@@ -1,0 +1,206 @@
+"""Summarize phase: compact Tier 1 transcript spans into `session_summaries`
+rows (ADR: session summaries are rebuildable from Tier 1, never a source of
+truth themselves).
+
+Two passes run per compactable session, mirroring the Light phase's
+conventions for usage accumulation, agent invocation, and fail-closed model
+access (see `vexic.pipeline.run_light_phase`):
+
+- Leaf pass: walk `find_session_compaction_span` until it yields no more
+  spans, rendering each span's transcript and asking the summary agent for a
+  plain-text summary (`result.output`), recorded as a `leaf` row.
+- Condense pass: once the session's summary frontier gets too large (more
+  than `CONDENSE_MAX_FRONTIER_LEAVES` entries, or more than a third of
+  `TAU_SOFT` tokens), the whole frontier -- which is always one contiguous
+  message-id run by construction (each leaf starts where the last coverage
+  left off) -- is condensed into a single `condensed` row that replaces it.
+
+Per-session error isolation: a failure summarizing one session (including a
+redaction violation) is swallowed and reported via a content-free print; the
+phase moves on to the next session rather than aborting the whole run.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from datetime import datetime
+
+from vexic.ports import AgentFactory, ContentCodec, missing_host_port
+from vexic.storage import (
+    SessionSummary,
+    fetch_session_summary_frontier,
+    find_session_compaction_span,
+    init_db,
+    list_compactable_session_ids,
+    record_session_summary,
+    render_compaction_source,
+)
+from vexic.text_utils import TAU_SOFT
+from vexic.usage import UsageSummary, summarize_agent_usage
+
+CONDENSE_MAX_FRONTIER_LEAVES = 8
+
+__all__ = [
+    "CONDENSE_MAX_FRONTIER_LEAVES",
+    "run_summarize_phase",
+]
+
+
+def _forbidden_secret_values(
+    secrets: Mapping[str, str] | None,
+    extra_values: tuple[str, ...] = (),
+) -> list[str]:
+    values = [] if secrets is None else list(secrets.values())
+    return [*values, *extra_values]
+
+
+def _render_condense_source(summaries: list[SessionSummary]) -> str:
+    return "\n---\n".join(summary.summary_text for summary in summaries)
+
+
+async def _run_leaf_pass(
+    db_path: str,
+    agent: object,
+    *,
+    session_id: str,
+    agent_id: str | None,
+    timezone_name: str,
+    now_utc: datetime | None,
+    forbidden: list[str],
+) -> UsageSummary:
+    usage = UsageSummary()
+    while True:
+        span = find_session_compaction_span(
+            db_path,
+            session_id=session_id,
+            agent_id=agent_id,
+            timezone_name=timezone_name,
+            now_utc=now_utc,
+        )
+        if span is None:
+            return usage
+
+        first_message_id, last_message_id = span
+        source = render_compaction_source(
+            db_path,
+            session_id=session_id,
+            agent_id=agent_id,
+            first_message_id=first_message_id,
+            last_message_id=last_message_id,
+        )
+        result = await agent.run(source)
+        span_usage = summarize_agent_usage(result)
+        record_session_summary(
+            db_path,
+            session_id=session_id,
+            agent_id=agent_id,
+            kind="leaf",
+            first_message_id=first_message_id,
+            last_message_id=last_message_id,
+            summary_text=result.output,
+            usage=span_usage,
+            forbidden_secret_values=forbidden,
+        )
+        usage = usage.plus(span_usage)
+
+
+async def _run_condense_pass(
+    db_path: str,
+    agent: object,
+    *,
+    session_id: str,
+    agent_id: str | None,
+    forbidden: list[str],
+) -> UsageSummary:
+    frontier = fetch_session_summary_frontier(
+        db_path,
+        session_id=session_id,
+        agent_id=agent_id,
+    )
+    frontier_tokens = sum(summary.token_estimate for summary in frontier)
+    if (
+        len(frontier) <= CONDENSE_MAX_FRONTIER_LEAVES
+        and frontier_tokens <= TAU_SOFT // 3
+    ):
+        return UsageSummary()
+
+    # The frontier is always one contiguous message-id run: each leaf starts
+    # where the previous coverage left off, so there is nothing to select --
+    # condensing the whole run collapses it back under both thresholds.
+    condense_source = _render_condense_source(frontier)
+    result = await agent.run(f"Condense the following summaries:\n{condense_source}")
+    condense_usage = summarize_agent_usage(result)
+    record_session_summary(
+        db_path,
+        session_id=session_id,
+        agent_id=agent_id,
+        kind="condensed",
+        first_message_id=frontier[0].first_message_id,
+        last_message_id=frontier[-1].last_message_id,
+        replaces_summary_ids=[summary.id for summary in frontier],
+        summary_text=result.output,
+        usage=condense_usage,
+        forbidden_secret_values=forbidden,
+    )
+    return condense_usage
+
+
+async def run_summarize_phase(
+    db_path: str,
+    model_group: str,
+    *,
+    agent_id: str | None = None,
+    timezone_name: str = "UTC",
+    now_utc: datetime | None = None,
+    secrets: Mapping[str, str] | None = None,
+    summary_agent_factory: AgentFactory | None = None,
+    forbidden_secret_values: tuple[str, ...] = (),
+    content_codec: ContentCodec | None = None,
+) -> UsageSummary:
+    if summary_agent_factory is None:
+        raise missing_host_port(
+            "Session summarization",
+            hint="Provide build_summary_agent in the dream-phase adapter.",
+        )
+
+    forbidden = _forbidden_secret_values(secrets, forbidden_secret_values)
+    init_db(db_path, content_codec=content_codec)
+    agent = summary_agent_factory(model_group, secrets=secrets)
+
+    usage = UsageSummary()
+    session_ids = list_compactable_session_ids(db_path, agent_id=agent_id)
+    error_count = 0
+    for session_id in session_ids:
+        try:
+            leaf_usage = await _run_leaf_pass(
+                db_path,
+                agent,
+                session_id=session_id,
+                agent_id=agent_id,
+                timezone_name=timezone_name,
+                now_utc=now_utc,
+                forbidden=forbidden,
+            )
+            condense_usage = await _run_condense_pass(
+                db_path,
+                agent,
+                session_id=session_id,
+                agent_id=agent_id,
+                forbidden=forbidden,
+            )
+            usage = usage.plus(leaf_usage).plus(condense_usage)
+        except Exception as exc:
+            # Per-session isolation: a failure summarizing one session (a
+            # raising agent, or a redaction violation on its output) must not
+            # prevent other sessions from being summarized this cycle.
+            error_count += 1
+            print(
+                f"Summarize phase: session error -- {type(exc).__name__}. "
+                "Continuing with next session."
+            )
+
+    print(
+        f"Summarize phase: {len(session_ids)} sessions considered, "
+        f"{error_count} failed."
+    )
+    return usage
