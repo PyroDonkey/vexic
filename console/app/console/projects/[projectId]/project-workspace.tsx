@@ -167,7 +167,9 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
     try {
       const response = await fetch(`/api/control-plane/projects/${projectId}/keys/${keyId}`, { method: "DELETE" });
       if (!response.ok) throw new Error(`Key revoke failed with ${response.status}`);
-      setKeys((current) => current.filter((key) => key.id !== keyId));
+      setKeys((current) =>
+        current.map((key) => (key.id === keyId ? { ...key, revokedAt: new Date().toISOString() } : key))
+      );
     } catch {
       toast.error("Agent API Key revocation failed.");
     }
