@@ -336,6 +336,30 @@ def register_control_plane_routes(
             )
         return JSONResponse({"usage": usage})
 
+    @app.get("/control/v1/clerk-orgs/{clerk_org_id}/projects/{project_id}/jobs")
+    @_control_plane_storage_boundary
+    async def list_control_plane_jobs(
+        clerk_org_id: str,
+        project_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        if not _has_control_plane_credential(request, control_plane_tokens):
+            return _error_response(401, "unauthorized", "Invalid control-plane credential.")
+        tenant_id = _resolve_control_tenant(service, clerk_org_id)
+        if tenant_id is None:
+            return _error_response(404, "not_found", "Project not found.")
+        try:
+            service.catalog.get_control_project(tenant_id, project_id)
+        except PermissionError:
+            return _error_response(404, "not_found", "Project not found.")
+        raw_limit = request.query_params.get("limit", "50")
+        try:
+            limit = max(1, min(200, int(raw_limit)))
+        except ValueError:
+            limit = 50
+        events = service.catalog.job_events(tenant_id, project_id=project_id, limit=limit)
+        return JSONResponse({"jobs": [_job_payload(event) for event in events]})
+
 
 def _api_key(request: Request) -> str | None:
     authorization = request.headers.get("authorization")
@@ -544,6 +568,16 @@ def _key_payload(key) -> dict[str, object]:
         "createdAt": key.created_at,
         "revokedAt": key.revoked_at,
         "lastUsedAt": key.last_used_at,
+    }
+
+
+def _job_payload(event) -> dict[str, object]:
+    return {
+        "jobId": event.job_id,
+        "operation": event.operation,
+        "phase": event.phase,
+        "status": event.status,
+        "recordedAt": event.recorded_at,
     }
 
 

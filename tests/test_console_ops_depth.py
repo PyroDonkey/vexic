@@ -324,5 +324,84 @@ class JobEventProjectAttributionTests(ConsoleOpsDepthHarness):
         self.assertEqual([event.job_id for event in events], ["job1", "job2"])
 
 
+class JobsEndpointTests(ConsoleOpsDepthHarness):
+    def _seed_jobs(self, project_id: str) -> None:
+        for job_id, status, error_type in (
+            ("job1", "running", None),
+            ("job1", "ok", None),
+            ("job2", "running", None),
+            ("job2", "error", "HostPortNotConfigured"),
+        ):
+            self.catalog.record_job_event(
+                HostedJobEvent(
+                    job_id=job_id,
+                    operation="run_dream_phase",
+                    tenant_id=self.tenant_id,
+                    principal_id="shared",
+                    status=status,
+                    recorded_at="2026-07-01T00:00:00Z",
+                    phase="light",
+                    error_type=error_type,
+                    project_id=project_id,
+                )
+            )
+
+    def _provisioned_project(self) -> dict:
+        project = self._create_project()
+        tenant = self.client.post(
+            "/control/v1/clerk-orgs/org_123/tenant",
+            headers=self._control_auth(),
+        ).json()["tenant"]
+        self.tenant_id = tenant["tenantId"]
+        return project
+
+    def test_jobs_endpoint_returns_project_events_without_error_detail(self) -> None:
+        project = self._provisioned_project()
+        self._seed_jobs(project["id"])
+
+        response = self.client.get(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/jobs?limit=50",
+            headers=self._control_auth(),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        jobs = response.json()["jobs"]
+        self.assertEqual(len(jobs), 4)
+        statuses = {job["status"] for job in jobs}
+        self.assertIn("error", statuses)
+        for job in jobs:
+            self.assertNotIn("errorType", job)
+            self.assertNotIn("error_type", job)
+            self.assertEqual(
+                set(job), {"jobId", "operation", "phase", "status", "recordedAt"}
+            )
+
+    def test_jobs_endpoint_requires_credential_and_known_project(self) -> None:
+        project = self._provisioned_project()
+
+        unauthorized = self.client.get(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/jobs",
+        )
+        self.assertEqual(unauthorized.status_code, 401)
+
+        missing = self.client.get(
+            "/control/v1/clerk-orgs/org_123/projects/proj_missing/jobs",
+            headers=self._control_auth(),
+        )
+        self.assertEqual(missing.status_code, 404)
+
+    def test_jobs_endpoint_is_tenant_isolated(self) -> None:
+        project = self._provisioned_project()
+        self._seed_jobs(project["id"])
+        other_project = self._create_project(org="org_other", name="Other")
+
+        response = self.client.get(
+            f"/control/v1/clerk-orgs/org_other/projects/{other_project['id']}/jobs",
+            headers=self._control_auth(),
+        )
+
+        self.assertEqual(response.json()["jobs"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
