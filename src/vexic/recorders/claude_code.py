@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 
-from vexic.contract import SourceTranscriptMessage
+from vexic.contract import PRIME_CONTEXT_HEADER, SourceTranscriptMessage
 from vexic.storage import single_message_adapter
 
 SOURCE_HOST = "claude-code"
@@ -53,6 +53,10 @@ def source_message_from_claude_code_row(
 
     text = _content_text(message.get("content"))
     if text is None:
+        return None
+    if PRIME_CONTEXT_HEADER in text:
+        # Injected SessionStart priming recap, echoed back into the JSONL
+        # transcript by the host; never re-ingest it into Tier 1 (WI-6).
         return None
 
     role = message.get("role")

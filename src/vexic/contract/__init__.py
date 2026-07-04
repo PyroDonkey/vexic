@@ -7,6 +7,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 CONTRACT_VERSION = "0.1.0"
 
+# Marker prefix stamped on every recorder-injected priming block (SessionStart
+# recap/search context). Recorders and ingest paths use this as a substring
+# guard so injected priming text can never re-enter Tier 1 transcript storage
+# and, downstream, Light extraction (WI-6).
+PRIME_CONTEXT_HEADER = "Vexic memory priming:"
+
 
 class ContractVersion(StrEnum):
     V0_1 = CONTRACT_VERSION

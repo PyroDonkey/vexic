@@ -25,6 +25,7 @@ from vexic.contract import (
     ExportScopeRequest,
     FreshContextRequest,
     IngestSourceTranscriptRequest,
+    PRIME_CONTEXT_HEADER,
     RecordRetrievalEventRequest,
     RebuildRequest,
     ReplayScopeRequest,
@@ -1577,6 +1578,55 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                 conn.execute("SELECT COUNT(*) FROM source_transcript_ledger").fetchone()[0],
                 0,
             )
+
+    def test_ingest_source_messages_rejects_echoed_prime_context(self) -> None:
+        init_db(self.db_path)
+
+        result = ingest_source_messages(
+            self.db_path,
+            [
+                SourceTranscriptInput(
+                    source_host="claude-code",
+                    source_session_id="session-1",
+                    source_message_id="echoed-prime",
+                    message_json=single_message_adapter.dump_json(
+                        ModelRequest(
+                            parts=[
+                                UserPromptPart(
+                                    content=(
+                                        f"{PRIME_CONTEXT_HEADER}\n"
+                                        "Long-term memory:\n- cedar"
+                                    )
+                                )
+                            ]
+                        )
+                    ).decode(),
+                ),
+                SourceTranscriptInput(
+                    source_host="claude-code",
+                    source_session_id="session-1",
+                    source_message_id="clean",
+                    message_json=single_message_adapter.dump_json(
+                        ModelRequest(parts=[UserPromptPart(content="clean cedar")])
+                    ).decode(),
+                ),
+            ],
+        )
+
+        self.assertEqual(result[0].status, "rejected")
+        self.assertEqual(result[0].reason, "prime context is not transcript text")
+        self.assertEqual(result[1].status, "inserted")
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 1)
+            bodies = [
+                row[0] for row in conn.execute("SELECT body FROM messages_fts").fetchall()
+            ]
+            self.assertTrue(all(PRIME_CONTEXT_HEADER not in body for body in bodies))
+
+        hits = search_messages(self.db_path, "cedar")
+        self.assertEqual([hit.body for hit in hits], ["User: clean cedar"])
+        self.assertTrue(all(PRIME_CONTEXT_HEADER not in hit.body for hit in hits))
 
     async def test_ingest_source_transcript_rejects_invalid_json_per_row(self) -> None:
         from vexic.service import LocalMemoryService
