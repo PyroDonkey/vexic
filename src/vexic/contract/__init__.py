@@ -58,6 +58,7 @@ class DreamPhase(StrEnum):
     LIGHT = "light"
     REM = "rem"
     DEEP = "deep"
+    SUMMARIZE = "summarize"
 
 
 class LifecycleAction(StrEnum):

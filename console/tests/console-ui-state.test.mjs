@@ -147,3 +147,22 @@ test("jobRuns leaves running jobs without finishedAt", () => {
   assert.equal(runs[0].status, "running");
   assert.equal(runs[0].finishedAt, null);
 });
+
+test("jobRuns groups a summarize phase run like any other dream phase", () => {
+  const runs = jobRuns([
+    { jobId: "job4", phase: "summarize", status: "ok", recordedAt: "2026-07-02T03:05:00Z" },
+    { jobId: "job4", phase: "summarize", status: "running", recordedAt: "2026-07-02T03:00:00Z" }
+  ]);
+
+  assert.equal(runs[0].phase, "summarize");
+  assert.equal(runs[0].status, "ok");
+});
+
+test("jobs tab renders a last-succeeded row for the summarize phase", () => {
+  const jobsTabSource = readFileSync(
+    path.join(root, "app/console/projects/[projectId]/jobs-tab.tsx"),
+    "utf8"
+  );
+
+  assert.match(jobsTabSource, /\["light", "rem", "deep", "summarize"\]/);
+});

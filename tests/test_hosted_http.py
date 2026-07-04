@@ -22,6 +22,7 @@ from vexic.contract import (
     Principal,
     PrincipalType,
     RedactionContext,
+    RunDreamPhaseRequest,
     SearchLongTermRequest,
     SearchTranscriptRequest,
     SourceTranscriptMessage,
@@ -1774,6 +1775,68 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(exit_code, 2)
         self.assertIn("requires a host-supplied model port", stderr.getvalue())
 
+    def test_run_dream_phase_cli_summarize_without_build_summary_agent_fails_closed(
+        self,
+    ) -> None:
+        raw_key, adapter = self._prepare_dream_phase_run()
+        stderr = io.StringIO()
+
+        with patch.dict(os.environ, {"VEXIC_TEST_API_KEY": f"{raw_key}\n"}):
+            with contextlib.redirect_stderr(stderr):
+                exit_code = _main_result(
+                    [
+                        "run-dream-phase",
+                        "--root",
+                        self.temp_dir.name,
+                        "--api-key-env",
+                        "VEXIC_TEST_API_KEY",
+                        "--adapter",
+                        str(adapter),
+                        "--model-group",
+                        "fake",
+                        "--tenant-id",
+                        "tenant-a",
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "session-a",
+                        "--agent-id",
+                        "agent-a",
+                        "--phase",
+                        "summarize",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("requires a host-supplied model port", stderr.getvalue())
+        self.assertIn("build_summary_agent", stderr.getvalue())
+
+    def test_handle_payload_maps_host_port_not_configured_to_503(self) -> None:
+        # Generic contract: _handle_payload is the shared HTTP mapping every
+        # hosted operation goes through (including run_dream_phase once it is
+        # wired to a request handler). It must already map
+        # HostPortNotConfigured -> 503 host_port_not_configured without any
+        # phase-specific error handling.
+        import asyncio
+
+        async def call(_api_key: str, _payload: object) -> None:
+            raise HostPortNotConfigured("Session summarization requires a host port.")
+
+        response = asyncio.run(
+            hosted_http._handle_payload(
+                "vx_fake_secret",
+                RunDreamPhaseRequest(
+                    scope=_scope(capabilities={MemoryCapability.ADMIN_REBUILD}),
+                    phase="summarize",
+                    redaction=RedactionContext(forbidden_values=()),
+                ),
+                call,
+            )
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(json.loads(response.body)["error"]["code"], "host_port_not_configured")
+
     def test_run_dream_phase_cli_defaults_adapter_and_model_group_from_env(self) -> None:
         raw_key, adapter = self._prepare_dream_phase_run()
         stdout = io.StringIO()
@@ -1866,6 +1929,29 @@ class DreamPhasePortsFromEnvTests(unittest.TestCase):
         self.assertIsNotNone(ports.extraction_agent_factory)
         self.assertIsNotNone(ports.contradiction_agent_factory)
         self.assertIsNone(ports.secrets)
+        # Regression: an adapter exposing only the required three (no
+        # build_summary_agent) must still load, with the optional summarize
+        # port left unset rather than failing adapter load.
+        self.assertIsNone(ports.summary_agent_factory)
+
+    def test_adapter_with_build_summary_agent_wires_summary_agent_factory(self) -> None:
+        adapter_path = Path(self.temp_dir.name) / "adapter_with_summary.py"
+        adapter_path.write_text(
+            _FAKE_DREAM_ADAPTER_SOURCE
+            + textwrap.dedent(
+                """
+                def build_summary_agent(model_group, secrets=None):
+                    return "fake-summary-agent"
+                """
+            )
+        )
+
+        ports = dream_phase_ports_from_env(
+            {"VEXIC_DREAM_PHASE_ADAPTER": str(adapter_path)}
+        )
+
+        self.assertIsNotNone(ports.summary_agent_factory)
+        self.assertEqual(ports.summary_agent_factory("model-group"), "fake-summary-agent")
 
     def test_model_group_env_overrides_default(self) -> None:
         adapter = _write_fake_dream_adapter(Path(self.temp_dir.name))

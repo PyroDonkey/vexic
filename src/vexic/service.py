@@ -823,7 +823,7 @@ async def _run_dream_phase_with_usage(
             agent_id=request.scope.agent_id,
             forbidden_secret_values=service._redaction_values(request.redaction),
         )
-    else:
+    elif request.phase is DreamPhase.DEEP:
         from vexic.deep import run_deep_phase
 
         usage = await run_deep_phase(
@@ -835,5 +835,19 @@ async def _run_dream_phase_with_usage(
             defer_contradiction=ports.defer_contradiction,
             forbidden_secret_values=service._redaction_values(request.redaction),
         )
+    elif request.phase is DreamPhase.SUMMARIZE:
+        from vexic.summarize import run_summarize_phase
+
+        usage = await run_summarize_phase(
+            service.db_path,
+            ports.model_group,
+            agent_id=request.scope.agent_id,
+            secrets=ports.secrets,
+            summary_agent_factory=ports.summary_agent_factory,
+            forbidden_secret_values=service._redaction_values(request.redaction),
+            content_codec=service.content_codec,
+        )
+    else:
+        raise ValueError(f"Unsupported dream phase: {request.phase!r}")
 
     return RunDreamPhaseResult(phase=request.phase, status="ok"), usage

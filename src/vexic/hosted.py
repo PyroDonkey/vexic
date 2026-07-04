@@ -1073,6 +1073,7 @@ def dream_phase_ports_from_env(env: Mapping[str, str]) -> DreamPhasePorts | None
         embed=adapter.embed_texts,
         extraction_agent_factory=adapter.build_extraction_agent,
         contradiction_agent_factory=adapter.build_contradiction_agent,
+        summary_agent_factory=getattr(adapter, "build_summary_agent", None),
     )
 
 
@@ -1120,6 +1121,7 @@ def _dream_phase_ports(args: argparse.Namespace) -> DreamPhasePorts:
         embed=adapter.embed_texts,
         extraction_agent_factory=adapter.build_extraction_agent,
         contradiction_agent_factory=adapter.build_contradiction_agent,
+        summary_agent_factory=getattr(adapter, "build_summary_agent", None),
         secrets=_secret_env_values(args.secret_env),
     )
 

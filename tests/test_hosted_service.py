@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import re
@@ -40,7 +41,7 @@ from vexic.hosted import (
 from vexic.models import ContradictionJudgment, FactCandidate
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 from vexic.ports import DreamPhasePorts, HostPortNotConfigured
-from vexic.storage import single_message_adapter
+from vexic.storage import save_messages, single_message_adapter
 
 
 def _unit_vector(first: float = 1.0) -> list[float]:
@@ -1540,6 +1541,77 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job_usage[1].input_tokens, 0)
         self.assertEqual(job_usage[1].output_tokens, 0)
         self.assertEqual(job_usage[1].total_tokens, 0)
+
+    async def test_hosted_dream_worker_runs_summarize_phase_with_fake_summary_agent(
+        self,
+    ) -> None:
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.ADMIN_REBUILD},
+            project_ids={"project-a"},
+        )
+
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        save_messages(
+            tenant.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="first summarize span")])],
+            session_id="default",
+            timestamp=start.isoformat(),
+        )
+        save_messages(
+            tenant.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="second summarize span")])],
+            session_id="default",
+            # A > 2h gap creates a compaction boundary so the summarize
+            # phase's leaf pass has a span to summarize.
+            timestamp=(start + timedelta(hours=3)).isoformat(),
+        )
+
+        class SummaryAgent:
+            async def run(self, prompt: str) -> object:
+                return SimpleNamespace(
+                    output="a fake summary",
+                    usage=lambda: SimpleNamespace(
+                        requests=1,
+                        input_tokens=6,
+                        output_tokens=4,
+                        total_tokens=10,
+                    ),
+                )
+
+        service = HostedMemoryService(
+            self.catalog,
+            self.keys,
+            telemetry=self.catalog,
+            dream_phase_ports=DreamPhasePorts(
+                model_group="fake",
+                summary_agent_factory=lambda *_args, **_kwargs: SummaryAgent(),
+            ),
+        )
+        jobs = HostedBackgroundJobRunner(service)
+
+        result = await jobs.run_dream_phase(
+            api_key.raw_key,
+            RunDreamPhaseRequest(
+                scope=_scope(capabilities={MemoryCapability.ADMIN_REBUILD}),
+                phase=DreamPhase.SUMMARIZE,
+                redaction=RedactionContext(forbidden_values=()),
+            ),
+        )
+
+        self.assertEqual(result.status, "ok")
+        self.assertEqual([event.status for event in jobs.job_events], ["running", "ok"])
+        self.assertEqual([event.phase for event in jobs.job_events], ["summarize", "summarize"])
+        job_usage = [
+            event
+            for event in self.catalog.usage_events("tenant-a")
+            if event.kind == "job"
+        ]
+        self.assertEqual(job_usage[-1].status, "ok")
+        self.assertEqual(job_usage[-1].model_requests, 1)
+        self.assertEqual(job_usage[-1].total_tokens, 10)
 
     async def test_hosted_dream_worker_redaction_failure_does_not_call_model(
         self,

@@ -68,7 +68,7 @@ export default function JobsTab({ projectId }: { projectId: string }) {
       <CardContent>
         {loadState === "ready" && runs.length > 0 ? (
           <div className="mb-4 flex flex-wrap gap-4 text-sm text-muted-foreground">
-            {["light", "rem", "deep"].map((phase) => {
+            {["light", "rem", "deep", "summarize"].map((phase) => {
               const lastOk = runs.find((run) => run.phase === phase && run.status === "ok");
               return (
                 <span key={phase}>
