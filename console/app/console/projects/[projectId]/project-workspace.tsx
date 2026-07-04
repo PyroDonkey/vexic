@@ -14,7 +14,7 @@ import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { usageRows } from "@/lib/console-ui-state.mjs";
+import { keyFreshness, usageRows } from "@/lib/console-ui-state.mjs";
 
 type Project = {
   id: string;
@@ -46,6 +46,8 @@ type AgentKey = {
   scopeTemplate: ScopeTemplate;
   display: string;
   createdAt: string;
+  lastUsedAt: string | null;
+  revokedAt: string | null;
 };
 
 type Usage = {
@@ -94,7 +96,9 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
     const seq = ++keysRequestSeq.current;
     try {
       setKeysLoadState("loading");
-      const response = await fetch(`/api/control-plane/projects/${projectId}/keys`, { cache: "no-store" });
+      const response = await fetch(`/api/control-plane/projects/${projectId}/keys?include=revoked`, {
+        cache: "no-store"
+      });
       if (!response.ok) throw new Error(`Key list failed with ${response.status}`);
       const data = (await response.json()) as { keys: AgentKey[] };
       if (seq !== keysRequestSeq.current) return;
@@ -188,6 +192,8 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
   }
 
   const usageRowData = usage ? usageRows(usage) : [];
+  const activeKeys = keys.filter((key) => !key.revokedAt);
+  const revokedKeys = keys.filter((key) => key.revokedAt);
 
   return (
     <div className="grid gap-6">
@@ -318,7 +324,7 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
                 <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-8 text-center text-sm text-destructive">
                   Agent API Keys could not be loaded. Refresh to try again.
                 </div>
-              ) : keys.length === 0 ? (
+              ) : activeKeys.length === 0 ? (
                 <div className="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground">
                   No active keys for this project.
                 </div>
@@ -330,11 +336,12 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
                       <TableHead>Capability</TableHead>
                       <TableHead>Display</TableHead>
                       <TableHead>Created</TableHead>
+                      <TableHead>Last used</TableHead>
                       <TableHead className="text-right">Action</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {keys.map((key) => (
+                    {activeKeys.map((key) => (
                       <TableRow key={key.id}>
                         <TableCell>
                           <div className="font-medium">{key.name}</div>
@@ -348,6 +355,17 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
                         </TableCell>
                         <TableCell className="text-muted-foreground">
                           {dateFormatter.format(new Date(key.createdAt))}
+                        </TableCell>
+                        <TableCell>
+                          {(() => {
+                            const freshness = keyFreshness(key.lastUsedAt);
+                            return (
+                              <span className="inline-flex items-center gap-2">
+                                {freshness.label}
+                                {freshness.stale ? <Badge variant="outline">Unused 30+ days</Badge> : null}
+                              </span>
+                            );
+                          })()}
                         </TableCell>
                         <TableCell className="text-right">
                           <div className="flex justify-end gap-2">
@@ -366,6 +384,31 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
                   </TableBody>
                 </Table>
               )}
+              {revokedKeys.length > 0 ? (
+                <details className="mt-4">
+                  <summary className="cursor-pointer text-sm text-muted-foreground">
+                    Revoked keys ({revokedKeys.length})
+                  </summary>
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>Name</TableHead>
+                        <TableHead>Key</TableHead>
+                        <TableHead>Revoked</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {revokedKeys.map((key) => (
+                        <TableRow key={key.id}>
+                          <TableCell>{key.name}</TableCell>
+                          <TableCell className="font-mono text-xs">{key.display}</TableCell>
+                          <TableCell>{dateFormatter.format(new Date(key.revokedAt!))}</TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </details>
+              ) : null}
             </CardContent>
           </Card>
         </TabsContent>

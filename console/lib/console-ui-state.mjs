@@ -41,6 +41,20 @@ export function usageMeterDisplay(value, max, valueLabel = formatNumber(value)) 
   };
 }
 
+const STALE_KEY_DAYS = 30;
+
+export function keyFreshness(lastUsedAt, nowIso = new Date().toISOString()) {
+  if (!lastUsedAt) {
+    return { label: "Never used", stale: false };
+  }
+  const last = new Date(lastUsedAt);
+  const ageDays = (new Date(nowIso).getTime() - last.getTime()) / 86_400_000;
+  return {
+    label: last.toLocaleDateString(undefined, { dateStyle: "medium" }),
+    stale: ageDays > STALE_KEY_DAYS
+  };
+}
+
 function formatLabel(value) {
   return value.replace(/([A-Z])/g, " $1").replace(/^./, (match) => match.toUpperCase());
 }

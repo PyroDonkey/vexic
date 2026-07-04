@@ -62,11 +62,12 @@ export async function getProjectResponse(_request, auth, projectId) {
   );
 }
 
-export async function listAgentKeysResponse(_request, auth, projectId) {
+export async function listAgentKeysResponse(request, auth, projectId) {
   const denied = requireOrg(auth);
   if (denied) return denied;
+  const includeRevoked = new URL(request.url).searchParams.get("include") === "revoked";
   return storeResponse(
-    () => listAgentKeys(auth.orgId, projectId),
+    () => listAgentKeys(auth.orgId, projectId, { includeRevoked }),
     (keys) => (keys ? json({ keys }) : json({ error: "not_found" }, 404))
   );
 }

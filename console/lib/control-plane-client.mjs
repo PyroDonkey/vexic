@@ -24,8 +24,9 @@ export async function getProject(orgId, projectId) {
   return data.project;
 }
 
-export async function listAgentKeys(orgId, projectId) {
-  const data = await request(orgId, "GET", `/projects/${encodeURIComponent(projectId)}/keys`);
+export async function listAgentKeys(orgId, projectId, { includeRevoked = false } = {}) {
+  const suffix = includeRevoked ? "?include=revoked" : "";
+  const data = await request(orgId, "GET", `/projects/${encodeURIComponent(projectId)}/keys${suffix}`);
   return data.keys;
 }
 

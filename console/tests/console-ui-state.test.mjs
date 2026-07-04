@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { dark } from "@clerk/themes";
 
 import { clerkBaseThemeFor } from "../lib/clerk-theme.mjs";
-import { projectCreateFailureMessage, usageMeterDisplay, usageRows } from "../lib/console-ui-state.mjs";
+import { keyFreshness, projectCreateFailureMessage, usageMeterDisplay, usageRows } from "../lib/console-ui-state.mjs";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 
@@ -84,4 +84,20 @@ test("Clerk theme provider keeps children rendered while theme resolves", () => 
 
   assert.doesNotMatch(providerSource, /return null;/);
   assert.match(providerSource, /<ClerkProvider[\s\S]*\{children\}[\s\S]*<\/ClerkProvider>/);
+});
+
+test("keyFreshness labels never-used keys", () => {
+  assert.deepEqual(keyFreshness(null, "2026-07-03T00:00:00Z"), {
+    label: "Never used",
+    stale: false
+  });
+});
+
+test("keyFreshness flags keys unused for more than 30 days as stale", () => {
+  const fresh = keyFreshness("2026-06-20T00:00:00Z", "2026-07-03T00:00:00Z");
+  assert.equal(fresh.stale, false);
+
+  const stale = keyFreshness("2026-05-01T00:00:00Z", "2026-07-03T00:00:00Z");
+  assert.equal(stale.stale, true);
+  assert.match(stale.label, /May 1|2026/);
 });

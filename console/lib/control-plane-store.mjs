@@ -51,8 +51,8 @@ export function createAgentKey(orgId, projectId, input = {}) {
   return selectedStore().createAgentKey(orgId, projectId, input);
 }
 
-export function listAgentKeys(orgId, projectId) {
-  return selectedStore().listAgentKeys(orgId, projectId);
+export function listAgentKeys(orgId, projectId, options = {}) {
+  return selectedStore().listAgentKeys(orgId, projectId, options);
 }
 
 export function revokeAgentKey(orgId, projectId, keyId) {
@@ -110,7 +110,8 @@ function stubCreateAgentKey(orgId, projectId, input = {}) {
     display: `${rawKey.slice(0, 16)}...${rawKey.slice(-4)}`,
     keyHash: createHash("sha256").update(rawKey).digest("hex"),
     createdAt: timestamp,
-    revokedAt: null
+    revokedAt: null,
+    lastUsedAt: null
   };
 
   const keys = keysByProject.get(projectId) ?? [];
@@ -123,12 +124,13 @@ function stubCreateAgentKey(orgId, projectId, input = {}) {
   };
 }
 
-function stubListAgentKeys(orgId, projectId) {
+function stubListAgentKeys(orgId, projectId, { includeRevoked = false } = {}) {
   if (!stubGetProject(orgId, projectId)) {
     return null;
   }
 
-  return (keysByProject.get(projectId) ?? []).filter((key) => !key.revokedAt).map(publicKey);
+  const keys = keysByProject.get(projectId) ?? [];
+  return keys.filter((key) => includeRevoked || !key.revokedAt).map(publicKey);
 }
 
 function stubRevokeAgentKey(orgId, projectId, keyId) {
@@ -204,7 +206,8 @@ function publicKey(key) {
     last4: key.last4,
     display: key.display,
     createdAt: key.createdAt,
-    revokedAt: key.revokedAt
+    revokedAt: key.revokedAt,
+    lastUsedAt: key.lastUsedAt ?? null
   };
 }
 
