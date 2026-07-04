@@ -466,9 +466,20 @@ def _cap_error(payload: MemoryRequest) -> JSONResponse | None:
 
 def _cap_result(result: _ResultT) -> _ResultT:
     if hasattr(result, "text") and len(result.text) > MAX_EXPAND_HISTORY_CHARS:
-        return result.model_copy(
-            update={"text": result.text[:MAX_EXPAND_HISTORY_CHARS], "truncated": True}
-        )
+        update: dict[str, object] = {
+            "text": result.text[:MAX_EXPAND_HISTORY_CHARS],
+            "truncated": True,
+        }
+        # The structured fields (e.g. FreshContextResult.recent/summaries)
+        # can carry the same raw content as `.text` uncapped. Drop them on
+        # truncation so a client can't bypass the char cap via the
+        # structured payload -- the original content stays recoverable via
+        # expand_history.
+        if hasattr(result, "recent"):
+            update["recent"] = []
+        if hasattr(result, "summaries"):
+            update["summaries"] = []
+        return result.model_copy(update=update)
     return result
 
 

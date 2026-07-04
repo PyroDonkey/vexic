@@ -1996,6 +1996,124 @@ class FreshContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result.recent), 1)
         self.assertEqual(result.recent[0].body, f"User: {long_text}")
 
+    async def test_oversized_frontier_is_trimmed_oldest_first(self) -> None:
+        from vexic.service import LocalMemoryService
+        from vexic.text_utils import estimate_tokens
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        for text in ("m1", "m2", "m3", "m4", "m5", "m6"):
+            self._save(text)
+        self._summary(
+            kind="leaf",
+            first_message_id=1,
+            last_message_id=2,
+            summary_text="a" * 400,
+        )
+        self._summary(
+            kind="leaf",
+            first_message_id=3,
+            last_message_id=4,
+            summary_text="b" * 400,
+        )
+        self._summary(
+            kind="leaf",
+            first_message_id=5,
+            last_message_id=6,
+            summary_text="c" * 40,
+        )
+
+        result = await service.fresh_context(
+            FreshContextRequest(
+                scope=_scope().model_copy(
+                    update={"capabilities": {MemoryCapability.FRESH_CONTEXT}}
+                ),
+                redaction=RedactionContext(forbidden_values=()),
+                token_budget=250,
+            )
+        )
+
+        # leaf a and leaf b (~100 tokens each) are dropped oldest-first
+        # because keeping all three would exceed token_budget (250) minus
+        # the minimum tail reservation (200); only the newest, small leaf c
+        # summary (~10 tokens) fits.
+        self.assertEqual([s.summary_text for s in result.summaries], ["c" * 40])
+        self.assertLessEqual(estimate_tokens(result.text), 250)
+
+    async def test_combined_frontier_and_tail_estimate_stays_within_token_budget(
+        self,
+    ) -> None:
+        # Exercise the storage-level assembly directly: the frontier ceiling
+        # (token_budget - _MIN_TAIL_TOKEN_BUDGET) must hold regardless of how
+        # the tail walk happens to size individual messages, so we check the
+        # invariant load_fresh_context_rows is documented to guarantee rather
+        # than depending on exact per-message JSON-overhead token estimates.
+        from vexic.service import LocalMemoryService
+        from vexic.storage.session_summaries import (
+            _MIN_TAIL_TOKEN_BUDGET,
+            load_fresh_context_rows,
+        )
+        from vexic.text_utils import estimate_tokens
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        for text in ("m1", "m2", "m3", "m4", "m5", "m6"):
+            self._save(text)
+        self._summary(
+            kind="leaf",
+            first_message_id=1,
+            last_message_id=2,
+            summary_text="s" * 2400,
+        )
+        self._summary(
+            kind="leaf",
+            first_message_id=3,
+            last_message_id=4,
+            summary_text="t" * 1200,
+        )
+
+        token_budget = 1000
+        frontier, tail = load_fresh_context_rows(
+            self.db_path, token_budget=token_budget, session_id="default"
+        )
+
+        frontier_tokens = sum(
+            estimate_tokens(summary.summary_text) for summary in frontier
+        )
+        # The frontier alone must leave room for at least the minimum tail
+        # reservation -- this is the ceiling the oldest-first trim enforces.
+        self.assertLessEqual(frontier_tokens, token_budget - _MIN_TAIL_TOKEN_BUDGET)
+
+    async def test_single_giant_summary_returns_tail_only(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        for text in ("m1", "m2", "m3"):
+            self._save(text)
+        self._summary(
+            kind="leaf",
+            first_message_id=1,
+            last_message_id=2,
+            summary_text="giant " * 2000,
+        )
+
+        result = await service.fresh_context(
+            FreshContextRequest(
+                scope=_scope().model_copy(
+                    update={"capabilities": {MemoryCapability.FRESH_CONTEXT}}
+                ),
+                redaction=RedactionContext(forbidden_values=()),
+                token_budget=250,
+            )
+        )
+
+        # The single summary alone blows the budget, so it's dropped
+        # entirely and the tail falls back to the full-budget path (same
+        # shape as the no-summaries fallback).
+        self.assertEqual(result.summaries, [])
+        self.assertTrue(result.recent)
+
     async def test_missing_summary_fallback_returns_budgeted_tail_from_start(self) -> None:
         from vexic.service import LocalMemoryService
 

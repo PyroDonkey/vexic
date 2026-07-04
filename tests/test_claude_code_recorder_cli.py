@@ -1970,7 +1970,7 @@ class ClaudeCodeRecorderPrimeCommandTests(unittest.TestCase):
                 if request.full_url.endswith("/v1/fresh_context")
             )
             body = json.loads(fresh_context_call.data.decode("utf-8"))
-            self.assertEqual(body, {"token_budget": 6_000 // 4})
+            self.assertEqual(body, {"token_budget": 6_000 // 16})
 
     def test_prime_fresh_context_failure_falls_back_to_search_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -2158,6 +2158,99 @@ class ClaudeCodeRecorderPrimeCommandTests(unittest.TestCase):
             self.assertEqual(code, 0)
             context = json.loads(stdout.getvalue())["hookSpecificOutput"]["additionalContext"]
             self.assertLessEqual(len(context), 200)
+
+    def test_prime_huge_recap_does_not_starve_long_term_and_transcript_sections(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+
+            class _Response:
+                def __init__(self, payload: dict[str, object]) -> None:
+                    self._payload = payload
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc):
+                    return False
+
+                def read(self) -> bytes:
+                    return json.dumps(self._payload).encode("utf-8")
+
+            def fake_urlopen(request, timeout):
+                if request.full_url.endswith("/v1/fresh_context"):
+                    # Simulate a hosted endpoint that ignores token_budget and
+                    # returns a recap large enough to fill the entire prime
+                    # budget on its own if left uncapped.
+                    return _Response(
+                        {
+                            "summaries": [],
+                            "recent": [],
+                            "text": "huge recap " * 2_000,
+                            "truncated": False,
+                        }
+                    )
+                if request.full_url.endswith("/v1/search_long_term"):
+                    return _Response(
+                        {
+                            "facts": [{"fact_text": "Durable cedar preference"}],
+                            "candidate_notes": [],
+                        }
+                    )
+                return _Response(
+                    {
+                        "hits": [
+                            {
+                                "message_id": 1,
+                                "session_id": "session-a",
+                                "body": "User: recent cedar note",
+                            }
+                        ]
+                    }
+                )
+
+            stdout = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--max-chars",
+                        "6000",
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            context = json.loads(stdout.getvalue())["hookSpecificOutput"]["additionalContext"]
+            self.assertLessEqual(len(context), 6000)
+            self.assertIn("Durable cedar preference", context)
+            self.assertIn("recent cedar note", context)
+            self.assertIn(
+                "Use this memory silently",
+                context,
+                "trailing footer instruction must survive a huge recap",
+            )
 
     def test_prime_uses_transcript_when_long_term_search_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

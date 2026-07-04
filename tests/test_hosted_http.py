@@ -1877,6 +1877,10 @@ class HostedHttpTests(unittest.TestCase):
         body = response.json()
         self.assertTrue(body["truncated"])
         self.assertEqual(len(body["text"]), hosted_http.MAX_EXPAND_HISTORY_CHARS)
+        # The structured fields (recoverable via expand_history) must not
+        # bypass the same cap that bounds `.text`.
+        self.assertEqual(body["recent"], [])
+        self.assertEqual(body["summaries"], [])
 
     def test_fresh_context_has_rate_limit_rule(self) -> None:
         api_key = self._api_key(capabilities={MemoryCapability.FRESH_CONTEXT})

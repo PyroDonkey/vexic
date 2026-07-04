@@ -652,10 +652,18 @@ def load_fresh_context_rows(
     """Assemble the fresh-context frontier + token-budgeted raw tail.
 
     Returns the summary recap frontier (oldest-first) alongside the raw
-    message tail strictly after the frontier's covered prefix, budgeted so the
-    combined recap + tail fits within `token_budget`. With no summaries, the
-    tail is budgeted over the full `token_budget` from the start of the
-    session (boundary 0).
+    message tail strictly after the frontier's covered prefix, budgeted so
+    the combined recap + tail fits within `token_budget`.
+
+    The frontier is a ceiling, not a bonus on top of the budget: if the
+    frontier alone would leave less than `_MIN_TAIL_TOKEN_BUDGET` for the
+    tail, the oldest frontier entries are dropped (oldest-first) until the
+    remainder fits within `token_budget - _MIN_TAIL_TOKEN_BUDGET`. If no
+    frontier entry fits even alone, the frontier is dropped entirely and the
+    tail is budgeted over the full `token_budget`, matching the no-summaries
+    fallback below. With no summaries (or an emptied-out frontier), the tail
+    is budgeted over the full `token_budget` from the start of the session
+    (boundary 0).
     """
     frontier = fetch_session_summary_frontier(
         db_path,
@@ -669,14 +677,20 @@ def load_fresh_context_rows(
         return frontier, []
 
     if frontier:
+        frontier_tokens = sum(
+            estimate_tokens(summary.summary_text) for summary in frontier
+        )
+        frontier_ceiling = token_budget - _MIN_TAIL_TOKEN_BUDGET
+        while frontier and frontier_tokens > frontier_ceiling:
+            oldest = frontier.pop(0)
+            frontier_tokens -= estimate_tokens(oldest.summary_text)
+
+    if frontier:
         covered_until = _frontier_covered_prefix(
             frontier,
             first_message_id=first_message_id,
         )
-        frontier_tokens = sum(
-            estimate_tokens(summary.summary_text) for summary in frontier
-        )
-        tail_budget = max(token_budget - frontier_tokens, _MIN_TAIL_TOKEN_BUDGET)
+        tail_budget = token_budget - frontier_tokens
         after_id: int | None = covered_until
     else:
         tail_budget = token_budget

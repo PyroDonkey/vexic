@@ -485,6 +485,14 @@ class LocalMemoryService(MemoryService):
         self._authorize(request.scope, request.required_capability)
         self._assert_not_tombstoned(request.scope, "retrieval")
         session_id = request.scope.session_id or "default"
+        # load_fresh_context_rows assumes the returned frontier starts at the
+        # session's covered prefix (spans are built from message id 1
+        # onward) -- a frontier that starts mid-session isn't constructible
+        # today, so the raw tail never needs to "skip forward" past a gap
+        # before the frontier's earliest span. If that ever changes (e.g. a
+        # frontier trimmed to start later than the session start), the tail
+        # would need to independently cover the pre-frontier prefix instead
+        # of duplicating it as raw text from message 1.
         frontier, tail_hits = load_fresh_context_rows(
             self.db_path,
             token_budget=request.token_budget,

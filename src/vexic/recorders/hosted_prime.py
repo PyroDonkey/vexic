@@ -49,10 +49,19 @@ def fetch_prime_context(
     long_term_limit: int = 5,
     transcript_limit: int = 5,
 ) -> str:
-    fresh_context = fetch_fresh_context(config, token_budget=max_chars // 4)
+    # The recap is one of several prime sections (long-term facts, transcript
+    # hits, and the trailing footer also need room). Cap the token_budget we
+    # request AND the char budget we accept for the recap to ~1/4 of
+    # max_chars, so a hosted endpoint that ignores token_budget (or whose
+    # token estimate undershoots ours) can't crowd out the other sections.
+    fresh_context = fetch_fresh_context(config, token_budget=max_chars // 16)
     recap_text = None
     if fresh_context is not None:
         recap_text = _str(fresh_context.get("text"))
+        if recap_text is not None:
+            recap_cap = max_chars // 4
+            if len(recap_text) > recap_cap:
+                recap_text = recap_text[:recap_cap].rstrip()
     long_term = _safe_post_search(
         config,
         "search_long_term",
