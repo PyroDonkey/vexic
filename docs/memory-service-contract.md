@@ -147,11 +147,17 @@ not await phase completion.
 **Scope is tenant(+agent)-wide, not project-scoped.** The request's
 authenticated project header binds and authorizes the call the same as any
 other route, but `messages` and `session_summaries` carry no `project_id`
-column, so the sweep itself (`list_compactable_session_ids`) walks every
-compactable session for the tenant (and agent, if scoped) regardless of
-which project triggered it. A tenant whose projects share one database get
-one shared sweep and one shared daily span budget, not per-project
-isolation.
+column, so the sweep sees every project sharing that tenant's database
+regardless of which project triggered it. Within that, `agent_id` scoping is
+exact, not "all agents": `list_compactable_session_ids` filters with
+`agent_id IS ?`, so a trigger that supplies no agent id matches only
+`NULL`-agent sessions, and a trigger that supplies an agent id matches only
+sessions recorded with that exact `agent_id`. There is no "sweep every
+agent for this tenant" mode -- the operator must align the trigger's agent
+header (or its absence) with how the recorder writes transcripts for the
+agent(s) they intend to sweep. A tenant whose projects share one database
+get one shared sweep and one shared daily span budget per `(tenant_id,
+agent_id)`, not per-project isolation.
 
 A daily span budget (`VEXIC_SUMMARIZE_DAILY_SPAN_BUDGET`, default `50`)
 caps `session_summaries` writes (leaf and condense both count) per

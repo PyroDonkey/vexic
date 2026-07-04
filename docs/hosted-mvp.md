@@ -559,13 +559,19 @@ authenticates the same way as the other `/v1/*` routes.
   trigger call, not once per session summarized.
 - **Sweep scope is tenant(+agent)-wide, not project-scoped.** The project
   header still authenticates and binds the request the same way as every
-  other hosted route, but the summarize sweep itself walks every compactable
-  session for the tenant (and agent, if the key is agent-scoped) regardless
-  of which project sent the trigger -- `messages`/`session_summaries` have no
-  `project_id` column today. A tenant with multiple projects sharing one
-  database gets one shared summarize budget and sweep, not per-project
-  isolation. Project-scoped storage is a separate future change if a
-  multi-project tenant ever needs it.
+  other hosted route, but `messages`/`session_summaries` have no `project_id`
+  column today, so the sweep itself sees every project sharing that tenant's
+  database. `list_compactable_session_ids` matches on `agent_id IS ?`
+  (exact equality, including SQL `NULL`-safe comparison) -- it is NOT "all
+  agents for the tenant." A trigger that omits `X-Vexic-Agent-Id` (or sends
+  no agent id in scope) sweeps only sessions recorded with a `NULL`
+  `agent_id`; a trigger that sends an agent id sweeps only sessions recorded
+  with that exact `agent_id`. Operators must align the trigger's agent
+  header with however the recorder writes transcripts for that agent, or
+  those sessions will never be swept. A tenant with multiple projects
+  sharing one database gets one shared summarize budget and sweep per
+  `(tenant_id, agent_id)`, not per-project isolation. Project-scoped storage
+  is a separate future change if a multi-project tenant ever needs it.
 - Execution itself never blocks the request or the serving event loop: the
   phase runs on its own worker thread with its own event loop
   (`asyncio.to_thread(asyncio.run, ...)`), so a slow summarize call cannot

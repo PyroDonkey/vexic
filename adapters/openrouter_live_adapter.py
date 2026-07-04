@@ -183,6 +183,9 @@ def build_summary_agent(
     model_group: str,
     secrets: Mapping[str, str] | None = None,
 ) -> Agent[None, str]:
+    # `model_group` is intentionally unused: the summary model is env-driven
+    # via `VEXIC_SUMMARY_MODEL` (see `_summary_model_name`), not routed by
+    # model group like the other agent builders in this module.
     _reject_passed_secrets(secrets)
     return _agent_with_model(_summary_model_name(), str, SUMMARY_INSTRUCTIONS)
 

@@ -6,9 +6,13 @@
 # 429, never double work. This workflow stays deliberately dumb: no matrix,
 # no retry logic beyond curl's own, no per-tenant looping.
 #
-# X-Vexic-Session-Id is required by the endpoint for auth binding, but the
-# summarize sweep itself is tenant(+agent)-wide regardless of which session
-# id is sent -- "cron" is a fixed placeholder, not a real session.
+# Agent scoping is exact, not "all agents": `list_compactable_session_ids`
+# matches sessions with `agent_id IS ?`. Omitting `X-Vexic-Agent-Id` (the
+# default here) sweeps only sessions recorded with a NULL agent_id. Set the
+# `VEXIC_DREAM_AGENT_ID` secret to the exact agent id the recorder writes
+# transcripts under if this tenant's sessions are agent-scoped -- otherwise
+# this cron sweep will silently never touch them. An unset/empty secret
+# means "omit the header entirely" (NULL-agent sweep), not "all agents".
 #
 # Non-2xx (e.g. 429, 5xx) fails the job red on purpose: that's the intended
 # v1 alerting signal, so no retries are layered on top beyond curl --retry.
@@ -24,11 +28,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Trigger summarize dream phase
+        env:
+          VEXIC_DREAM_AGENT_ID: ${{ secrets.VEXIC_DREAM_AGENT_ID }}
         run: |
-          curl --fail-with-body --max-time 30 --retry 2 \
-            -X POST "${{ secrets.VEXIC_DREAM_TRIGGER_URL }}" \
-            -H "Authorization: Bearer ${{ secrets.VEXIC_DREAM_TRIGGER_KEY }}" \
-            -H "X-Vexic-Project-Id: ${{ secrets.VEXIC_DREAM_PROJECT_ID }}" \
-            -H "X-Vexic-Session-Id: cron" \
-            -H "Content-Type: application/json" \
-            -d '{"phase": "summarize"}'
+          args=(
+            --fail-with-body --max-time 30 --retry 2
+            -X POST "${{ secrets.VEXIC_DREAM_TRIGGER_URL }}"
+            -H "Authorization: Bearer ${{ secrets.VEXIC_DREAM_TRIGGER_KEY }}"
+            -H "X-Vexic-Project-Id: ${{ secrets.VEXIC_DREAM_PROJECT_ID }}"
+            -H "Content-Type: application/json"
+          )
+          if [ -n "$VEXIC_DREAM_AGENT_ID" ]; then
+            args+=(-H "X-Vexic-Agent-Id: $VEXIC_DREAM_AGENT_ID")
+          fi
+          args+=(-d '{"phase": "summarize"}')
+          curl "${args[@]}"
