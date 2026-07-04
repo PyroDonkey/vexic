@@ -4,6 +4,7 @@ from vexic.contract import CandidateNote, LongTermFact, MemoryCategory, Transcri
 from vexic.formatting import UNVERIFIED_NOTES_PREAMBLE
 from vexic.mcp_presentation import (
     PRESENTATION_REMINDER,
+    RECALL_USER_MEMORY_DESCRIPTION,
     render_long_term,
     render_transcript_hits,
     server_instructions,
@@ -57,12 +58,31 @@ class ServerInstructionsTests(unittest.TestCase):
         self.assertIn("verbatim history expansion", instructions)
         self.assertNotIn("expand_history", instructions)
 
+    def test_default_instructions_carry_search_before_deny_backstop(self) -> None:
+        instructions = server_instructions(False)
+
+        self.assertIn("is made-up", instructions)
+        self.assertIn("search before denying, don't refuse to deny", instructions)
+
     def test_expand_enabled_instructions_mention_expand_history(self) -> None:
         instructions = server_instructions(True)
 
         self.assertIn("expand_history", instructions)
         self.assertIn("proactively", instructions)
         self.assertIn("No transcript append", instructions)
+
+    def test_expand_enabled_instructions_carry_search_before_deny_backstop(self) -> None:
+        instructions = server_instructions(True)
+
+        self.assertIn("search before denying, don't refuse to deny", instructions)
+
+
+class ToolDescriptionTests(unittest.TestCase):
+    def test_user_memory_description_has_search_before_deny_tail(self) -> None:
+        self.assertIn(
+            "doesn't exist or is made-up", RECALL_USER_MEMORY_DESCRIPTION
+        )
+        self.assertIn("search first", RECALL_USER_MEMORY_DESCRIPTION)
 
 
 class RenderTranscriptHitsTests(unittest.TestCase):
