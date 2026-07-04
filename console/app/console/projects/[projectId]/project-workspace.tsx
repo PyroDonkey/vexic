@@ -85,16 +85,20 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
   // Bumped by every loadKeys call and by createKey, so an in-flight key-list
   // fetch that resolves after a newer write cannot clobber the fresher state.
   const keysRequestSeq = useRef(0);
+  const workspaceRequestSeq = useRef(0);
 
   async function loadProject() {
+    const seq = workspaceRequestSeq.current;
     try {
       setProjectLoadState("loading");
       const response = await fetch(`/api/control-plane/projects/${projectId}`, { cache: "no-store" });
       if (!response.ok) throw new Error(`Project load failed with ${response.status}`);
       const data = (await response.json()) as { project: Project };
+      if (seq !== workspaceRequestSeq.current) return;
       setProject(data.project);
       setProjectLoadState("ready");
     } catch {
+      if (seq !== workspaceRequestSeq.current) return;
       setProjectLoadState("error");
       toast.error("Project details failed to load.");
     }
@@ -120,20 +124,24 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
   }
 
   async function loadUsage() {
+    const seq = workspaceRequestSeq.current;
     try {
       setUsageLoadState("loading");
       const response = await fetch(`/api/control-plane/projects/${projectId}/usage`, { cache: "no-store" });
       if (!response.ok) throw new Error(`Usage load failed with ${response.status}`);
       const data = (await response.json()) as { usage: Usage };
+      if (seq !== workspaceRequestSeq.current) return;
       setUsage(data.usage);
       setUsageLoadState("ready");
     } catch {
+      if (seq !== workspaceRequestSeq.current) return;
       setUsageLoadState("error");
       toast.error("Usage failed to load.");
     }
   }
 
   async function loadDaily() {
+    const seq = workspaceRequestSeq.current;
     try {
       setDailyLoadState("loading");
       const response = await fetch(`/api/control-plane/projects/${projectId}/usage/daily`, { cache: "no-store" });
@@ -141,29 +149,35 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
       const data = (await response.json()) as {
         daily: { date: string; writes: number; retrievals: number; other: number }[];
       };
+      if (seq !== workspaceRequestSeq.current) return;
       setDaily(data.daily);
       setDailyLoadState("ready");
     } catch {
+      if (seq !== workspaceRequestSeq.current) return;
       setDailyLoadState("error");
       toast.error("Daily usage failed to load.");
     }
   }
 
   async function loadByKey() {
+    const seq = workspaceRequestSeq.current;
     try {
       setByKeyLoadState("loading");
       const response = await fetch(`/api/control-plane/projects/${projectId}/usage/by-key`, { cache: "no-store" });
       if (!response.ok) throw new Error(`Usage by key load failed with ${response.status}`);
       const data = (await response.json()) as { byKey: { keyId: string | null; requests: number }[] };
+      if (seq !== workspaceRequestSeq.current) return;
       setByKey(data.byKey);
       setByKeyLoadState("ready");
     } catch {
+      if (seq !== workspaceRequestSeq.current) return;
       setByKeyLoadState("error");
       toast.error("Usage by key failed to load.");
     }
   }
 
   useEffect(() => {
+    workspaceRequestSeq.current += 1;
     setRawKey("");
     setCreatedKey(null);
     void loadProject();

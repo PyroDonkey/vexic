@@ -891,7 +891,7 @@ class HostedTenantCatalog:
         return [
             {"keyId": key_id, "requests": count}
             for key_id, count in sorted(
-                counts.items(), key=lambda item: (-item[1], item[0] or "")
+                counts.items(), key=lambda item: (-item[1], item[0] is None, item[0] or "")
             )
         ]
 

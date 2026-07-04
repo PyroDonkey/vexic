@@ -100,13 +100,16 @@ test("keyFreshness labels never-used keys", () => {
   });
 });
 
-test("keyFreshness flags keys unused for more than 30 days as stale", () => {
+test("keyFreshness flags keys unused for 30+ days as stale", () => {
   const fresh = keyFreshness("2026-06-20T00:00:00Z", "2026-07-03T00:00:00Z");
   assert.equal(fresh.stale, false);
 
   const stale = keyFreshness("2026-05-01T00:00:00Z", "2026-07-03T00:00:00Z");
   assert.equal(stale.stale, true);
   assert.match(stale.label, /May 1|2026/);
+
+  const boundary = keyFreshness("2026-06-03T00:00:00Z", "2026-07-03T00:00:00Z");
+  assert.equal(boundary.stale, true);
 });
 
 test("capStatus thresholds: ok below 80, warn at 80, alert at 95, none without cap", () => {

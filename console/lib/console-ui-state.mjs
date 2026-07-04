@@ -75,7 +75,7 @@ export function keyFreshness(lastUsedAt, nowIso = new Date().toISOString()) {
   const ageDays = (new Date(nowIso).getTime() - last.getTime()) / 86_400_000;
   return {
     label: last.toLocaleDateString(undefined, { dateStyle: "medium" }),
-    stale: ageDays > STALE_KEY_DAYS
+    stale: ageDays >= STALE_KEY_DAYS
   };
 }
 

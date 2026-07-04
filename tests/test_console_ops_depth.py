@@ -273,6 +273,34 @@ class UsageAnalyticsEndpointTests(ConsoleOpsDepthHarness):
         self.assertEqual(by_key["key_b"], 2)
         self.assertEqual(by_key[None], 1)
 
+    def test_by_key_sorts_unattributed_bucket_last_on_tied_counts(self) -> None:
+        project = self._provisioned_project()
+        from datetime import UTC, datetime, timedelta
+
+        day = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%dT10:00:00Z")
+        for key_id in ("key_z", None):
+            self.catalog.record_usage_event(
+                HostedUsageEvent(
+                    kind="request",
+                    operation="append_transcript",
+                    tenant_id=self.tenant_id,
+                    principal_id="shared",
+                    status="ok",
+                    recorded_at=day,
+                    project_id=project["id"],
+                    key_id=key_id,
+                )
+            )
+
+        response = self.client.get(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/usage/by-key"
+            "?days=30",
+            headers=self._control_auth(),
+        )
+
+        rows = response.json()["byKey"]
+        self.assertEqual([row["keyId"] for row in rows], ["key_z", None])
+
     def test_by_key_requires_control_credential(self) -> None:
         project = self._provisioned_project()
 
