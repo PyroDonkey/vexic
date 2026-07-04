@@ -183,7 +183,7 @@ regenerated from Tier 1.
 
 ## Retrieval
 
-Vexic has two retrieval families.
+Vexic has two query-driven retrieval families, plus a no-query fresh-context family described below.
 
 ### Transcript Search
 
