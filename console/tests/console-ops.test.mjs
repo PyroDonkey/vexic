@@ -5,6 +5,7 @@ import {
   createAgentKeyResponse,
   createProjectResponse,
   listAgentKeysResponse,
+  listJobsResponse,
   revokeAgentKeyResponse,
   usageByKeyResponse,
   usageDailyResponse
@@ -104,4 +105,23 @@ test("usage daily requires an active org", async () => {
     "proj_x"
   );
   assert.equal(denied.status, 403);
+});
+
+test("jobs endpoint responds with a status-only job list for a stub project", async () => {
+  const { project } = await json(
+    await createProjectResponse(request("POST", "/api/control-plane/projects", { name: "Alpha" }), authedOrg)
+  );
+
+  const jobs = await json(
+    await listJobsResponse(
+      request("GET", `/api/control-plane/projects/${project.id}/jobs`),
+      authedOrg,
+      project.id
+    )
+  );
+
+  assert.ok(Array.isArray(jobs.jobs));
+  for (const job of jobs.jobs) {
+    assert.deepEqual(Object.keys(job).sort(), ["jobId", "operation", "phase", "recordedAt", "status"]);
+  }
 });

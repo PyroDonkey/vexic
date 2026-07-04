@@ -3,6 +3,7 @@ import {
   createProject,
   getProject,
   listAgentKeys,
+  listJobs,
   listProjects,
   revokeAgentKey,
   supportMetadata,
@@ -117,6 +118,15 @@ export async function usageByKeyResponse(_request, auth, projectId) {
   return storeResponse(
     () => usageByKey(auth.orgId, projectId),
     (byKey) => (byKey ? json({ byKey }) : json({ error: "not_found" }, 404))
+  );
+}
+
+export async function listJobsResponse(_request, auth, projectId) {
+  const denied = requireOrg(auth);
+  if (denied) return denied;
+  return storeResponse(
+    () => listJobs(auth.orgId, projectId),
+    (jobs) => (jobs ? json({ jobs }) : json({ error: "not_found" }, 404))
   );
 }
 

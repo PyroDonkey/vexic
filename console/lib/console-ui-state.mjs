@@ -1,3 +1,27 @@
+const TERMINAL_JOB_STATUSES = new Set(["ok", "error"]);
+
+export function jobRuns(events) {
+  const byJob = new Map();
+  for (const event of events) {
+    const entries = byJob.get(event.jobId) ?? [];
+    entries.push(event);
+    byJob.set(event.jobId, entries);
+  }
+  const runs = [];
+  for (const [jobId, entries] of byJob) {
+    const ordered = [...entries].sort((a, b) => a.recordedAt.localeCompare(b.recordedAt));
+    const latest = ordered[ordered.length - 1];
+    runs.push({
+      jobId,
+      phase: latest.phase,
+      status: latest.status,
+      startedAt: ordered[0].recordedAt,
+      finishedAt: TERMINAL_JOB_STATUSES.has(latest.status) ? latest.recordedAt : null
+    });
+  }
+  return runs.sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+}
+
 export function projectCreateFailureMessage(status) {
   return status === 403 ? "Project creation requires an active organization." : "Project creation failed. Try again.";
 }

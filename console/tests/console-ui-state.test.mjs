@@ -9,6 +9,7 @@ import { dark } from "@clerk/themes";
 import { clerkBaseThemeFor } from "../lib/clerk-theme.mjs";
 import {
   capStatus,
+  jobRuns,
   keyFreshness,
   projectCreateFailureMessage,
   usageMeterDisplay,
@@ -114,4 +115,32 @@ test("capStatus thresholds: ok below 80, warn at 80, alert at 95, none without c
   assert.equal(capStatus(95, 100).level, "alert");
   assert.equal(capStatus(120, 100).level, "alert");
   assert.equal(capStatus(50, 0).level, "none");
+});
+
+test("jobRuns groups events per job with latest status and time range", () => {
+  const runs = jobRuns([
+    { jobId: "job2", phase: "rem", status: "error", recordedAt: "2026-07-02T01:05:00Z" },
+    { jobId: "job2", phase: "rem", status: "running", recordedAt: "2026-07-02T01:00:00Z" },
+    { jobId: "job1", phase: "light", status: "ok", recordedAt: "2026-07-01T00:05:00Z" },
+    { jobId: "job1", phase: "light", status: "running", recordedAt: "2026-07-01T00:00:00Z" }
+  ]);
+
+  assert.equal(runs.length, 2);
+  assert.deepEqual(runs[0], {
+    jobId: "job2",
+    phase: "rem",
+    status: "error",
+    startedAt: "2026-07-02T01:00:00Z",
+    finishedAt: "2026-07-02T01:05:00Z"
+  });
+  assert.equal(runs[1].status, "ok");
+});
+
+test("jobRuns leaves running jobs without finishedAt", () => {
+  const runs = jobRuns([
+    { jobId: "job3", phase: "deep", status: "running", recordedAt: "2026-07-02T02:00:00Z" }
+  ]);
+
+  assert.equal(runs[0].status, "running");
+  assert.equal(runs[0].finishedAt, null);
 });

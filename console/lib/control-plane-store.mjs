@@ -75,6 +75,10 @@ export function usageByKey(orgId, projectId) {
   return selectedStore().usageByKey(orgId, projectId);
 }
 
+export function listJobs(orgId, projectId) {
+  return selectedStore().listJobs(orgId, projectId);
+}
+
 function stubCreateProject(orgId, input = {}) {
   const timestamp = now();
   const project = {
@@ -213,6 +217,43 @@ function stubUsageByKey(orgId, projectId) {
   return rows;
 }
 
+function stubListJobs(orgId, projectId) {
+  if (!stubGetProject(orgId, projectId)) {
+    return null;
+  }
+  const base = Date.now() - 3 * 3_600_000;
+  return [
+    {
+      jobId: "job_stub_3",
+      operation: "run_dream_phase",
+      phase: "deep",
+      status: "running",
+      recordedAt: new Date(base + 2 * 3_600_000).toISOString()
+    },
+    {
+      jobId: "job_stub_2",
+      operation: "run_dream_phase",
+      phase: "rem",
+      status: "ok",
+      recordedAt: new Date(base + 3_600_000).toISOString()
+    },
+    {
+      jobId: "job_stub_2",
+      operation: "run_dream_phase",
+      phase: "rem",
+      status: "running",
+      recordedAt: new Date(base + 3_540_000).toISOString()
+    },
+    {
+      jobId: "job_stub_1",
+      operation: "run_dream_phase",
+      phase: "light",
+      status: "error",
+      recordedAt: new Date(base).toISOString()
+    }
+  ];
+}
+
 function stubSupportMetadata(orgId) {
   const projects = stubListProjects(orgId);
   const timestamp = now();
@@ -284,7 +325,8 @@ const stubStore = {
   usageSummary: stubUsageSummary,
   supportMetadata: stubSupportMetadata,
   usageDaily: stubUsageDaily,
-  usageByKey: stubUsageByKey
+  usageByKey: stubUsageByKey,
+  listJobs: stubListJobs
 };
 
 const failClosedStore = {
@@ -297,7 +339,8 @@ const failClosedStore = {
   usageSummary: notConfigured,
   supportMetadata: notConfigured,
   usageDaily: notConfigured,
-  usageByKey: notConfigured
+  usageByKey: notConfigured,
+  listJobs: notConfigured
 };
 
 function notConfigured() {

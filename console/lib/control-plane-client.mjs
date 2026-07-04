@@ -58,6 +58,11 @@ export async function usageByKey(orgId, projectId) {
   return data.byKey ?? [];
 }
 
+export async function listJobs(orgId, projectId) {
+  const data = await request(orgId, "GET", `/projects/${encodeURIComponent(projectId)}/jobs?limit=50`);
+  return data.jobs ?? [];
+}
+
 export async function supportMetadata(_orgId) {
   return [];
 }
