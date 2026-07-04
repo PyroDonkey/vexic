@@ -283,5 +283,46 @@ class UsageAnalyticsEndpointTests(ConsoleOpsDepthHarness):
         self.assertEqual(response.status_code, 401)
 
 
+class JobEventProjectAttributionTests(ConsoleOpsDepthHarness):
+    def _record(self, job_id: str, status: str, project_id: str | None, recorded_at: str) -> None:
+        self.catalog.record_job_event(
+            HostedJobEvent(
+                job_id=job_id,
+                operation="run_dream_phase",
+                tenant_id="tenant-a",
+                principal_id="shared",
+                status=status,
+                recorded_at=recorded_at,
+                phase="light",
+                project_id=project_id,
+            )
+        )
+
+    def test_job_events_filter_by_project(self) -> None:
+        self._record("job1", "ok", "proj_a", "2026-07-01T00:00:00Z")
+        self._record("job2", "ok", "proj_b", "2026-07-01T01:00:00Z")
+        self._record("job3", "ok", None, "2026-07-01T02:00:00Z")
+
+        events = self.catalog.job_events("tenant-a", project_id="proj_a")
+
+        self.assertEqual([event.job_id for event in events], ["job1"])
+
+    def test_job_events_limit_returns_newest_first(self) -> None:
+        for index in range(5):
+            self._record(f"job{index}", "ok", "proj_a", f"2026-07-01T0{index}:00:00Z")
+
+        events = self.catalog.job_events("tenant-a", project_id="proj_a", limit=2)
+
+        self.assertEqual([event.job_id for event in events], ["job4", "job3"])
+
+    def test_job_events_default_behavior_unchanged(self) -> None:
+        self._record("job1", "ok", "proj_a", "2026-07-01T00:00:00Z")
+        self._record("job2", "ok", "proj_b", "2026-07-01T01:00:00Z")
+
+        events = self.catalog.job_events("tenant-a")
+
+        self.assertEqual([event.job_id for event in events], ["job1", "job2"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -760,9 +760,9 @@ class HostedTenantCatalog:
                 """
                 INSERT INTO hosted_job_events (
                     job_id, operation, tenant_id, principal_id, status, recorded_at,
-                    phase, error_type
+                    phase, error_type, project_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.job_id,
@@ -773,6 +773,7 @@ class HostedTenantCatalog:
                     event.recorded_at,
                     event.phase,
                     event.error_type,
+                    event.project_id,
                 ),
             )
             conn.commit()
@@ -894,18 +895,33 @@ class HostedTenantCatalog:
             )
         ]
 
-    def job_events(self, tenant_id: str) -> list[HostedJobEvent]:
+    def job_events(
+        self,
+        tenant_id: str,
+        *,
+        project_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[HostedJobEvent]:
+        conditions = ["tenant_id = ?"]
+        params: list[object] = [tenant_id]
+        if project_id is not None:
+            conditions.append("project_id = ?")
+            params.append(project_id)
+        order = "ORDER BY id"
+        if limit is not None:
+            order = "ORDER BY id DESC LIMIT ?"
+            params.append(limit)
         with closing(self._connect_control()) as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT
                     job_id, operation, tenant_id, principal_id, status,
-                    recorded_at, phase, error_type
+                    recorded_at, phase, error_type, project_id
                 FROM hosted_job_events
-                WHERE tenant_id = ?
-                ORDER BY id
+                WHERE {" AND ".join(conditions)}
+                {order}
                 """,
-                (tenant_id,),
+                tuple(params),
             ).fetchall()
         return [
             HostedJobEvent(
@@ -917,6 +933,7 @@ class HostedTenantCatalog:
                 recorded_at=row[5],
                 phase=row[6],
                 error_type=row[7],
+                project_id=row[8],
             )
             for row in rows
         ]
@@ -940,6 +957,12 @@ class HostedTenantCatalog:
                 conn.execute("ALTER TABLE hosted_usage_events ADD COLUMN project_id TEXT")
             if "key_id" not in columns:
                 conn.execute("ALTER TABLE hosted_usage_events ADD COLUMN key_id TEXT")
+            job_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(hosted_job_events)").fetchall()
+            }
+            if "project_id" not in job_columns:
+                conn.execute("ALTER TABLE hosted_job_events ADD COLUMN project_id TEXT")
             tenant_columns = {
                 str(row[1])
                 for row in conn.execute("PRAGMA table_info(tenants)").fetchall()

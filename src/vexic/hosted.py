@@ -331,6 +331,7 @@ class HostedJobEvent:
     recorded_at: str
     phase: str | None = None
     error_type: str | None = None
+    project_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -935,6 +936,7 @@ class HostedBackgroundJobRunner:
             phase=request.phase.value,
             recorded_at=_now(),
             error_type=error_type,
+            project_id=request.scope.project_id,
         )
         self.job_events.append(event)
         try:
