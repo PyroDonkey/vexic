@@ -24,8 +24,9 @@ export async function getProject(orgId, projectId) {
   return data.project;
 }
 
-export async function listAgentKeys(orgId, projectId) {
-  const data = await request(orgId, "GET", `/projects/${encodeURIComponent(projectId)}/keys`);
+export async function listAgentKeys(orgId, projectId, { includeRevoked = false } = {}) {
+  const suffix = includeRevoked ? "?include=revoked" : "";
+  const data = await request(orgId, "GET", `/projects/${encodeURIComponent(projectId)}/keys${suffix}`);
   return data.keys;
 }
 
@@ -41,6 +42,25 @@ export async function revokeAgentKey(orgId, projectId, keyId) {
 export async function usageSummary(orgId, projectId) {
   const data = await request(orgId, "GET", `/projects/${encodeURIComponent(projectId)}/usage`);
   return normalizeUsage(data.usage);
+}
+
+export async function usageDaily(orgId, projectId) {
+  const data = await request(
+    orgId,
+    "GET",
+    `/projects/${encodeURIComponent(projectId)}/usage?granularity=day&days=30`
+  );
+  return data.usage?.daily ?? [];
+}
+
+export async function usageByKey(orgId, projectId) {
+  const data = await request(orgId, "GET", `/projects/${encodeURIComponent(projectId)}/usage/by-key?days=30`);
+  return data.byKey ?? [];
+}
+
+export async function listJobs(orgId, projectId) {
+  const data = await request(orgId, "GET", `/projects/${encodeURIComponent(projectId)}/jobs?limit=50`);
+  return data.jobs ?? [];
 }
 
 export async function supportMetadata(_orgId) {

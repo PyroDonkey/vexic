@@ -169,6 +169,7 @@ class HostedApiKeyRecord:
     display: str
     created_at: str
     revoked_at: str | None = None
+    last_used_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -184,6 +185,7 @@ class _HostedApiKey:
     revoked_at: str | None = None
     revoked_by: str | None = None
     active: bool = True
+    last_used_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -729,9 +731,9 @@ class HostedTenantCatalog:
                 INSERT INTO hosted_usage_events (
                     kind, operation, tenant_id, principal_id, status, recorded_at,
                     model_requests, input_tokens, output_tokens, total_tokens,
-                    estimated_cost_micros, error_type, project_id
+                    estimated_cost_micros, error_type, project_id, key_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.kind,
@@ -747,6 +749,7 @@ class HostedTenantCatalog:
                     event.estimated_cost_micros,
                     event.error_type,
                     event.project_id,
+                    event.key_id,
                 ),
             )
             conn.commit()
@@ -757,9 +760,9 @@ class HostedTenantCatalog:
                 """
                 INSERT INTO hosted_job_events (
                     job_id, operation, tenant_id, principal_id, status, recorded_at,
-                    phase, error_type
+                    phase, error_type, project_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.job_id,
@@ -770,6 +773,7 @@ class HostedTenantCatalog:
                     event.recorded_at,
                     event.phase,
                     event.error_type,
+                    event.project_id,
                 ),
             )
             conn.commit()
@@ -827,7 +831,7 @@ class HostedTenantCatalog:
                 f"""
                 SELECT kind, operation, tenant_id, principal_id, status, recorded_at,
                        model_requests, input_tokens, output_tokens, total_tokens,
-                       estimated_cost_micros, error_type, project_id
+                       estimated_cost_micros, error_type, project_id, key_id
                 FROM hosted_usage_events
                 WHERE {where_clause}
                 ORDER BY id
@@ -836,18 +840,88 @@ class HostedTenantCatalog:
             ).fetchall()
         return [HostedUsageEvent(*row) for row in rows]
 
-    def job_events(self, tenant_id: str) -> list[HostedJobEvent]:
+    _WRITE_OPERATIONS = ("append_transcript",)
+    _RETRIEVAL_OPERATIONS = ("search_transcript", "search_long_term")
+
+    def usage_daily(
+        self,
+        tenant_id: str,
+        *,
+        project_id: str,
+        recorded_at_gte: str,
+        recorded_at_lt: str,
+    ) -> list[dict[str, object]]:
+        events = self.usage_events(
+            tenant_id,
+            project_id=project_id,
+            recorded_at_gte=recorded_at_gte,
+            recorded_at_lt=recorded_at_lt,
+        )
+        buckets: dict[str, dict[str, object]] = {}
+        for event in events:
+            date = event.recorded_at[:10]
+            bucket = buckets.setdefault(
+                date, {"date": date, "writes": 0, "retrievals": 0, "other": 0}
+            )
+            if event.operation in self._WRITE_OPERATIONS:
+                bucket["writes"] += 1
+            elif event.operation in self._RETRIEVAL_OPERATIONS:
+                bucket["retrievals"] += 1
+            else:
+                bucket["other"] += 1
+        return [buckets[date] for date in sorted(buckets)]
+
+    def usage_by_key(
+        self,
+        tenant_id: str,
+        *,
+        project_id: str,
+        recorded_at_gte: str,
+        recorded_at_lt: str,
+    ) -> list[dict[str, object]]:
+        events = self.usage_events(
+            tenant_id,
+            project_id=project_id,
+            recorded_at_gte=recorded_at_gte,
+            recorded_at_lt=recorded_at_lt,
+        )
+        counts: dict[str | None, int] = {}
+        for event in events:
+            counts[event.key_id] = counts.get(event.key_id, 0) + 1
+        return [
+            {"keyId": key_id, "requests": count}
+            for key_id, count in sorted(
+                counts.items(), key=lambda item: (-item[1], item[0] is None, item[0] or "")
+            )
+        ]
+
+    def job_events(
+        self,
+        tenant_id: str,
+        *,
+        project_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[HostedJobEvent]:
+        conditions = ["tenant_id = ?"]
+        params: list[object] = [tenant_id]
+        if project_id is not None:
+            conditions.append("project_id = ?")
+            params.append(project_id)
+        order = "ORDER BY id"
+        if limit is not None:
+            order = "ORDER BY id DESC LIMIT ?"
+            params.append(limit)
         with closing(self._connect_control()) as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT
                     job_id, operation, tenant_id, principal_id, status,
-                    recorded_at, phase, error_type
+                    recorded_at, phase, error_type, project_id
                 FROM hosted_job_events
-                WHERE tenant_id = ?
-                ORDER BY id
+                WHERE {" AND ".join(conditions)}
+                {order}
                 """,
-                (tenant_id,),
+                tuple(params),
             ).fetchall()
         return [
             HostedJobEvent(
@@ -859,6 +933,7 @@ class HostedTenantCatalog:
                 recorded_at=row[5],
                 phase=row[6],
                 error_type=row[7],
+                project_id=row[8],
             )
             for row in rows
         ]
@@ -880,6 +955,14 @@ class HostedTenantCatalog:
             }
             if "project_id" not in columns:
                 conn.execute("ALTER TABLE hosted_usage_events ADD COLUMN project_id TEXT")
+            if "key_id" not in columns:
+                conn.execute("ALTER TABLE hosted_usage_events ADD COLUMN key_id TEXT")
+            job_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(hosted_job_events)").fetchall()
+            }
+            if "project_id" not in job_columns:
+                conn.execute("ALTER TABLE hosted_job_events ADD COLUMN project_id TEXT")
             tenant_columns = {
                 str(row[1])
                 for row in conn.execute("PRAGMA table_info(tenants)").fetchall()
@@ -1060,6 +1143,7 @@ class HostedApiKeyStore:
         key_hash = self._hash(raw_key)
         stored = self._load_key(key_id)
         if hmac.compare_digest(stored.key_hash, key_hash) and stored.active:
+            self._touch_last_used(stored)
             return HostedAuthContext(
                 key_id=stored.key_id,
                 tenant_id=stored.tenant_id,
@@ -1072,6 +1156,34 @@ class HostedApiKeyStore:
                 agent_ids=stored.agent_ids,
             )
         raise PermissionError("Invalid hosted API key.")
+
+    _LAST_USED_MIN_INTERVAL_DAYS = 60.0 / 86400.0  # one minute, in julianday units
+
+    def _touch_last_used(self, stored: _HostedApiKey) -> None:
+        now = _now()
+        if self._control_target is None:
+            if _last_used_is_fresh(stored.last_used_at, now):
+                return
+            self._keys[stored.key_id] = replace(stored, last_used_at=now)
+            return
+        try:
+            with closing(self._connect_control()) as conn:
+                conn.execute(
+                    """
+                    UPDATE hosted_api_keys
+                    SET last_used_at = ?
+                    WHERE key_id = ?
+                      AND (
+                        last_used_at IS NULL
+                        OR julianday(?) - julianday(last_used_at) >= ?
+                      )
+                    """,
+                    (now, stored.key_id, now, self._LAST_USED_MIN_INTERVAL_DAYS),
+                )
+                conn.commit()
+        except Exception:
+            # Last-used telemetry must never break the auth hot path.
+            pass
 
     def revoke_key(self, key_id: str, *, revoked_by: str | None = None) -> None:
         if self._control_target is None:
@@ -1184,25 +1296,36 @@ class HostedApiKeyStore:
         *,
         tenant_id: str,
         project_id: str,
+        include_revoked: bool = False,
     ) -> list[HostedApiKeyRecord]:
         if self._control_target is None:
-            return [
-                replace(record, revoked_at=self._keys[record.key_id].revoked_at)
-                for record in self._control_metadata.values()
-                if record.tenant_id == tenant_id
-                and record.project_id == project_id
-                and self._keys[record.key_id].revoked_at is None
-            ]
+            records = []
+            for record in self._control_metadata.values():
+                if record.tenant_id != tenant_id or record.project_id != project_id:
+                    continue
+                stored = self._keys[record.key_id]
+                if stored.revoked_at is not None and not include_revoked:
+                    continue
+                records.append(
+                    replace(
+                        record,
+                        revoked_at=stored.revoked_at,
+                        last_used_at=stored.last_used_at,
+                    )
+                )
+            return records
+        revoked_filter = "" if include_revoked else "AND keys.revoked_at IS NULL"
         with closing(self._connect_control()) as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT
                     meta.key_id, meta.tenant_id, meta.project_id, meta.name,
                     meta.capability, meta.agent_scope, meta.key_prefix,
-                    meta.last4, meta.display, meta.created_at, keys.revoked_at
+                    meta.last4, meta.display, meta.created_at, keys.revoked_at,
+                    keys.last_used_at
                 FROM hosted_api_key_metadata AS meta
                 JOIN hosted_api_keys AS keys ON keys.key_id = meta.key_id
-                WHERE meta.tenant_id = ? AND meta.project_id = ? AND keys.revoked_at IS NULL
+                WHERE meta.tenant_id = ? AND meta.project_id = ? {revoked_filter}
                 ORDER BY meta.created_at, meta.key_id
                 """,
                 (tenant_id, project_id),
@@ -1220,6 +1343,7 @@ class HostedApiKeyStore:
                 display=row[8],
                 created_at=row[9],
                 revoked_at=row[10],
+                last_used_at=row[11],
             )
             for row in rows
         ]
@@ -1302,6 +1426,12 @@ class HostedApiKeyStore:
                 )
                 """
             )
+            columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(hosted_api_keys)").fetchall()
+            }
+            if "last_used_at" not in columns:
+                conn.execute("ALTER TABLE hosted_api_keys ADD COLUMN last_used_at TEXT")
             conn.commit()
 
     def _load_key(self, key_id: str) -> _HostedApiKey:
@@ -1315,7 +1445,8 @@ class HostedApiKeyStore:
                 """
                 SELECT
                     key_id, key_hash, tenant_id, principal_id, capabilities,
-                    project_ids, agent_ids, created_at, revoked_at, revoked_by
+                    project_ids, agent_ids, created_at, revoked_at, revoked_by,
+                    last_used_at
                 FROM hosted_api_keys
                 WHERE key_id = ?
                 """,
@@ -1339,6 +1470,7 @@ class HostedApiKeyStore:
                 revoked_at=revoked_at,
                 revoked_by=row[9],
                 active=revoked_at is None,
+                last_used_at=row[10],
             )
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
             raise PermissionError("Invalid hosted API key.") from exc
@@ -1399,3 +1531,13 @@ def _load_json_list(raw: str, *, allow_none: bool = False) -> list[str | None]:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _last_used_is_fresh(previous: str | None, now: str) -> bool:
+    if previous is None:
+        return False
+    parse = lambda value: datetime.fromisoformat(value.replace("Z", "+00:00"))
+    try:
+        return (parse(now) - parse(previous)).total_seconds() < 60
+    except ValueError:
+        return False

@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { FolderKanban, LifeBuoy, Menu, Settings } from "lucide-react";
+import { CreditCard, FolderKanban, LifeBuoy, Menu, Settings } from "lucide-react";
 import { CreateOrganization, OrganizationSwitcher, UserButton } from "@clerk/nextjs";
 
 import { ThemeToggle } from "@/components/theme-toggle";
@@ -17,6 +17,7 @@ export const dynamic = "force-dynamic";
 
 const navItems = [
   { href: "/console", label: "Projects", icon: FolderKanban },
+  { href: "/console/billing", label: "Billing", icon: CreditCard },
   { href: "/console/settings", label: "Settings", icon: Settings },
   { href: "/console/support", label: "Support", icon: LifeBuoy }
 ];

@@ -51,8 +51,8 @@ export function createAgentKey(orgId, projectId, input = {}) {
   return selectedStore().createAgentKey(orgId, projectId, input);
 }
 
-export function listAgentKeys(orgId, projectId) {
-  return selectedStore().listAgentKeys(orgId, projectId);
+export function listAgentKeys(orgId, projectId, options = {}) {
+  return selectedStore().listAgentKeys(orgId, projectId, options);
 }
 
 export function revokeAgentKey(orgId, projectId, keyId) {
@@ -65,6 +65,18 @@ export function usageSummary(orgId, projectId) {
 
 export function supportMetadata(orgId) {
   return selectedStore().supportMetadata(orgId);
+}
+
+export function usageDaily(orgId, projectId) {
+  return selectedStore().usageDaily(orgId, projectId);
+}
+
+export function usageByKey(orgId, projectId) {
+  return selectedStore().usageByKey(orgId, projectId);
+}
+
+export function listJobs(orgId, projectId) {
+  return selectedStore().listJobs(orgId, projectId);
 }
 
 function stubCreateProject(orgId, input = {}) {
@@ -110,7 +122,8 @@ function stubCreateAgentKey(orgId, projectId, input = {}) {
     display: `${rawKey.slice(0, 16)}...${rawKey.slice(-4)}`,
     keyHash: createHash("sha256").update(rawKey).digest("hex"),
     createdAt: timestamp,
-    revokedAt: null
+    revokedAt: null,
+    lastUsedAt: null
   };
 
   const keys = keysByProject.get(projectId) ?? [];
@@ -123,12 +136,13 @@ function stubCreateAgentKey(orgId, projectId, input = {}) {
   };
 }
 
-function stubListAgentKeys(orgId, projectId) {
+function stubListAgentKeys(orgId, projectId, { includeRevoked = false } = {}) {
   if (!stubGetProject(orgId, projectId)) {
     return null;
   }
 
-  return (keysByProject.get(projectId) ?? []).filter((key) => !key.revokedAt).map(publicKey);
+  const keys = keysByProject.get(projectId) ?? [];
+  return keys.filter((key) => includeRevoked || !key.revokedAt).map(publicKey);
 }
 
 function stubRevokeAgentKey(orgId, projectId, keyId) {
@@ -176,6 +190,70 @@ function stubUsageSummary(orgId, projectId) {
   };
 }
 
+function stubUsageDaily(orgId, projectId) {
+  if (!stubGetProject(orgId, projectId)) {
+    return null;
+  }
+  const rows = [];
+  for (let back = 13; back >= 0; back -= 1) {
+    const day = new Date(Date.now() - back * 86_400_000);
+    rows.push({
+      date: day.toISOString().slice(0, 10),
+      writes: 3 + ((back * 7) % 9),
+      retrievals: 20 + ((back * 13) % 31),
+      other: (back * 3) % 5
+    });
+  }
+  return rows;
+}
+
+function stubUsageByKey(orgId, projectId) {
+  const keys = stubListAgentKeys(orgId, projectId, { includeRevoked: false });
+  if (keys === null) {
+    return null;
+  }
+  const rows = keys.map((key, index) => ({ keyId: key.id, requests: 240 - index * 60 }));
+  rows.push({ keyId: null, requests: 12 });
+  return rows;
+}
+
+function stubListJobs(orgId, projectId) {
+  if (!stubGetProject(orgId, projectId)) {
+    return null;
+  }
+  const base = Date.now() - 3 * 3_600_000;
+  return [
+    {
+      jobId: "job_stub_3",
+      operation: "run_dream_phase",
+      phase: "deep",
+      status: "running",
+      recordedAt: new Date(base + 2 * 3_600_000).toISOString()
+    },
+    {
+      jobId: "job_stub_2",
+      operation: "run_dream_phase",
+      phase: "rem",
+      status: "ok",
+      recordedAt: new Date(base + 3_600_000).toISOString()
+    },
+    {
+      jobId: "job_stub_2",
+      operation: "run_dream_phase",
+      phase: "rem",
+      status: "running",
+      recordedAt: new Date(base + 3_540_000).toISOString()
+    },
+    {
+      jobId: "job_stub_1",
+      operation: "run_dream_phase",
+      phase: "light",
+      status: "error",
+      recordedAt: new Date(base).toISOString()
+    }
+  ];
+}
+
 function stubSupportMetadata(orgId) {
   const projects = stubListProjects(orgId);
   const timestamp = now();
@@ -204,7 +282,8 @@ function publicKey(key) {
     last4: key.last4,
     display: key.display,
     createdAt: key.createdAt,
-    revokedAt: key.revokedAt
+    revokedAt: key.revokedAt,
+    lastUsedAt: key.lastUsedAt ?? null
   };
 }
 
@@ -244,7 +323,10 @@ const stubStore = {
   listAgentKeys: stubListAgentKeys,
   revokeAgentKey: stubRevokeAgentKey,
   usageSummary: stubUsageSummary,
-  supportMetadata: stubSupportMetadata
+  supportMetadata: stubSupportMetadata,
+  usageDaily: stubUsageDaily,
+  usageByKey: stubUsageByKey,
+  listJobs: stubListJobs
 };
 
 const failClosedStore = {
@@ -255,7 +337,10 @@ const failClosedStore = {
   listAgentKeys: notConfigured,
   revokeAgentKey: notConfigured,
   usageSummary: notConfigured,
-  supportMetadata: notConfigured
+  supportMetadata: notConfigured,
+  usageDaily: notConfigured,
+  usageByKey: notConfigured,
+  listJobs: notConfigured
 };
 
 function notConfigured() {

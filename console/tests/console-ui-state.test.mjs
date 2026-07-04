@@ -7,7 +7,14 @@ import { fileURLToPath } from "node:url";
 import { dark } from "@clerk/themes";
 
 import { clerkBaseThemeFor } from "../lib/clerk-theme.mjs";
-import { projectCreateFailureMessage, usageMeterDisplay, usageRows } from "../lib/console-ui-state.mjs";
+import {
+  capStatus,
+  jobRuns,
+  keyFreshness,
+  projectCreateFailureMessage,
+  usageMeterDisplay,
+  usageRows
+} from "../lib/console-ui-state.mjs";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 
@@ -84,4 +91,59 @@ test("Clerk theme provider keeps children rendered while theme resolves", () => 
 
   assert.doesNotMatch(providerSource, /return null;/);
   assert.match(providerSource, /<ClerkProvider[\s\S]*\{children\}[\s\S]*<\/ClerkProvider>/);
+});
+
+test("keyFreshness labels never-used keys", () => {
+  assert.deepEqual(keyFreshness(null, "2026-07-03T00:00:00Z"), {
+    label: "Never used",
+    stale: false
+  });
+});
+
+test("keyFreshness flags keys unused for 30+ days as stale", () => {
+  const fresh = keyFreshness("2026-06-20T00:00:00Z", "2026-07-03T00:00:00Z");
+  assert.equal(fresh.stale, false);
+
+  const stale = keyFreshness("2026-05-01T00:00:00Z", "2026-07-03T00:00:00Z");
+  assert.equal(stale.stale, true);
+  assert.match(stale.label, /May 1|2026/);
+
+  const boundary = keyFreshness("2026-06-03T00:00:00Z", "2026-07-03T00:00:00Z");
+  assert.equal(boundary.stale, true);
+});
+
+test("capStatus thresholds: ok below 80, warn at 80, alert at 95, none without cap", () => {
+  assert.equal(capStatus(50, 100).level, "ok");
+  assert.equal(capStatus(80, 100).level, "warn");
+  assert.equal(capStatus(95, 100).level, "alert");
+  assert.equal(capStatus(120, 100).level, "alert");
+  assert.equal(capStatus(50, 0).level, "none");
+});
+
+test("jobRuns groups events per job with latest status and time range", () => {
+  const runs = jobRuns([
+    { jobId: "job2", phase: "rem", status: "error", recordedAt: "2026-07-02T01:05:00Z" },
+    { jobId: "job2", phase: "rem", status: "running", recordedAt: "2026-07-02T01:00:00Z" },
+    { jobId: "job1", phase: "light", status: "ok", recordedAt: "2026-07-01T00:05:00Z" },
+    { jobId: "job1", phase: "light", status: "running", recordedAt: "2026-07-01T00:00:00Z" }
+  ]);
+
+  assert.equal(runs.length, 2);
+  assert.deepEqual(runs[0], {
+    jobId: "job2",
+    phase: "rem",
+    status: "error",
+    startedAt: "2026-07-02T01:00:00Z",
+    finishedAt: "2026-07-02T01:05:00Z"
+  });
+  assert.equal(runs[1].status, "ok");
+});
+
+test("jobRuns leaves running jobs without finishedAt", () => {
+  const runs = jobRuns([
+    { jobId: "job3", phase: "deep", status: "running", recordedAt: "2026-07-02T02:00:00Z" }
+  ]);
+
+  assert.equal(runs[0].status, "running");
+  assert.equal(runs[0].finishedAt, null);
 });

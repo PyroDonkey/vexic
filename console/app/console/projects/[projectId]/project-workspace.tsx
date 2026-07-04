@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { BarList } from "@/components/tremor/bar-list";
+import { DailyBars } from "@/components/tremor/daily-bars";
 import { UsageMeter } from "@/components/tremor/usage-meter";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -14,7 +15,10 @@ import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { usageRows } from "@/lib/console-ui-state.mjs";
+import { capStatus, keyFreshness, usageRows } from "@/lib/console-ui-state.mjs";
+
+import DataTab from "./data-tab";
+import JobsTab from "./jobs-tab";
 
 type Project = {
   id: string;
@@ -46,6 +50,8 @@ type AgentKey = {
   scopeTemplate: ScopeTemplate;
   display: string;
   createdAt: string;
+  lastUsedAt: string | null;
+  revokedAt: string | null;
 };
 
 type Usage = {
@@ -55,7 +61,7 @@ type Usage = {
   caps: Record<string, number>;
 };
 
-type Tab = "keys" | "usage" | "settings";
+type Tab = "keys" | "usage" | "jobs" | "data" | "settings";
 type LoadState = "loading" | "ready" | "error";
 
 const dateFormatter = new Intl.DateTimeFormat(undefined, { dateStyle: "medium" });
@@ -65,6 +71,8 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
   const [project, setProject] = useState<Project | null>(null);
   const [keys, setKeys] = useState<AgentKey[]>([]);
   const [usage, setUsage] = useState<Usage | null>(null);
+  const [daily, setDaily] = useState<{ date: string; writes: number; retrievals: number; other: number }[]>([]);
+  const [byKey, setByKey] = useState<{ keyId: string | null; requests: number }[]>([]);
   const [rawKey, setRawKey] = useState("");
   const [createdKey, setCreatedKey] = useState<AgentKey | null>(null);
   const [name, setName] = useState("");
@@ -72,19 +80,25 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
   const [projectLoadState, setProjectLoadState] = useState<LoadState>("loading");
   const [keysLoadState, setKeysLoadState] = useState<LoadState>("loading");
   const [usageLoadState, setUsageLoadState] = useState<LoadState>("loading");
+  const [dailyLoadState, setDailyLoadState] = useState<LoadState>("loading");
+  const [byKeyLoadState, setByKeyLoadState] = useState<LoadState>("loading");
   // Bumped by every loadKeys call and by createKey, so an in-flight key-list
   // fetch that resolves after a newer write cannot clobber the fresher state.
   const keysRequestSeq = useRef(0);
+  const workspaceRequestSeq = useRef(0);
 
   async function loadProject() {
+    const seq = workspaceRequestSeq.current;
     try {
       setProjectLoadState("loading");
       const response = await fetch(`/api/control-plane/projects/${projectId}`, { cache: "no-store" });
       if (!response.ok) throw new Error(`Project load failed with ${response.status}`);
       const data = (await response.json()) as { project: Project };
+      if (seq !== workspaceRequestSeq.current) return;
       setProject(data.project);
       setProjectLoadState("ready");
     } catch {
+      if (seq !== workspaceRequestSeq.current) return;
       setProjectLoadState("error");
       toast.error("Project details failed to load.");
     }
@@ -94,7 +108,9 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
     const seq = ++keysRequestSeq.current;
     try {
       setKeysLoadState("loading");
-      const response = await fetch(`/api/control-plane/projects/${projectId}/keys`, { cache: "no-store" });
+      const response = await fetch(`/api/control-plane/projects/${projectId}/keys?include=revoked`, {
+        cache: "no-store"
+      });
       if (!response.ok) throw new Error(`Key list failed with ${response.status}`);
       const data = (await response.json()) as { keys: AgentKey[] };
       if (seq !== keysRequestSeq.current) return;
@@ -108,25 +124,67 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
   }
 
   async function loadUsage() {
+    const seq = workspaceRequestSeq.current;
     try {
       setUsageLoadState("loading");
       const response = await fetch(`/api/control-plane/projects/${projectId}/usage`, { cache: "no-store" });
       if (!response.ok) throw new Error(`Usage load failed with ${response.status}`);
       const data = (await response.json()) as { usage: Usage };
+      if (seq !== workspaceRequestSeq.current) return;
       setUsage(data.usage);
       setUsageLoadState("ready");
     } catch {
+      if (seq !== workspaceRequestSeq.current) return;
       setUsageLoadState("error");
       toast.error("Usage failed to load.");
     }
   }
 
+  async function loadDaily() {
+    const seq = workspaceRequestSeq.current;
+    try {
+      setDailyLoadState("loading");
+      const response = await fetch(`/api/control-plane/projects/${projectId}/usage/daily`, { cache: "no-store" });
+      if (!response.ok) throw new Error(`Daily usage load failed with ${response.status}`);
+      const data = (await response.json()) as {
+        daily: { date: string; writes: number; retrievals: number; other: number }[];
+      };
+      if (seq !== workspaceRequestSeq.current) return;
+      setDaily(data.daily);
+      setDailyLoadState("ready");
+    } catch {
+      if (seq !== workspaceRequestSeq.current) return;
+      setDailyLoadState("error");
+      toast.error("Daily usage failed to load.");
+    }
+  }
+
+  async function loadByKey() {
+    const seq = workspaceRequestSeq.current;
+    try {
+      setByKeyLoadState("loading");
+      const response = await fetch(`/api/control-plane/projects/${projectId}/usage/by-key`, { cache: "no-store" });
+      if (!response.ok) throw new Error(`Usage by key load failed with ${response.status}`);
+      const data = (await response.json()) as { byKey: { keyId: string | null; requests: number }[] };
+      if (seq !== workspaceRequestSeq.current) return;
+      setByKey(data.byKey);
+      setByKeyLoadState("ready");
+    } catch {
+      if (seq !== workspaceRequestSeq.current) return;
+      setByKeyLoadState("error");
+      toast.error("Usage by key failed to load.");
+    }
+  }
+
   useEffect(() => {
+    workspaceRequestSeq.current += 1;
     setRawKey("");
     setCreatedKey(null);
     void loadProject();
     void loadKeys();
     void loadUsage();
+    void loadDaily();
+    void loadByKey();
   }, [projectId]);
 
   async function createKey() {
@@ -163,7 +221,9 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
     try {
       const response = await fetch(`/api/control-plane/projects/${projectId}/keys/${keyId}`, { method: "DELETE" });
       if (!response.ok) throw new Error(`Key revoke failed with ${response.status}`);
-      setKeys((current) => current.filter((key) => key.id !== keyId));
+      setKeys((current) =>
+        current.map((key) => (key.id === keyId ? { ...key, revokedAt: new Date().toISOString() } : key))
+      );
     } catch {
       toast.error("Agent API Key revocation failed.");
     }
@@ -188,6 +248,8 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
   }
 
   const usageRowData = usage ? usageRows(usage) : [];
+  const activeKeys = keys.filter((key) => !key.revokedAt);
+  const revokedKeys = keys.filter((key) => key.revokedAt);
 
   return (
     <div className="grid gap-6">
@@ -218,6 +280,8 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
             <ShieldCheck />
             Usage & Caps
           </TabsTrigger>
+          <TabsTrigger value="jobs">Jobs</TabsTrigger>
+          <TabsTrigger value="data">Data</TabsTrigger>
           <TabsTrigger value="settings">
             <SlidersHorizontal />
             Project Settings
@@ -318,7 +382,7 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
                 <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-8 text-center text-sm text-destructive">
                   Agent API Keys could not be loaded. Refresh to try again.
                 </div>
-              ) : keys.length === 0 ? (
+              ) : activeKeys.length === 0 ? (
                 <div className="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground">
                   No active keys for this project.
                 </div>
@@ -330,11 +394,12 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
                       <TableHead>Capability</TableHead>
                       <TableHead>Display</TableHead>
                       <TableHead>Created</TableHead>
+                      <TableHead>Last used</TableHead>
                       <TableHead className="text-right">Action</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {keys.map((key) => (
+                    {activeKeys.map((key) => (
                       <TableRow key={key.id}>
                         <TableCell>
                           <div className="font-medium">{key.name}</div>
@@ -348,6 +413,17 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
                         </TableCell>
                         <TableCell className="text-muted-foreground">
                           {dateFormatter.format(new Date(key.createdAt))}
+                        </TableCell>
+                        <TableCell>
+                          {(() => {
+                            const freshness = keyFreshness(key.lastUsedAt);
+                            return (
+                              <span className="inline-flex items-center gap-2">
+                                {freshness.label}
+                                {freshness.stale ? <Badge variant="outline">Unused 30+ days</Badge> : null}
+                              </span>
+                            );
+                          })()}
                         </TableCell>
                         <TableCell className="text-right">
                           <div className="flex justify-end gap-2">
@@ -366,11 +442,36 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
                   </TableBody>
                 </Table>
               )}
+              {revokedKeys.length > 0 ? (
+                <details className="mt-4">
+                  <summary className="cursor-pointer text-sm text-muted-foreground">
+                    Revoked keys ({revokedKeys.length})
+                  </summary>
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>Name</TableHead>
+                        <TableHead>Key</TableHead>
+                        <TableHead>Revoked</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {revokedKeys.map((key) => (
+                        <TableRow key={key.id}>
+                          <TableCell>{key.name}</TableCell>
+                          <TableCell className="font-mono text-xs">{key.display}</TableCell>
+                          <TableCell>{dateFormatter.format(new Date(key.revokedAt!))}</TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </details>
+              ) : null}
             </CardContent>
           </Card>
         </TabsContent>
 
-        <TabsContent value="usage">
+        <TabsContent value="usage" className="grid gap-4">
           <Card>
             <CardHeader>
               <CardTitle>Usage & Caps</CardTitle>
@@ -406,15 +507,18 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
                       }))}
                     />
                   </div>
-                  {usageRowData.map((row) => (
-                    <UsageMeter
-                      key={row.key}
-                      label={row.label}
-                      max={row.max}
-                      value={row.value}
-                      valueLabel={row.valueLabel}
-                    />
-                  ))}
+                  {usageRowData.map((row) => {
+                    const status = capStatus(row.value, row.max);
+                    return (
+                      <div key={row.key} className="grid gap-2">
+                        <div className="flex items-center gap-2">
+                          {status.level === "warn" ? <Badge variant="outline">Approaching cap</Badge> : null}
+                          {status.level === "alert" ? <Badge variant="destructive">Near cap</Badge> : null}
+                        </div>
+                        <UsageMeter label={row.label} max={row.max} value={row.value} valueLabel={row.valueLabel} />
+                      </div>
+                    );
+                  })}
                 </>
               ) : (
                 <div className="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground md:col-span-2">
@@ -423,6 +527,78 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
               )}
             </CardContent>
           </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Operations per day</CardTitle>
+              <CardDescription>Writes, retrievals, and other operations over the last 30 days.</CardDescription>
+            </CardHeader>
+            <CardContent>
+              {dailyLoadState === "loading" ? (
+                <Skeleton className="h-40 w-full" />
+              ) : dailyLoadState === "error" ? (
+                <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-8 text-center text-sm text-destructive">
+                  Daily usage could not be loaded. Refresh to try again.
+                </div>
+              ) : (
+                <DailyBars rows={daily} />
+              )}
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Usage by key</CardTitle>
+              <CardDescription>Which agent keys are consuming operations (last 30 days).</CardDescription>
+            </CardHeader>
+            <CardContent>
+              {byKeyLoadState === "loading" ? (
+                <div className="grid gap-3">
+                  {Array.from({ length: 3 }, (_, index) => (
+                    <Skeleton key={index} className="h-10 w-full" />
+                  ))}
+                </div>
+              ) : byKeyLoadState === "error" ? (
+                <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-8 text-center text-sm text-destructive">
+                  Usage by key could not be loaded. Refresh to try again.
+                </div>
+              ) : byKey.length === 0 ? (
+                <div className="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground">
+                  No usage recorded in the last 30 days.
+                </div>
+              ) : (
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Key</TableHead>
+                      <TableHead className="text-right">Requests</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {byKey.map((row) => {
+                      const key = keys.find((item) => item.id === row.keyId);
+                      return (
+                        <TableRow key={row.keyId ?? "unattributed"}>
+                          <TableCell className="font-mono text-xs">
+                            {row.keyId === null ? "Unattributed (recorded before key tracking)" : key?.display ?? row.keyId}
+                          </TableCell>
+                          <TableCell className="text-right">{row.requests}</TableCell>
+                        </TableRow>
+                      );
+                    })}
+                  </TableBody>
+                </Table>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="jobs">
+          <JobsTab projectId={projectId} />
+        </TabsContent>
+
+        <TabsContent value="data">
+          <DataTab />
         </TabsContent>
 
         <TabsContent value="settings">

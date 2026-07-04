@@ -318,6 +318,7 @@ class HostedUsageEvent:
     estimated_cost_micros: int = 0
     error_type: str | None = None
     project_id: str | None = None
+    key_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -330,6 +331,7 @@ class HostedJobEvent:
     recorded_at: str
     phase: str | None = None
     error_type: str | None = None
+    project_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -696,7 +698,7 @@ class HostedMemoryService:
                 auth=auth,
             )
             raise
-        self._record_request(operation, bound, status="ok")
+        self._record_request(operation, bound, status="ok", auth=auth)
         return result
 
     def _bind_request(
@@ -798,6 +800,7 @@ class HostedMemoryService:
             tenant_id = None
             principal_id = None
             project_id = None
+        key_id = auth.key_id if auth is not None else None
         recorded_at = _now()
         self.telemetry.record_audit_event(
             HostedAuditEvent(
@@ -819,6 +822,7 @@ class HostedMemoryService:
                 recorded_at=recorded_at,
                 error_type=error_type,
                 project_id=project_id,
+                key_id=key_id,
             )
         )
 
@@ -832,6 +836,7 @@ class HostedMemoryService:
         usage: UsageSummary | None = None,
         error_type: str | None = None,
         project_id: str | None = None,
+        key_id: str | None = None,
     ) -> None:
         if self.telemetry is None:
             return
@@ -852,6 +857,7 @@ class HostedMemoryService:
                     estimated_cost_micros=counters.estimated_cost_micros,
                     error_type=error_type,
                     project_id=project_id,
+                    key_id=key_id,
                 )
             )
         except Exception:
@@ -897,6 +903,7 @@ class HostedBackgroundJobRunner:
                 status="error",
                 error_type=type(exc).__name__,
                 project_id=request.scope.project_id,
+                key_id=auth.key_id,
             )
             raise
         self._record_job(job_id, request, auth, status="ok")
@@ -907,6 +914,7 @@ class HostedBackgroundJobRunner:
             status="ok",
             usage=usage,
             project_id=request.scope.project_id,
+            key_id=auth.key_id,
         )
         return result
 
@@ -928,6 +936,7 @@ class HostedBackgroundJobRunner:
             phase=request.phase.value,
             recorded_at=_now(),
             error_type=error_type,
+            project_id=request.scope.project_id,
         )
         self.job_events.append(event)
         try:
