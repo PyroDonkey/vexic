@@ -50,6 +50,7 @@ class DreamPhasePorts:
     summary_agent_factory: AgentFactory | None = None
     defer_contradiction: bool = True
     secrets: Mapping[str, str] | None = None
+    daily_span_budget: int = 50
 
 
 def missing_host_port(name: str, hint: str | None = None) -> HostPortNotConfigured:

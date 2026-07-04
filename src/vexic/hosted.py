@@ -1263,6 +1263,8 @@ def _secret_env_values(names: list[str]) -> dict[str, str] | None:
 DREAM_PHASE_ADAPTER_ENV = "VEXIC_DREAM_PHASE_ADAPTER"
 DREAM_PHASE_MODEL_GROUP_ENV = "VEXIC_DREAM_PHASE_MODEL_GROUP"
 DEFAULT_DREAM_PHASE_MODEL_GROUP = "hosted-dream"
+SUMMARIZE_DAILY_SPAN_BUDGET_ENV = "VEXIC_SUMMARIZE_DAILY_SPAN_BUDGET"
+DEFAULT_SUMMARIZE_DAILY_SPAN_BUDGET = 50
 
 
 def dream_phase_ports_from_env(env: Mapping[str, str]) -> DreamPhasePorts | None:
@@ -1286,6 +1288,7 @@ def dream_phase_ports_from_env(env: Mapping[str, str]) -> DreamPhasePorts | None
         extraction_agent_factory=adapter.build_extraction_agent,
         contradiction_agent_factory=adapter.build_contradiction_agent,
         summary_agent_factory=getattr(adapter, "build_summary_agent", None),
+        daily_span_budget=_dream_phase_daily_span_budget(env),
     )
 
 
@@ -1294,6 +1297,23 @@ def _dream_phase_model_group(env: Mapping[str, str]) -> str:
         env.get(DREAM_PHASE_MODEL_GROUP_ENV, "").strip()
         or DEFAULT_DREAM_PHASE_MODEL_GROUP
     )
+
+
+def _dream_phase_daily_span_budget(env: Mapping[str, str]) -> int:
+    """Parse the summarize phase's daily span budget (cost runaway guard).
+
+    Unset/blank/unparseable -> the default (50); a negative value is treated
+    as 0 (fully closed) rather than raising, since this gates a background
+    job rather than serving a request -- fail closed on cost, not loud.
+    """
+    raw = env.get(SUMMARIZE_DAILY_SPAN_BUDGET_ENV, "").strip()
+    if not raw:
+        return DEFAULT_SUMMARIZE_DAILY_SPAN_BUDGET
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_SUMMARIZE_DAILY_SPAN_BUDGET
+    return max(value, 0)
 
 
 def _load_dream_phase_adapter(path: Path) -> ModuleType:
@@ -1335,6 +1355,7 @@ def _dream_phase_ports(args: argparse.Namespace) -> DreamPhasePorts:
         contradiction_agent_factory=adapter.build_contradiction_agent,
         summary_agent_factory=getattr(adapter, "build_summary_agent", None),
         secrets=_secret_env_values(args.secret_env),
+        daily_span_budget=_dream_phase_daily_span_budget(os.environ),
     )
 
 

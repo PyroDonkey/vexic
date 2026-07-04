@@ -100,39 +100,75 @@ def record_session_summary(
     usage: UsageSummary = UsageSummary(),
     forbidden_secret_values: tuple[str, ...] = (),
     content_codec: ContentCodec | None = None,
+    created_at: str | None = None,
 ) -> int:
     assert_no_forbidden_secret_values(forbidden_secret_values, summary_text)
     token_estimate = estimate_tokens(summary_text)
     stored_summary_text = _encode_stored(content_codec, summary_text)
     replaces_json = json.dumps(list(replaces_summary_ids))
+    columns = (
+        "session_id, agent_id, kind, first_message_id, last_message_id, "
+        "summary_text, token_estimate, replaces_summary_ids, "
+        "model_requests, input_tokens, output_tokens, total_tokens, "
+        "estimated_cost_micros"
+    )
+    values: tuple[object, ...] = (
+        session_id,
+        agent_id,
+        kind,
+        first_message_id,
+        last_message_id,
+        stored_summary_text,
+        token_estimate,
+        replaces_json,
+        usage.model_requests,
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.total_tokens,
+        usage.estimated_cost_micros,
+    )
+    if created_at is not None:
+        columns = f"{columns}, created_at"
+        values = (*values, created_at)
+    placeholders = ", ".join("?" for _ in values)
     with closing(connect(db_path)) as conn:
         with conn:
             cursor = conn.execute(
-                """
+                f"""
                 INSERT INTO session_summaries
-                    (session_id, agent_id, kind, first_message_id, last_message_id,
-                     summary_text, token_estimate, replaces_summary_ids,
-                     model_requests, input_tokens, output_tokens, total_tokens,
-                     estimated_cost_micros)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ({columns})
+                VALUES ({placeholders})
                 """,
-                (
-                    session_id,
-                    agent_id,
-                    kind,
-                    first_message_id,
-                    last_message_id,
-                    stored_summary_text,
-                    token_estimate,
-                    replaces_json,
-                    usage.model_requests,
-                    usage.input_tokens,
-                    usage.output_tokens,
-                    usage.total_tokens,
-                    usage.estimated_cost_micros,
-                ),
+                values,
             )
             return int(cursor.lastrowid)
+
+
+def count_session_summaries_since(
+    db_path: str,
+    *,
+    agent_id: str | None = None,
+    created_at_floor: str,
+) -> int:
+    """Count `session_summaries` rows for `agent_id` created on/after
+    `created_at_floor` (a ``"YYYY-MM-DD HH:MM:SS"`` string in the same format
+    SQLite's ``CURRENT_TIMESTAMP`` emits -- a plain TEXT-affinity comparison,
+    so callers must pass floors in this same space-separated shape or legacy
+    rows will silently sort incorrectly. Scope is tenant(+agent)-wide across
+    all sessions, matching the daily span budget's honest scope (no
+    project_id column on this table).
+    """
+    with closing(connect(db_path)) as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM session_summaries
+            WHERE agent_id IS ?
+                AND created_at >= ?
+            """,
+            (agent_id, created_at_floor),
+        ).fetchone()
+    return int(row[0]) if row is not None else 0
 
 
 def fetch_session_summary_frontier(

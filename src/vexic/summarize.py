@@ -23,12 +23,13 @@ phase moves on to the next session rather than aborting the whole run.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timezone
 
 from vexic.ports import AgentFactory, ContentCodec, missing_host_port
 from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage import (
     SessionSummary,
+    count_session_summaries_since,
     fetch_session_summary_frontier,
     find_session_compaction_span,
     init_db,
@@ -74,6 +75,23 @@ def _oldest_contiguous_run(frontier: list[SessionSummary]) -> list[SessionSummar
     return run
 
 
+def _budget_reached(
+    db_path: str,
+    *,
+    agent_id: str | None,
+    daily_span_budget: int | None,
+    day_start: str,
+) -> bool:
+    if daily_span_budget is None:
+        return False
+    count = count_session_summaries_since(
+        db_path,
+        agent_id=agent_id,
+        created_at_floor=day_start,
+    )
+    return count >= daily_span_budget
+
+
 async def _run_leaf_pass(
     db_path: str,
     agent: object,
@@ -84,6 +102,9 @@ async def _run_leaf_pass(
     now_utc: datetime | None,
     forbidden: list[str],
     content_codec: ContentCodec | None,
+    daily_span_budget: int | None,
+    day_start: str,
+    created_at: str,
 ) -> UsageSummary:
     usage = UsageSummary()
     while True:
@@ -96,6 +117,18 @@ async def _run_leaf_pass(
             content_codec=content_codec,
         )
         if span is None:
+            return usage
+
+        if _budget_reached(
+            db_path,
+            agent_id=agent_id,
+            daily_span_budget=daily_span_budget,
+            day_start=day_start,
+        ):
+            print(
+                "Summarize phase: daily span budget reached, "
+                "stopping leaf pass for this session."
+            )
             return usage
 
         first_message_id, last_message_id = span
@@ -121,6 +154,7 @@ async def _run_leaf_pass(
             usage=span_usage,
             forbidden_secret_values=forbidden,
             content_codec=content_codec,
+            created_at=created_at,
         )
         usage = usage.plus(span_usage)
 
@@ -133,6 +167,9 @@ async def _run_condense_pass(
     agent_id: str | None,
     forbidden: list[str],
     content_codec: ContentCodec | None,
+    daily_span_budget: int | None,
+    day_start: str,
+    created_at: str,
 ) -> UsageSummary:
     frontier = fetch_session_summary_frontier(
         db_path,
@@ -145,6 +182,18 @@ async def _run_condense_pass(
         len(frontier) <= CONDENSE_MAX_FRONTIER_LEAVES
         and frontier_tokens <= TAU_SOFT // 3
     ):
+        return UsageSummary()
+
+    if _budget_reached(
+        db_path,
+        agent_id=agent_id,
+        daily_span_budget=daily_span_budget,
+        day_start=day_start,
+    ):
+        print(
+            "Summarize phase: daily span budget reached, "
+            "skipping condense pass for this session."
+        )
         return UsageSummary()
 
     # Condense only the oldest contiguous run of frontier summaries: walk
@@ -169,6 +218,7 @@ async def _run_condense_pass(
         usage=condense_usage,
         forbidden_secret_values=forbidden,
         content_codec=content_codec,
+        created_at=created_at,
     )
     return condense_usage
 
@@ -184,6 +234,7 @@ async def run_summarize_phase(
     summary_agent_factory: AgentFactory | None = None,
     forbidden_secret_values: tuple[str, ...] = (),
     content_codec: ContentCodec | None = None,
+    daily_span_budget: int | None = None,
 ) -> UsageSummary:
     if summary_agent_factory is None:
         raise missing_host_port(
@@ -194,6 +245,13 @@ async def run_summarize_phase(
     forbidden = _forbidden_secret_values(secrets, forbidden_secret_values)
     init_db(db_path, content_codec=content_codec)
     agent = summary_agent_factory(model_group, secrets=secrets)
+
+    # A single per-run clock reading: every summary write from this run
+    # shares the same explicit `created_at`, and the budget window is this
+    # same instant's UTC-day. Frozen/mocked via `now_utc` in tests.
+    run_now_utc = now_utc if now_utc is not None else datetime.now(timezone.utc)
+    created_at = run_now_utc.strftime("%Y-%m-%d %H:%M:%S")
+    day_start = run_now_utc.strftime("%Y-%m-%d") + " 00:00:00"
 
     usage = UsageSummary()
     session_ids = list_compactable_session_ids(db_path, agent_id=agent_id)
@@ -209,6 +267,9 @@ async def run_summarize_phase(
                 now_utc=now_utc,
                 forbidden=forbidden,
                 content_codec=content_codec,
+                daily_span_budget=daily_span_budget,
+                day_start=day_start,
+                created_at=created_at,
             )
             condense_usage = await _run_condense_pass(
                 db_path,
@@ -217,6 +278,9 @@ async def run_summarize_phase(
                 agent_id=agent_id,
                 forbidden=forbidden,
                 content_codec=content_codec,
+                daily_span_budget=daily_span_budget,
+                day_start=day_start,
+                created_at=created_at,
             )
             usage = usage.plus(leaf_usage).plus(condense_usage)
         except Exception as exc:

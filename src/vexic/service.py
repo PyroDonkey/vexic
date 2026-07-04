@@ -908,6 +908,7 @@ async def _run_dream_phase_with_usage(
             summary_agent_factory=ports.summary_agent_factory,
             forbidden_secret_values=service._redaction_values(request.redaction),
             content_codec=service.content_codec,
+            daily_span_budget=ports.daily_span_budget,
         )
     else:
         raise ValueError(f"Unsupported dream phase: {request.phase!r}")
