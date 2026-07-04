@@ -17,6 +17,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { capStatus, keyFreshness, usageRows } from "@/lib/console-ui-state.mjs";
 
+import DataTab from "./data-tab";
 import JobsTab from "./jobs-tab";
 
 type Project = {
@@ -60,7 +61,7 @@ type Usage = {
   caps: Record<string, number>;
 };
 
-type Tab = "keys" | "usage" | "jobs" | "settings";
+type Tab = "keys" | "usage" | "jobs" | "data" | "settings";
 type LoadState = "loading" | "ready" | "error";
 
 const dateFormatter = new Intl.DateTimeFormat(undefined, { dateStyle: "medium" });
@@ -266,6 +267,7 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
             Usage & Caps
           </TabsTrigger>
           <TabsTrigger value="jobs">Jobs</TabsTrigger>
+          <TabsTrigger value="data">Data</TabsTrigger>
           <TabsTrigger value="settings">
             <SlidersHorizontal />
             Project Settings
@@ -579,6 +581,10 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
 
         <TabsContent value="jobs">
           <JobsTab projectId={projectId} />
+        </TabsContent>
+
+        <TabsContent value="data">
+          <DataTab />
         </TabsContent>
 
         <TabsContent value="settings">
