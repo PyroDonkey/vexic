@@ -171,7 +171,7 @@ Each doc owns one thing. Avoid duplicate status and copied platform history.
   conventions.
 - `docs/ai/CLAUDE.md` - Claude Code prompt-context pointer.
 - `docs/ai/CONTEXT.md` - product-language glossary for planning.
-- `docs/ai/kilo-review-policy.md` - internal review-agent calibration.
+- `docs/ai/REVIEW.md` - internal review-agent calibration.
 - `docs/adr/README.md` - index of every ADR with title and one-line status.
 - `docs/adr/*` - dated architecture decision records.
 - `docs/provenance.md` - extraction provenance from the private source host.

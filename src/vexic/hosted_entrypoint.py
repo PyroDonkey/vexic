@@ -24,7 +24,7 @@ def _runtime_ids(user: str) -> tuple[int, int]:
 
 def _chown_tree(root: Path, uid: int, gid: int) -> None:
     root.mkdir(parents=True, exist_ok=True)
-    # ponytail: recursive volume repair is fine for alpha; use a one-time migration if the volume grows.
+    # NOTE(alpha): recursive volume repair is fine for alpha; use a one-time migration if the volume grows.
     for current, dir_names, file_names in os.walk(root):
         os.lchown(current, uid, gid)
         for name in (*dir_names, *file_names):

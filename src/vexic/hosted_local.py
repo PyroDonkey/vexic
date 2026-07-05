@@ -193,7 +193,7 @@ class _HostedApiKey:
 @dataclass(frozen=True)
 class ReplacementTarget:
     """A validated `activate_replacement_database` replacement, normalized to
-    either a local filesystem path or a Turso/libSQL DSN (COA-273 Task 12).
+    either a local filesystem path or a Turso/libSQL DSN.
 
     `connect_target` is what gets passed to `connect()` to read the
     replacement's `canonical_migration_imports` metadata and run
@@ -978,7 +978,7 @@ class HostedTenantCatalog:
             conn.commit()
 
     def _allocate_db_filename(self, conn: sqlite3.Connection) -> str:
-        # ponytail: local staging assumes serialized provisioning; retry INSERT on
+        # NOTE(alpha): local staging assumes serialized provisioning; retry INSERT on
         # IntegrityError if concurrent tenant creation becomes a real workload.
         for _ in range(100):
             db_filename = f"customer-{secrets.token_hex(16)}.db"
@@ -1284,7 +1284,7 @@ class HostedApiKeyStore:
                     )
                     conn.commit()
             except Exception:
-                # ponytail: compensate here instead of threading a shared transaction through create_key.
+                # NOTE(alpha): compensate here instead of threading a shared transaction through create_key.
                 with suppress(PermissionError):
                     self.revoke_key(
                         provisioned.key_id,

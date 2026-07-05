@@ -23,7 +23,7 @@ from vexic.service import LocalMemoryService
 from vexic.storage import StorageTarget, single_message_adapter
 from vexic.storage.connection import connect as storage_connect
 
-# Live gate (Task 8 / COA-273 P2): the round-trip and latency tests below hit
+# Live gate: the round-trip and latency tests below hit
 # the real Turso dev DB named by TURSO_DATABASE_URL/TURSO_AUTH_TOKEN, so they
 # only run when creds AND the optional `libsql` (vexic[hosted]) extra are
 # present. Default `uv run pytest` (no creds) collects but SKIPS them.
@@ -46,7 +46,7 @@ def test_unknown_flag_rejected():
 
 
 # ---------------------------------------------------------------------------
-# Task 16 (COA-273 P4): the per-tenant customer-target RESOLVER seam replaces
+# The per-tenant customer-target RESOLVER seam replaces
 # the Task-7b single-DB override. The resolver derives the Turso db NAME from
 # the tenant's stored `customer_target` DSN and mints a short-lived, DB-scoped
 # token via `TenantTokenCache` to build a connectable `StorageTarget`.
@@ -320,7 +320,7 @@ def test_override_wiring_is_removed():
 
 
 # ---------------------------------------------------------------------------
-# Task 16 (COA-273 P4, live): full per-tenant provision -> ingest/search
+# Live: full per-tenant provision -> ingest/search
 # round-trip -> destroy against the real Turso Platform API + a real per-tenant
 # database. Gated on creds + the libsql extra; self-cleaning (the throwaway DB
 # is destroyed in a `finally` and asserted gone). Never prints the platform
@@ -352,7 +352,7 @@ def _scope(*, tenant_id: str, capabilities: set[MemoryCapability]) -> MemoryScop
 @pytest.mark.turso
 @pytest.mark.skipif(not _HAS_PROVISIONING, reason="Turso platform creds/libsql missing")
 def test_per_tenant_provision_round_trip_then_destroy(tmp_path):
-    """Live e2e (COA-273 Task 16): provision a throwaway per-tenant Turso DB,
+    """Live e2e: provision a throwaway per-tenant Turso DB,
     round-trip ingest -> search through the hosted HTTP API via the real
     token-minting resolver, then DESTROY the DB and assert it is gone.
 

@@ -1,4 +1,4 @@
-"""Task 18 (COA-273 P5): `run_restore_drill` decision-logic orchestration.
+"""`run_restore_drill` decision-logic orchestration.
 
 Creds-free: every dependency (`provision_replacement`, `import_canonical`,
 `verify`, `activate`, `destroy`) is an injected fake callable that records

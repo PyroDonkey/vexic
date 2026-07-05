@@ -3,7 +3,7 @@
 Role: operator procedure for local/self-host to hosted Customer Memory Database
 migration.
 
-This runbook implements ADR 0011 for COA-202. Migration is an operator-run
+This runbook implements ADR 0011. Migration is an operator-run
 canonical row move, not a public `MemoryService` operation, hosted HTTP
 endpoint, or customer self-serve import API.
 

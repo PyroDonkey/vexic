@@ -1051,7 +1051,7 @@ class ClaudeCodeSetupTests(unittest.TestCase):
             settings = json.loads(result.settings_path.read_text(encoding="utf-8"))
             hook = settings["hooks"]["Stop"][0]["hooks"][0]
             command = hook["command"]
-            self.assertIn("C:/Users/Ryan/.local/bin/uv.exe", command)
+            self.assertIn("C:/Users/user/.local/bin/uv.exe", command)
             self.assertIn(str(result.config_path).replace("\\", "/"), command)
             self.assertNotIn("\\", command)
             self.assertFalse(hook["async"])

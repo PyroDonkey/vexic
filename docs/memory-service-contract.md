@@ -287,12 +287,13 @@ Those are adapter or host responsibilities. LLM-backed operations use host ports
 from `src/vexic/ports.py`; embedding text for vector search can use a host port
 or the optional lazy local adapter from ADR 0016.
 
-## Coalescent Compatibility Map
+## Reference Host Integration Map
 
-Vexic was extracted from Coalescent. These mappings are compatibility context,
-not runtime dependencies.
+Vexic was extracted from an existing private host application. These mappings
+are compatibility context for such a host integration, not runtime
+dependencies.
 
-| Coalescent surface | Vexic mapping |
+| Host surface | Vexic mapping |
 | --- | --- |
 | `engine.memory_contract` | `vexic.contract` |
 | `engine.memory_service` local behavior | `vexic.service.LocalMemoryService` where implemented |
@@ -302,5 +303,5 @@ not runtime dependencies.
 | Light, REM, Deep | `vexic.pipeline`, `vexic.rem`, and `vexic.deep` primitives; host-supplied agent ports cover Light extraction and Deep contradiction only (REM is a local heuristic), with optional local embeddings and deferrable Deep contradiction |
 | Per-tenant SQLite `memory.db` | local SQLite adapter opened through validated scope/context |
 
-Coalescent remains a private host and first-party consumer. Vexic must stay
-usable without importing Coalescent runtime modules.
+The reference host remains a private, first-party consumer. Vexic must stay
+usable without importing any host runtime modules.

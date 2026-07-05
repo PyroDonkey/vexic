@@ -1,5 +1,4 @@
-"""Thin CLI wrapper for the verify-gated Turso restore drill (COA-273 P5
-Task 18).
+"""Thin CLI wrapper for the verify-gated Turso restore drill.
 
 This script wires the REAL, secret-bearing dependencies -- Turso Platform
 API provisioning, canonical-migration import, catalog activation, and
