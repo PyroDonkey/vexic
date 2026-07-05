@@ -1,3 +1,12 @@
+"""Light-phase extraction pipeline.
+
+Reads new transcript messages past the dream watermark, renders them for the
+host-supplied extraction agent, validates the returned ``FactCandidate``
+provenance, embeds candidate text, and commits the cycle atomically. The
+extraction agent itself is a host port: callers must inject an
+``extraction_agent_factory`` (see ``vexic.ports``).
+"""
+
 import asyncio
 from collections.abc import Mapping
 from typing import Any
@@ -40,6 +49,7 @@ def build_extraction_agent(
     model_group: str,
     secrets: Mapping[str, str] | None = None,
 ) -> Any:
+    """Host port stub: raises until an adapter supplies an extraction agent."""
     raise missing_host_port("Light extraction")
 
 
@@ -49,6 +59,7 @@ def _ensure_embedding_adapter(embedder: EmbedTexts) -> None:
 
 
 def render_transcript(rows: list[tuple[int, ModelMessage]]) -> str:
+    """Render user/assistant text parts as ``[message_id=N] Role: text`` lines."""
     lines: list[str] = []
     for message_id, msg in rows:
         lines.extend(_render_message_lines(message_id, msg))
@@ -56,6 +67,7 @@ def render_transcript(rows: list[tuple[int, ModelMessage]]) -> str:
 
 
 def rendered_message_ids(rows: list[tuple[int, ModelMessage]]) -> list[int]:
+    """Ids of messages that produce at least one rendered transcript line."""
     return [
         message_id
         for message_id, msg in rows
@@ -80,6 +92,7 @@ def validate_candidate_source_ids(
     candidates: list[FactCandidate],
     allowed_message_ids: list[int],
 ) -> None:
+    """Reject candidates citing message ids outside the rendered window."""
     allowed = set(allowed_message_ids)
     for index, candidate in enumerate(candidates):
         candidate_ids = set(candidate.source_message_ids)
@@ -117,6 +130,11 @@ async def run_light_phase(
     forbidden_secret_values: tuple[str, ...] = (),
     content_codec: ContentCodec | None = None,
 ) -> UsageSummary:
+    """Run one Light extraction cycle over messages past the watermark.
+
+    Returns a usage summary; commits candidates and the new watermark
+    atomically via ``commit_dream_cycle``.
+    """
     started_at = utc_now_iso()
     watermark = 0
     forbidden = _forbidden_secret_values(secrets, forbidden_secret_values)
