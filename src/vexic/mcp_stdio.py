@@ -1,3 +1,14 @@
+"""Local read-only MCP server over stdio.
+
+Speaks JSON-RPC (MCP protocol framing, one JSON message per line) and
+exposes the read-only recall tools -- ``recall_conversation_history``,
+``recall_user_memory``, and optionally ``expand_history`` -- backed by a
+``LocalMemoryService`` or a hosted HTTP client. Input sizes are clamped and
+all egress passes the forbidden-secret-values guard.
+
+Entry point: ``python -m vexic.mcp_stdio`` or ``scripts/vexic-mcp-stdio.py``.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -47,6 +58,8 @@ MAX_EXPAND_HISTORY_CHARS = 20_000
 
 
 class McpMemoryService(Protocol):
+    """The subset of ``MemoryService`` the MCP server needs (read-only ops)."""
+
     async def search_transcript(
         self,
         request: SearchTranscriptRequest,
@@ -67,6 +80,9 @@ class McpMemoryService(Protocol):
 
 @dataclass(frozen=True)
 class McpServerConfig:
+    """Server configuration: scope identity, backing store (local ``db_path``
+    or hosted ``api_base_url``), redaction values, and tool toggles."""
+
     tenant_id: str
     db_path: str | None = None
     session_id: str = "default"
@@ -352,6 +368,7 @@ async def handle_jsonrpc_message(
     message: dict[str, Any],
     config: McpServerConfig,
 ) -> dict[str, Any] | None:
+    """Dispatch one JSON-RPC message; returns the response, or None for notifications."""
     message_id = message.get("id")
     method = message.get("method")
     is_notification = "id" not in message
@@ -407,6 +424,7 @@ async def run_stdio(
     stdout: TextIO = sys.stdout,
     stderr: TextIO = sys.stderr,
 ) -> None:
+    """Serve MCP over the given stdio streams until stdin closes."""
     service = config.service()
     init_schema = getattr(service, "init_schema", None)
     if callable(init_schema):
@@ -481,6 +499,7 @@ def main(
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
 ) -> int:
+    """CLI entry point: parse args, build the config, serve stdio, return exit code."""
     raw_argv = sys.argv[1:] if argv is None else argv
     # Decode/encode stdio as UTF-8 regardless of the platform locale. On Windows
     # the default sys.std* streams use cp1252, which silently mojibakes

@@ -2,6 +2,7 @@
 
 This page keeps setup and integration examples out of the root README. For the
 short project overview, see `../README.md`.
+Environment variables are catalogued in [`configuration.md`](configuration.md).
 
 Vexic stores cleaned conversation history, stages possible memories for review,
 and promotes durable facts with provenance. Agents can recall prior work without
