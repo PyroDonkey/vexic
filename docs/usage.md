@@ -41,11 +41,12 @@ engine install requirements.
 Run the read-only stdio MCP server against a local Vexic database:
 
 ```powershell
-uv run python scripts\vexic-mcp-stdio.py --db-path .\memory.db --tenant-id local --session-id default
+uv run vexic mcp-stdio --db-path .\memory.db --tenant-id local --session-id default
 ```
 
-For v0.1, `scripts\vexic-mcp-stdio.py` is the supported launcher. A package
-entry point can wait for release packaging.
+`vexic mcp-stdio` is the packaged launcher and ships with the `vexic` package
+entry point. `scripts\vexic-mcp-stdio.py` remains available for hosted
+recorder-proxy mode (`--recorder-config`).
 Pass `--agent-id <id>` to bind the server to one agent-specific memory scope;
 omit it to bind the server to the explicit shared agent scope.
 
@@ -71,8 +72,8 @@ Codex-style MCP config:
 command = "uv"
 args = [
   "run",
-  "python",
-  "scripts\\vexic-mcp-stdio.py",
+  "vexic",
+  "mcp-stdio",
   "--db-path",
   ".\\memory.db",
   "--tenant-id",
@@ -91,7 +92,7 @@ cwd = "<absolute-path-to-vexic-repo>"
 Claude Code local MCP config:
 
 ```powershell
-claude mcp add --scope local vexic -- uv run python scripts\vexic-mcp-stdio.py --db-path .\memory.db --tenant-id local --session-id default
+claude mcp add --scope local vexic -- uv run vexic mcp-stdio --db-path .\memory.db --tenant-id local --session-id default
 ```
 
 The stdio tool schemas cap `query` at 1000 characters, `limit` at 1-20 results,

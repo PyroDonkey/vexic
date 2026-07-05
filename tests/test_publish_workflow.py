@@ -25,7 +25,7 @@ def _load_checker() -> ModuleType:
 
 
 def _project_version() -> str:
-    data = tomllib.loads((ROOT / "pypi" / "pyproject.toml").read_text(encoding="utf-8"))
+    data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     return data["project"]["version"]
 
 
@@ -33,9 +33,9 @@ def test_release_tag_checker_rejects_mismatched_dispatch_input(monkeypatch) -> N
     checker = _load_checker()
     version = _project_version()
     monkeypatch.chdir(ROOT)
-    monkeypatch.setenv("PROJECT_DIR", "pypi")
+    monkeypatch.delenv("PROJECT_DIR", raising=False)
     monkeypatch.setenv("GITHUB_REF_NAME", f"v{version}")
-    monkeypatch.setenv("RELEASE_TAG", "v0.1.0")
+    monkeypatch.setenv("RELEASE_TAG", "v9.9.9")
 
     assert checker.main() == 1
 
@@ -44,7 +44,7 @@ def test_release_tag_checker_accepts_matching_version_tag(monkeypatch) -> None:
     checker = _load_checker()
     version = _project_version()
     monkeypatch.chdir(ROOT)
-    monkeypatch.setenv("PROJECT_DIR", "pypi")
+    monkeypatch.delenv("PROJECT_DIR", raising=False)
     monkeypatch.setenv("GITHUB_REF_NAME", f"v{version}")
     monkeypatch.setenv("RELEASE_TAG", f"v{version}")
 
@@ -81,14 +81,15 @@ def test_publish_workflow_requires_matching_version_tag() -> None:
         "release_tag:",
         "required: true",
         "if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v') && github.ref_name == inputs.release_tag",
-        "working-directory: pypi",
         "RELEASE_TAG: ${{ inputs.release_tag }}",
         "GITHUB_REF_NAME: ${{ github.ref_name }}",
-        "uv run python ../scripts/check_release_tag.py",
-        "uv build --sdist --wheel --out-dir dist --clear pypi",
+        "uv run python scripts/check_release_tag.py",
+        "uv build --sdist --wheel --out-dir dist --clear",
     ]
 
     assert [item for item in required if item not in workflow] == []
+    assert "working-directory: pypi" not in workflow
+    assert "uv build --sdist --wheel --out-dir dist --clear pypi" not in workflow
 
 
 def test_pypi_placeholder_does_not_package_real_source() -> None:

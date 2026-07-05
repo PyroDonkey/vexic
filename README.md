@@ -2,7 +2,7 @@
 
 **Memory your agents can trust.**
 
-[![PyPI version](https://img.shields.io/pypi/v/vexic.svg)](https://pypi.org/project/vexic/)
+[![PyPI](https://img.shields.io/badge/PyPI-coming%20soon-lightgrey.svg)](https://pypi.org/project/vexic/)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![CI](https://github.com/PyroDonkey/vexic/actions/workflows/ci.yml/badge.svg)](https://github.com/PyroDonkey/vexic/actions/workflows/ci.yml)
 [![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-blue.svg)](https://www.python.org/)
