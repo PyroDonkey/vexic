@@ -26,15 +26,10 @@ Install and test the Python memory core with `uv`:
 uv run pytest
 ```
 
-The Vexic Console source lives in `console/` as a repo-local Next.js
-control-plane app. It is not Vexic package runtime, not a `vexic.*` entrypoint,
-and must not move under `src/vexic`; ADR 0012 keeps dashboard concerns outside
-the memory core. The repository root remains `uv`-managed.
-
-For Vercel, Console may carry the isolated npm build contract in
-`console/package.json` and `console/package-lock.json`. Do not add Node package
-files at the repository root, and do not treat Console dependencies as memory
-engine install requirements.
+Vexic Console and the marketing website source live in the private
+`PyroDonkey/vexic-website` repository, not this one (COA-295: open-core
+boundary; see ADR 0012's addendum). This repository's root remains
+`uv`-managed with no Node package surface.
 
 ## Local MCP MVP
 

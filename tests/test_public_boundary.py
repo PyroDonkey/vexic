@@ -97,19 +97,11 @@ def test_core_hosted_http_does_not_own_hosted_write_adapter() -> None:
         assert forbidden not in text
 
 
-def test_console_boundary_is_documented_as_outside_vexic_package() -> None:
-    root_readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    console_readme = (ROOT / "console" / "README.md").read_text(encoding="utf-8")
-    console_layout = (
-        ROOT / "console" / "app" / "console" / "layout.tsx"
-    ).read_text(encoding="utf-8")
-
-    for text in (" ".join(root_readme.split()), " ".join(console_readme.split())):
-        assert "repo-local Next.js control-plane app" in text
-        assert "not Vexic package runtime" in text
-        assert "`vexic.*` entrypoint" in text
-
-    assert "not memory-core runtime under src/vexic" in console_layout
+def test_console_and_website_are_not_in_this_repository() -> None:
+    # COA-295: console/ and website/ were extracted to a private repo
+    # (PyroDonkey/vexic-website). This repo's tip must never carry them back.
+    assert not (ROOT / "console").exists()
+    assert not (ROOT / "website").exists()
 
 
 def test_superpowers_specs_do_not_embed_tracking_references() -> None:

@@ -16,14 +16,16 @@ contract (`contract/__init__.py`), a local SQLite reference service
 (`ports.py`), and the promotion/redaction pipeline. Hosted
 FastAPI + MCP adapters (`hosted*.py`, `*_http.py`, `*_mcp.py`) are multi-tenant
 and read-only by default. `adapters/` (repo root) is host-owned provider wiring:
-in review scope, but never package core. `console/` is an isolated Next.js app
-(ADR 0012). Decisions live in `docs/adr/` (index is canonical); behavior of
-record is `src/vexic` + `tests/`, and prose docs are downstream.
+in review scope, but never package core. Console and website (formerly
+`console/`, `website/`) live in the private `PyroDonkey/vexic-website` repo,
+not here (COA-295; ADR 0012 addendum). Decisions live in `docs/adr/` (index is
+canonical); behavior of record is `src/vexic` + `tests/`, and prose docs are
+downstream.
 
 ## Review style
 
 Balanced overall; strict on the memory core and hosted/security surfaces;
-lenient on exploratory `console/` and docs. Vexic's real risk is semantic
+lenient on docs. Vexic's real risk is semantic
 corruption of memory (wrong tier, lost provenance, cross-tenant leakage), not
 typical web-app bugs, so review for invariants, not style. Priority: (1)
 memory-correctness invariants, (2) tenant scope + redaction + secrets, (3)
@@ -60,7 +62,8 @@ missing capability check on a scoped operation; a fact or candidate destroyed
 instead of retired.
 
 **MEDIUM** - boundary leak (`engine.*` import; private source-host names; Node
-package files at repo root; Console logic in `src/vexic`; Vexic schema init
+package files at repo root; Console/website logic reintroduced into `src/vexic`
+or this repository; Vexic schema init
 creating or owning host-extension tables such as `background_tool_audit`);
 closed-category vocabulary violated; a new operation/contract path with no test;
 an ADR file added or renamed without updating `docs/adr/README.md`, or
@@ -94,7 +97,7 @@ stdlib or a one-line solution over a new abstraction).
    markdown follows code.
 10. No private tracker / source-host identifiers (e.g. Linear/COA issue IDs,
     internal hostnames, private-repo or source-host URLs) in `src/vexic`,
-    `tests`, `console/**`, schema values, public contract fields, or
+    `tests`, schema values, public contract fields, or
     `docs/architecture.md` / `docs/hosted-mvp.md` /
     `docs/memory-service-contract.md`; allowed only in provenance, ADR, runbook,
     or README pointers.
@@ -102,10 +105,10 @@ stdlib or a one-line solution over a new abstraction).
 ## Files to skip
 
 Suppress findings on generated/vendored files: `uv.lock`,
-`console/package-lock.json`, `node_modules/`, `.venv/`, `build/`, `dist/`,
+`node_modules/`, `.venv/`, `build/`, `dist/`,
 `*.egg-info/`, `__pycache__/`, `*.pyc`, `.pytest_cache/`, `.next/`, generated
 `pypi/` + `npm/` trees, and any `*.db` / `*.sqlite*` (e.g. `memory.db`). Still
-review `pyproject.toml`, `console/package.json`, `adapters/**`, workflow YAML,
+review `pyproject.toml`, `adapters/**`, workflow YAML,
 and any intentional dependency change (spot-check new deps for supply-chain
 risk).
 
@@ -151,7 +154,7 @@ and posts.
 - **1 sub-agent** - 3-5 files or 100-300 changed lines confined to one risky
   area (storage/schema, contract/scope, hosted auth, redaction, or a migration).
 - **2-3 sub-agents** - a change spanning a few domains (contract+storage,
-  storage+tests, console+API); one per seam.
+  storage+tests, hosted+API); one per seam.
 - **Full 6 sub-agents** - 6+ files or more than 300 changed lines, or any
   security-sensitive or cross-cutting work; scale toward six as domain spread
   grows and shard by independent domain (never point all six at the same files):
@@ -170,6 +173,6 @@ and posts.
      provider secrets in core, `HostPortNotConfigured` behavior,
      cleaned-transcript rules.
   6. Tests, docs & boundary - `tests/**` coverage of changed behavior, ADR/doc
-     drift, provenance-ID scan, Console / root-package boundary.
+     drift, provenance-ID scan, root-package boundary.
 
 Use fewer than six when the diff touches fewer domains.
