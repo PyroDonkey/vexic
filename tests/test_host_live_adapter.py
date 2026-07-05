@@ -206,7 +206,7 @@ def test_live_adapter_build_summary_agent_respects_env_model(
     assert captured["model_name"] == "anthropic/claude-haiku-4.5"
 
 
-def test_live_adapter_build_summary_agent_defaults_to_haiku(
+def test_live_adapter_build_summary_agent_defaults_to_deepseek(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     adapter = _load_adapter()
@@ -227,7 +227,7 @@ def test_live_adapter_build_summary_agent_defaults_to_haiku(
 
     adapter.build_summary_agent("summarize")
 
-    assert captured["model_name"] == "anthropic/claude-haiku-4.5"
+    assert captured["model_name"] == "deepseek/deepseek-v4-pro"
 
 
 def test_live_adapter_build_summary_agent_rejects_passed_secrets(
