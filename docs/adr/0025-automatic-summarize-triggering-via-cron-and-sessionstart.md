@@ -191,9 +191,9 @@ sits on top of it.
 ### D6 -- Live adapter port
 
 `adapters/openrouter_live_adapter.py` gains `build_summary_agent`, reading
-`VEXIC_SUMMARY_MODEL` (default `anthropic/claude-haiku-4.5`, a haiku-class
-model appropriate to summarization's lower per-call value relative to
-extraction/contradiction judging) and reusing the adapter's existing
+`VEXIC_SUMMARY_MODEL` (default `deepseek/deepseek-v4-pro`, matching the
+extraction/contradiction default so all dream-phase legs share one model
+absent an explicit override) and reusing the adapter's existing
 `_agent`/model-settings helpers. `DreamPhasePorts.summary_agent_factory` was
 already wired end-to-end by ADR 0024; only the adapter symbol was missing.
 

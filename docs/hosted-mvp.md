@@ -590,7 +590,7 @@ evaluated on a wall-clock heuristic; the two are intentionally independent.
 
 Model used for summarization: `VEXIC_SUMMARY_MODEL`, read by
 `adapters/openrouter_live_adapter.py`'s `build_summary_agent`, defaulting to
-`anthropic/claude-haiku-4.5`.
+`deepseek/deepseek-v4-pro`.
 
 ### Cron producer
 

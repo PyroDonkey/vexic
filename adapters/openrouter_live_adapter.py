@@ -50,7 +50,7 @@ Do not speculate beyond what the transcript states. No preamble or
 meta-commentary -- return only the summary body.\
 """
 
-DEFAULT_SUMMARY_MODEL = "anthropic/claude-haiku-4.5"
+DEFAULT_SUMMARY_MODEL = "deepseek/deepseek-v4-pro"
 
 
 def _env_key(value: str) -> str:
