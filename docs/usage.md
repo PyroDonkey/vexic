@@ -315,7 +315,7 @@ memory. This consolidates pieces otherwise spread across `README.md`,
    type a tenant id by hand.
 
 2. **Create an Agent API Key** for that project in the Console. Copy the raw
-   key once — it is not shown again. The create/list response also includes a
+   key once -- it is not shown again. The create/list response also includes a
    `scopeTemplate` carrying the correct `tenant_id`, `project_id`, `principal`,
    `trust_boundary`, and capabilities; keep it for step 4.
 

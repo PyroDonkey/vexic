@@ -57,17 +57,17 @@ class _TursoProvisioning:
     with no real credentials.
     """
 
-    def build_port(self, env: dict[str, str]):
+    def build_port(self, env: dict[str, str]) -> object:
         from adapters.turso_adapter import TursoProvisioningPort
 
         return TursoProvisioningPort.from_env(env)
 
-    def build_resolver(self, token_cache, *, org: str):
+    def build_resolver(self, token_cache: object, *, org: str) -> object:
         from adapters.turso_adapter import make_customer_target_resolver
 
         return make_customer_target_resolver(token_cache, org=org)
 
-    def build_token_cache(self, port):
+    def build_token_cache(self, port: object) -> object:
         from adapters.turso_adapter import TenantTokenCache
 
         return TenantTokenCache(port)
@@ -114,7 +114,10 @@ def create_app(
     )
 
     @app.middleware("http")
-    async def cap_body(request: Request, call_next: Callable[[Request], Awaitable[object]]):
+    async def cap_body(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[object]],
+    ) -> object:
         if request.method in {"POST", "PUT", "PATCH"}:
             content_length = request.headers.get("content-length")
             if content_length is not None:

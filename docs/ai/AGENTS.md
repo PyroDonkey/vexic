@@ -233,7 +233,6 @@ loop against the tracking docs remains a manual step under the triggers above.
 - The Vexic Console may use the isolated npm package surface in `console/` for
   the Vercel Next.js app. Do not add Node package files at the repository root
   or move Console runtime into `src/vexic`.
-- Type annotate new public functions and models.
 - Prefer Pydantic models and structured APIs over string parsing.
 - Keep code in focused modules that match the existing package boundaries.
 - Do not add provider secrets, hosted auth, billing, public HTTP, mature remote
@@ -242,8 +241,6 @@ loop against the tracking docs remains a manual step under the triggers above.
   limited to read-only hosted adapter code.
 - Before relying on pydantic-ai import paths or behavior, verify the current
   upstream docs. The package changes quickly.
-- Keep generated docs ASCII unless an existing file has a clear reason to use
-  non-ASCII.
 
 ## Loop Bounds and Escalation
 
