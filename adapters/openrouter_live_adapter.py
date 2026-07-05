@@ -43,6 +43,15 @@ Judge whether the new fact contradicts the existing fact.
 Return contradicts=false unless both facts cannot be true at the same time.\
 """
 
+SUMMARY_INSTRUCTIONS = """\
+Write a concise, factual summary of this transcript span.
+Capture concrete decisions, facts, and open threads/action items.
+Do not speculate beyond what the transcript states. No preamble or
+meta-commentary -- return only the summary body.\
+"""
+
+DEFAULT_SUMMARY_MODEL = "anthropic/claude-haiku-4.5"
+
 
 def _env_key(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_").upper()
@@ -107,6 +116,13 @@ def _model_name(model_group: str) -> str:
     return "deepseek/deepseek-v4-pro"
 
 
+def _summary_model_name() -> str:
+    model = os.environ.get("VEXIC_SUMMARY_MODEL")
+    if model:
+        return _require_openrouter_model(model, "VEXIC_SUMMARY_MODEL")
+    return DEFAULT_SUMMARY_MODEL
+
+
 def _embedding_model_name() -> str:
     model = os.environ.get("VEXIC_LIVE_EMBEDDING_MODEL")
     if model:
@@ -138,6 +154,15 @@ def _agent(model_group: str, output_type: Any, instructions: str) -> Agent[None,
     )
 
 
+def _agent_with_model(model_name: str, output_type: Any, instructions: str) -> Agent[None, Any]:
+    return Agent(
+        OpenAIChatModel(model_name, provider=_provider()),
+        output_type=output_type,
+        instructions=instructions,
+        model_settings=_model_settings(),
+    )
+
+
 def build_extraction_agent(
     model_group: str,
     secrets: Mapping[str, str] | None = None,
@@ -152,6 +177,17 @@ def build_contradiction_agent(
 ) -> Agent[None, ContradictionJudgment]:
     _reject_passed_secrets(secrets)
     return _agent(model_group, ContradictionJudgment, CONTRADICTION_INSTRUCTIONS)
+
+
+def build_summary_agent(
+    model_group: str,
+    secrets: Mapping[str, str] | None = None,
+) -> Agent[None, str]:
+    # `model_group` is intentionally unused: the summary model is env-driven
+    # via `VEXIC_SUMMARY_MODEL` (see `_summary_model_name`), not routed by
+    # model group like the other agent builders in this module.
+    _reject_passed_secrets(secrets)
+    return _agent_with_model(_summary_model_name(), str, SUMMARY_INSTRUCTIONS)
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:

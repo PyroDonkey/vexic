@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Iterator
@@ -19,6 +20,7 @@ from vexic.recorders.hosted_prime import (
     DEFAULT_PRIME_MAX_CHARS,
     HostedPrimeConfig,
     fetch_prime_context,
+    post_trigger_dream_phase,
 )
 from vexic.recorders.hosted_ingest import HostedIngestConfig, post_source_messages
 from vexic.recorders.status import RecorderStatus, write_status
@@ -134,6 +136,14 @@ def _parser() -> argparse.ArgumentParser:
     prime.add_argument("--timeout-seconds", type=float, default=15.0)
     prime.add_argument("--max-chars", type=int, default=DEFAULT_PRIME_MAX_CHARS)
     prime.add_argument("--status-path", type=Path)
+
+    trigger_dream = subparsers.add_parser("trigger-dream")
+    trigger_dream.add_argument("--config", type=Path, required=True)
+    trigger_dream.add_argument("--base-url")
+    trigger_dream.add_argument("--api-key")
+    trigger_dream.add_argument("--project-id")
+    trigger_dream.add_argument("--session-id")
+    trigger_dream.add_argument("--agent-id")
 
     setup = subparsers.add_parser(
         "setup-claude-code",
@@ -295,11 +305,58 @@ def _ingest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _trigger_dream(args: argparse.Namespace) -> int:
+    # Fail-open by construction: this subcommand always exits 0. It runs
+    # detached from `prime` (see _spawn_trigger_dream) and has no stdout/
+    # stderr consumer other than an operator tailing logs, so any failure
+    # here must never surface as a nonzero exit or block anything.
+    try:
+        _apply_ingest_config(args)
+        config = HostedPrimeConfig(
+            base_url=args.base_url,
+            api_key=args.api_key,
+            project_id=args.project_id,
+            session_id=args.session_id,
+            agent_id=args.agent_id,
+        )
+        post_trigger_dream_phase(config)
+    except Exception as exc:
+        print(f"warning: {exc}", file=sys.stderr)
+    return 0
+
+
+def _spawn_trigger_dream(config_path: Path) -> None:
+    # Detached, fire-and-forget: prime's SessionStart hook must not gain any
+    # serial latency waiting on this. All three stdio streams are DEVNULL --
+    # an inherited stdout pipe would keep the hook's own stdout open until
+    # this child exits, silently defeating "zero added latency". Credentials
+    # travel via --config only, never argv, to avoid `ps` exposure.
+    try:
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "vexic.cli",
+                "recorder",
+                "trigger-dream",
+                "--config",
+                str(config_path),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as exc:
+        print(f"warning: trigger-dream spawn failed: {exc}", file=sys.stderr)
+
+
 def _prime(args: argparse.Namespace) -> int:
     try:
         payload = _read_session_start_payload(args.hook_input)
         if payload.source not in {"startup", "clear"}:
             return 0
+        _spawn_trigger_dream(args.config)
         _apply_ingest_config(args)
         context = fetch_prime_context(
             HostedPrimeConfig(
@@ -392,6 +449,8 @@ def main(argv: list[str] | None = None) -> int:
             return _ingest(args)
         if args.command == "prime":
             return _prime(args)
+        if args.command == "trigger-dream":
+            return _trigger_dream(args)
         if args.command == "setup-claude-code":
             return _setup_claude_code(args)
         if args.command == "uninstall-claude-code":

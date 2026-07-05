@@ -15,6 +15,7 @@ from vexic.storage import (
     record_session_summary,
     save_messages,
 )
+from vexic.storage.session_summaries import count_session_summaries_since
 from vexic.summarize import CONDENSE_MAX_FRONTIER_LEAVES, run_summarize_phase
 
 
@@ -452,6 +453,223 @@ class SummarizePhaseTests(unittest.IsolatedAsyncioTestCase):
             frontier = fetch_session_summary_frontier(db_path, session_id="default")
             self.assertEqual(len(frontier), leaf_count)
             self.assertTrue(all(s.kind == "leaf" for s in frontier))
+
+
+class DailySpanBudgetTests(unittest.IsolatedAsyncioTestCase):
+    def _seed_one_span_session(
+        self, db_path: str, session_id: str, *, start: datetime
+    ) -> None:
+        # A single message group. Combined with a `now_utc` on a later
+        # calendar day (see the daily 3am-boundary heuristic in
+        # `_latest_boundary_message_id`), every message in this group lands
+        # before the cutoff, so the whole session becomes exactly one
+        # gap-free compaction span with no uncovered leftover tail.
+        _save_session(db_path, session_id, count=5, start=start)
+
+    async def test_budget_stops_after_admitted_spans_and_leaves_rest_untouched(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            for session_id in ("s1", "s2", "s3"):
+                self._seed_one_span_session(db_path, session_id, start=start)
+
+            agent = FakeSummaryAgent()
+
+            def factory(model_group: str, secrets=None):
+                return agent
+
+            run_day1 = start + timedelta(days=1, hours=6)
+            usage = await run_summarize_phase(
+                db_path,
+                "glm",
+                summary_agent_factory=factory,
+                now_utc=run_day1,
+                daily_span_budget=2,
+            )
+
+            self.assertEqual(len(fetch_session_summary_frontier(db_path, session_id="s1")), 1)
+            self.assertEqual(len(fetch_session_summary_frontier(db_path, session_id="s2")), 1)
+            self.assertEqual(fetch_session_summary_frontier(db_path, session_id="s3"), [])
+            self.assertGreater(usage.total_tokens, 0)
+
+            # Next run, same UTC day: budget already spent, third span untouched.
+            usage_again = await run_summarize_phase(
+                db_path,
+                "glm",
+                summary_agent_factory=factory,
+                now_utc=run_day1,
+                daily_span_budget=2,
+            )
+            self.assertEqual(fetch_session_summary_frontier(db_path, session_id="s3"), [])
+            self.assertEqual(usage_again.total_tokens, 0)
+
+            # Next UTC day: budget resets, third span now gets summarized.
+            run_day2 = start + timedelta(days=2, hours=6)
+            await run_summarize_phase(
+                db_path,
+                "glm",
+                summary_agent_factory=factory,
+                now_utc=run_day2,
+                daily_span_budget=2,
+            )
+            self.assertEqual(len(fetch_session_summary_frontier(db_path, session_id="s3")), 1)
+
+    async def test_budget_admits_leaves_but_condense_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+            leaf_count = CONDENSE_MAX_FRONTIER_LEAVES + 1
+            message_ids = _save_session(
+                db_path, "default", count=leaf_count, start=start
+            )
+            for message_id in message_ids:
+                record_session_summary(
+                    db_path,
+                    session_id="default",
+                    kind="leaf",
+                    first_message_id=message_id,
+                    last_message_id=message_id,
+                    summary_text=f"leaf summary for message {message_id}",
+                )
+
+            agent = FakeSummaryAgent()
+
+            def factory(model_group: str, secrets=None):
+                return agent
+
+            await run_summarize_phase(
+                db_path,
+                "glm",
+                summary_agent_factory=factory,
+                now_utc=start + timedelta(hours=1),
+                daily_span_budget=leaf_count,
+            )
+
+            self.assertEqual(agent.calls, [])
+            frontier = fetch_session_summary_frontier(db_path, session_id="default")
+            self.assertEqual(len(frontier), leaf_count)
+            self.assertTrue(all(s.kind == "leaf" for s in frontier))
+
+    async def test_format_mix_legacy_and_explicit_created_at_both_count(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+            # Legacy row: no created_at passed, DB default (real wall-clock,
+            # always later than any of these historical frozen dates) applies.
+            record_session_summary(
+                db_path,
+                session_id="legacy",
+                kind="leaf",
+                first_message_id=1,
+                last_message_id=1,
+                summary_text="legacy row",
+            )
+
+            for session_id in ("s1", "s2"):
+                self._seed_one_span_session(db_path, session_id, start=start)
+
+            agent = FakeSummaryAgent()
+
+            def factory(model_group: str, secrets=None):
+                return agent
+
+            await run_summarize_phase(
+                db_path,
+                "glm",
+                summary_agent_factory=factory,
+                now_utc=start + timedelta(days=1, hours=6),
+                daily_span_budget=2,
+            )
+
+            self.assertEqual(len(fetch_session_summary_frontier(db_path, session_id="s1")), 1)
+            self.assertEqual(fetch_session_summary_frontier(db_path, session_id="s2"), [])
+
+    async def test_budget_zero_never_invokes_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            self._seed_one_span_session(db_path, "default", start=start)
+
+            agent = FakeSummaryAgent()
+
+            def factory(model_group: str, secrets=None):
+                return agent
+
+            usage = await run_summarize_phase(
+                db_path,
+                "glm",
+                summary_agent_factory=factory,
+                now_utc=start + timedelta(hours=6),
+                daily_span_budget=0,
+            )
+
+            self.assertEqual(agent.calls, [])
+            self.assertEqual(usage.total_tokens, 0)
+            self.assertEqual(fetch_session_summary_frontier(db_path, session_id="default"), [])
+
+    async def test_explicit_created_at_round_trips_through_frontier(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+
+            record_session_summary(
+                db_path,
+                session_id="default",
+                kind="leaf",
+                first_message_id=1,
+                last_message_id=1,
+                summary_text="a summary",
+                created_at="2026-01-01 03:00:00",
+            )
+
+            frontier = fetch_session_summary_frontier(db_path, session_id="default")
+            self.assertEqual(len(frontier), 1)
+            self.assertEqual(frontier[0].created_at, "2026-01-01 03:00:00")
+
+    async def test_count_session_summaries_since_counts_mixed_formats(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+
+            record_session_summary(
+                db_path,
+                session_id="default",
+                kind="leaf",
+                first_message_id=1,
+                last_message_id=1,
+                summary_text="legacy",
+            )
+            record_session_summary(
+                db_path,
+                session_id="default",
+                kind="leaf",
+                first_message_id=2,
+                last_message_id=2,
+                summary_text="explicit",
+                created_at="2026-01-01 03:00:00",
+            )
+
+            count = count_session_summaries_since(
+                db_path,
+                agent_id=None,
+                created_at_floor="2026-01-01 00:00:00",
+            )
+            self.assertEqual(count, 2)
+
+            count_after_both = count_session_summaries_since(
+                db_path,
+                agent_id=None,
+                created_at_floor="2099-01-01 00:00:00",
+            )
+            self.assertEqual(count_after_both, 0)
 
 
 if __name__ == "__main__":

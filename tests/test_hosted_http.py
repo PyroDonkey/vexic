@@ -2212,6 +2212,63 @@ class DreamPhasePortsFromEnvTests(unittest.TestCase):
 
         self.assertEqual(ports.model_group, "alpha-group")
 
+    def test_daily_span_budget_unset_defaults_to_50(self) -> None:
+        adapter = _write_fake_dream_adapter(Path(self.temp_dir.name))
+
+        ports = dream_phase_ports_from_env(
+            {"VEXIC_DREAM_PHASE_ADAPTER": str(adapter)}
+        )
+
+        self.assertEqual(ports.daily_span_budget, 50)
+
+    def test_daily_span_budget_explicit_zero_closes_budget(self) -> None:
+        adapter = _write_fake_dream_adapter(Path(self.temp_dir.name))
+
+        ports = dream_phase_ports_from_env(
+            {
+                "VEXIC_DREAM_PHASE_ADAPTER": str(adapter),
+                "VEXIC_SUMMARIZE_DAILY_SPAN_BUDGET": "0",
+            }
+        )
+
+        self.assertEqual(ports.daily_span_budget, 0)
+
+    def test_daily_span_budget_negative_treated_as_zero(self) -> None:
+        adapter = _write_fake_dream_adapter(Path(self.temp_dir.name))
+
+        ports = dream_phase_ports_from_env(
+            {
+                "VEXIC_DREAM_PHASE_ADAPTER": str(adapter),
+                "VEXIC_SUMMARIZE_DAILY_SPAN_BUDGET": "-3",
+            }
+        )
+
+        self.assertEqual(ports.daily_span_budget, 0)
+
+    def test_daily_span_budget_garbage_defaults_to_50(self) -> None:
+        adapter = _write_fake_dream_adapter(Path(self.temp_dir.name))
+
+        ports = dream_phase_ports_from_env(
+            {
+                "VEXIC_DREAM_PHASE_ADAPTER": str(adapter),
+                "VEXIC_SUMMARIZE_DAILY_SPAN_BUDGET": "garbage",
+            }
+        )
+
+        self.assertEqual(ports.daily_span_budget, 50)
+
+    def test_daily_span_budget_explicit_value(self) -> None:
+        adapter = _write_fake_dream_adapter(Path(self.temp_dir.name))
+
+        ports = dream_phase_ports_from_env(
+            {
+                "VEXIC_DREAM_PHASE_ADAPTER": str(adapter),
+                "VEXIC_SUMMARIZE_DAILY_SPAN_BUDGET": "7",
+            }
+        )
+
+        self.assertEqual(ports.daily_span_budget, 7)
+
     def test_configured_but_missing_adapter_fails_loudly(self) -> None:
         missing = Path(self.temp_dir.name) / "missing.py"
 

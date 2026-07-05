@@ -510,12 +510,10 @@ environment that already carries the dream-phase env config both flags may be
 omitted. The adapter file must define `embed_texts`, `build_extraction_agent`,
 and `build_contradiction_agent`. `build_summary_agent` is optional: an
 adapter that omits it can still run `light`/`rem`/`deep`, but
-`run-dream-phase --phase summarize` fails closed with a `HostPortNotConfigured`
-CLI error until the adapter exposes it. (There is no HTTP route for dream
-phases today -- `run-dream-phase` is CLI-only -- but if one is added later,
-`HostPortNotConfigured` maps to `503` via the shared hosted-error mapping,
-same as other missing-port failures.) Provider secrets stay in the host
-environment; pass
+`run-dream-phase --phase summarize` (and the trigger endpoint below) fails
+closed with a `HostPortNotConfigured` error until the adapter exposes it (a
+CLI error for the CLI path, `503 host_port_not_configured` for the HTTP path).
+Provider secrets stay in the host environment; pass
 secret variable names with `--secret-env NAME` when Vexic should include those
 values in redaction checks.
 
@@ -527,13 +525,124 @@ against `/v1/fresh_context` calls made by the primer, gets a `403`, and the
 primer falls back to its existing search-only priming -- it does not fail the
 session.
 
-Dream-phase trigger, recorded: the current trigger is this documented manual
-CLI run, executed in the deployed environment (Railway one-off command against
-the same volume/env) per scope and phase after transcripts have been recorded.
-A scheduled background worker remains the target and is deliberately deferred
-until the dream-phase concurrency lock and the tenant model-credential
-strategy land; running unattended on the platform key without spend caps is
-not acceptable yet.
+### Dream-phase trigger endpoint (automatic summarize)
+
+`POST /v1/trigger_dream_phase` schedules the Summarize dream phase and
+returns immediately -- this is now how summarize runs in practice, replacing
+the old manual `run-dream-phase --phase summarize` CLI invocation as the
+day-to-day trigger. The body is `{"phase": "summarize"}`; v1 hard-rejects any
+other phase value with `400` (light/rem/deep triggering has a different
+cost/abuse profile and is a separate decision). A header-bound scope
+authenticates the same way as the other `/v1/*` routes.
+
+- Requires capability `memory:dream:trigger`, a new capability distinct from
+  `memory:admin:rebuild`: trigger-only keys (the recorder and the cron
+  workflow below) never need admin-rebuild just to kick off a sweep. Issue a
+  trigger key with, for example:
+
+  ```powershell
+  uv run --no-sync python -m vexic.hosted_http issue-key --root /data/vexic --tenant-id tenant-a --project-id project-a --principal-id cron --capability memory:dream:trigger
+  ```
+
+  A priming key that should also self-trigger from `recorder prime` needs
+  both capabilities: `--capability memory:fresh-context --capability
+  memory:dream:trigger`.
+- Returns `202` with `{"status": "scheduled"}`, or `{"status": "skipped",
+  "reason": "already_running"}` when a sweep for the same (tenant, agent) is
+  already in flight (an in-process lock -- see "Known limitations" below).
+- Missing/invalid key: `401`. Key without `memory:dream:trigger`: `403`.
+  `phase` other than `"summarize"`: `400`. No `build_summary_agent` port
+  configured: `503 host_port_not_configured`, checked synchronously before
+  any task is scheduled. Exceeding the shared rate rule: `429`.
+- Shares the existing `run_dream_phase` rate rule (6 requests/hour) with the
+  CLI/admin dream-phase path -- one bucket per tenant, consumed once per
+  trigger call, not once per session summarized.
+- **Sweep scope is tenant(+agent)-wide, not project-scoped.** The project
+  header still authenticates and binds the request the same way as every
+  other hosted route, but `messages`/`session_summaries` have no `project_id`
+  column today, so the sweep itself sees every project sharing that tenant's
+  database. `list_compactable_session_ids` matches on `agent_id IS ?`
+  (exact equality, including SQL `NULL`-safe comparison) -- it is NOT "all
+  agents for the tenant." A trigger that omits `X-Vexic-Agent-Id` (or sends
+  no agent id in scope) sweeps only sessions recorded with a `NULL`
+  `agent_id`; a trigger that sends an agent id sweeps only sessions recorded
+  with that exact `agent_id`. Operators must align the trigger's agent
+  header with however the recorder writes transcripts for that agent, or
+  those sessions will never be swept. A tenant with multiple projects
+  sharing one database gets one shared summarize budget and sweep per
+  `(tenant_id, agent_id)`, not per-project isolation. Project-scoped storage
+  is a separate future change if a multi-project tenant ever needs it.
+- Execution itself never blocks the request or the serving event loop: the
+  phase runs on its own worker thread with its own event loop
+  (`asyncio.to_thread(asyncio.run, ...)`), so a slow summarize call cannot
+  stall other hosted traffic.
+
+Daily span budget: `VEXIC_SUMMARIZE_DAILY_SPAN_BUDGET` (default `50`) caps
+how many `session_summaries` rows (leaf writes and condense writes both
+count) a tenant(+agent) can accumulate per UTC calendar day. Once the budget
+is reached, the phase stops adding new spans/condensations for the rest of
+that UTC day and returns cleanly -- `/v1/fresh_context` still serves whatever
+frontier-plus-tail recap is available, it just stops growing until the next
+UTC day. The budget window is UTC-day and is a different clock than the
+2h-idle/3am-local "is this session ripe to summarize" heuristic the phase
+uses elsewhere -- spend is bounded on a calendar-day clock, ripeness is
+evaluated on a wall-clock heuristic; the two are intentionally independent.
+
+Model used for summarization: `VEXIC_SUMMARY_MODEL`, read by
+`adapters/openrouter_live_adapter.py`'s `build_summary_agent`, defaulting to
+`anthropic/claude-haiku-4.5`.
+
+### Cron producer
+
+`.github/workflows/dream-cron.yml` fires the trigger endpoint hourly
+(`schedule: "0 * * * *"`, plus `workflow_dispatch` for hand-testing). It is
+deliberately dumb: no per-tenant matrix, no retry logic beyond `curl`'s own
+`--retry 2`; the endpoint owns dedup, rate limiting, and budget enforcement,
+so overlapping or redundant fires are cheap no-ops (`skipped`/`429`), never
+double work. A non-2xx response fails the workflow run red on purpose -- that
+is the intended v1 alerting signal, and it never blocks anything else in the
+repo.
+
+Required GitHub secrets (operator-configured; not present until an operator
+sets them):
+
+- `VEXIC_DREAM_TRIGGER_URL` -- the full `https://.../v1/trigger_dream_phase`
+  URL for the deployed hosted service.
+- `VEXIC_DREAM_TRIGGER_KEY` -- a raw API key carrying `memory:dream:trigger`.
+- `VEXIC_DREAM_PROJECT_ID` -- the `X-Vexic-Project-Id` header value the
+  trigger key is bound to (the sweep itself is still tenant-wide per the
+  scoping note above; this only authenticates the call).
+
+### Recorder-side backstop trigger
+
+`recorder prime` (invoked from the Claude Code SessionStart hook) spawns a
+detached, fire-and-forget `vexic recorder trigger-dream` subprocess before
+doing its normal priming work, as a backstop between hourly cron ticks. This
+adds no serial latency to the hook: the subprocess is spawned with
+`stdin`/`stdout`/`stderr` all `DEVNULL` and `start_new_session=True` (an
+inherited stdout pipe would keep the hook's own stdout open until the child
+exits, which would defeat the "zero added latency" goal) and prime does not
+wait on it. Credentials travel to the child via `--config <path>` only, never
+as an `--api-key` argv value, to avoid exposure in `ps` output for the
+child's lifetime. Spawn failures, trigger timeouts (5s), and non-2xx
+responses are all swallowed with a stderr warning -- the subcommand always
+exits `0` and never affects prime's own output or exit code.
+
+**Known limitations, accepted for v1** (see ADR 0025):
+
+- The in-flight dedup lock and the 6/hour rate limiter are in-process. The
+  current deploy is verified single-process/single-instance; if the hosted
+  service ever scales to multiple replicas, dedup stops deduping across
+  replicas and the rate cap becomes per-replica rather than global. Revisit
+  with a durable queue or a shared limiter before scaling out.
+- A scheduled trigger task is in-memory: it does not survive a process
+  restart or redeploy mid-sweep. The next trigger (cron or prime) re-runs
+  idempotently, so no data is lost, but an in-flight sweep at deploy time is
+  simply abandoned rather than resumed.
+- Prime's pre-existing serial-timeout budget (up to three sequential 15s
+  `urlopen` calls against the SessionStart hook's 30s kill) is unchanged by
+  this work and remains a known follow-up to tighten or parallelize
+  separately.
 
 Revoke a throwaway key by key id, not by raw key:
 

@@ -35,6 +35,8 @@ from vexic.contract import (
     IngestSourceTranscriptResult,
     RunDreamPhaseRequest,
     RunDreamPhaseResult,
+    TriggerDreamPhaseRequest,
+    TriggerDreamPhaseResult,
     MemoryCapability,
     MemoryRequest,
     MemoryResult,
@@ -493,6 +495,25 @@ class HostedMemoryService:
         # shared-DB / second-tenant hazard. Secrets (the minted jwt) live only
         # inside the resolver, which is built in `adapters/`.
         self._customer_target_resolver = customer_target_resolver
+        # trigger_dream_phase (COA-254 T-A / ADR 0025): per-(tenant_id,
+        # agent_id) in-process in-flight guard so a concurrent trigger is a
+        # cheap no-op (`skipped/already_running`) instead of a second
+        # summarize sweep. Process-local by design (see plan D3's accepted
+        # single-process risk); a multi-replica deploy needs a shared lock.
+        self._dream_trigger_lock = threading.Lock()
+        self._dream_trigger_inflight: set[tuple[str, str | None]] = set()
+        # Background dream-trigger job events, mirroring
+        # `HostedBackgroundJobRunner.job_events` for the trigger path. The
+        # list append itself is safe on the asyncio event loop (single
+        # cooperative thread), but `threading.Lock` is cheap insurance since
+        # the surrounding job body crosses a real worker thread via
+        # `asyncio.to_thread` (see `_run_dream_trigger_job`).
+        self._dream_trigger_job_events_lock = threading.Lock()
+        self.dream_trigger_job_events: list[HostedJobEvent] = []
+        # Strong references to in-flight `asyncio.create_task(...)` background
+        # jobs so they are never garbage-collected mid-flight; tests can await
+        # them deterministically via this set instead of sleeping.
+        self._background_tasks: set[asyncio.Task] = set()
 
     async def append_transcript(
         self,
@@ -628,6 +649,190 @@ class HostedMemoryService:
             request.required_capability,
             lambda bound, tenant: self._run_dream_phase_with_usage(bound, tenant),
         )
+
+    async def trigger_dream_phase(
+        self,
+        api_key: str,
+        request: TriggerDreamPhaseRequest,
+    ) -> TriggerDreamPhaseResult:
+        """Schedule a tenant(+agent)-wide summarize sweep and return at once.
+
+        THE CRITICAL ROUTING (COA-254 T-A / ADR 0025, plan D1-D3): this
+        authenticates + binds + rate-checks EXACTLY ONCE, at this trigger
+        boundary, against `TriggerDreamPhaseRequest`'s own
+        `MemoryCapability.DREAM_TRIGGER` -- deliberately NOT
+        `ADMIN_REBUILD`. The actual phase execution is a server-minted,
+        pre-bound `RunDreamPhaseRequest` (built in `_schedule_dream_trigger`)
+        that is executed by calling `_run_dream_phase_with_usage` DIRECTLY.
+        It must never re-enter `self._call` / `self._bind_request` /
+        `HostedBackgroundJobRunner.run_dream_phase`: the capability
+        intersection in `_bind_request` would strip the minted
+        `ADMIN_REBUILD` (a trigger-only key doesn't hold it) and 403 the
+        background job, and the 6/hour `run_dream_phase` rate bucket would be
+        double-counted.
+        """
+        operation = "run_dream_phase"
+        auth: HostedAuthContext | None = None
+        bound: TriggerDreamPhaseRequest | None = None
+        try:
+            auth = self.api_keys.authenticate(api_key)
+            bound, tenant = self._bind_request(auth, request, request.required_capability)
+            self.rate_limiter.check(operation, auth)
+            result = self._schedule_dream_trigger(bound, tenant, auth)
+        except HostedRateLimitExceeded as exc:
+            self._record_request(
+                operation,
+                bound,
+                status="rate_limited",
+                error_type=type(exc).__name__,
+                auth=auth,
+            )
+            raise
+        except Exception as exc:
+            self._record_request(
+                operation,
+                bound,
+                status="error",
+                error_type=type(exc).__name__,
+                auth=auth,
+            )
+            raise
+        self._record_request(operation, bound, status="ok", auth=auth)
+        return result
+
+    def _schedule_dream_trigger(
+        self,
+        request: TriggerDreamPhaseRequest,
+        tenant: HostedTenant,
+        auth: HostedAuthContext,
+    ) -> TriggerDreamPhaseResult:
+        ports = self.dream_phase_ports
+        if ports is None or ports.summary_agent_factory is None:
+            # Fail closed SYNCHRONOUSLY, before any task is scheduled, so the
+            # caller gets a real 503 signal at trigger time instead of a
+            # silently-swallowed background failure.
+            raise missing_host_port("Dream phase")
+        lock_key = (request.scope.tenant_id, request.scope.agent_id)
+        if not self._acquire_dream_trigger_lock(lock_key):
+            return TriggerDreamPhaseResult(status="skipped", reason="already_running")
+        try:
+            minted_scope = request.scope.model_copy(
+                update={"capabilities": {MemoryCapability.ADMIN_REBUILD}}
+            )
+            minted_request = RunDreamPhaseRequest(
+                scope=minted_scope,
+                phase=DreamPhase.SUMMARIZE,
+                # Deliberate: matches the fresh_context header-bound precedent
+                # (hosted_http.py). The phase still receives adapter-level
+                # `forbidden_secret_values` via `ports.secrets`.
+                redaction=RedactionContext(forbidden_values=()),
+            )
+            job_id = secrets.token_hex(8)
+            self._record_dream_trigger_job(job_id, minted_request, auth, status="running")
+            task = asyncio.create_task(
+                self._run_dream_trigger_job(job_id, minted_request, tenant, auth, lock_key)
+            )
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        except BaseException:
+            # Anything raised between acquiring the lock and successfully
+            # handing the job off to `asyncio.create_task` must release the
+            # lock -- otherwise it wedges forever: this trigger 500s and
+            # every subsequent trigger for the same (tenant, agent) silently
+            # returns `skipped`/`already_running` until process restart.
+            self._release_dream_trigger_lock(lock_key)
+            raise
+        return TriggerDreamPhaseResult(status="scheduled")
+
+    def _acquire_dream_trigger_lock(self, key: tuple[str, str | None]) -> bool:
+        with self._dream_trigger_lock:
+            if key in self._dream_trigger_inflight:
+                return False
+            self._dream_trigger_inflight.add(key)
+            return True
+
+    def _release_dream_trigger_lock(self, key: tuple[str, str | None]) -> None:
+        with self._dream_trigger_lock:
+            self._dream_trigger_inflight.discard(key)
+
+    async def _run_dream_trigger_job(
+        self,
+        job_id: str,
+        request: RunDreamPhaseRequest,
+        tenant: HostedTenant,
+        auth: HostedAuthContext,
+        lock_key: tuple[str, str | None],
+    ) -> None:
+        """Run the minted dream phase on its own worker-thread event loop.
+
+        `run_summarize_phase` is itself a coroutine mixing `await agent.run`
+        with synchronous sqlite I/O; running it on the serving loop would
+        stall every other request. `asyncio.to_thread(asyncio.run, ...)`
+        gives it its own loop on a worker thread instead -- sqlite is safe
+        here because every storage call opens/closes its own connection
+        in-thread. Exceptions are swallowed into the existing `_record_job`
+        error path; they never propagate out of this task.
+        """
+
+        def _run_in_worker_thread() -> tuple[RunDreamPhaseResult, UsageSummary]:
+            return asyncio.run(self._run_dream_phase_with_usage(request, tenant))
+
+        try:
+            result, usage = await asyncio.to_thread(_run_in_worker_thread)
+        except Exception as exc:
+            self._record_dream_trigger_job(
+                job_id, request, auth, status="error", error_type=type(exc).__name__
+            )
+            self.record_job_usage(
+                operation="run_dream_phase",
+                tenant_id=auth.tenant_id,
+                principal_id=auth.principal.principal_id,
+                status="error",
+                error_type=type(exc).__name__,
+                project_id=request.scope.project_id,
+                key_id=auth.key_id,
+            )
+        else:
+            self._record_dream_trigger_job(job_id, request, auth, status="ok")
+            self.record_job_usage(
+                operation="run_dream_phase",
+                tenant_id=auth.tenant_id,
+                principal_id=auth.principal.principal_id,
+                status="ok",
+                usage=usage,
+                project_id=request.scope.project_id,
+                key_id=auth.key_id,
+            )
+        finally:
+            self._release_dream_trigger_lock(lock_key)
+
+    def _record_dream_trigger_job(
+        self,
+        job_id: str,
+        request: RunDreamPhaseRequest,
+        auth: HostedAuthContext,
+        *,
+        status: str,
+        error_type: str | None = None,
+    ) -> None:
+        event = HostedJobEvent(
+            job_id=job_id,
+            operation="run_dream_phase",
+            tenant_id=auth.tenant_id,
+            principal_id=auth.principal.principal_id,
+            status=status,
+            phase=request.phase.value,
+            recorded_at=_now(),
+            error_type=error_type,
+            project_id=request.scope.project_id,
+        )
+        with self._dream_trigger_job_events_lock:
+            self.dream_trigger_job_events.append(event)
+        if self.telemetry is not None:
+            try:
+                self.telemetry.record_job_event(event)
+            except Exception:
+                pass
 
     async def export_scope(
         self,
@@ -1067,6 +1272,8 @@ def _secret_env_values(names: list[str]) -> dict[str, str] | None:
 DREAM_PHASE_ADAPTER_ENV = "VEXIC_DREAM_PHASE_ADAPTER"
 DREAM_PHASE_MODEL_GROUP_ENV = "VEXIC_DREAM_PHASE_MODEL_GROUP"
 DEFAULT_DREAM_PHASE_MODEL_GROUP = "hosted-dream"
+SUMMARIZE_DAILY_SPAN_BUDGET_ENV = "VEXIC_SUMMARIZE_DAILY_SPAN_BUDGET"
+DEFAULT_SUMMARIZE_DAILY_SPAN_BUDGET = 50
 
 
 def dream_phase_ports_from_env(env: Mapping[str, str]) -> DreamPhasePorts | None:
@@ -1090,6 +1297,7 @@ def dream_phase_ports_from_env(env: Mapping[str, str]) -> DreamPhasePorts | None
         extraction_agent_factory=adapter.build_extraction_agent,
         contradiction_agent_factory=adapter.build_contradiction_agent,
         summary_agent_factory=getattr(adapter, "build_summary_agent", None),
+        daily_span_budget=_dream_phase_daily_span_budget(env),
     )
 
 
@@ -1098,6 +1306,23 @@ def _dream_phase_model_group(env: Mapping[str, str]) -> str:
         env.get(DREAM_PHASE_MODEL_GROUP_ENV, "").strip()
         or DEFAULT_DREAM_PHASE_MODEL_GROUP
     )
+
+
+def _dream_phase_daily_span_budget(env: Mapping[str, str]) -> int:
+    """Parse the summarize phase's daily span budget (cost runaway guard).
+
+    Unset/blank/unparseable -> the default (50); a negative value is treated
+    as 0 (fully closed) rather than raising, since this gates a background
+    job rather than serving a request -- fail closed on cost, not loud.
+    """
+    raw = env.get(SUMMARIZE_DAILY_SPAN_BUDGET_ENV, "").strip()
+    if not raw:
+        return DEFAULT_SUMMARIZE_DAILY_SPAN_BUDGET
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_SUMMARIZE_DAILY_SPAN_BUDGET
+    return max(value, 0)
 
 
 def _load_dream_phase_adapter(path: Path) -> ModuleType:
@@ -1139,6 +1364,7 @@ def _dream_phase_ports(args: argparse.Namespace) -> DreamPhasePorts:
         contradiction_agent_factory=adapter.build_contradiction_agent,
         summary_agent_factory=getattr(adapter, "build_summary_agent", None),
         secrets=_secret_env_values(args.secret_env),
+        daily_span_budget=_dream_phase_daily_span_budget(os.environ),
     )
 
 

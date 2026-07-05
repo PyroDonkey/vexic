@@ -37,6 +37,7 @@ index (and the reverse).
 | 0022 | Physical purge erases tombstoned scopes from the primary database | accepted |
 | 0023 | Hosted content encryption flows through a core ContentCodec port | accepted |
 | 0024 | Hosted fresh-conversation context ships as a Summarize dream phase plus a dedicated fresh_context capability | accepted |
+| 0025 | Automatic summarize triggering ships as an async trigger endpoint, hourly cron, and a detached SessionStart backstop | accepted |
 
 Notes:
 
@@ -102,6 +103,16 @@ Notes:
   `PRIME_CONTEXT_HEADER`) keeps the injected recap out of Tier 1. Tagging
   fresh-context-sourced rows with `source == "compact"` and threshold tuning
   is COA-268.
+- 0025 settles the COA-254 follow-on that makes Summarize triggering
+  automatic: `POST /v1/trigger_dream_phase` (capability
+  `memory:dream:trigger`, summarize-only in v1) schedules an async sweep run
+  on its own worker-thread event loop, an hourly `dream-cron.yml` workflow is
+  the primary producer, and a detached subprocess spawned from `recorder
+  prime` is a SessionStart backstop. It documents the tenant(+agent)-wide
+  sweep/budget scope honestly (project header authenticates, does not scope
+  the sweep) and the accepted single-process risks (in-process dedup lock
+  and rate limiter, task loss on restart). It affirms ADR 0018 and extends
+  ADR 0024.
 - These numbers are the Vexic `docs/adr/` series and are self-contained.
   `src/vexic` source no longer carries any `upstream ADR-00NN` extraction-source
   labels (they were removed when the COA boundary policy was clarified), so there

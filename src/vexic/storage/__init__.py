@@ -66,6 +66,7 @@ from vexic.storage.schema import (
 from vexic.storage.session_summaries import (
     SessionSummary,
     SessionSummaryKind,
+    count_session_summaries_since,
     estimate_session_tokens,
     fetch_session_summary_frontier,
     find_session_compaction_span,
@@ -168,6 +169,7 @@ __all__ = [
     "record_fact_use_verdict",
     "record_long_term_retrieval",
     "record_promotion_label",
+    "count_session_summaries_since",
     "record_session_summary",
     "render_compaction_source",
     "render_recap_blocks",

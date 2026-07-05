@@ -52,6 +52,7 @@ class MemoryCapability(StrEnum):
     REPLAY = "memory:replay"
     ADMIN_REBUILD = "memory:admin:rebuild"
     ADMIN_LIFECYCLE = "memory:admin:lifecycle"
+    DREAM_TRIGGER = "memory:dream:trigger"
 
 
 class EgressKind(StrEnum):
@@ -342,6 +343,39 @@ class RunDreamPhaseRequest(RedactionRequiredRequest):
 class RunDreamPhaseResult(MemoryResult):
     phase: DreamPhase
     status: Literal["ok", "error", "partial"]
+
+
+class TriggerDreamPhaseRequest(MemoryRequest):
+    """Boundary request for ``POST /v1/trigger_dream_phase`` (ADR 0025).
+
+    Deliberately thin: it carries its own capability (``DREAM_TRIGGER``, not
+    ``ADMIN_REBUILD``) so trigger-only keys (e.g. the recorder/cron caller)
+    never need the heavier admin capability. The hosted service authenticates
+    and binds this request exactly once at the trigger boundary, then
+    internally mints a fully-scoped ``RunDreamPhaseRequest`` (server-side
+    ``ADMIN_REBUILD``) to execute the phase directly -- see
+    ``HostedMemoryService.trigger_dream_phase``.
+
+    ``scope.session_id`` is intentionally not required: v1 summarize sweeps
+    all compactable sessions tenant(+agent)-wide (see plan D1's honest-scope
+    note), not a single session.
+    """
+
+    required_capability: ClassVar[MemoryCapability] = MemoryCapability.DREAM_TRIGGER
+    phase: DreamPhase
+
+    @model_validator(mode="after")
+    def _v1_restricts_to_summarize(self) -> Self:
+        if self.phase is not DreamPhase.SUMMARIZE:
+            raise ValueError(
+                "trigger_dream_phase only supports phase='summarize' in v1."
+            )
+        return self
+
+
+class TriggerDreamPhaseResult(MemoryResult):
+    status: Literal["scheduled", "skipped"]
+    reason: str | None = None
 
 
 class ExportScopeRequest(RedactionRequiredRequest):

@@ -5,6 +5,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -2443,3 +2444,271 @@ class ClaudeCodeRecorderPrimeCommandTests(unittest.TestCase):
                 fetch_prime_context(config)
 
         urlopen_mock.assert_not_called()
+
+
+def _write_trigger_config(root: Path, **overrides: object) -> Path:
+    config_path = root / "config.json"
+    payload = {
+        "base_url": "https://api.example.test",
+        "api_key": "vx_secret",
+        "project_id": "project-a",
+        "session_id": "session-a",
+        "agent_id": "agent-a",
+    }
+    payload.update(overrides)
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    return config_path
+
+
+class ClaudeCodeRecorderTriggerDreamCommandTests(unittest.TestCase):
+    def test_trigger_dream_posts_summarize_phase_with_tenancy_headers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = _write_trigger_config(root)
+            calls = []
+
+            class _Response:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc):
+                    return False
+
+                def read(self) -> bytes:
+                    return b'{"status": "scheduled"}'
+
+            def fake_urlopen(request, timeout):
+                calls.append((request, timeout))
+                return _Response()
+
+            stdout = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(["trigger-dream", "--config", str(config_path)])
+
+            self.assertEqual(code, 0)
+            self.assertEqual(len(calls), 1)
+            request, timeout = calls[0]
+            self.assertEqual(timeout, 5.0)
+            self.assertEqual(
+                urlsplit(request.full_url).path, "/v1/trigger_dream_phase"
+            )
+            self.assertEqual(request.get_header("Authorization"), "Bearer vx_secret")
+            self.assertEqual(request.get_header("X-vexic-project-id"), "project-a")
+            self.assertEqual(request.get_header("X-vexic-agent-id"), "agent-a")
+            body = json.loads(request.data.decode("utf-8"))
+            self.assertEqual(body, {"phase": "summarize"})
+
+    def test_trigger_dream_exits_zero_on_forbidden(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = _write_trigger_config(root)
+            error = HTTPError(
+                url="https://api.example.test/v1/trigger_dream_phase",
+                code=403,
+                msg="Forbidden",
+                hdrs={},
+                fp=None,
+            )
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", side_effect=error),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = recorder_main(["trigger-dream", "--config", str(config_path)])
+
+            self.assertEqual(code, 0)
+            self.assertIn("HTTP 403", stderr.getvalue())
+
+    def test_trigger_dream_exits_zero_on_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = _write_trigger_config(root)
+
+            def fake_urlopen(request, timeout):
+                raise URLError(TimeoutError("timed out"))
+
+            stdout = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(["trigger-dream", "--config", str(config_path)])
+
+            self.assertEqual(code, 0)
+
+    def test_trigger_dream_exits_zero_on_connection_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = _write_trigger_config(root)
+
+            def fake_urlopen(request, timeout):
+                raise URLError(ConnectionRefusedError())
+
+            stdout = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(["trigger-dream", "--config", str(config_path)])
+
+            self.assertEqual(code, 0)
+
+    def test_trigger_dream_exits_zero_on_missing_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            missing_config = root / "does-not-exist.json"
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = recorder_main(["trigger-dream", "--config", str(missing_config)])
+
+            self.assertEqual(code, 0)
+
+
+class ClaudeCodeRecorderPrimeSpawnsTriggerDreamTests(unittest.TestCase):
+    def test_prime_spawns_trigger_dream_detached_with_safe_argv(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = _write_trigger_config(root)
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+
+            popen_calls = []
+
+            class _FakeProcess:
+                pass
+
+            def fake_popen(argv, **kwargs):
+                popen_calls.append((argv, kwargs))
+                return _FakeProcess()
+
+            stdout = io.StringIO()
+            with (
+                patch("vexic.recorders.cli.subprocess.Popen", fake_popen),
+                patch(
+                    "vexic.recorders.cli.fetch_prime_context",
+                    return_value="",
+                ),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(len(popen_calls), 1)
+            argv, kwargs = popen_calls[0]
+
+            self.assertEqual(argv[0], sys.executable)
+            self.assertEqual(argv[1:4], ["-m", "vexic.cli", "recorder"])
+            self.assertIn("trigger-dream", argv)
+            config_index = argv.index("--config")
+            self.assertEqual(argv[config_index + 1], str(config_path))
+            self.assertNotIn("vx_secret", argv)
+            self.assertNotIn("--api-key", argv)
+            self.assertEqual(kwargs.get("stdin"), subprocess.DEVNULL)
+            self.assertEqual(kwargs.get("stdout"), subprocess.DEVNULL)
+            self.assertEqual(kwargs.get("stderr"), subprocess.DEVNULL)
+            self.assertTrue(kwargs.get("start_new_session"))
+
+    def test_prime_output_unchanged_when_trigger_spawn_raises_oserror(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = _write_trigger_config(root)
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+
+            def fake_popen(argv, **kwargs):
+                raise OSError("spawn failed")
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch("vexic.recorders.cli.subprocess.Popen", side_effect=fake_popen),
+                patch(
+                    "vexic.recorders.cli.fetch_prime_context",
+                    return_value="",
+                ),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("trigger-dream", stderr.getvalue())
+
+    def test_prime_returns_before_detached_child_exits(self) -> None:
+        # Audit-mandated: an inherited stdout pipe would keep the SessionStart
+        # hook's stdout open until the child exits. Prove prime's own output
+        # is complete while a slow "child" is still blocked, by using a real
+        # detached subprocess that waits on a file marker prime never touches.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = _write_trigger_config(root)
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            release_marker = root / "release.marker"
+
+            spawned_processes = []
+            real_popen = subprocess.Popen
+
+            def blocking_popen(argv, **kwargs):
+                # Replace the real trigger-dream argv with a tiny helper that
+                # blocks until release_marker appears, simulating a slow
+                # detached child while keeping the test hermetic (no network).
+                del argv
+                process = real_popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import pathlib, time\n"
+                            f"marker = pathlib.Path({str(release_marker)!r})\n"
+                            "while not marker.exists():\n"
+                            "    time.sleep(0.01)\n"
+                        ),
+                    ],
+                    **kwargs,
+                )
+                spawned_processes.append(process)
+                return process
+
+            stdout = io.StringIO()
+            with (
+                patch("vexic.recorders.cli.subprocess.Popen", blocking_popen),
+                patch(
+                    "vexic.recorders.cli.fetch_prime_context",
+                    return_value="some prime context",
+                ),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            try:
+                self.assertEqual(code, 0)
+                output = json.loads(stdout.getvalue())
+                self.assertEqual(
+                    output["hookSpecificOutput"]["additionalContext"],
+                    "some prime context",
+                )
+                self.assertFalse(release_marker.exists())
+                self.assertTrue(spawned_processes)
+                self.assertIsNone(
+                    spawned_processes[0].poll(),
+                    "child should still be running; prime must not have waited on it",
+                )
+            finally:
+                release_marker.write_text("go", encoding="utf-8")
+                for process in spawned_processes:
+                    process.wait(timeout=5)

@@ -26,6 +26,29 @@ class HostedPrimeConfig:
     timeout_seconds: float = 15.0
 
 
+DREAM_TRIGGER_TIMEOUT_SECONDS = 5.0
+
+
+def post_trigger_dream_phase(config: HostedPrimeConfig) -> dict[str, object]:
+    """POST ``/v1/trigger_dream_phase`` with a hard 5s timeout.
+
+    Used by the recorder's detached ``trigger-dream`` subcommand. Callers are
+    responsible for fail-open behavior (this raises RuntimeError on any
+    transport/HTTP failure, same as the other hosted prime calls).
+    """
+    trigger_config = config
+    if config.timeout_seconds != DREAM_TRIGGER_TIMEOUT_SECONDS:
+        trigger_config = HostedPrimeConfig(
+            base_url=config.base_url,
+            api_key=config.api_key,
+            project_id=config.project_id,
+            session_id=config.session_id,
+            agent_id=config.agent_id,
+            timeout_seconds=DREAM_TRIGGER_TIMEOUT_SECONDS,
+        )
+    return _post_search(trigger_config, "trigger_dream_phase", {"phase": "summarize"})
+
+
 def fetch_fresh_context(
     config: HostedPrimeConfig,
     *,

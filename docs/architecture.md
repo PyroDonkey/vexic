@@ -179,7 +179,15 @@ phase fails closed with `HostPortNotConfigured`, matching Light and Deep. A
 per-session failure (including a redaction violation) is isolated and logged;
 the phase continues with the next session. `session_summaries` rows are a
 rebuildable derived projection, not source of truth -- they can be
-regenerated from Tier 1.
+regenerated from Tier 1. A daily span budget bounds how many rows a
+tenant(+agent) can add per UTC day.
+
+Summarize now has automatic producers rather than only a manual CLI run: an
+hourly cron workflow and a detached, fire-and-forget subprocess spawned from
+the Claude Code SessionStart recorder prime both call `POST
+/v1/trigger_dream_phase` (capability `memory:dream:trigger`), which schedules
+an async summarize sweep and returns at once (see ADR 0025 and
+`docs/hosted-mvp.md`).
 
 ## Retrieval
 
