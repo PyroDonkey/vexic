@@ -22,8 +22,9 @@
 1. In the Clerk dashboard, create a replacement secret key and revoke the old
    one. Rotation invalidates active console sessions; schedule accordingly.
 2. Update `CLERK_SECRET_KEY` in the deploy platform's secret store.
-3. For local development, update the untracked `console/.env.local`. Confirm
-   it is still ignored: `git check-ignore console/.env.local`.
+3. For local development, update the untracked `.env.local` in the private
+   `PyroDonkey/vexic-website` repo's `console/` directory (COA-295 — console
+   no longer lives in this repo).
 
 ## Rotate a Turso database auth token
 
@@ -46,7 +47,7 @@
 ## After any rotation
 
 - Verify nothing secret-bearing is tracked:
-  `git log -p -- .env.turso console/.env.local` must return nothing.
+  `git log -p -- .env.turso` must return nothing.
 - Follow ADR 0008 "Compromised Credentials" when rotation is
   compromise-driven: revoke, rotate adjacent credentials, audit access, and
   create fresh exports under the new keys.

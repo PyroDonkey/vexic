@@ -53,3 +53,24 @@ existing memory boundary: Vexic Console is a control-plane client, not memory
 core runtime. The hosted API remains the authority for project-scoped agent
 credentials, capability checks, revocation, rate-limit dimensions, and
 sanitized operational telemetry.
+
+## Addendum (2026-07-05): Console and website extracted to a private repo
+
+Following the public flip (COA-276), Vexic Console and the marketing website
+moved out of this repository into a private repo, `PyroDonkey/vexic-website`
+(COA-295 — scope expanded during execution to include the marketing site
+alongside Console; see the issue for the recorded decision). This is a
+boundary change, not a reversal of this ADR: Console remains a control-plane
+client of the hosted Vexic API, not memory-core runtime.
+
+Rationale: this repository is public under Apache-2.0; Console is the hosted
+product's paid control plane (billing, tenant admin, support views), and its
+roadmap, issues, and Vercel deploy pipeline should not run in public.
+Extending the same boundary to the marketing website keeps this repository
+scoped to the local-first memory core with no web surface in the tree.
+
+Historical note: source as committed to this repository up to the extraction
+commit (`db7207b6f6cdc8ff8f788159fa7bae16aa8c061e`) remains visible in this
+repository's public git history under the Apache-2.0 license already granted
+on those commits; that grant is not revocable. Development from the
+extraction point forward happens in the private repo under its own NOTICE.

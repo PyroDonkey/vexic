@@ -230,9 +230,8 @@ loop against the tracking docs remains a manual step under the triggers above.
 - Python 3.13, managed with `uv`.
 - Install and test the Vexic memory core through `uv`; do not add a second
   package manager to the core package.
-- The Vexic Console may use the isolated npm package surface in `console/` for
-  the Vercel Next.js app. Do not add Node package files at the repository root
-  or move Console runtime into `src/vexic`.
+- Console and website live in the private `PyroDonkey/vexic-website` repo, not
+  this one. Do not add Node package files at the repository root.
 - Type annotate new public functions and models.
 - Prefer Pydantic models and structured APIs over string parsing.
 - Keep code in focused modules that match the existing package boundaries.
@@ -384,7 +383,7 @@ For boundary-sensitive changes, inspect these explicitly:
 
 ```powershell
 rg -n "^(from|import) engine\\." src/vexic tests
-rg -n "C[o]alescent|A[g]entOS|Telegram|Blog Writer|teammate" docs/ai/AGENTS.md README.md docs src/vexic tests console
+rg -n "C[o]alescent|A[g]entOS|Telegram|Blog Writer|teammate" docs/ai/AGENTS.md README.md docs src/vexic tests
 ```
 
 `scripts/check_doc_drift.py --ci` is the committed doc-drift gate. Optional
@@ -399,7 +398,7 @@ sections. They should not become Vexic runtime instructions.
 Private tracker issue references are allowed only as project-tracking,
 traceability, or evidence pointers in `README.md`, `docs/provenance.md`,
 `docs/adr/**`, and `docs/runbooks/**`. Do not allow private tracker or
-private-host issue IDs in `src/vexic`, `tests`, `console/**`, schema values,
+private-host issue IDs in `src/vexic`, `tests`, schema values,
 public contract fields, `docs/architecture.md`, `docs/hosted-mvp.md`, or
 `docs/memory-service-contract.md`, except in explicit provenance or
 compatibility sections. Replace legacy source comments and docstrings with
