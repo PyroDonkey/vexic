@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse, Response
 from vexic.hosted import HostedMemoryService
 from vexic.hosted_http import create_app as create_hosted_memory_app
 from vexic.hosted_http import create_service_from_env
+from vexic.hosted_local import _CONTROL_PLANE_AGENT_CAPABILITIES
 from vexic.storage.errors import (
     is_operational_error,
     is_retryable_operational_error,
@@ -536,11 +537,11 @@ def _string_field(
     return value.strip() or default
 
 
-_CONTROL_PLANE_SCOPE_CAPABILITIES = [
-    "memory:write",
-    "memory:search",
-    "memory:expand",
-]
+# Sorted so the scope template's capability order is stable across server
+# restarts (frozenset iteration order varies with PYTHONHASHSEED).
+_CONTROL_PLANE_SCOPE_CAPABILITIES = sorted(
+    capability.value for capability in _CONTROL_PLANE_AGENT_CAPABILITIES
+)
 
 
 def _project_payload(project) -> dict[str, str]:

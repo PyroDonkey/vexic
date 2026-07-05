@@ -84,7 +84,9 @@ test("agent key creation reveals the raw key once and later responses never expo
   assert.deepEqual(created.key.scopeTemplate.capabilities, [
     "memory:write",
     "memory:search",
-    "memory:expand"
+    "memory:expand",
+    "memory:fresh-context",
+    "memory:dream:trigger"
   ]);
 
   const listedResponse = await listAgentKeysResponse(
