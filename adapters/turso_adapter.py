@@ -36,8 +36,8 @@ def control_plane_target(env: Mapping[str, str]) -> StorageTarget:
 @dataclass(frozen=True)
 class ReconcileReport:
     """Result of reconciling the Turso Platform API's list of databases
-    against the control-plane catalog's tenant -> customer_target mapping
-    (COA-273 Task 13, P2->P3 split-brain window).
+    against the control-plane catalog's tenant -> customer_target mapping,
+    covering the window where the two can diverge (split-brain).
 
     - ``matched``: tenant_id -> target present both in the catalog and on
       the platform.
@@ -140,7 +140,7 @@ def _looks_like_conflict(status: int, payload: dict) -> bool:
 
 class TursoProvisioningPort:
     """Creates/mints/destroys per-tenant Turso databases via the Turso
-    Platform API (COA-273 P4).
+    Platform API.
 
     Secrets (the platform API token) are read only in ``adapters/`` --
     ``src/vexic`` never sees them. The HTTP transport is injectable so unit
@@ -268,8 +268,7 @@ class TursoProvisioningPort:
 
 
 class TenantTokenCache:
-    """In-process TTL cache of short-lived per-tenant Turso tokens
-    (COA-273 Task 15, P4).
+    """In-process TTL cache of short-lived per-tenant Turso tokens.
 
     Mints a fresh, DB-scoped token via ``TursoProvisioningPort.mint_token``
     on cache miss/expiry and caches it in memory only, keyed by
@@ -348,7 +347,7 @@ def _db_name_from_dsn(customer_target: str, org: str) -> str:
 def make_customer_target_resolver(
     token_cache: TenantTokenCache, *, org: str
 ) -> "Callable[[HostedTenant], StorageTarget | None]":
-    """Build the per-tenant customer-memory resolver (COA-273 Task 16, P4).
+    """Build the per-tenant customer-memory resolver.
 
     The returned resolver, given a ``HostedTenant``:
     - returns ``None`` when the tenant has no ``customer_target`` (local

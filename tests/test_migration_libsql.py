@@ -1,4 +1,4 @@
-"""Task 17 (COA-273 P5): `import_canonical_migration` accepts a libSQL
+"""`import_canonical_migration` accepts a libSQL
 `StorageTarget` as the import target, not just a local filesystem path.
 
 Creds-free: the import target is backed by a `FakeLibsqlConn` (in-memory

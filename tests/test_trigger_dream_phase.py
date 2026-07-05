@@ -1,6 +1,6 @@
 """Tests for POST /v1/trigger_dream_phase + its pre-bound async runner.
 
-COA-254 T-A (plan D1-D3 / ADR 0025). The critical, audit-driven property
+Design per plan D1-D3 / ADR 0025. The critical, audit-driven property
 under test throughout: a trigger-only API key (holding
 `MemoryCapability.DREAM_TRIGGER` but NOT `ADMIN_REBUILD`) must be able to
 schedule -- and have the background job actually complete -- a summarize

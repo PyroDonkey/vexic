@@ -1,5 +1,4 @@
-"""Verify-gated, generation-stamped restore-drill orchestration (COA-273 P5
-Task 18).
+"""Verify-gated, generation-stamped restore-drill orchestration.
 
 `run_restore_drill` is PURE ORCHESTRATION over injected callables: it reads
 NO secrets, imports NO adapter, and does no I/O of its own. Everything that

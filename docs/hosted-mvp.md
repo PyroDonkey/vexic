@@ -292,7 +292,7 @@ the user approves the project MCP server in Claude Code, targeted reads go
 through the scaffolded stdio proxy to hosted `/mcp`. The raw API key stays in
 the user-local recorder config, not `.mcp.json` or Claude settings.
 
-## Turso/libSQL Storage Backend (COA-273)
+## Turso/libSQL Storage Backend
 
 The hosted storage cutover decided by
 [ADR 0019](adr/0019-hosted-storage-cutover-starts-turso-only.md) is implemented.

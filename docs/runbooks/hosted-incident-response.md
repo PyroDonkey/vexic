@@ -1,18 +1,18 @@
 # Hosted Incident Response And Pre-Beta Security Review Runbook
 
-This is a `docs/runbooks` artifact for COA-203, incorporating the settled
-COA-231 adversarial fixes. It is not runtime implementation, not a legal breach
-notice package, and not external readiness by itself.
+This is a `docs/runbooks` artifact incorporating settled adversarial-review
+fixes. It is not runtime implementation, not a legal breach notice package,
+and not external readiness by itself.
 
-Completing this runbook or a tabletop does not close COA-177 and does not make
-hosted Vexic external/customer-data ready. Any `blocked`, `fail`, or unaccepted
+Completing this runbook or a tabletop does not by itself make hosted Vexic
+external/customer-data ready. Any `blocked`, `fail`, or unaccepted
 `pass-with-caveats` row keeps the hosted readiness gate blocked unless the
 designated security/engineering risk owner accepts the risk in Linear or an ADR.
 
 ## Evidence Tiers
 
-- `doc-only`: written procedure or decision. Useful for COA-203 documentation;
-  not enough for production control claims.
+- `doc-only`: written procedure or decision. Useful as documentation; not
+  enough for production control claims.
 - `tabletop-synthetic`: dry-run evidence using fake tenants, fake keys, fake
   events, and metadata-only artifacts.
 - `requires-prod-control`: runtime, infrastructure, or operational-control
@@ -293,7 +293,7 @@ included in this update. Next update target: `[time]`.
 
 Status vocabulary: `pass`, `pass-with-caveats`, `fail`, `blocked`.
 
-`pass-with-caveats` may satisfy COA-203 documentation only; it does not make the
+`pass-with-caveats` may satisfy documentation requirements only; it does not make the
 hosted readiness gate green or external/customer-data ready. `blocked` creates
 a follow-up todo and leaves the gate blocked.
 
@@ -334,24 +334,24 @@ Status vocabulary:
   unless the designated security/engineering risk owner accepts the risk in
   Linear or an ADR.
 
-Each review row must record status, evidence pointer, owner issue,
-notes/caveat, follow-up todo when not a clean pass, and risk-acceptance pointer
-when proceeding despite a gap.
+Each review row must record status, evidence pointer, notes/caveat, follow-up
+todo when not a clean pass, and risk-acceptance pointer when proceeding
+despite a gap.
 
-| Row | Evidence tier | Current default status | Owner/evidence | Gate rule |
-| --- | --- | --- | --- | --- |
-| 1. Auth, Clerk/session abuse, and Agent API Key scope/revocation | requires-prod-control | blocked | COA-200, COA-199; need revocation/session-abuse artifacts | Blocks unless concrete auth/key evidence or acceptance by the designated risk owner exists. |
-| 2. Tenant isolation and routing integrity | requires-prod-control | blocked | COA-199, COA-200; need production-control catalog/routing checks | Blocks unless content-blind isolation evidence or acceptance by the designated risk owner exists. |
-| 3. No Operator Raw Memory Access and support metadata boundaries | requires-prod-control | blocked | COA-179, COA-203; unresolved support workflow/audit | Blocks unless support metadata controls exist or acceptance by the designated risk owner exists. |
-| 4. Redaction fail-closed paths | requires-prod-control | blocked | COA-200 plus contract/tests; need request/persistence/log/export evidence | Blocks unless fail-closed evidence covers egress and persistence. |
-| 5. Encryption, TLS, secrets, and key rotation | requires-prod-control | blocked | COA-189; need deployed TLS/encryption/rotation evidence | Blocks unless deployed control evidence or acceptance by the designated risk owner exists. |
-| 6. Backup, PITR, immutable/export backup, and restore drills | requires-prod-control | blocked | COA-189, COA-232; Railway-volume alpha drill passed with caveats in `docs/runbooks/restore-drills/2026-06-26-coa-232-railway-alpha-volume.md`; production Turso/Neon/S3 drills blocked | Blocks unless customer-readiness restore drill artifacts pass or acceptance by the designated risk owner exists. |
-| 7. Audit, usage, job, incident ledgers, and detection signals | requires-prod-control | blocked | COA-199; durable-ledger/production-control unresolved | Blocks unless durable ledger and detection artifacts exist. |
-| 8. Rate limits, payload caps, abuse controls, origin protection, and alerting | requires-prod-control | blocked | COA-191; abuse enforcement/origin protection unresolved | Blocks unless enforcement and alert evidence exists. |
-| 9. Worker/model processor consent, spend caps, and job cancellation | requires-prod-control | blocked | COA-201; processor spend/job-cancel controls unresolved | Blocks unless consent, cap, pause/cancel evidence exists. |
-| 10. Migration/import/repoint safety | tabletop-synthetic | pass-with-caveats | COA-202; local runbook and drill evidence | Does not gate-green external readiness without hosted route evidence. |
-| 11. Incident response tabletop and customer communications | tabletop-synthetic | pass-with-caveats | COA-203; `docs/runbooks/incident-tabletops/2026-06-26-coa-203-scoped-key-routing.md` | Satisfies COA-203 documentation/tabletop evidence only; caveats do not gate-green external readiness. |
-| 12. Compliance-claim guardrails | doc-only | pass-with-caveats | COA-177, COA-203; no SOC2/HIPAA claims | Allows docs only; blocks claims beyond documented controls. |
+| Row | Evidence tier | Evidence expected | Gate rule |
+| --- | --- | --- | --- |
+| 1. Auth, Clerk/session abuse, and Agent API Key scope/revocation | requires-prod-control | Revocation and session-abuse artifacts | Blocks unless concrete auth/key evidence or acceptance by the designated risk owner exists. |
+| 2. Tenant isolation and routing integrity | requires-prod-control | Production-control catalog/routing checks | Blocks unless content-blind isolation evidence or acceptance by the designated risk owner exists. |
+| 3. No Operator Raw Memory Access and support metadata boundaries | requires-prod-control | Support metadata workflow and audit enforcement | Blocks unless support metadata controls exist or acceptance by the designated risk owner exists. |
+| 4. Redaction fail-closed paths | requires-prod-control | Request/persistence/log/export evidence plus contract/tests | Blocks unless fail-closed evidence covers egress and persistence. |
+| 5. Encryption, TLS, secrets, and key rotation | requires-prod-control | Deployed TLS/encryption/rotation evidence | Blocks unless deployed control evidence or acceptance by the designated risk owner exists. |
+| 6. Backup, PITR, immutable/export backup, and restore drills | requires-prod-control | Restore drill artifacts; a Railway-volume alpha drill is covered in `docs/runbooks/restore-drills/2026-06-26-coa-232-railway-alpha-volume.md` | Blocks unless customer-readiness restore drill artifacts pass or acceptance by the designated risk owner exists. |
+| 7. Audit, usage, job, incident ledgers, and detection signals | requires-prod-control | Durable-ledger and detection artifacts | Blocks unless durable ledger and detection artifacts exist. |
+| 8. Rate limits, payload caps, abuse controls, origin protection, and alerting | requires-prod-control | Abuse enforcement, origin protection, and alert evidence | Blocks unless enforcement and alert evidence exists. |
+| 9. Worker/model processor consent, spend caps, and job cancellation | requires-prod-control | Processor consent, spend-cap, and pause/cancel evidence | Blocks unless consent, cap, pause/cancel evidence exists. |
+| 10. Migration/import/repoint safety | tabletop-synthetic | Local runbook and drill evidence; covered by tabletop drill | Does not gate-green external readiness without hosted route evidence. |
+| 11. Incident response tabletop and customer communications | tabletop-synthetic | Covered by tabletop drill: `docs/runbooks/incident-tabletops/2026-06-26-coa-203-scoped-key-routing.md` | Satisfies documentation/tabletop evidence only; caveats do not gate-green external readiness. |
+| 12. Compliance-claim guardrails | doc-only | Written guardrails; no SOC2/HIPAA claims | Allows docs only; blocks claims beyond documented controls. |
 
 ## Follow-Up Todo Seeds
 

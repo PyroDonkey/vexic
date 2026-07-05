@@ -1,4 +1,4 @@
-"""Top-level ``vexic`` import surface (COA-284).
+"""Top-level ``vexic`` import surface.
 
 The package re-exports the light contract symbols eagerly and
 ``LocalMemoryService`` lazily (PEP 562), so ``import vexic`` must never drag

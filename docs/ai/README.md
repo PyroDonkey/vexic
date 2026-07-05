@@ -10,5 +10,5 @@ or public Vexic documentation.
   agent instructions.
 - `docs/ai/CONTEXT.md` is a product-language glossary for agent and maintainer
   planning.
-- `docs/ai/kilo-review-policy.md` is review-agent calibration kept out of the
+- `docs/ai/REVIEW.md` is review-agent calibration kept out of the
   repository root.

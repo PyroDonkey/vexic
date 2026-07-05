@@ -155,8 +155,10 @@ also stays deferred until external beta or real customer memory.
 
 This addendum refines the Decision for implementation; it does not reverse ADR
 0019. It records findings from a real-Turso verification spike and a multi-model
-design audit. Design spec:
-`docs/superpowers/specs/2026-07-01-turso-hosted-cutover-design.md`.
+design audit. One spike finding that constrains all adapter code: the managed
+libSQL connection supports `execute`/`executemany`/`cursor`/`commit`/`rollback`/
+`close` and `with conn:`, but has no settable `row_factory` (use dict-row
+helpers), no named/dict parameters, and no `enable_load_extension`.
 
 1. **The token is not carried in the DSN.** Empirically, a libSQL token embedded
    in the URL (`?authToken=`) returns 401; the managed client authenticates only

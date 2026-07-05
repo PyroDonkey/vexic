@@ -8,7 +8,7 @@ CONSOLE = ROOT / "console"
 
 
 def _version_tuple(version: str) -> tuple[int, ...]:
-    # ponytail: stable numeric pins only; use packaging.version if prereleases matter.
+    # NOTE(alpha): stable numeric pins only; use packaging.version if prereleases matter.
     return tuple(int(part) for part in version.split("."))
 
 
