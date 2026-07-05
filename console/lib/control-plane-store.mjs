@@ -297,7 +297,13 @@ function scopeTemplate(key) {
       principal_type: "agent"
     },
     trust_boundary: "networked",
-    capabilities: ["memory:write", "memory:search", "memory:expand"]
+    capabilities: [
+      "memory:write",
+      "memory:search",
+      "memory:expand",
+      "memory:fresh-context",
+      "memory:dream:trigger"
+    ]
   };
 }
 

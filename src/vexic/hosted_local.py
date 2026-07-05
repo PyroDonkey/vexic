@@ -32,6 +32,8 @@ _CONTROL_PLANE_AGENT_CAPABILITIES = frozenset(
         MemoryCapability.WRITE,
         MemoryCapability.SEARCH,
         MemoryCapability.EXPAND_HISTORY,
+        MemoryCapability.FRESH_CONTEXT,
+        MemoryCapability.DREAM_TRIGGER,
     }
 )
 

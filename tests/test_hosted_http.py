@@ -40,7 +40,12 @@ from vexic.embeddings import EMBEDDING_DIM
 from vexic.ports import DreamPhasePorts, HostPortNotConfigured
 from vexic.storage import record_session_summary, single_message_adapter
 from vexic.hosted_http import create_app
-from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
+from vexic.hosted_local import (
+    _CONTROL_PLANE_AGENT_CAPABILITIES,
+    HostedApiKeyStore,
+    HostedTenantCatalog,
+)
+from vexic.hosted_control_plane_http import _CONTROL_PLANE_SCOPE_CAPABILITIES
 
 
 def _scope(
@@ -117,6 +122,14 @@ def _write_fake_dream_adapter(directory: Path) -> Path:
     adapter = directory / "adapter.py"
     adapter.write_text(_FAKE_DREAM_ADAPTER_SOURCE)
     return adapter
+
+
+class _StubSummaryAgent:
+    """Placeholder summary agent: enough to satisfy `summary_agent_factory
+    is not None` so `run_summarize_phase` doesn't fail-closed. It is never
+    actually invoked for a freshly-provisioned tenant with no compactable
+    sessions.
+    """
 
 
 class HostedHttpTests(unittest.TestCase):
@@ -748,6 +761,72 @@ class HostedHttpTests(unittest.TestCase):
         )
         self.assertEqual(revoked.status_code, 204)
         self.assertEqual(denied.status_code, 401)
+
+    def test_control_plane_scope_template_capabilities_match_actual_grant(self) -> None:
+        """Kill drift between the two capability lists (COA-254): the scope
+        template shown/returned by the control-plane API
+        (`_CONTROL_PLANE_SCOPE_CAPABILITIES`) must always match the
+        capabilities actually granted to console-created keys
+        (`_CONTROL_PLANE_AGENT_CAPABILITIES`), or the console will advertise
+        capabilities the key doesn't really have (or vice versa).
+        """
+        self.assertEqual(
+            set(_CONTROL_PLANE_SCOPE_CAPABILITIES),
+            {capability.value for capability in _CONTROL_PLANE_AGENT_CAPABILITIES},
+        )
+
+    def test_control_plane_key_grants_fresh_context_and_dream_trigger(self) -> None:
+        """Console-created keys must work with /v1/fresh_context and
+        /v1/trigger_dream_phase (COA-254): both routes bind their scope's
+        capabilities against the KEY's granted capabilities (see
+        `HostedMemoryService._bind_request`'s `scope.capabilities &
+        auth.capabilities` intersection), so the console-side grant must
+        include `MemoryCapability.FRESH_CONTEXT` and `DREAM_TRIGGER` or every
+        request 403s regardless of what the route handler assumes.
+        """
+        service = HostedMemoryService(
+            self.catalog,
+            self.keys,
+            telemetry=self.catalog,
+            dream_phase_ports=DreamPhasePorts(
+                model_group="test",
+                embed=lambda texts: [[1.0] + [0.0] * (EMBEDDING_DIM - 1) for _ in texts],
+                summary_agent_factory=lambda model_group, secrets=None: _StubSummaryAgent(),
+            ),
+        )
+        control_client = TestClient(
+            create_control_plane_app(service, control_plane_tokens=("console-secret",))
+        )
+        memory_client = TestClient(create_app(service))
+        project = control_client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo"},
+        ).json()["project"]
+        created = control_client.post(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/keys",
+            headers=self._control_auth(),
+            json={"name": "Worker", "agentScope": "agent-a"},
+        ).json()
+        raw_key = created["rawKey"]
+        scope_template_capabilities = created["key"]["scopeTemplate"]["capabilities"]
+
+        self.assertIn("memory:fresh-context", scope_template_capabilities)
+        self.assertIn("memory:dream:trigger", scope_template_capabilities)
+
+        fresh_context_response = memory_client.post(
+            "/v1/fresh_context",
+            headers=self._write_headers(raw_key, project_id=project["id"], agent_id="agent-a"),
+            json={},
+        )
+        trigger_dream_phase_response = memory_client.post(
+            "/v1/trigger_dream_phase",
+            headers=self._write_headers(raw_key, project_id=project["id"], agent_id="agent-a"),
+            json={"phase": "summarize"},
+        )
+
+        self.assertEqual(fresh_context_response.status_code, 200)
+        self.assertEqual(trigger_dream_phase_response.status_code, 202)
 
     def test_control_plane_key_create_rejects_null_string_fields(self) -> None:
         client = TestClient(
