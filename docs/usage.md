@@ -27,9 +27,9 @@ uv run pytest
 ```
 
 Vexic Console and the marketing website source live in the private
-`PyroDonkey/vexic-website` repository, not this one (COA-295: open-core
-boundary; see ADR 0012's addendum). This repository's root remains
-`uv`-managed with no Node package surface.
+`PyroDonkey/vexic-website` repository, not this one (open-core boundary; see
+ADR 0012's addendum). This repository's root remains `uv`-managed with no
+Node package surface.
 
 ## Local MCP MVP
 

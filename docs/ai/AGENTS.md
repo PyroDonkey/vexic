@@ -231,7 +231,7 @@ loop against the tracking docs remains a manual step under the triggers above.
 - Install and test the Vexic memory core through `uv`; do not add a second
   package manager to the core package.
 - Console and website live in the private `PyroDonkey/vexic-website` repo, not
-  this one (COA-295). Do not add Node package files at the repository root.
+  this one. Do not add Node package files at the repository root.
 - Type annotate new public functions and models.
 - Prefer Pydantic models and structured APIs over string parsing.
 - Keep code in focused modules that match the existing package boundaries.

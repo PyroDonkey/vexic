@@ -18,7 +18,7 @@ FastAPI + MCP adapters (`hosted*.py`, `*_http.py`, `*_mcp.py`) are multi-tenant
 and read-only by default. `adapters/` (repo root) is host-owned provider wiring:
 in review scope, but never package core. Console and website (formerly
 `console/`, `website/`) live in the private `PyroDonkey/vexic-website` repo,
-not here (COA-295; ADR 0012 addendum). Decisions live in `docs/adr/` (index is
+not here (ADR 0012 addendum). Decisions live in `docs/adr/` (index is
 canonical); behavior of record is `src/vexic` + `tests/`, and prose docs are
 downstream.
 
