@@ -10,6 +10,9 @@ local staging and tests. This is not a public HTTP server, dashboard, billing
 system, or production customer-data service. A future web/API process can wrap
 this boundary without changing the memory contract.
 
+All environment variables referenced below are catalogued in
+[`configuration.md`](configuration.md).
+
 ## What Exists
 
 - `HostedMemoryService` exposes the public memory contract operation names,
