@@ -236,6 +236,8 @@ class LongTermFact(MemoryContractModel):
     created_at: str
     retrieved_count: int = 0
     used_count: int = 0
+    # Event time (partial-precision ISO) for category="event" facts; None otherwise.
+    occurred_at: str | None = None
 
 
 class CandidateNote(MemoryContractModel):

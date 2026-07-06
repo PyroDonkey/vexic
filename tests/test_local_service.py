@@ -66,6 +66,13 @@ def _unit_vector(first: float) -> list[float]:
     return vector
 
 
+def _axis_vector(index: int) -> list[float]:
+    # Orthogonal vectors: distinct enough to dodge candidate-dedup merging.
+    vector = [0.0] * EMBEDDING_DIM
+    vector[index] = 1.0
+    return vector
+
+
 def _scope(
     *,
     session_id: str = "default",
@@ -492,6 +499,160 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result.facts), 1)
         self.assertEqual(result.facts[0].category, MemoryCategory.PREFERENCE)
         self.assertEqual(result.facts[0].fact_text, "Ryan prefers compact reports.")
+        # A non-event fact carries no event time.
+        self.assertIsNone(result.facts[0].occurred_at)
+
+    async def test_search_long_term_contract_fact_exposes_occurred_at(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(
+            db_path=self.db_path,
+            tenant_id="tenant-a",
+            embed=lambda texts: [_unit_vector(1.0) for _ in texts],
+        )
+        service.init_schema()
+        commit_dream_cycle(
+            self.db_path,
+            [
+                FactCandidate(
+                    fact_text="Ryan moved to Vancouver.",
+                    subject="Ryan",
+                    category="event",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[1],
+                    occurred_at="2025-03",
+                )
+            ],
+            candidate_embeddings=[_unit_vector(1.0)],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+        commit_deep_cycle(
+            self.db_path,
+            [PromotionDecision(candidate_id=1, embedding=_unit_vector(1.0))],
+            started_at="2026-06-01T00:01:00+00:00",
+            finished_at="2026-06-01T00:01:01+00:00",
+        )
+
+        result = await service.search_long_term(
+            SearchLongTermRequest(scope=_scope(), query="Vancouver")
+        )
+
+        self.assertEqual(len(result.facts), 1)
+        self.assertEqual(result.facts[0].occurred_at, "2025-03")
+
+    async def test_search_long_term_orders_event_facts_by_occurred_at(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(
+            db_path=self.db_path,
+            tenant_id="tenant-a",
+            embed=lambda texts: [_unit_vector(1.0) for _ in texts],
+        )
+        service.init_schema()
+        commit_dream_cycle(
+            self.db_path,
+            [
+                FactCandidate(
+                    fact_text="Team meeting in January.",
+                    subject="Ryan",
+                    category="event",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[1],
+                    occurred_at="2024-01",
+                ),
+                FactCandidate(
+                    fact_text="Team meeting in June.",
+                    subject="Ryan",
+                    category="event",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[2],
+                    occurred_at="2025-06",
+                ),
+                FactCandidate(
+                    fact_text="Team meeting in September.",
+                    subject="Ryan",
+                    category="event",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[3],
+                    occurred_at="2024-09",
+                ),
+            ],
+            candidate_embeddings=[
+                _axis_vector(0),
+                _axis_vector(1),
+                _axis_vector(2),
+            ],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=3,
+            last_processed_message_id=3,
+        )
+        commit_deep_cycle(
+            self.db_path,
+            [
+                PromotionDecision(candidate_id=1, embedding=_axis_vector(0)),
+                PromotionDecision(candidate_id=2, embedding=_axis_vector(1)),
+                PromotionDecision(candidate_id=3, embedding=_axis_vector(2)),
+            ],
+            started_at="2026-06-01T00:01:00+00:00",
+            finished_at="2026-06-01T00:01:01+00:00",
+        )
+
+        result = await service.search_long_term(
+            SearchLongTermRequest(scope=_scope(), query="meeting", limit=5)
+        )
+
+        # Event facts surface newest-event-first, ordered by occurred_at, not
+        # by storage time or fusion rank.
+        self.assertEqual(
+            [fact.occurred_at for fact in result.facts],
+            ["2025-06", "2024-09", "2024-01"],
+        )
+
+    def test_promotion_refuses_event_candidate_without_occurred_at(self) -> None:
+        # Invariant 11: an event fact must carry an event time. Event retrieval
+        # sorts by occurred_at, so every promoted event must have one; this
+        # locks the fail-closed promotion guard that guarantees it.
+        commit_dream_cycle(
+            self.db_path,
+            [
+                FactCandidate(
+                    fact_text="Something happened, date unknown.",
+                    subject="Ryan",
+                    category="event",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[1],
+                    # occurred_at intentionally omitted -> None
+                )
+            ],
+            candidate_embeddings=[_unit_vector(1.0)],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+
+        with self.assertRaisesRegex(ValueError, "occurred_at"):
+            commit_deep_cycle(
+                self.db_path,
+                [PromotionDecision(candidate_id=1, embedding=_unit_vector(1.0))],
+                started_at="2026-06-01T00:01:00+00:00",
+                finished_at="2026-06-01T00:01:01+00:00",
+            )
 
     async def test_search_long_term_uses_exact_agent_scope_for_facts(self) -> None:
         from vexic.service import LocalMemoryService
@@ -2420,6 +2581,97 @@ class FreshContextTests(unittest.IsolatedAsyncioTestCase):
             await service.fresh_context(
                 FreshContextRequest(scope=scope, redaction=redaction)
             )
+
+
+class WithEventsSortedTests(unittest.TestCase):
+    """Ordering contract for the event-slot reordering in Tier-3 retrieval."""
+
+    @staticmethod
+    def _fact(
+        fact_id: int,
+        category: str,
+        *,
+        occurred_at: str | None = None,
+        created_at: str = "",
+    ):
+        from vexic.storage import LongTermFact
+
+        return LongTermFact(
+            fact_id=fact_id,
+            fact_text=f"fact-{fact_id}",
+            subject="Ryan",
+            category=category,
+            importance=5,
+            confidence=0.5,
+            source_message_ids=[fact_id],
+            retrieved_count=0,
+            used_count=0,
+            editable=True,
+            created_at=created_at,
+            occurred_at=occurred_at,
+        )
+
+    def test_events_sort_in_place_non_events_keep_slots(self) -> None:
+        from vexic.subagents.retrieval import _with_events_sorted
+
+        facts = [
+            self._fact(1, "event", occurred_at="2024-01"),
+            self._fact(2, "preference"),
+            self._fact(3, "event", occurred_at="2025-06"),
+            self._fact(4, "event", occurred_at="2024-09"),
+        ]
+
+        result = _with_events_sorted(facts)
+
+        # Event slots (0, 2, 3) hold events newest-first; the non-event at
+        # slot 1 keeps its relevance position untouched.
+        self.assertEqual([fact.fact_id for fact in result], [3, 2, 4, 1])
+        self.assertEqual(result[1].category, "preference")
+
+    def test_equal_event_time_keeps_rrf_order(self) -> None:
+        from vexic.subagents.retrieval import _with_events_sorted
+
+        facts = [
+            self._fact(1, "event", occurred_at="2025-01"),
+            self._fact(2, "event", occurred_at="2025-01"),
+        ]
+
+        result = _with_events_sorted(facts)
+
+        # Stable sort: equal event time preserves incoming (RRF) order.
+        self.assertEqual([fact.fact_id for fact in result], [1, 2])
+
+    def test_missing_occurred_at_falls_back_to_created_at(self) -> None:
+        from vexic.subagents.retrieval import _with_events_sorted
+
+        facts = [
+            self._fact(
+                1, "event", occurred_at=None, created_at="2020-01-01 00:00:00"
+            ),
+            self._fact(2, "event", occurred_at="2025-06"),
+        ]
+
+        result = _with_events_sorted(facts)
+
+        # The 2025 event outranks the one dated only by its 2020 storage time.
+        self.assertEqual([fact.fact_id for fact in result], [2, 1])
+
+    def test_day_grain_truncation_ignores_timestamp_suffix(self) -> None:
+        from vexic.subagents.retrieval import _with_events_sorted
+
+        facts = [
+            self._fact(1, "event", occurred_at="2025-03-15"),
+            self._fact(
+                2, "event", occurred_at=None, created_at="2025-03-15 08:00:00"
+            ),
+        ]
+
+        result = _with_events_sorted(facts)
+
+        # Same day: the created_at time suffix is truncated ([:10]) so the two
+        # compare equal and stay in RRF order, rather than the timestamped one
+        # jumping ahead.
+        self.assertEqual([fact.fact_id for fact in result], [1, 2])
 
 
 if __name__ == "__main__":
