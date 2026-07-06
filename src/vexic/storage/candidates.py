@@ -559,16 +559,33 @@ def keyword_candidate_ids(
     *,
     k: int,
     agent_id: str | None = None,
+    as_of: str | None = None,
 ) -> list[int]:
     """BM25-ranked active candidate ids for a free-text query, best first.
 
     The keyword half of the candidate-fallback hybrid retriever.
     Filters to the active-candidate predicate so promoted/retired/stale/review
     candidates never surface as unverified notes.
+
+    `as_of`, if given, restricts results to rows where
+    `COALESCE(NULLIF(c.occurred_at, ''), c.created_at) <= as_of` — a plain
+    TEXT-affinity string comparison. `occurred_at` is a partial-precision ISO
+    string; a partial string is always lexicographically `<=` any of its own
+    completions, so a candidate with an unknown exact day always passes an
+    `as_of` check for any cutoff at or after that partial period's start.
+    `created_at` is the full `"YYYY-MM-DD HH:MM:SS"` fallback used when
+    `occurred_at` is NULL or empty — callers must pass `as_of` in a directly
+    comparable shape (matching separator/precision) or same-day boundary
+    comparisons will behave unexpectedly. This is a deliberate, documented
+    approximation, not a bug.
     """
     safe_query = _fts_match_query(query, any_token=True)
     if safe_query is None:
         return []
+
+    date_clause = ""
+    if as_of is not None:
+        date_clause = "AND COALESCE(NULLIF(c.occurred_at, ''), c.created_at) <= ?"
 
     init_db(db_path)
     with closing(connect(db_path)) as conn:
@@ -581,10 +598,11 @@ def keyword_candidate_ids(
                 WHERE memory_candidates_fts MATCH ?
                     AND {_ACTIVE_CANDIDATE_PREDICATE}
                     AND c.agent_id IS ?
+                    {date_clause}
                 ORDER BY rank
                 LIMIT ?
                 """,
-                (safe_query, agent_id, k),
+                (safe_query, agent_id, *((as_of,) if as_of is not None else ()), k),
             ).fetchall()
         except (sqlite3.OperationalError, ValueError) as exc:
             # A malformed FTS MATCH is a sqlite3.OperationalError locally and a
@@ -711,16 +729,33 @@ def nearest_candidate_ids(
     *,
     k: int,
     agent_id: str | None = None,
+    as_of: str | None = None,
 ) -> list[int]:
     """sqlite-vec KNN over active candidate embeddings, nearest first.
 
     The vector half of the candidate-fallback hybrid retriever.
     sqlite-vec applies its KNN before the eligibility join, so over-fetch then
     keep the k nearest active candidates — same shape as nearest_long_term_facts.
+
+    `as_of`, if given, restricts results to rows where
+    `COALESCE(NULLIF(c.occurred_at, ''), c.created_at) <= as_of` — a plain
+    TEXT-affinity string comparison. `occurred_at` is a partial-precision ISO
+    string; a partial string is always lexicographically `<=` any of its own
+    completions, so a candidate with an unknown exact day always passes an
+    `as_of` check for any cutoff at or after that partial period's start.
+    `created_at` is the full `"YYYY-MM-DD HH:MM:SS"` fallback used when
+    `occurred_at` is NULL or empty — callers must pass `as_of` in a directly
+    comparable shape (matching separator/precision) or same-day boundary
+    comparisons will behave unexpectedly. This is a deliberate, documented
+    approximation, not a bug.
     """
     if len(embedding) != EMBEDDING_DIM:
         raise ValueError(f"Expected {EMBEDDING_DIM}-dim embedding; got {len(embedding)}.")
     normalized = _normalize_embedding(embedding)
+
+    date_clause = ""
+    if as_of is not None:
+        date_clause = "AND COALESCE(NULLIF(c.occurred_at, ''), c.created_at) <= ?"
 
     fetch_k = max(k * 4, k + 10)
     init_vector_memory(db_path)
@@ -737,10 +772,17 @@ def nearest_candidate_ids(
             JOIN memory_candidates AS c ON c.id = e._id
             WHERE {_ACTIVE_CANDIDATE_PREDICATE}
                 AND c.agent_id IS ?
+                {date_clause}
             ORDER BY e._distance
             LIMIT ?
             """,
-            (_serialize_float32(normalized), fetch_k, agent_id, k),
+            (
+                _serialize_float32(normalized),
+                fetch_k,
+                agent_id,
+                *((as_of,) if as_of is not None else ()),
+                k,
+            ),
         ).fetchall()
     return [int(row[0]) for row in rows]
 

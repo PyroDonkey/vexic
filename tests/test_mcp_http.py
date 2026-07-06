@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from pydantic_ai.messages import ModelRequest, UserPromptPart
@@ -13,11 +14,13 @@ from vexic.contract import (
     PrincipalType,
     TrustBoundary,
 )
+from vexic.embeddings import EMBEDDING_DIM
 from vexic.hosted import HostedInMemoryRateLimiter, HostedMemoryService, HostedRateLimitRule
 from vexic.hosted_http import MAX_BODY_BYTES, create_app
 from vexic.mcp_presentation import server_instructions
 from vexic.mcp_stdio import MCP_PROTOCOL_VERSION
-from vexic.storage import single_message_adapter
+from vexic.models import FactCandidate
+from vexic.storage import commit_dream_cycle, single_message_adapter
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 
 
@@ -142,6 +145,19 @@ class McpHttpTests(unittest.TestCase):
         self.assertEqual(tool_names, {"recall_conversation_history", "recall_user_memory"})
         self.assertNotIn("expand_history", response.text)
 
+    def test_tools_list_advertises_as_of_on_recall_user_memory(self) -> None:
+        api_key = self._api_key()
+
+        response = self.client.post(
+            "/mcp",
+            headers=self._mcp_headers(api_key),
+            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+        )
+
+        tools = {tool["name"]: tool for tool in response.json()["result"]["tools"]}
+        properties = tools["recall_user_memory"]["inputSchema"]["properties"]
+        self.assertIn("as_of", properties)
+
     def test_search_transcript_uses_header_bound_session_scope(self) -> None:
         api_key = self._api_key(
             capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH}
@@ -192,6 +208,76 @@ class McpHttpTests(unittest.TestCase):
         result = response.json()["result"]
         self.assertTrue(result["isError"])
         self.assertIn("Embeddings", result["content"][0]["text"])
+
+    def test_recall_user_memory_accepts_as_of_argument(self) -> None:
+        """COA-298: the `recall_user_memory` tool's extra-key allowlist
+        (`_reject_extra(arguments, {"query", "limit"})`) must accept `as_of`
+        and thread it into `SearchLongTermRequest.as_of`.
+        """
+        api_key = self._api_key()
+        tenant_db_path = self.catalog.get_tenant("tenant-a").db_path
+        commit_dream_cycle(
+            tenant_db_path,
+            [
+                FactCandidate(
+                    fact_text="Ryan keeps cedar notes tentative.",
+                    subject="Ryan",
+                    category="fact",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[1],
+                    occurred_at="2025-03-14",
+                )
+            ],
+            candidate_embeddings=[[1.0] + [0.0] * (EMBEDDING_DIM - 1)],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+
+        with patch(
+            "vexic.subagents.retrieval.embed_texts",
+            side_effect=lambda texts: [[1.0] + [0.0] * (EMBEDDING_DIM - 1) for _ in texts],
+        ):
+            before = self.client.post(
+                "/mcp",
+                headers=self._mcp_headers(api_key, session_id="session-a"),
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "recall_user_memory",
+                        "arguments": {"query": "cedar notes", "as_of": "2024-01-01"},
+                    },
+                },
+            )
+            after = self.client.post(
+                "/mcp",
+                headers=self._mcp_headers(api_key, session_id="session-a"),
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "recall_user_memory",
+                        "arguments": {"query": "cedar notes", "as_of": "2025-04-01"},
+                    },
+                },
+            )
+
+        self.assertEqual(before.status_code, 200)
+        before_result = before.json()["result"]
+        self.assertFalse(before_result["isError"])
+        self.assertNotIn("cedar notes tentative", before_result["content"][0]["text"])
+
+        self.assertEqual(after.status_code, 200)
+        after_result = after.json()["result"]
+        self.assertFalse(after_result["isError"])
+        self.assertIn("cedar notes tentative", after_result["content"][0]["text"])
 
     def test_origin_header_is_rejected_by_default(self) -> None:
         api_key = self._api_key()

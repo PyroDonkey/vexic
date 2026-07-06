@@ -248,6 +248,168 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([fact.fact_text for fact in result.facts], ["Ryan prefers compact reports."])
 
+    async def test_search_long_term_as_of_filters_tier3_facts(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        commit_dream_cycle(
+            self.db_path,
+            [
+                FactCandidate(
+                    fact_text="Ryan started a new job.",
+                    subject="Ryan",
+                    category="event",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[1],
+                    occurred_at="2025-03-14",
+                )
+            ],
+            candidate_embeddings=[_unit_vector(1.0)],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+        commit_deep_cycle(
+            self.db_path,
+            [PromotionDecision(candidate_id=1, embedding=_unit_vector(1.0))],
+            started_at="2026-06-01T00:01:00+00:00",
+            finished_at="2026-06-01T00:01:01+00:00",
+        )
+
+        with patch(
+            "vexic.subagents.retrieval.embed_texts",
+            side_effect=lambda texts: [_unit_vector(1.0) for _ in texts],
+        ):
+            before = await service.search_long_term(
+                SearchLongTermRequest(
+                    scope=_scope(), query="new job", as_of="2024-01-01"
+                )
+            )
+            after = await service.search_long_term(
+                SearchLongTermRequest(
+                    scope=_scope(), query="new job", as_of="2025-04-01"
+                )
+            )
+
+        self.assertEqual(before.facts, [])
+        self.assertEqual(
+            [fact.fact_text for fact in after.facts], ["Ryan started a new job."]
+        )
+
+    async def test_search_long_term_as_of_filters_tier2_candidate_fallback(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        commit_dream_cycle(
+            self.db_path,
+            [
+                FactCandidate(
+                    fact_text="Ryan keeps cedar notes tentative.",
+                    subject="Ryan",
+                    category="fact",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[1],
+                    occurred_at="2025-03-14",
+                )
+            ],
+            candidate_embeddings=[_unit_vector(1.0)],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+
+        with patch(
+            "vexic.subagents.retrieval.embed_texts",
+            side_effect=lambda texts: [_unit_vector(1.0) for _ in texts],
+        ):
+            before = await service.search_long_term(
+                SearchLongTermRequest(
+                    scope=_scope(), query="cedar notes", as_of="2024-01-01"
+                )
+            )
+            after = await service.search_long_term(
+                SearchLongTermRequest(
+                    scope=_scope(), query="cedar notes", as_of="2025-04-01"
+                )
+            )
+
+        self.assertEqual(before.candidate_notes, [])
+        self.assertEqual(
+            [note.fact_text for note in after.candidate_notes],
+            ["Ryan keeps cedar notes tentative."],
+        )
+
+    async def test_search_long_term_as_of_uses_created_at_when_occurred_at_absent(
+        self,
+    ) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        commit_dream_cycle(
+            self.db_path,
+            [
+                FactCandidate(
+                    fact_text="Ryan prefers concise standups.",
+                    subject="Ryan",
+                    category="preference",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[1],
+                )
+            ],
+            candidate_embeddings=[_unit_vector(1.0)],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+        commit_deep_cycle(
+            self.db_path,
+            [PromotionDecision(candidate_id=1, embedding=_unit_vector(1.0))],
+            started_at="2026-06-01T00:01:00+00:00",
+            finished_at="2026-06-01T00:01:01+00:00",
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE long_term_memory SET created_at = ? WHERE fact_text = ?",
+                ("2025-03-14 00:00:00", "Ryan prefers concise standups."),
+            )
+            conn.commit()
+
+        with patch(
+            "vexic.subagents.retrieval.embed_texts",
+            side_effect=lambda texts: [_unit_vector(1.0) for _ in texts],
+        ):
+            before = await service.search_long_term(
+                SearchLongTermRequest(
+                    scope=_scope(), query="concise standups", as_of="2024-01-01"
+                )
+            )
+            after = await service.search_long_term(
+                SearchLongTermRequest(
+                    scope=_scope(), query="concise standups", as_of="2025-04-01"
+                )
+            )
+
+        self.assertEqual(before.facts, [])
+        self.assertEqual(
+            [fact.fact_text for fact in after.facts],
+            ["Ryan prefers concise standups."],
+        )
+
     async def test_search_long_term_uses_default_embedder_for_candidate_fallback(self) -> None:
         from vexic.service import LocalMemoryService
 

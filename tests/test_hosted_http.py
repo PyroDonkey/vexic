@@ -37,8 +37,9 @@ from vexic.hosted import (
     dream_phase_ports_from_env,
 )
 from vexic.embeddings import EMBEDDING_DIM
+from vexic.models import FactCandidate
 from vexic.ports import DreamPhasePorts, HostPortNotConfigured
-from vexic.storage import record_session_summary, single_message_adapter
+from vexic.storage import commit_dream_cycle, record_session_summary, single_message_adapter
 from vexic.hosted_http import create_app
 from vexic.hosted_local import (
     _CONTROL_PLANE_AGENT_CAPABILITIES,
@@ -1209,6 +1210,75 @@ class HostedHttpTests(unittest.TestCase):
             [hit["body"] for hit in search_response.json()["hits"]],
             ["User: header scoped cedar"],
         )
+
+    def test_hosted_search_long_term_header_bound_body_accepts_as_of(self) -> None:
+        """COA-298: the header-bound `_HeaderBoundSearchBody` used by
+        `/v1/search_long_term` must accept `as_of` (not reject it as an
+        unexpected key) and thread it into `SearchLongTermRequest.as_of`, so
+        the filter actually reaches the storage layer.
+        """
+        api_key = self._api_key(capabilities={MemoryCapability.SEARCH})
+        tenant_db_path = self.catalog.get_tenant("tenant-a").db_path
+        commit_dream_cycle(
+            tenant_db_path,
+            [
+                FactCandidate(
+                    fact_text="Ryan keeps cedar notes tentative.",
+                    subject="Ryan",
+                    category="fact",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[1],
+                    occurred_at="2025-03-14",
+                )
+            ],
+            candidate_embeddings=[[1.0] + [0.0] * (EMBEDDING_DIM - 1)],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+
+        with patch(
+            "vexic.subagents.retrieval.embed_texts",
+            side_effect=lambda texts: [[1.0] + [0.0] * (EMBEDDING_DIM - 1) for _ in texts],
+        ):
+            before = self.client.post(
+                "/v1/search_long_term",
+                headers=self._write_headers(api_key),
+                json={"query": "cedar notes", "limit": 5, "as_of": "2024-01-01"},
+            )
+            after = self.client.post(
+                "/v1/search_long_term",
+                headers=self._write_headers(api_key),
+                json={"query": "cedar notes", "limit": 5, "as_of": "2025-04-01"},
+            )
+
+        self.assertEqual(before.status_code, 200)
+        self.assertEqual(before.json()["candidate_notes"], [])
+        self.assertEqual(after.status_code, 200)
+        self.assertEqual(
+            [note["fact_text"] for note in after.json()["candidate_notes"]],
+            ["Ryan keeps cedar notes tentative."],
+        )
+
+    def test_hosted_search_transcript_header_bound_body_rejects_as_of(self) -> None:
+        """COA-298: `as_of` is a `SearchLongTermRequest`-only field.
+        `SearchTranscriptRequest` has no `as_of`, so a header-bound
+        `/v1/search_transcript` call carrying it must be rejected (422),
+        not silently accepted and dropped.
+        """
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
+
+        search_response = self.client.post(
+            "/v1/search_transcript",
+            headers=self._write_headers(api_key),
+            json={"query": "cedar", "limit": 5, "as_of": "2025-04-01"},
+        )
+
+        self.assertEqual(search_response.status_code, 422)
 
     def test_hosted_append_rejects_forbidden_values_without_persisting(self) -> None:
         api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
