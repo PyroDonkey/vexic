@@ -308,6 +308,7 @@ class SearchLongTermRequest(MemoryRequest):
     required_capability: ClassVar[MemoryCapability] = MemoryCapability.SEARCH
     query: str
     limit: int = 5
+    as_of: str | None = None
 
 
 class SearchLongTermResult(MemoryResult):

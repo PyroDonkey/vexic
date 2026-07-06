@@ -22,11 +22,21 @@ from vexic.storage import (
     record_candidate_retrieval,
     save_messages,
 )
-from vexic.storage.candidates import _load_candidate_by_id, read_candidate_for_promotion
+from vexic.storage.candidates import (
+    _load_candidate_by_id,
+    keyword_candidate_ids,
+    nearest_candidate_ids,
+    read_candidate_for_promotion,
+)
 from vexic.storage.connection import connect
-from vexic.storage.longterm import insert_long_term_fact
+from vexic.storage.longterm import (
+    insert_long_term_fact,
+    keyword_long_term_fact_ids,
+    nearest_long_term_facts,
+)
 from vexic.storage.promotion import PromotionDecision
 from vexic.storage.schema import _ensure_vector_memory_schema, init_vector_memory
+from vexic.subagents.retrieval import retrieve_long_term_facts
 from vexic.tools import expand_history, search_long_term, search_memory
 
 
@@ -1092,6 +1102,460 @@ class OccurredAtRoundTripTests(unittest.TestCase):
         facts = fetch_long_term_facts(self.db_path, [fact_id])
         self.assertEqual(len(facts), 1)
         self.assertIsNone(facts[0].occurred_at)
+
+
+class LongTermSearchAsOfFilterTests(unittest.TestCase):
+    # COA-298: `as_of` restricts keyword (FTS) and vector (KNN) Tier 3 search
+    # to facts whose COALESCE(NULLIF(occurred_at, ''), created_at) <= as_of.
+    # Facts are seeded directly via insert_long_term_fact rather than a full
+    # dream->deep promotion cycle -- cheaper, and keeps this search-filtering
+    # behavior decoupled from promotion's separately-tested occurred_at
+    # carry-through (OccurredAtRoundTripTests, above).
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.temp_dir.name) / "memory.db")
+        init_db(self.db_path)
+        init_vector_memory(self.db_path)
+        self._next_candidate_id = 1
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _insert_fact(
+        self,
+        fact_text: str,
+        *,
+        occurred_at: str | None = None,
+        embedding: list[float] | None = None,
+    ) -> int:
+        candidate_id = self._next_candidate_id
+        self._next_candidate_id += 1
+        with closing(connect(self.db_path)) as conn:
+            with conn:
+                _ensure_vector_memory_schema(conn)
+                fact_id = insert_long_term_fact(
+                    conn,
+                    fact_text=fact_text,
+                    subject="Ryan",
+                    category="event",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[1],
+                    agent_id=None,
+                    promoted_from_candidate_id=candidate_id,
+                    retrieved_count=0,
+                    used_count=0,
+                    editable=True,
+                    embedding=embedding if embedding is not None else _unit_vector(1.0),
+                    occurred_at=occurred_at,
+                )
+        return fact_id
+
+    def _set_created_at(self, fact_id: int, created_at: str) -> None:
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE long_term_memory SET created_at = ? WHERE id = ?",
+                (created_at, fact_id),
+            )
+            conn.commit()
+
+    def test_keyword_filters_by_as_of_via_occurred_at(self) -> None:
+        earlier_id = self._insert_fact("Ryan started a new job.", occurred_at="2025-01-01")
+        later_id = self._insert_fact("Ryan started a new project.", occurred_at="2025-06-01")
+
+        ids = keyword_long_term_fact_ids(
+            self.db_path, "Ryan started", k=10, as_of="2025-03-01"
+        )
+
+        self.assertIn(earlier_id, ids)
+        self.assertNotIn(later_id, ids)
+
+    def test_keyword_as_of_none_stays_unfiltered(self) -> None:
+        earlier_id = self._insert_fact("Ryan started a new job.", occurred_at="2025-01-01")
+        later_id = self._insert_fact("Ryan started a new project.", occurred_at="2025-06-01")
+
+        ids = keyword_long_term_fact_ids(self.db_path, "Ryan started", k=10, as_of=None)
+
+        self.assertIn(earlier_id, ids)
+        self.assertIn(later_id, ids)
+
+    def test_keyword_falls_back_to_created_at_when_occurred_at_is_null(self) -> None:
+        earlier_id = self._insert_fact("Ryan started a new job.", occurred_at=None)
+        self._set_created_at(earlier_id, "2025-01-01 00:00:00")
+        later_id = self._insert_fact("Ryan started a new project.", occurred_at=None)
+        self._set_created_at(later_id, "2025-06-01 00:00:00")
+
+        ids = keyword_long_term_fact_ids(
+            self.db_path, "Ryan started", k=10, as_of="2025-03-01"
+        )
+
+        self.assertIn(earlier_id, ids)
+        self.assertNotIn(later_id, ids)
+
+    def test_keyword_empty_string_occurred_at_also_falls_back_to_created_at(self) -> None:
+        earlier_id = self._insert_fact("Ryan started a new job.", occurred_at="")
+        self._set_created_at(earlier_id, "2025-01-01 00:00:00")
+        later_id = self._insert_fact("Ryan started a new project.", occurred_at="")
+        self._set_created_at(later_id, "2025-06-01 00:00:00")
+
+        ids = keyword_long_term_fact_ids(
+            self.db_path, "Ryan started", k=10, as_of="2025-03-01"
+        )
+
+        self.assertIn(earlier_id, ids)
+        self.assertNotIn(later_id, ids)
+
+    def test_keyword_same_day_boundary_is_separator_sensitive(self) -> None:
+        fact_id = self._insert_fact("Ryan started a new job.", occurred_at=None)
+        self._set_created_at(fact_id, "2025-04-01 10:00:00")
+
+        date_only_ids = keyword_long_term_fact_ids(
+            self.db_path, "Ryan started", k=10, as_of="2025-04-01"
+        )
+        t_separator_ids = keyword_long_term_fact_ids(
+            self.db_path, "Ryan started", k=10, as_of="2025-04-01T00:00:00"
+        )
+
+        self.assertNotIn(
+            fact_id,
+            date_only_ids,
+            "date-only as_of is lexicographically less than a same-day 'created_at' timestamp",
+        )
+        self.assertIn(
+            fact_id,
+            t_separator_ids,
+            "'T' separator sorts after the space in 'created_at', so it includes same-day rows",
+        )
+
+    def test_keyword_partial_precision_occurred_at_included_or_excluded_by_full_as_of(
+        self,
+    ) -> None:
+        fact_id = self._insert_fact("Ryan started a new job.", occurred_at="2025")
+
+        included_ids = keyword_long_term_fact_ids(
+            self.db_path, "Ryan started", k=10, as_of="2025-06-01"
+        )
+        excluded_ids = keyword_long_term_fact_ids(
+            self.db_path, "Ryan started", k=10, as_of="2024-12-31"
+        )
+
+        self.assertIn(
+            fact_id,
+            included_ids,
+            "a partial occurred_at is <= any as_of at or after its period's start",
+        )
+        self.assertNotIn(fact_id, excluded_ids)
+
+    def test_keyword_partial_as_of_excludes_more_specific_occurred_at(self) -> None:
+        # "2025" reads as "before this period began", not "through it": a
+        # more specific occurred_at like "2025-03" is lexicographically
+        # greater than the bare "2025" cutoff, so it must be excluded.
+        fact_id = self._insert_fact("Ryan started a new job.", occurred_at="2025-03")
+
+        ids = keyword_long_term_fact_ids(self.db_path, "Ryan started", k=10, as_of="2025")
+
+        self.assertNotIn(fact_id, ids)
+
+    def test_nearest_filters_by_as_of(self) -> None:
+        embedding = _unit_vector(1.0)
+        earlier_id = self._insert_fact(
+            "Ryan started a new job.", occurred_at="2025-01-01", embedding=embedding
+        )
+        later_id = self._insert_fact(
+            "Ryan started a new project.", occurred_at="2025-06-01", embedding=embedding
+        )
+
+        neighbors = nearest_long_term_facts(
+            self.db_path, embedding, k=10, as_of="2025-03-01"
+        )
+
+        neighbor_ids = [neighbor.fact_id for neighbor in neighbors]
+        self.assertIn(earlier_id, neighbor_ids)
+        self.assertNotIn(later_id, neighbor_ids)
+
+    def test_nearest_falls_back_to_created_at_when_occurred_at_is_null(self) -> None:
+        embedding = _unit_vector(1.0)
+        earlier_id = self._insert_fact(
+            "Ryan started a new job.", occurred_at=None, embedding=embedding
+        )
+        self._set_created_at(earlier_id, "2025-01-01 00:00:00")
+        later_id = self._insert_fact(
+            "Ryan started a new project.", occurred_at=None, embedding=embedding
+        )
+        self._set_created_at(later_id, "2025-06-01 00:00:00")
+
+        neighbors = nearest_long_term_facts(
+            self.db_path, embedding, k=10, as_of="2025-03-01"
+        )
+
+        neighbor_ids = [neighbor.fact_id for neighbor in neighbors]
+        self.assertIn(earlier_id, neighbor_ids)
+        self.assertNotIn(later_id, neighbor_ids)
+
+
+class RetrieveLongTermFactsAsOfThreadThroughTests(unittest.IsolatedAsyncioTestCase):
+    # COA-298 step 4: retrieve_long_term_facts must thread `as_of` into both
+    # keyword_long_term_fact_ids and nearest_long_term_facts. This is a
+    # tracer bullet for the thread-through, not a re-test of the filtering
+    # semantics themselves (already covered by LongTermSearchAsOfFilterTests
+    # above) -- the fact excluded here would otherwise surface via both the
+    # keyword and vector halves of the hybrid search if `as_of` were dropped
+    # anywhere along the call chain.
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.temp_dir.name) / "memory.db")
+        init_db(self.db_path)
+        init_vector_memory(self.db_path)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _insert_fact(
+        self,
+        fact_text: str,
+        *,
+        candidate_id: int,
+        occurred_at: str | None,
+        embedding: list[float],
+    ) -> int:
+        with closing(connect(self.db_path)) as conn:
+            with conn:
+                _ensure_vector_memory_schema(conn)
+                fact_id = insert_long_term_fact(
+                    conn,
+                    fact_text=fact_text,
+                    subject="Ryan",
+                    category="event",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[1],
+                    agent_id=None,
+                    promoted_from_candidate_id=candidate_id,
+                    retrieved_count=0,
+                    used_count=0,
+                    editable=True,
+                    embedding=embedding,
+                    occurred_at=occurred_at,
+                )
+        return fact_id
+
+    async def test_retrieve_long_term_facts_threads_as_of_to_storage_layer(self) -> None:
+        embedding = _unit_vector(1.0)
+        self._insert_fact(
+            "Ryan started a new job.",
+            candidate_id=1,
+            occurred_at="2025-01-01",
+            embedding=embedding,
+        )
+        self._insert_fact(
+            "Ryan started a new project.",
+            candidate_id=2,
+            occurred_at="2025-06-01",
+            embedding=embedding,
+        )
+
+        with patch(
+            "vexic.subagents.retrieval.embed_texts",
+            side_effect=lambda texts: [embedding for _ in texts],
+        ):
+            facts = await retrieve_long_term_facts(
+                self.db_path,
+                "Ryan started",
+                as_of="2025-03-01",
+            )
+
+        fact_texts = [fact.fact_text for fact in facts]
+        self.assertIn("Ryan started a new job.", fact_texts)
+        self.assertNotIn("Ryan started a new project.", fact_texts)
+
+
+class CandidateSearchAsOfFilterTests(unittest.TestCase):
+    # COA-298: `as_of` restricts keyword (FTS) and vector (KNN) Tier 2
+    # candidate-fallback search to candidates whose
+    # COALESCE(NULLIF(occurred_at, ''), created_at) <= as_of. Candidates are
+    # seeded via commit_dream_cycle (the existing dedup-aware insert path),
+    # not a private insert helper, since candidates.py has no direct-insert
+    # equivalent to insert_long_term_fact.
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.temp_dir.name) / "memory.db")
+        init_db(self.db_path)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _seeded_candidate_ids(self) -> list[int]:
+        # Ids assigned in insertion order by commit_dream_cycle within a
+        # single call; read back oldest-first so callers can zip against the
+        # candidates list they passed in.
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            rows = conn.execute("SELECT id FROM memory_candidates ORDER BY id ASC").fetchall()
+        return [int(row[0]) for row in rows]
+
+    def _set_created_at(self, candidate_id: int, created_at: str) -> None:
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE memory_candidates SET created_at = ? WHERE id = ?",
+                (created_at, candidate_id),
+            )
+            conn.commit()
+
+    def test_keyword_candidate_ids_filters_by_as_of_via_occurred_at(self) -> None:
+        embedding = _unit_vector(1.0)
+        commit_dream_cycle(
+            self.db_path,
+            [
+                _candidate(
+                    "Ryan adopted a rescue greyhound.",
+                    message_ids=[1],
+                    category="event",
+                    occurred_at="2025-01-01",
+                ),
+                _candidate(
+                    "Ryan adopted a rescue parrot.",
+                    message_ids=[2],
+                    category="fact",
+                    occurred_at="2025-06-01",
+                ),
+            ],
+            candidate_embeddings=[embedding, embedding],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+        earlier_id, later_id = self._seeded_candidate_ids()
+
+        ids = keyword_candidate_ids(
+            self.db_path, "Ryan adopted", k=10, as_of="2025-03-01"
+        )
+
+        self.assertIn(earlier_id, ids)
+        self.assertNotIn(later_id, ids)
+
+    def test_keyword_candidate_ids_falls_back_to_created_at_when_occurred_at_missing(
+        self,
+    ) -> None:
+        embedding = _unit_vector(1.0)
+        commit_dream_cycle(
+            self.db_path,
+            [
+                _candidate(
+                    "Ryan switched to a standing desk.",
+                    message_ids=[1],
+                    occurred_at="",
+                )
+            ],
+            candidate_embeddings=[embedding],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+        (candidate_id,) = self._seeded_candidate_ids()
+        self._set_created_at(candidate_id, "2025-04-01 10:00:00")
+
+        date_only_ids = keyword_candidate_ids(
+            self.db_path, "standing desk", k=10, as_of="2025-04-01"
+        )
+        self.assertNotIn(
+            candidate_id,
+            date_only_ids,
+            "date-only as_of should exclude a same-day created_at fallback row",
+        )
+
+        full_precision_ids = keyword_candidate_ids(
+            self.db_path, "standing desk", k=10, as_of="2025-04-01T00:00:00"
+        )
+        self.assertIn(
+            candidate_id,
+            full_precision_ids,
+            "a 'T'-separated as_of should include the same-day created_at fallback row",
+        )
+
+    def test_nearest_candidate_ids_filters_by_as_of(self) -> None:
+        embedding = _unit_vector(1.0)
+        commit_dream_cycle(
+            self.db_path,
+            [
+                _candidate(
+                    "Ryan learned to sail.",
+                    message_ids=[1],
+                    category="event",
+                    occurred_at="2025-01-01",
+                ),
+                _candidate(
+                    "Ryan learned to weld.",
+                    message_ids=[2],
+                    category="fact",
+                    occurred_at="2025-06-01",
+                ),
+            ],
+            candidate_embeddings=[embedding, embedding],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+        earlier_id, later_id = self._seeded_candidate_ids()
+
+        ids = nearest_candidate_ids(
+            self.db_path, embedding, k=10, as_of="2025-03-01"
+        )
+
+        self.assertIn(earlier_id, ids)
+        self.assertNotIn(later_id, ids)
+
+    def test_nearest_candidate_ids_falls_back_to_created_at_when_occurred_at_missing(
+        self,
+    ) -> None:
+        embedding = _unit_vector(1.0)
+        commit_dream_cycle(
+            self.db_path,
+            [
+                _candidate(
+                    "Ryan tried freediving.",
+                    message_ids=[1],
+                    occurred_at=None,
+                )
+            ],
+            candidate_embeddings=[embedding],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+        (candidate_id,) = self._seeded_candidate_ids()
+        self._set_created_at(candidate_id, "2025-04-01 10:00:00")
+
+        date_only_ids = nearest_candidate_ids(
+            self.db_path, embedding, k=10, as_of="2025-04-01"
+        )
+        self.assertNotIn(
+            candidate_id,
+            date_only_ids,
+            "date-only as_of should exclude a same-day created_at fallback row",
+        )
+
+        full_precision_ids = nearest_candidate_ids(
+            self.db_path, embedding, k=10, as_of="2025-04-01T00:00:00"
+        )
+        self.assertIn(
+            candidate_id,
+            full_precision_ids,
+            "a 'T'-separated as_of should include the same-day created_at fallback row",
+        )
 
 
 if __name__ == "__main__":

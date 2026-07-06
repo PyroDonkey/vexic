@@ -149,6 +149,7 @@ class MemoryContractScopeTests(unittest.TestCase):
             scope=self._scope(capabilities={MemoryCapability.SEARCH}),
             query="Ryan preferences",
             limit=5,
+            as_of="2025-06-01",
         )
 
         round_tripped = SearchLongTermRequest.model_validate_json(
@@ -158,6 +159,15 @@ class MemoryContractScopeTests(unittest.TestCase):
         self.assertEqual(round_tripped.contract_version, CONTRACT_VERSION)
         self.assertEqual(round_tripped.scope.tenant_id, "tenant-a")
         self.assertEqual(round_tripped.query, "Ryan preferences")
+        self.assertEqual(round_tripped.as_of, "2025-06-01")
+
+    def test_search_long_term_request_as_of_defaults_to_none(self) -> None:
+        request = SearchLongTermRequest(
+            scope=self._scope(capabilities={MemoryCapability.SEARCH}),
+            query="x",
+        )
+
+        self.assertIsNone(request.as_of)
 
     def test_delete_scope_target_is_identifier_selector_not_actor_scope(self) -> None:
         actor_scope = self._scope(

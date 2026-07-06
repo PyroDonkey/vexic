@@ -91,6 +91,7 @@ class _HeaderBoundSearchBody(BaseModel):
 
     query: str
     limit: int = 5
+    as_of: str | None = None
 
 
 class _HeaderBoundFreshContextBody(BaseModel):
@@ -310,11 +311,20 @@ async def _handle_search(
         else:
             auth = _authenticate_for_header_scope(service, api_key)
             search = _HeaderBoundSearchBody.model_validate(body)
-            payload = request_type(
-                scope=_read_scope_from_headers(request, auth),
-                query=search.query,
-                limit=search.limit,
-            )
+            if search.as_of is not None and "as_of" not in request_type.model_fields:
+                return _error_response(
+                    422,
+                    "invalid_request",
+                    "Request body does not match the Vexic contract.",
+                )
+            search_kwargs: dict[str, Any] = {
+                "scope": _read_scope_from_headers(request, auth),
+                "query": search.query,
+                "limit": search.limit,
+            }
+            if "as_of" in request_type.model_fields:
+                search_kwargs["as_of"] = search.as_of
+            payload = request_type(**search_kwargs)
     except ValidationError:
         return _error_response(
             422,

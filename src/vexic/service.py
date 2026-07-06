@@ -551,6 +551,7 @@ class LocalMemoryService(MemoryService):
             agent_id=request.scope.agent_id,
             return_k=request.limit,
             embed=self.embed,
+            as_of=request.as_of,
         )
         if facts:
             return SearchLongTermResult(
@@ -579,6 +580,7 @@ class LocalMemoryService(MemoryService):
             agent_id=request.scope.agent_id,
             return_k=request.limit,
             embed=self.embed,
+            as_of=request.as_of,
         )
         return SearchLongTermResult(
             candidate_notes=[

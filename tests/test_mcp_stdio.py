@@ -16,6 +16,7 @@ from unittest.mock import patch
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 from vexic.contract import SearchTranscriptResult, TranscriptHit
+from vexic.embeddings import EMBEDDING_DIM
 from vexic.mcp_presentation import TOOL_ANNOTATIONS, server_instructions
 from vexic.mcp_stdio import (
     MAX_EXPAND_HISTORY_CHARS,
@@ -26,7 +27,8 @@ from vexic.mcp_stdio import (
     main,
     run_stdio,
 )
-from vexic.storage import save_messages
+from vexic.models import FactCandidate
+from vexic.storage import commit_dream_cycle, save_messages
 from vexic.hosted_mcp import create_hosted_http_memory_service, run_recorder_config_proxy
 
 
@@ -143,6 +145,15 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
         for tool in tools:
             self.assertEqual(tool["annotations"], TOOL_ANNOTATIONS)
             self.assertIn("proactively", tool["description"])
+
+    async def test_tools_list_advertises_as_of_on_recall_user_memory(self) -> None:
+        response = await self._request(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        )
+
+        tools = {tool["name"]: tool for tool in response["result"]["tools"]}
+        properties = tools["recall_user_memory"]["inputSchema"]["properties"]
+        self.assertIn("as_of", properties)
 
     async def test_expand_history_is_unavailable_without_privileged_slice(self) -> None:
         response = await self._request(
@@ -1090,6 +1101,65 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(response["result"]["isError"])
         self.assertIn("Embeddings", response["result"]["content"][0]["text"])
+
+    async def test_recall_user_memory_accepts_as_of_argument(self) -> None:
+        """COA-298: the stdio `recall_user_memory` tool's extra-key
+        allowlist (`_reject_extra(arguments, {"query", "limit"})`) must
+        accept `as_of` and thread it into `SearchLongTermRequest.as_of`.
+        """
+        commit_dream_cycle(
+            self.db_path,
+            [
+                FactCandidate(
+                    fact_text="Ryan keeps cedar notes tentative.",
+                    subject="Ryan",
+                    category="fact",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[1],
+                    occurred_at="2025-03-14",
+                )
+            ],
+            candidate_embeddings=[[1.0] + [0.0] * (EMBEDDING_DIM - 1)],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+
+        with patch(
+            "vexic.subagents.retrieval.embed_texts",
+            side_effect=lambda texts: [[1.0] + [0.0] * (EMBEDDING_DIM - 1) for _ in texts],
+        ):
+            before = await self._request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "recall_user_memory",
+                        "arguments": {"query": "cedar notes", "as_of": "2024-01-01"},
+                    },
+                }
+            )
+            after = await self._request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "recall_user_memory",
+                        "arguments": {"query": "cedar notes", "as_of": "2025-04-01"},
+                    },
+                }
+            )
+
+        self.assertFalse(before["result"]["isError"])
+        self.assertNotIn("cedar notes tentative", before["result"]["content"][0]["text"])
+        self.assertFalse(after["result"]["isError"])
+        self.assertIn("cedar notes tentative", after["result"]["content"][0]["text"])
 
     async def test_invalid_tool_calls_return_tool_errors(self) -> None:
         cases = [
