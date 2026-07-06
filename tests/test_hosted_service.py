@@ -17,10 +17,12 @@ from pydantic_ai.messages import ModelRequest, UserPromptPart
 from vexic.embeddings import EMBEDDING_DIM
 from vexic.contract import (
     AppendTranscriptRequest,
+    DeleteScopeRequest,
     DreamPhase,
     FreshContextRequest,
     MemoryCapability,
     MemoryScope,
+    MemoryScopeSelector,
     Principal,
     PrincipalType,
     RedactionContext,
@@ -995,6 +997,56 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(usage_events[0].error_type, "PermissionError")
         self.assertNotIn(api_key.raw_key, repr(audit_events) + repr(usage_events))
         self.assertNotIn("cedar", repr(audit_events) + repr(usage_events))
+
+    async def test_delete_scope_binds_target_scope_project_to_api_key(self) -> None:
+        # A project-A lifecycle key must not tombstone project-B (or a
+        # None/wildcard project) in the same tenant via target_scope.
+        self.catalog.provision_tenant(
+            "tenant-a", project_ids={"project-a", "project-b"}
+        )
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.ADMIN_LIFECYCLE},
+            project_ids={"project-a"},
+        )
+
+        def _delete_request(target_project_id: str | None) -> DeleteScopeRequest:
+            return DeleteScopeRequest(
+                scope=_scope(
+                    project_id="project-a",
+                    capabilities={MemoryCapability.ADMIN_LIFECYCLE},
+                ),
+                target_scope=MemoryScopeSelector(
+                    tenant_id="tenant-a",
+                    project_id=target_project_id,
+                ),
+                reason="regression",
+                redaction=RedactionContext(forbidden_values=()),
+            )
+
+        with self.assertRaisesRegex(
+            PermissionError,
+            "Target scope project_id is not allowed for API key",
+        ):
+            await self.service.delete_scope(
+                api_key.raw_key, _delete_request("project-b")
+            )
+
+        with self.assertRaisesRegex(
+            PermissionError,
+            "Target scope project_id is required for project-scoped API key",
+        ):
+            await self.service.delete_scope(
+                api_key.raw_key, _delete_request(None)
+            )
+
+        result = await self.service.delete_scope(
+            api_key.raw_key, _delete_request("project-a")
+        )
+        self.assertEqual(
+            result.tombstone.target_scope.project_id, "project-a"
+        )
 
     async def test_api_key_rejects_tenant_switch_and_capability_escalation(self) -> None:
         self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
