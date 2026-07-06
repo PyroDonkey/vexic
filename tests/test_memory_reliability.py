@@ -16,11 +16,17 @@ from vexic.rem import run_rem_phase
 from vexic.storage import (
     commit_deep_cycle,
     commit_dream_cycle,
+    fetch_long_term_facts,
     init_db,
+    load_promotion_candidates,
     record_candidate_retrieval,
     save_messages,
 )
+from vexic.storage.candidates import _load_candidate_by_id, read_candidate_for_promotion
+from vexic.storage.connection import connect
+from vexic.storage.longterm import insert_long_term_fact
 from vexic.storage.promotion import PromotionDecision
+from vexic.storage.schema import _ensure_vector_memory_schema, init_vector_memory
 from vexic.tools import expand_history, search_long_term, search_memory
 
 
@@ -41,6 +47,7 @@ def _candidate(
     message_ids: list[int],
     category: str = "fact",
     confidence: float = 0.8,
+    occurred_at: str | None = None,
 ) -> FactCandidate:
     return FactCandidate(
         fact_text=fact_text,
@@ -49,6 +56,7 @@ def _candidate(
         importance=6,
         confidence=confidence,
         source_message_ids=message_ids,
+        occurred_at=occurred_at,
     )
 
 
@@ -845,6 +853,245 @@ class OfflineRetrievalBaselinePreflightTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Ryan prefers compact reliability reports with provenance.", result)
         self.assertIn("source messages: 1", result)
         self.assertNotIn("[unverified note]", result)
+
+
+class OccurredAtRoundTripTests(unittest.TestCase):
+    # COA-297: `occurred_at` is a nullable, flexible ISO-ish event-time string
+    # (e.g. "2025-03" or "2025-03-14") threaded through Tier 2 candidate
+    # insert/merge/load and Tier 3 fact insert/fetch. These tests exercise the
+    # SQL wiring directly; promotion.py's carry-through of occurred_at into
+    # Tier 3 is a separate, later task and is intentionally not asserted here.
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.temp_dir.name) / "memory.db")
+        init_db(self.db_path)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _committed_candidate_id(self) -> int:
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            row = conn.execute("SELECT id FROM memory_candidates ORDER BY id DESC LIMIT 1").fetchone()
+        return int(row[0])
+
+    def test_insert_persists_occurred_at(self) -> None:
+        embedding = _unit_vector(1.0)
+        commit_dream_cycle(
+            self.db_path,
+            [_candidate("Ryan started a new job.", message_ids=[1], occurred_at="2025-03-14")],
+            candidate_embeddings=[embedding],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+        candidate_id = self._committed_candidate_id()
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            occurred_at = conn.execute(
+                "SELECT occurred_at FROM memory_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()[0]
+        self.assertEqual(occurred_at, "2025-03-14")
+
+        loaded = load_promotion_candidates(self.db_path)
+        self.assertEqual(loaded[0].occurred_at, "2025-03-14")
+
+        with closing(connect(self.db_path)) as conn:
+            candidate = _load_candidate_by_id(conn, candidate_id)
+        self.assertEqual(candidate.occurred_at, "2025-03-14")
+
+        with closing(connect(self.db_path)) as conn:
+            row = read_candidate_for_promotion(conn, candidate_id)
+        self.assertEqual(len(row), 14, "occurred_at must be appended as the last column")
+        self.assertEqual(row[-1], "2025-03-14")
+
+    def test_merge_backfills_missing_occurred_at_without_clobbering_known_date(self) -> None:
+        fact_text = "Ryan started a new job."
+        embedding = _unit_vector(1.0)
+        # First observation has no event-time yet.
+        commit_dream_cycle(
+            self.db_path,
+            [_candidate(fact_text, message_ids=[1], occurred_at=None)],
+            candidate_embeddings=[embedding],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+        candidate_id = self._committed_candidate_id()
+
+        # A later duplicate observation supplies the date; merge should
+        # backfill it via COALESCE(occurred_at, ?).
+        commit_dream_cycle(
+            self.db_path,
+            [_candidate(fact_text, message_ids=[2], occurred_at="2025-03")],
+            candidate_embeddings=[embedding],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:01:00+00:00",
+            finished_at="2026-06-01T00:01:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=2,
+        )
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            occurred_at = conn.execute(
+                "SELECT occurred_at FROM memory_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()[0]
+        self.assertEqual(occurred_at, "2025-03")
+
+        # A third duplicate observation with a *different* date must not
+        # clobber the date already known.
+        commit_dream_cycle(
+            self.db_path,
+            [_candidate(fact_text, message_ids=[3], occurred_at="1999-01-01")],
+            candidate_embeddings=[embedding],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:02:00+00:00",
+            finished_at="2026-06-01T00:02:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=3,
+        )
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            occurred_at = conn.execute(
+                "SELECT occurred_at FROM memory_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()[0]
+        self.assertEqual(
+            occurred_at,
+            "2025-03",
+            "a later duplicate's occurred_at must not clobber a date already known",
+        )
+
+    def test_insert_persists_year_only_occurred_at_as_string(self) -> None:
+        # Regression: a bare year like "2025" is a well-formed SQLite integer
+        # literal. A column declared DATETIME has NUMERIC affinity and would
+        # silently coerce it to INTEGER 2025 on write; occurred_at must be
+        # declared TEXT so a partial-precision date round-trips as a string.
+        embedding = _unit_vector(1.0)
+        commit_dream_cycle(
+            self.db_path,
+            [_candidate("Ryan moved to Vancouver.", message_ids=[1], occurred_at="2025")],
+            candidate_embeddings=[embedding],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+        candidate_id = self._committed_candidate_id()
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            occurred_at, type_name = conn.execute(
+                "SELECT occurred_at, typeof(occurred_at) FROM memory_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()
+        self.assertEqual(occurred_at, "2025")
+        self.assertEqual(type_name, "text")
+
+    def test_merge_treats_blank_occurred_at_as_missing_for_backfill(self) -> None:
+        # Regression: COALESCE(occurred_at, ?) only treats SQL NULL as
+        # replaceable. An empty string is not NULL, so a first observation
+        # that (incorrectly) produced "" instead of None would otherwise
+        # permanently block a later observation from backfilling a real date.
+        fact_text = "Ryan started a new job."
+        embedding = _unit_vector(1.0)
+        commit_dream_cycle(
+            self.db_path,
+            [_candidate(fact_text, message_ids=[1], occurred_at="")],
+            candidate_embeddings=[embedding],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+        candidate_id = self._committed_candidate_id()
+
+        commit_dream_cycle(
+            self.db_path,
+            [_candidate(fact_text, message_ids=[2], occurred_at="2025-03")],
+            candidate_embeddings=[embedding],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:01:00+00:00",
+            finished_at="2026-06-01T00:01:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=2,
+        )
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            occurred_at = conn.execute(
+                "SELECT occurred_at FROM memory_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()[0]
+        self.assertEqual(
+            occurred_at,
+            "2025-03",
+            "a blank occurred_at from the first observation must not block backfill",
+        )
+
+    def test_insert_long_term_fact_and_fetch_round_trip_occurred_at(self) -> None:
+        init_vector_memory(self.db_path)
+        with closing(connect(self.db_path)) as conn:
+            with conn:
+                _ensure_vector_memory_schema(conn)
+                fact_id = insert_long_term_fact(
+                    conn,
+                    fact_text="Ryan started a new job.",
+                    subject="Ryan",
+                    category="event",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[1],
+                    agent_id=None,
+                    promoted_from_candidate_id=1,
+                    retrieved_count=0,
+                    used_count=0,
+                    editable=True,
+                    embedding=_unit_vector(1.0),
+                    occurred_at="2025-03-14",
+                )
+
+        facts = fetch_long_term_facts(self.db_path, [fact_id])
+        self.assertEqual(len(facts), 1)
+        self.assertEqual(facts[0].occurred_at, "2025-03-14")
+
+    def test_insert_long_term_fact_defaults_occurred_at_to_none(self) -> None:
+        init_vector_memory(self.db_path)
+        with closing(connect(self.db_path)) as conn:
+            with conn:
+                _ensure_vector_memory_schema(conn)
+                fact_id = insert_long_term_fact(
+                    conn,
+                    fact_text="Ryan likes Python.",
+                    subject="Ryan",
+                    category="preference",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[1],
+                    agent_id=None,
+                    promoted_from_candidate_id=1,
+                    retrieved_count=0,
+                    used_count=0,
+                    editable=True,
+                    embedding=_unit_vector(1.0),
+                )
+
+        facts = fetch_long_term_facts(self.db_path, [fact_id])
+        self.assertEqual(len(facts), 1)
+        self.assertIsNone(facts[0].occurred_at)
 
 
 if __name__ == "__main__":

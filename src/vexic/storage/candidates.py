@@ -69,6 +69,7 @@ class PromotionCandidate:
     last_seen_at: datetime
     rem_boost: float
     embedding: list[float]
+    occurred_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -184,8 +185,8 @@ def _insert_candidate(
         INSERT INTO memory_candidates
             (fact_text, subject, category, importance, confidence,
              source_message_ids, agent_id, editable, needs_review, review_neighbor_id,
-             best_similarity, last_seen_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+             best_similarity, occurred_at, last_seen_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """,
         (
             candidate.fact_text,
@@ -199,6 +200,7 @@ def _insert_candidate(
             needs_review,
             review_neighbor_id,
             best_similarity,
+            candidate.occurred_at,
         ),
     )
     candidate_id = int(cursor.lastrowid)
@@ -285,7 +287,8 @@ def _merge_candidate(
             source_message_ids = ?,
             importance = MAX(importance, ?),
             confidence = MAX(confidence, ?),
-            best_similarity = ?
+            best_similarity = ?,
+            occurred_at = COALESCE(NULLIF(occurred_at, ''), NULLIF(?, ''))
         WHERE id = ?
         """,
         (
@@ -293,6 +296,7 @@ def _merge_candidate(
             candidate.importance,
             candidate.confidence,
             match.similarity,
+            candidate.occurred_at,
             match.candidate_id,
         ),
     )
@@ -445,7 +449,7 @@ def _load_candidate_by_id(conn: sqlite3.Connection, candidate_id: int) -> FactCa
     row = conn.execute(
         """
         SELECT fact_text, subject, category, importance, confidence,
-               source_message_ids, editable
+               source_message_ids, editable, occurred_at
         FROM memory_candidates
         WHERE id = ?
         """,
@@ -463,6 +467,7 @@ def _load_candidate_by_id(conn: sqlite3.Connection, candidate_id: int) -> FactCa
         confidence=row[4],
         source_message_ids=_load_source_message_ids(row[5]),
         editable=bool(row[6]),
+        occurred_at=row[7],
     )
 
 
@@ -785,7 +790,7 @@ def load_promotion_candidates(
             """
             SELECT c.id, c.fact_text, c.subject, c.category, c.confidence,
                    c.importance, c.hit_count, c.last_seen_at, c.rem_boost,
-                   e.embedding
+                   e.embedding, c.occurred_at
             FROM memory_candidates AS c
             JOIN memory_candidate_embeddings AS e ON e.candidate_id = c.id
             WHERE c.promoted = 0
@@ -810,6 +815,7 @@ def load_promotion_candidates(
             last_seen_at=_parse_db_datetime(str(row[7])),
             rem_boost=float(row[8]),
             embedding=_embedding_blob_to_list(row[9]),
+            occurred_at=row[10],
         )
         for row in rows
     ]
@@ -991,12 +997,13 @@ def read_candidate_for_promotion(
 ) -> tuple | None:
     # Conn-scoped read the promotion module uses inside its cross-tier
     # transaction. Returns the full eligibility row, or None when the candidate
-    # is missing. Column order is the promotion module's contract.
+    # is missing. Column order is the promotion module's contract; occurred_at
+    # is appended last so the module's fixed-arity unpack keeps working.
     return conn.execute(
         """
         SELECT fact_text, subject, category, importance, confidence,
                source_message_ids, agent_id, editable, retrieved_count, used_count,
-               promoted, retired, stale
+               promoted, retired, stale, occurred_at
         FROM memory_candidates
         WHERE id = ?
         """,
