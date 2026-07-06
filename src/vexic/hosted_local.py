@@ -1555,6 +1555,9 @@ class HostedApiKeyStore:
                 if cursor.rowcount != 1:
                     raise PermissionError("Invalid setup token.")
             tenant_id, project_id, agent_scope, session_id = row[1], row[2], row[3], row[4]
+        # Fail closed: consumption commits before key mint, so a mint failure
+        # leaves the token consumed rather than replayable. Recovery is a fresh
+        # console-minted token, never a retry of a partially executed exchange.
         provisioned, record = self._mint_control_plane_key(
             tenant_id=tenant_id,
             project_id=project_id,
