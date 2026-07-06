@@ -1,7 +1,9 @@
 import contextlib
+import hashlib
 import importlib.util
 import os
 from contextlib import closing
+from datetime import datetime
 
 import pytest
 from fastapi.responses import JSONResponse
@@ -755,6 +757,287 @@ def test_replacement_scope_libsql_missing_table_yields_permission_error(
     tenant = catalog.get_tenant("tenant-a")
     assert tenant.customer_target is None
     assert tenant.generation == 1
+
+
+# ---------------------------------------------------------------------------
+# COA-300 Phase 1: single-use setup tokens minted by the console, exchanged
+# once by an agent for a project-scoped control-plane API key.
+
+
+def _setup_token_store(monkeypatch, tmp_path):
+    fake_conn = FakeLibsqlConn()
+    _patch_connect_to_fake(monkeypatch, fake_conn)
+    _forbid_local_permission_ops(monkeypatch)
+    target = StorageTarget("libsql://fake-control-plane", auth_token="s3cr3t-token")
+    return HostedApiKeyStore(tmp_path, control_target=target), fake_conn
+
+
+def _parse_z(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def test_setup_token_mint_returns_raw_token_and_stores_only_hash(monkeypatch, tmp_path):
+    keys, fake_conn = _setup_token_store(monkeypatch, tmp_path)
+
+    provisioned, record = keys.create_setup_token(
+        tenant_id="tenant-a", project_id="project-a", session_id="sess-1"
+    )
+
+    assert provisioned.raw_token.startswith("vxsetup_")
+    assert record.token_id == provisioned.token_id
+    assert record.tenant_id == "tenant-a"
+    assert record.project_id == "project-a"
+    assert record.agent_scope == "shared"
+    assert record.session_id == "sess-1"
+    assert record.consumed_at is None
+    assert record.consumed_key_id is None
+    assert record.revoked_at is None
+    ttl = (_parse_z(record.expires_at) - _parse_z(record.created_at)).total_seconds()
+    assert abs(ttl - 600) < 1
+
+    row = fake_conn.execute(
+        "SELECT token_hash FROM hosted_setup_tokens WHERE token_id = ?",
+        (record.token_id,),
+    ).fetchone()
+    assert row[0] == hashlib.sha256(provisioned.raw_token.encode("utf-8")).hexdigest()
+    stored_cells = fake_conn.execute("SELECT * FROM hosted_setup_tokens").fetchall()
+    assert all(
+        provisioned.raw_token not in str(cell)
+        for stored_row in stored_cells
+        for cell in stored_row
+    )
+
+
+def test_setup_token_mint_generates_session_id_when_blank(monkeypatch, tmp_path):
+    keys, fake_conn = _setup_token_store(monkeypatch, tmp_path)
+
+    _, blank_record = keys.create_setup_token(tenant_id="tenant-a", project_id="project-a")
+    assert blank_record.session_id.startswith("setup-")
+    assert len(blank_record.session_id) > len("setup-")
+    stored = fake_conn.execute(
+        "SELECT session_id FROM hosted_setup_tokens WHERE token_id = ?",
+        (blank_record.token_id,),
+    ).fetchone()
+    assert stored[0] == blank_record.session_id
+
+    _, explicit_record = keys.create_setup_token(
+        tenant_id="tenant-a", project_id="project-a", session_id="sess-explicit"
+    )
+    assert explicit_record.session_id == "sess-explicit"
+
+
+def test_setup_token_exchange_mints_scoped_key_once(monkeypatch, tmp_path):
+    from vexic.hosted_local import _CONTROL_PLANE_AGENT_CAPABILITIES
+
+    keys, fake_conn = _setup_token_store(monkeypatch, tmp_path)
+    provisioned_token, token_record = keys.create_setup_token(
+        tenant_id="tenant-a", project_id="project-a", session_id="sess-1"
+    )
+
+    exchange = keys.exchange_setup_token(provisioned_token.raw_token)
+
+    assert exchange.project_id == "project-a"
+    assert exchange.session_id == "sess-1"
+    assert exchange.agent_scope == "shared"
+    assert exchange.key_record.key_id == exchange.provisioned.key_id
+    auth = keys.authenticate(exchange.provisioned.raw_key)
+    assert auth.tenant_id == "tenant-a"
+    assert auth.project_ids == frozenset({"project-a"})
+    assert auth.capabilities == _CONTROL_PLANE_AGENT_CAPABILITIES
+    row = fake_conn.execute(
+        "SELECT consumed_at, consumed_key_id FROM hosted_setup_tokens WHERE token_id = ?",
+        (token_record.token_id,),
+    ).fetchone()
+    assert row[0] is not None
+    assert row[1] == exchange.provisioned.key_id
+
+
+def test_setup_token_exchange_replay_fails(monkeypatch, tmp_path):
+    keys, _ = _setup_token_store(monkeypatch, tmp_path)
+    provisioned_token, _ = keys.create_setup_token(
+        tenant_id="tenant-a", project_id="project-a"
+    )
+    exchange = keys.exchange_setup_token(provisioned_token.raw_token)
+
+    with pytest.raises(PermissionError, match="Invalid setup token."):
+        keys.exchange_setup_token(provisioned_token.raw_token)
+
+    auth = keys.authenticate(exchange.provisioned.raw_key)
+    assert auth.key_id == exchange.provisioned.key_id
+
+
+def test_setup_token_exchange_rejects_expired_token(monkeypatch, tmp_path):
+    keys, _ = _setup_token_store(monkeypatch, tmp_path)
+    provisioned_token, _ = keys.create_setup_token(
+        tenant_id="tenant-a", project_id="project-a", ttl_seconds=0
+    )
+
+    with pytest.raises(PermissionError, match="Invalid setup token."):
+        keys.exchange_setup_token(provisioned_token.raw_token)
+
+
+def test_setup_token_exchange_rejects_wrong_secret_and_malformed(monkeypatch, tmp_path):
+    keys, _ = _setup_token_store(monkeypatch, tmp_path)
+    provisioned_token, record = keys.create_setup_token(
+        tenant_id="tenant-a", project_id="project-a"
+    )
+
+    with pytest.raises(PermissionError, match="Invalid setup token."):
+        keys.exchange_setup_token(f"vxsetup_{record.token_id}_wrong-secret")
+    for malformed in (f"vx_{record.token_id}_secret", "", "vxsetup", "vxsetup_", "no-underscores"):
+        with pytest.raises(PermissionError, match="Invalid setup token."):
+            keys.exchange_setup_token(malformed)
+
+    # A wrong secret must not have consumed the token.
+    exchange = keys.exchange_setup_token(provisioned_token.raw_token)
+    assert keys.authenticate(exchange.provisioned.raw_key).tenant_id == "tenant-a"
+
+
+def test_setup_token_revoke_before_use_blocks_exchange(monkeypatch, tmp_path):
+    keys, _ = _setup_token_store(monkeypatch, tmp_path)
+    provisioned_token, record = keys.create_setup_token(
+        tenant_id="tenant-a", project_id="project-a"
+    )
+
+    with pytest.raises(PermissionError):
+        keys.revoke_setup_token(
+            tenant_id="tenant-b", project_id="project-a", token_id=record.token_id
+        )
+    with pytest.raises(PermissionError):
+        keys.revoke_setup_token(
+            tenant_id="tenant-a", project_id="project-b", token_id=record.token_id
+        )
+    with pytest.raises(PermissionError):
+        keys.revoke_setup_token(
+            tenant_id="tenant-a", project_id="project-a", token_id="no-such-token"
+        )
+
+    keys.revoke_setup_token(
+        tenant_id="tenant-a", project_id="project-a", token_id=record.token_id
+    )
+    keys.revoke_setup_token(
+        tenant_id="tenant-a", project_id="project-a", token_id=record.token_id
+    )
+
+    with pytest.raises(PermissionError, match="Invalid setup token."):
+        keys.exchange_setup_token(provisioned_token.raw_token)
+
+
+def test_exchanged_key_metadata_carries_setup_provenance(monkeypatch, tmp_path):
+    keys, fake_conn = _setup_token_store(monkeypatch, tmp_path)
+
+    # Pre-seed a legacy metadata table WITHOUT created_via on a second store's
+    # connection to prove the guarded ALTER backfills it (mirrors the
+    # last_used_at column-migration guard on hosted_api_keys).
+    legacy_conn = FakeLibsqlConn()
+    legacy_conn.execute(
+        """
+        CREATE TABLE hosted_api_key_metadata (
+            key_id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            capability TEXT NOT NULL,
+            agent_scope TEXT NOT NULL,
+            key_prefix TEXT NOT NULL,
+            last4 TEXT NOT NULL,
+            display TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    legacy_conn.commit()
+
+    provisioned_token, _ = keys.create_setup_token(
+        tenant_id="tenant-a", project_id="project-a"
+    )
+    exchange = keys.exchange_setup_token(provisioned_token.raw_token)
+    console_provisioned, _ = keys.create_control_plane_key(
+        tenant_id="tenant-a", project_id="project-a", name="console-key"
+    )
+
+    listed = {
+        record.key_id: record
+        for record in keys.list_control_plane_keys(
+            tenant_id="tenant-a", project_id="project-a"
+        )
+    }
+    assert listed[exchange.provisioned.key_id].created_via == "setup"
+    assert listed[console_provisioned.key_id].created_via == "console"
+
+    _patch_connect_to_fake(monkeypatch, legacy_conn)
+    legacy_keys = HostedApiKeyStore(
+        tmp_path,
+        control_target=StorageTarget(
+            "libsql://fake-control-plane", auth_token="s3cr3t-token"
+        ),
+    )
+    columns = {
+        str(row[1])
+        for row in legacy_conn.execute(
+            "PRAGMA table_info(hosted_api_key_metadata)"
+        ).fetchall()
+    }
+    assert "created_via" in columns
+    legacy_provisioned, _ = legacy_keys.create_control_plane_key(
+        tenant_id="tenant-a", project_id="project-a", name="legacy-key"
+    )
+    legacy_listed = legacy_keys.list_control_plane_keys(
+        tenant_id="tenant-a", project_id="project-a"
+    )
+    assert [r.created_via for r in legacy_listed if r.key_id == legacy_provisioned.key_id] == [
+        "console"
+    ]
+
+
+def test_setup_token_store_in_memory_branch_parity():
+    keys = HostedApiKeyStore()
+
+    provisioned_token, record = keys.create_setup_token(
+        tenant_id="tenant-a", project_id="project-a", session_id="sess-1"
+    )
+    assert provisioned_token.raw_token.startswith("vxsetup_")
+    assert record.session_id == "sess-1"
+
+    with pytest.raises(PermissionError, match="Invalid setup token."):
+        keys.exchange_setup_token(f"vxsetup_{record.token_id}_wrong-secret")
+
+    exchange = keys.exchange_setup_token(provisioned_token.raw_token)
+    assert exchange.project_id == "project-a"
+    assert exchange.session_id == "sess-1"
+    auth = keys.authenticate(exchange.provisioned.raw_key)
+    assert auth.project_ids == frozenset({"project-a"})
+    listed = keys.list_control_plane_keys(tenant_id="tenant-a", project_id="project-a")
+    assert [r.created_via for r in listed if r.key_id == exchange.provisioned.key_id] == [
+        "setup"
+    ]
+
+    with pytest.raises(PermissionError, match="Invalid setup token."):
+        keys.exchange_setup_token(provisioned_token.raw_token)
+
+    expired_token, _ = keys.create_setup_token(
+        tenant_id="tenant-a", project_id="project-a", ttl_seconds=0
+    )
+    with pytest.raises(PermissionError, match="Invalid setup token."):
+        keys.exchange_setup_token(expired_token.raw_token)
+
+    revocable_token, revocable_record = keys.create_setup_token(
+        tenant_id="tenant-a", project_id="project-a"
+    )
+    with pytest.raises(PermissionError):
+        keys.revoke_setup_token(
+            tenant_id="tenant-b",
+            project_id="project-a",
+            token_id=revocable_record.token_id,
+        )
+    keys.revoke_setup_token(
+        tenant_id="tenant-a", project_id="project-a", token_id=revocable_record.token_id
+    )
+    keys.revoke_setup_token(
+        tenant_id="tenant-a", project_id="project-a", token_id=revocable_record.token_id
+    )
+    with pytest.raises(PermissionError, match="Invalid setup token."):
+        keys.exchange_setup_token(revocable_token.raw_token)
 
 
 def test_replacement_scope_unrelated_valueerror_still_propagates(monkeypatch, tmp_path):
