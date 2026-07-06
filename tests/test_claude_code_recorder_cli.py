@@ -1324,6 +1324,138 @@ class ClaudeCodeSetupTests(unittest.TestCase):
             self.assertFalse((home / ".vexic" / "claude-code-recorder.json").exists())
             self.assertFalse((project_root / ".mcp.json").exists())
 
+    def test_setup_pip_install_hooks_use_setup_python_module_invocation(self) -> None:
+        from vexic.cli import main as vexic_main
+
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            project_root = home / "project"
+            project_root.mkdir()
+
+            with patch("vexic.recorders.claude_setup._repo_root", return_value=None):
+                code = vexic_main(
+                    [
+                        "setup",
+                        "claude-code",
+                        "--home",
+                        str(home),
+                        "--project-root",
+                        str(project_root),
+                        "--base-url",
+                        "https://api.example.test",
+                        "--api-key",
+                        "vx_secret",
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "session-a",
+                    ]
+                )
+
+            settings = json.loads((home / ".claude" / "settings.json").read_text(encoding="utf-8"))
+            stop_command = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+            prime_command = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            python = sys.executable.replace("\\", "/")
+
+            self.assertEqual(code, 0)
+            self.assertTrue(
+                stop_command.startswith(f"{python} -m vexic.cli recorder ingest"),
+                stop_command,
+            )
+            self.assertTrue(
+                prime_command.startswith(f"{python} -m vexic.cli recorder prime"),
+                prime_command,
+            )
+            for command in (stop_command, prime_command):
+                self.assertNotIn("--with-editable", command)
+                self.assertNotIn("uv run", command)
+
+    def test_pip_install_hook_command_quotes_interpreter_path_with_spaces(self) -> None:
+        import shlex
+
+        from vexic.recorders.claude_setup import default_recorder_hook_command
+
+        with (
+            patch("vexic.recorders.claude_setup._repo_root", return_value=None),
+            patch("sys.executable", "C:\\Program Files\\Python 3.12\\python.exe"),
+        ):
+            command = default_recorder_hook_command()
+
+        parts = shlex.split(command)
+        self.assertEqual(parts[0], "C:/Program Files/Python 3.12/python.exe")
+        self.assertEqual(parts[1:], ["-m", "vexic.cli", "recorder", "ingest"])
+
+    def test_setup_pip_install_scaffolds_module_mcp_entry_without_uv(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            project_root = home / "project"
+            project_root.mkdir()
+
+            with (
+                patch("vexic.recorders.claude_setup._repo_root", return_value=None),
+                patch("shutil.which", return_value=None),
+            ):
+                result = install_claude_code_setup(
+                    home=home,
+                    base_url="https://api.example.test",
+                    api_key="vx_secret",
+                    project_id="project-a",
+                    session_id="session-a",
+                    agent_id=None,
+                    command="python -m vexic.cli recorder ingest",
+                    project_root=project_root,
+                )
+
+            mcp_config = json.loads((project_root / ".mcp.json").read_text(encoding="utf-8"))
+            vexic_server = mcp_config["mcpServers"]["vexic"]
+            settings = json.loads(result.settings_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(vexic_server["command"], sys.executable)
+            self.assertEqual(
+                vexic_server["args"],
+                [
+                    "-m",
+                    "vexic.mcp_stdio_main",
+                    "--recorder-config",
+                    str(result.config_path),
+                ],
+            )
+            self.assertNotIn("vx_secret", json.dumps(mcp_config))
+            self.assertEqual(settings["disabledMcpjsonServers"], ["vexic"])
+
+    def test_uninstall_removes_pip_install_setup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            project_root = home / "project"
+            project_root.mkdir()
+
+            with (
+                patch("vexic.recorders.claude_setup._repo_root", return_value=None),
+                patch("shutil.which", return_value=None),
+            ):
+                install_claude_code_setup(
+                    home=home,
+                    base_url="https://api.example.test",
+                    api_key="vx_secret",
+                    project_id="project-a",
+                    session_id="session-a",
+                    agent_id=None,
+                    command="python -m vexic.cli recorder ingest",
+                    project_root=project_root,
+                )
+
+                removed = uninstall_claude_code_setup(home=home, project_root=project_root)
+
+            self.assertTrue(removed)
+            settings = json.loads(
+                (home / ".claude" / "settings.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(settings["hooks"]["Stop"], [])
+            self.assertEqual(settings["hooks"]["SessionStart"], [])
+            self.assertNotIn("vexic", settings.get("disabledMcpjsonServers", []))
+            mcp_config = json.loads((project_root / ".mcp.json").read_text(encoding="utf-8"))
+            self.assertNotIn("vexic", mcp_config["mcpServers"])
+
     def test_setup_rejects_non_derivable_hook_command_cleanly(self) -> None:
         from vexic.cli import main as vexic_main
 
