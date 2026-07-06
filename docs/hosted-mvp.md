@@ -289,6 +289,12 @@ the user approves the project MCP server in Claude Code, targeted reads go
 through the scaffolded stdio proxy to hosted `/mcp`. The raw API key stays in
 the user-local recorder config, not `.mcp.json` or Claude settings.
 
+Passing the raw key on the setup command line is the current interim path.
+The accepted target flow is a console-minted, single-use setup token that the
+CLI exchanges for the scoped key
+([ADR 0026](adr/0026-agent-setup-token-exchange.md)); follow-up issues own
+that implementation.
+
 ## Turso/libSQL Storage Backend (COA-273)
 
 The hosted storage cutover decided by
@@ -326,7 +332,7 @@ directory does that, per ADR 0008/0013 precedent.
   always re-minted well before Turso would reject it. Nothing is written to
   the catalog, disk, or any persistent store; a process restart or GC simply
   drops the cache and the next call re-mints. This is the accepted answer to
-  ADR 0019's open token-store question for the current scale — if measured
+  ADR 0019's open token-store question for the current scale -- if measured
   latency ever forces persistence, the ADR addendum records the fallback
   (encrypted at rest under an `adapters/`-only key that never enters
   `src/vexic`), but that fallback is not built.
@@ -341,9 +347,9 @@ directory does that, per ADR 0008/0013 precedent.
   be a per-request latency tax.
 - **Control-plane over the same seam, local-only filesystem guards.** The
   control-plane catalog and API-key store open through the same `connect()`
-  seam (`StorageTarget`-aware). Filesystem-coupled operations —
+  seam (`StorageTarget`-aware). Filesystem-coupled operations --
   `_ensure_control_db_permissions` (`os.open`/`chmod`) and the `Path`-based
-  half of `activate_replacement_database` — run only when the target is a
+  half of `activate_replacement_database` -- run only when the target is a
   local filesystem path; a DSN-shaped replacement (Turso) instead validates as
   a well-formed libSQL URL distinct from the tenant's current
   `customer_target`, and repointing bumps the catalog row's `generation`
@@ -355,7 +361,7 @@ directory does that, per ADR 0008/0013 precedent.
   list-databases response against the catalog's tenant -> `customer_target`
   mapping and reports matched, orphaned (platform-only), and dangling
   (catalog-only) entries. It is a pure function over two already-fetched
-  collections — no network I/O, no secrets — so recovery from a lost or
+  collections -- no network I/O, no secrets -- so recovery from a lost or
   stale mapping is a documented, tested reconcile pass rather than manual
   Turso-console archaeology. This is accepted as adequate for the internal
   dogfood posture; it does not remove the split-brain window ADR 0019's
@@ -380,7 +386,7 @@ directory does that, per ADR 0008/0013 precedent.
   separately.
 - **Restore drill.** `src/vexic/restore.py` provides `run_restore_drill`, a
   pure orchestration function (provision -> import -> verify -> activate-or-destroy)
-  over caller-injected callables — it reads no secrets and does no I/O itself.
+  over caller-injected callables -- it reads no secrets and does no I/O itself.
   It activates the replacement (repointing the catalog and bumping
   `generation`) only when `verify` returns `True`; otherwise it destroys the
   replacement and leaves the original active. The decision logic is unit
@@ -394,7 +400,7 @@ Known follow-ups, deliberately not built in this cutover:
 - `connect()` has no explicit timeout or retry/backoff on the hot path against
   remote libSQL; a slow or transiently-failing Turso call currently propagates
   directly rather than being retried.
-- `TenantTokenCache` has no size-bounded eviction — it is an unbounded `dict`
+- `TenantTokenCache` has no size-bounded eviction -- it is an unbounded `dict`
   keyed by database name, acceptable at current dogfood tenant counts but not
   reviewed for large tenant fleets.
 - Some adapter type annotations (e.g. around the injected HTTP transport and
@@ -432,15 +438,15 @@ Dream-phase / embedding model port config (optional; unset keeps every
 model-backed operation, including the `search_long_term` vector path, failing
 closed with `HostPortNotConfigured`):
 
-- `VEXIC_DREAM_PHASE_ADAPTER=/app/adapters/openrouter_live_adapter.py` — path
+- `VEXIC_DREAM_PHASE_ADAPTER=/app/adapters/openrouter_live_adapter.py` -- path
   to a host adapter module baked into the image; loading it wires
   `DreamPhasePorts` (embedding plus the Light extraction and Deep
   contradiction agents; REM needs no agent) into the deployed service at
   startup. A configured-but-unloadable adapter fails the deploy loudly at app
   startup.
-- `VEXIC_DREAM_PHASE_MODEL_GROUP` — optional model group name, default
+- `VEXIC_DREAM_PHASE_MODEL_GROUP` -- optional model group name, default
   `hosted-dream`.
-- `OPENROUTER_API_KEY=<platform key>` — read only by the adapter module,
+- `OPENROUTER_API_KEY=<platform key>` -- read only by the adapter module,
   never by `src/vexic`.
 - Optional model selection read by the adapter: `VEXIC_LIVE_EMBEDDING_MODEL`
   (default `openai/text-embedding-3-small`), `VEXIC_LIVE_MODEL` (default
@@ -737,7 +743,7 @@ Not production/customer-data ready yet:
 - no production control-plane catalog, audit store, usage store, or job ledger
   (the control-plane catalog and API-key store stay local/filesystem-rooted
   even under `VEXIC_STORAGE_BACKEND=turso`; only customer memory moved to
-  per-tenant Turso databases — see "Turso/libSQL Storage Backend" above);
+  per-tenant Turso databases -- see "Turso/libSQL Storage Backend" above);
 - no customer-readiness restore drill signed off end-to-end, incident
   tabletop/security-review signoff, network hardening, distributed rate
   limiting, or implemented support-access workflow; the Railway-volume alpha
