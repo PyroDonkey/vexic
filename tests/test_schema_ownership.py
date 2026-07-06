@@ -2,10 +2,14 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from datetime import datetime
 from pathlib import Path
 
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
+from vexic.models import FactCandidate
+from vexic.storage.candidates import PromotionCandidate
+from vexic.storage.longterm import LongTermFact
 from vexic.storage.transcript import single_message_adapter
 
 
@@ -237,6 +241,140 @@ class VexicSchemaOwnershipTests(unittest.TestCase):
                     )
 
         self.assertEqual(count, 2)
+
+    def test_fresh_init_db_adds_occurred_at_to_memory_candidates_and_long_term_memory(
+        self,
+    ) -> None:
+        from vexic.storage import init_db
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                candidate_columns = {
+                    row[1] for row in conn.execute("PRAGMA table_info(memory_candidates)")
+                }
+                long_term_columns = {
+                    row[1] for row in conn.execute("PRAGMA table_info(long_term_memory)")
+                }
+
+        self.assertIn("occurred_at", candidate_columns)
+        self.assertIn("occurred_at", long_term_columns)
+
+    def test_init_db_twice_is_idempotent_and_occurred_at_persists(self) -> None:
+        from vexic.storage import init_db
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            # Re-running init_db against an already-migrated DB must not raise,
+            # and the additive _ensure_column backfill must remain a no-op.
+            init_db(db_path)
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                candidate_columns = {
+                    row[1] for row in conn.execute("PRAGMA table_info(memory_candidates)")
+                }
+                long_term_columns = {
+                    row[1] for row in conn.execute("PRAGMA table_info(long_term_memory)")
+                }
+
+        self.assertIn("occurred_at", candidate_columns)
+        self.assertIn("occurred_at", long_term_columns)
+
+
+class OccurredAtFieldDefaultTests(unittest.TestCase):
+    """occurred_at is a nullable, flexible event-time string that
+    defaults to None so existing callers that construct these types without
+    it keep working."""
+
+    def test_long_term_fact_defaults_occurred_at_to_none(self) -> None:
+        fact = LongTermFact(
+            fact_id=1,
+            fact_text="likes tea",
+            subject="user",
+            category="preference",
+            importance=5,
+            confidence=0.9,
+            source_message_ids=[1],
+            retrieved_count=0,
+            used_count=0,
+        )
+
+        self.assertIsNone(fact.occurred_at)
+
+    def test_long_term_fact_accepts_occurred_at(self) -> None:
+        fact = LongTermFact(
+            fact_id=1,
+            fact_text="started new job",
+            subject="user",
+            category="event",
+            importance=5,
+            confidence=0.9,
+            source_message_ids=[1],
+            retrieved_count=0,
+            used_count=0,
+            occurred_at="2025-03",
+        )
+
+        self.assertEqual(fact.occurred_at, "2025-03")
+
+    def test_promotion_candidate_defaults_occurred_at_to_none(self) -> None:
+        candidate = PromotionCandidate(
+            candidate_id=1,
+            fact_text="likes tea",
+            subject="user",
+            category="preference",
+            confidence=0.9,
+            importance=5,
+            hit_count=1,
+            last_seen_at=datetime(2026, 1, 1),
+            rem_boost=0.0,
+            embedding=[0.0],
+        )
+
+        self.assertIsNone(candidate.occurred_at)
+
+    def test_promotion_candidate_accepts_occurred_at(self) -> None:
+        candidate = PromotionCandidate(
+            candidate_id=1,
+            fact_text="started new job",
+            subject="user",
+            category="event",
+            confidence=0.9,
+            importance=5,
+            hit_count=1,
+            last_seen_at=datetime(2026, 1, 1),
+            rem_boost=0.0,
+            embedding=[0.0],
+            occurred_at="2025-03-14",
+        )
+
+        self.assertEqual(candidate.occurred_at, "2025-03-14")
+
+    def test_fact_candidate_defaults_occurred_at_to_none(self) -> None:
+        candidate = FactCandidate(
+            fact_text="likes tea",
+            subject="user",
+            category="preference",
+            importance=5,
+            confidence=0.9,
+        )
+
+        self.assertIsNone(candidate.occurred_at)
+
+    def test_fact_candidate_accepts_occurred_at(self) -> None:
+        candidate = FactCandidate(
+            fact_text="started new job",
+            subject="user",
+            category="event",
+            importance=5,
+            confidence=0.9,
+            occurred_at="2025-03",
+        )
+
+        self.assertEqual(candidate.occurred_at, "2025-03")
 
 
 if __name__ == "__main__":

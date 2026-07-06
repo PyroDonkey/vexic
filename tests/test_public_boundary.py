@@ -1,4 +1,5 @@
 import re
+import subprocess
 from pathlib import Path
 
 
@@ -97,19 +98,19 @@ def test_core_hosted_http_does_not_own_hosted_write_adapter() -> None:
         assert forbidden not in text
 
 
-def test_console_boundary_is_documented_as_outside_vexic_package() -> None:
-    root_readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    console_readme = (ROOT / "console" / "README.md").read_text(encoding="utf-8")
-    console_layout = (
-        ROOT / "console" / "app" / "console" / "layout.tsx"
-    ).read_text(encoding="utf-8")
+def test_console_and_website_are_not_tracked_in_this_repository() -> None:
+    # console/ and website/ were extracted to a private repo. This checks
+    # tracked files (not local directory presence) so untracked local
+    # artifacts left over in a worktree don't produce a false failure.
+    tracked = subprocess.run(
+        ["git", "ls-files", "console", "website"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
 
-    for text in (" ".join(root_readme.split()), " ".join(console_readme.split())):
-        assert "repo-local Next.js control-plane app" in text
-        assert "not Vexic package runtime" in text
-        assert "`vexic.*` entrypoint" in text
-
-    assert "not memory-core runtime under src/vexic" in console_layout
+    assert tracked == ""
 
 
 def test_public_tree_does_not_embed_tracking_references() -> None:

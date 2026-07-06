@@ -292,6 +292,12 @@ the user approves the project MCP server in Claude Code, targeted reads go
 through the scaffolded stdio proxy to hosted `/mcp`. The raw API key stays in
 the user-local recorder config, not `.mcp.json` or Claude settings.
 
+Passing the raw key on the setup command line is the current interim path.
+The accepted target flow is a console-minted, single-use setup token that the
+CLI exchanges for the scoped key
+([ADR 0026](adr/0026-agent-setup-token-exchange.md)); follow-up issues own
+that implementation.
+
 ## Turso/libSQL Storage Backend
 
 The hosted storage cutover decided by

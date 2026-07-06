@@ -109,6 +109,7 @@ async def retrieve_long_term_facts(
     sink: list[RetrievedFact] | None = None,
     query_rewrite_agent_factory: AgentFactory | None = None,
     embed: EmbedTexts | None = None,
+    as_of: str | None = None,
 ) -> list[LongTermFact]:
     """Hybrid Tier 3 retrieval: FTS5 keyword + sqlite-vec KNN, fused via RRF.
 
@@ -139,6 +140,7 @@ async def retrieve_long_term_facts(
         keyword_query,
         k=retrieve_k,
         agent_id=agent_id,
+        as_of=as_of,
     )
     vector_ids = [
         neighbor.fact_id
@@ -147,6 +149,7 @@ async def retrieve_long_term_facts(
             query_embedding,
             k=retrieve_k,
             agent_id=agent_id,
+            as_of=as_of,
         )
     ]
 
@@ -182,6 +185,7 @@ async def retrieve_candidate_fallback(
     retrieve_k: int = RETRIEVE_K,
     return_k: int = RETURN_K,
     embed: EmbedTexts | None = None,
+    as_of: str | None = None,
 ) -> list[CandidateNote]:
     """Tier 2 candidate-fallback retrieval from the hosted MCP design.
 
@@ -194,12 +198,15 @@ async def retrieve_candidate_fallback(
     """
     embedder = embed or embed_texts
     query_embedding = _embed_query(embedder, query)
-    keyword_ids = keyword_candidate_ids(db_path, query, k=retrieve_k, agent_id=agent_id)
+    keyword_ids = keyword_candidate_ids(
+        db_path, query, k=retrieve_k, agent_id=agent_id, as_of=as_of
+    )
     vector_ids = nearest_candidate_ids(
         db_path,
         query_embedding,
         k=retrieve_k,
         agent_id=agent_id,
+        as_of=as_of,
     )
 
     fused_ids = reciprocal_rank_fusion([keyword_ids, vector_ids])[:return_k]

@@ -38,6 +38,7 @@ index (and the reverse).
 | 0023 | Hosted content encryption flows through a core ContentCodec port | accepted |
 | 0024 | Hosted fresh-conversation context ships as a Summarize dream phase plus a dedicated fresh_context capability | accepted |
 | 0025 | Automatic summarize triggering ships as an async trigger endpoint, hourly cron, and a detached SessionStart backstop | accepted |
+| 0026 | Agent setup uses a short-lived setup token exchange             | accepted |
 
 Notes:
 
@@ -113,6 +114,11 @@ Notes:
   the sweep) and the accepted single-process risks (in-process dedup lock
   and rate limiter, task loss on restart). It affirms ADR 0018 and extends
   ADR 0024.
+- 0026 settles the COA-252 setup-UX decision: agent setup moves to a
+  single-use, short-TTL setup token minted in the console and exchanged by the
+  CLI for a scoped Agent API key, so the raw key never transits the browser.
+  Full device-code/OAuth stays deferred per ADR 0010. Follow-up issues own the
+  token store/endpoints, console UI, and CLI exchange path.
 - These numbers are the Vexic `docs/adr/` series and are self-contained.
   `src/vexic` source no longer carries any `upstream ADR-00NN` extraction-source
   labels (they were removed when the COA boundary policy was clarified), so there

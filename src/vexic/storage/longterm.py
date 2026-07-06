@@ -48,6 +48,7 @@ class LongTermFact:
     used_count: int
     editable: bool = True
     created_at: str = ""
+    occurred_at: str | None = None
 
 
 def keyword_long_term_fact_ids(
@@ -56,27 +57,49 @@ def keyword_long_term_fact_ids(
     *,
     k: int,
     agent_id: str | None = None,
+    as_of: str | None = None,
 ) -> list[int]:
-    """BM25-ranked live Tier 3 fact ids for a free-text query, best first."""
+    """BM25-ranked live Tier 3 fact ids for a free-text query, best first.
+
+    `as_of`, if given, restricts results to rows where
+    `COALESCE(NULLIF(occurred_at, ''), created_at) <= as_of` -- a plain
+    TEXT-affinity string comparison. `occurred_at` is a partial-precision ISO
+    string; a partial string is always lexicographically `<=` any of its own
+    completions, so a fact with an unknown exact day always passes an `as_of`
+    check for any cutoff at or after that partial period's start. `created_at`
+    is the full `"YYYY-MM-DD HH:MM:SS"` fallback used when `occurred_at` is
+    NULL or empty -- callers must pass `as_of` in a directly comparable shape
+    (matching separator/precision) or same-day boundary comparisons will
+    behave unexpectedly. This is a deliberate, documented approximation, not
+    a bug.
+    """
     safe_query = _fts_match_query(query, any_token=True)
     if safe_query is None:
         return []
+
+    date_clause = ""
+    params: list[object] = [safe_query, agent_id]
+    if as_of is not None:
+        date_clause = "AND COALESCE(NULLIF(l.occurred_at, ''), l.created_at) <= ?"
+        params.append(as_of)
+    params.append(k)
 
     init_db(db_path)
     with closing(connect(db_path)) as conn:
         try:
             rows = conn.execute(
-                """
+                f"""
                 SELECT f.rowid
                 FROM long_term_memory_fts AS f
                 JOIN long_term_memory AS l ON l.id = f.rowid
                 WHERE long_term_memory_fts MATCH ?
                     AND l.retired = 0
                     AND l.agent_id IS ?
+                    {date_clause}
                 ORDER BY rank
                 LIMIT ?
                 """,
-                (safe_query, agent_id, k),
+                params,
             ).fetchall()
         except (sqlite3.OperationalError, ValueError) as exc:
             # A malformed FTS MATCH is a sqlite3.OperationalError locally and a
@@ -104,7 +127,8 @@ def fetch_long_term_facts(
         rows = conn.execute(
             f"""
             SELECT id, fact_text, subject, category, importance, confidence,
-                   source_message_ids, retrieved_count, used_count, editable, created_at
+                   source_message_ids, retrieved_count, used_count, editable, created_at,
+                   occurred_at
             FROM long_term_memory
             WHERE id IN ({placeholders})
                 AND agent_id IS ?
@@ -125,6 +149,7 @@ def fetch_long_term_facts(
             used_count=int(row[8]),
             editable=bool(row[9]),
             created_at=str(row[10]),
+            occurred_at=row[11],
         )
         for row in rows
     }
@@ -297,7 +322,22 @@ def nearest_long_term_facts(
     *,
     k: int = 3,
     agent_id: str | None = None,
+    as_of: str | None = None,
 ) -> list[LongTermNeighbor]:
+    """Nearest live Tier 3 facts to `embedding` by cosine distance, best first.
+
+    `as_of`, if given, restricts results to rows where
+    `COALESCE(NULLIF(occurred_at, ''), created_at) <= as_of` -- a plain
+    TEXT-affinity string comparison. `occurred_at` is a partial-precision ISO
+    string; a partial string is always lexicographically `<=` any of its own
+    completions, so a fact with an unknown exact day always passes an `as_of`
+    check for any cutoff at or after that partial period's start. `created_at`
+    is the full `"YYYY-MM-DD HH:MM:SS"` fallback used when `occurred_at` is
+    NULL or empty -- callers must pass `as_of` in a directly comparable shape
+    (matching separator/precision) or same-day boundary comparisons will
+    behave unexpectedly. This is a deliberate, documented approximation, not
+    a bug.
+    """
     if len(embedding) != EMBEDDING_DIM:
         raise ValueError(f"Expected {EMBEDDING_DIM}-dim embedding; got {len(embedding)}.")
     normalized = _normalize_embedding(embedding)
@@ -307,6 +347,14 @@ def nearest_long_term_facts(
     # live ones would otherwise steal a slot. Over-fetch, then keep the k
     # nearest live neighbors.
     fetch_k = max(k * 4, k + 10)
+
+    date_clause = ""
+    params: list[object] = [_serialize_float32(normalized), fetch_k, agent_id]
+    if as_of is not None:
+        date_clause = "AND COALESCE(NULLIF(l.occurred_at, ''), l.created_at) <= ?"
+        params.append(as_of)
+    params.append(k)
+
     init_vector_memory(db_path)
     with closing(connect(db_path)) as conn:
         _ensure_vector_memory_schema(conn)
@@ -321,10 +369,11 @@ def nearest_long_term_facts(
             JOIN long_term_memory AS l ON l.id = e._id
             WHERE l.retired = 0
                 AND l.agent_id IS ?
+                {date_clause}
             ORDER BY e._distance
             LIMIT ?
             """,
-            (_serialize_float32(normalized), fetch_k, agent_id, k),
+            params,
         ).fetchall()
 
     return [
@@ -368,6 +417,7 @@ def insert_long_term_fact(
     used_count: int,
     editable: bool,
     embedding: list[float],
+    occurred_at: str | None = None,
 ) -> int:
     # Conn-scoped Tier 3 write used by the promotion transaction. Inserts the
     # durable fact and its embedding in the caller's connection so the whole
@@ -378,8 +428,8 @@ def insert_long_term_fact(
         INSERT INTO long_term_memory
             (fact_text, subject, category, importance, confidence,
              source_message_ids, agent_id, promoted_from_candidate_id,
-             retrieved_count, used_count, editable)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             retrieved_count, used_count, editable, occurred_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             fact_text,
@@ -393,6 +443,7 @@ def insert_long_term_fact(
             retrieved_count,
             used_count,
             editable,
+            occurred_at,
         ),
     )
     fact_id = int(cursor.lastrowid)

@@ -91,23 +91,22 @@ package and its adapters read are listed in
 - `src/vexic/` - memory contract, local service, storage, retrieval, and hosted
   adapter code.
 - `tests/` - executable conformance and reliability coverage.
-- `console/` and `website/` - isolated Next.js apps (control-plane and marketing
-  site); not package runtime.
 - `docs/usage.md` - setup, MCP, recorder, hosted-alpha, and smoke-test examples.
 - `docs/architecture.md` and `docs/memory-service-contract.md` - architecture
   and contract references.
 - `docs/adr/` - accepted architecture decision records.
 - `docs/ai/README.md` - internal automation and maintainer tooling docs.
 
+Vexic Console and the marketing website live in the private
+`PyroDonkey/vexic-website` repository (COA-295: open-core boundary) — see
+[ADR 0012's addendum](docs/adr/0012-vexic-console-implementation-path.md).
+
 ## Package Boundary
 
-The repository root remains `uv`-managed. The Vexic Console (`console/`) is a
-repo-local Next.js control-plane app — not Vexic package runtime, not a
-`vexic.*` entrypoint, and not memory-core runtime under `src/vexic`. The
-marketing site (`website/`) is likewise a repo-local Next.js app outside the
-package. Their dependencies stay in their own `package.json` files
-(`console/package.json`, `website/package.json`); do not add Node package files
-at the root.
+The repository root remains `uv`-managed; do not add Node package files at the
+root. Console and website ownership moved out of this repository entirely
+(see Repository Map above) — there is no in-repo Node package surface to
+isolate anymore.
 
 ## Contributing
 

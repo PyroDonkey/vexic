@@ -158,6 +158,7 @@ BASE_TOOLS: tuple[dict[str, Any], ...] = (
             "properties": {
                 "query": {"type": "string", "minLength": 1, "maxLength": MAX_QUERY_CHARS},
                 "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT},
+                "as_of": {"type": "string"},
             },
             "required": ["query"],
             "additionalProperties": False,
@@ -330,12 +331,13 @@ async def _search_long_term(
     arguments: dict[str, Any],
     config: McpServerConfig,
 ) -> dict[str, Any]:
-    _reject_extra(arguments, {"query", "limit"})
+    _reject_extra(arguments, {"query", "limit", "as_of"})
     result = await config.service().search_long_term(
         SearchLongTermRequest(
             scope=config.scope(),
             query=_query(arguments),
             limit=_limit(arguments),
+            as_of=arguments.get("as_of"),
         )
     )
     text = render_long_term(result.facts, result.candidate_notes)

@@ -31,6 +31,7 @@ class FactCandidate(BaseModel):
     timestamp: int = 0
     source_message_ids: list[int] = Field(default_factory=list)
     editable: bool = True
+    occurred_at: str | None = None
 
 
 class ContradictionJudgment(BaseModel):

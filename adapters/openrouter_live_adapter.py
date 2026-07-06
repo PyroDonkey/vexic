@@ -35,6 +35,14 @@ Extract only durable user facts stated in the transcript.
 Use the closed category vocabulary exactly: preference, fact, goal, event,
 relationship, skill, constraint, context.
 Every candidate must include source_message_ids from the [message_id=N] markers.
+When the transcript states or clearly implies a temporal reference for when
+the fact occurred (a date, month, year, or relative time you can resolve
+against context), populate occurred_at with an ISO 8601 string at whatever
+precision is actually known: a full date ("2025-03-14"), a year-month
+("2025-03"), or a year ("2025"). Never fabricate a day or month you were not
+told. Leave occurred_at null when no temporal reference exists. Look
+especially hard for a date on category="event" facts, since event facts
+should carry an occurred_at whenever the transcript gives any basis for one.
 Return an empty list when there are no durable user facts.\
 """
 

@@ -27,15 +27,10 @@ Install and test the Python memory core with `uv`:
 uv run pytest
 ```
 
-The Vexic Console source lives in `console/` as a repo-local Next.js
-control-plane app. It is not Vexic package runtime, not a `vexic.*` entrypoint,
-and must not move under `src/vexic`; ADR 0012 keeps dashboard concerns outside
-the memory core. The repository root remains `uv`-managed.
-
-For Vercel, Console may carry the isolated npm build contract in
-`console/package.json` and `console/package-lock.json`. Do not add Node package
-files at the repository root, and do not treat Console dependencies as memory
-engine install requirements.
+Vexic Console and the marketing website source live in the private
+`PyroDonkey/vexic-website` repository, not this one (open-core boundary; see
+ADR 0012's addendum). This repository's root remains `uv`-managed with no
+Node package surface.
 
 ## Local MCP MVP
 
@@ -159,6 +154,13 @@ duplicate context dumps. The MCP entry launches `scripts/vexic-mcp-stdio.py`
 with `--recorder-config`, so `.mcp.json` does not contain the raw API key.
 Claude Code treats the project MCP server as pending until you approve/enable
 it in Claude Code.
+
+Setup also works from a plain `pip install vexic` (no source checkout and no
+`uv` required): run `python -m vexic.cli setup claude-code ...` and the hooks
+invoke the installing interpreter directly, while `.mcp.json` launches
+`python -m vexic.mcp_stdio_main --recorder-config ...`. Long-term semantic
+search through the local MCP server needs the embedding extra, so install with
+`pip install 'vexic[local-embed]'` if you want `search_long_term` available.
 
 On Claude Code stop events, the recorder reads the JSONL transcript, keeps
 visible user/assistant text, maps source keys as
@@ -330,7 +332,9 @@ memory. This consolidates pieces otherwise spread across `README.md`,
 
    Claude Code treats the project MCP server as pending until you approve/enable
    it. See [Claude Code Transcript Import](#claude-code-transcript-import) for
-   what the hook and recorder do.
+   what the hook and recorder do. Copying the raw key into this command is the
+   current interim path; the accepted target is a console-minted, single-use
+   setup token exchanged by the CLI (ADR 0026), owned by follow-up issues.
 
 4. **Make the first read.** Once approved, the agent has two read-only MCP
    tools: `recall_conversation_history` (this and earlier conversations with the

@@ -932,6 +932,241 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(invalid_run_count, 0)
         self.assertEqual(agent_a_promoted, 0)
 
+    def test_deep_commit_rejects_event_candidate_without_occurred_at(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            commit_dream_cycle(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="Ryan shipped the release on July 5.",
+                        subject="Ryan",
+                        category="event",
+                        importance=6,
+                        confidence=0.9,
+                        source_message_ids=[1],
+                    )
+                ],
+                candidate_embeddings=[_unit_vector(1.0)],
+                agent_id=None,
+                status="ok",
+                started_at="2026-01-01T00:00:00Z",
+                finished_at="2026-01-01T00:00:01Z",
+                messages_processed=1,
+                last_processed_message_id=1,
+            )
+
+            with self.assertRaisesRegex(ValueError, r"candidate 1.*'event'"):
+                commit_deep_cycle(
+                    db_path,
+                    [PromotionDecision(candidate_id=1, embedding=_unit_vector(1.0))],
+                    started_at="2026-01-01T00:01:00Z",
+                    finished_at="2026-01-01T00:01:01Z",
+                )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                fact_count = conn.execute(
+                    "SELECT COUNT(*) FROM long_term_memory"
+                ).fetchone()[0]
+                promoted = conn.execute(
+                    "SELECT promoted FROM memory_candidates WHERE id = 1"
+                ).fetchone()[0]
+
+        self.assertEqual(fact_count, 0)
+        self.assertEqual(promoted, 0)
+
+    def test_deep_commit_rejects_event_candidate_with_blank_occurred_at(self) -> None:
+        # Regression: `occurred_at is None` alone let a blank string through,
+        # since "" is falsy but not None. The check must treat blank the same
+        # as missing.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            commit_dream_cycle(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="Ryan shipped the release on July 5.",
+                        subject="Ryan",
+                        category="event",
+                        importance=6,
+                        confidence=0.9,
+                        source_message_ids=[1],
+                        occurred_at="",
+                    )
+                ],
+                candidate_embeddings=[_unit_vector(1.0)],
+                agent_id=None,
+                status="ok",
+                started_at="2026-01-01T00:00:00Z",
+                finished_at="2026-01-01T00:00:01Z",
+                messages_processed=1,
+                last_processed_message_id=1,
+            )
+
+            with self.assertRaisesRegex(ValueError, r"candidate 1.*'event'"):
+                commit_deep_cycle(
+                    db_path,
+                    [PromotionDecision(candidate_id=1, embedding=_unit_vector(1.0))],
+                    started_at="2026-01-01T00:01:00Z",
+                    finished_at="2026-01-01T00:01:01Z",
+                )
+
+    def test_deep_commit_is_idempotent_for_legacy_promoted_event_candidate(self) -> None:
+        # Regression: the event/occurred_at check originally ran before the
+        # `promoted` idempotency skip, so a candidate promoted before event-time support
+        # shipped (occurred_at forever NULL, but already promoted=1 with a
+        # linked Tier 3 fact) would raise ValueError on a benign rerun instead
+        # of hitting the documented idempotent no-op.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            commit_dream_cycle(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="Ryan shipped the release on July 5.",
+                        subject="Ryan",
+                        category="event",
+                        importance=6,
+                        confidence=0.9,
+                        source_message_ids=[1],
+                    )
+                ],
+                candidate_embeddings=[_unit_vector(1.0)],
+                agent_id=None,
+                status="ok",
+                started_at="2026-01-01T00:00:00Z",
+                finished_at="2026-01-01T00:00:01Z",
+                messages_processed=1,
+                last_processed_message_id=1,
+            )
+
+            # Simulate a legacy promotion that predates occurred_at: write the
+            # Tier 3 fact and flip promoted=1 directly, bypassing the (now
+            # occurred_at-checking) promotion path.
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO long_term_memory
+                        (fact_text, subject, category, importance, confidence,
+                         source_message_ids, promoted_from_candidate_id)
+                    VALUES (
+                        'Ryan shipped the release on July 5.', 'Ryan', 'event', 6, 0.9,
+                        '[1]', 1
+                    )
+                    """
+                )
+                conn.execute(
+                    "UPDATE memory_candidates SET promoted = 1, promoted_fact_id = 1 WHERE id = 1"
+                )
+                conn.commit()
+
+            # Rerunning promotion on the same candidate must be a benign
+            # no-op, not a ValueError.
+            commit_deep_cycle(
+                db_path,
+                [PromotionDecision(candidate_id=1, embedding=_unit_vector(1.0))],
+                started_at="2026-01-01T00:02:00Z",
+                finished_at="2026-01-01T00:02:01Z",
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                fact_count = conn.execute(
+                    "SELECT COUNT(*) FROM long_term_memory"
+                ).fetchone()[0]
+
+        self.assertEqual(fact_count, 1, "rerun must not write a second Tier 3 fact")
+
+    def test_deep_commit_promotes_event_candidate_with_occurred_at(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            commit_dream_cycle(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="Ryan shipped the release on July 5.",
+                        subject="Ryan",
+                        category="event",
+                        importance=6,
+                        confidence=0.9,
+                        source_message_ids=[1],
+                        occurred_at="2026-07-05T00:00:00Z",
+                    )
+                ],
+                candidate_embeddings=[_unit_vector(1.0)],
+                agent_id=None,
+                status="ok",
+                started_at="2026-01-01T00:00:00Z",
+                finished_at="2026-01-01T00:00:01Z",
+                messages_processed=1,
+                last_processed_message_id=1,
+            )
+
+            commit_deep_cycle(
+                db_path,
+                [PromotionDecision(candidate_id=1, embedding=_unit_vector(1.0))],
+                started_at="2026-01-01T00:01:00Z",
+                finished_at="2026-01-01T00:01:01Z",
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                occurred_at, category = conn.execute(
+                    """
+                    SELECT occurred_at, category FROM long_term_memory
+                    WHERE promoted_from_candidate_id = 1
+                    """
+                ).fetchone()
+
+        self.assertEqual(category, "event")
+        self.assertEqual(occurred_at, "2026-07-05T00:00:00Z")
+
+    def test_deep_commit_promotes_non_event_candidate_without_occurred_at(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            commit_dream_cycle(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="Ryan prefers dark mode editors.",
+                        subject="Ryan",
+                        category="preference",
+                        importance=5,
+                        confidence=0.8,
+                        source_message_ids=[1],
+                    )
+                ],
+                candidate_embeddings=[_unit_vector(1.0)],
+                agent_id=None,
+                status="ok",
+                started_at="2026-01-01T00:00:00Z",
+                finished_at="2026-01-01T00:00:01Z",
+                messages_processed=1,
+                last_processed_message_id=1,
+            )
+
+            commit_deep_cycle(
+                db_path,
+                [PromotionDecision(candidate_id=1, embedding=_unit_vector(1.0))],
+                started_at="2026-01-01T00:01:00Z",
+                finished_at="2026-01-01T00:01:01Z",
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                occurred_at, category, count = conn.execute(
+                    """
+                    SELECT occurred_at, category, COUNT(*) FROM long_term_memory
+                    WHERE promoted_from_candidate_id = 1
+                    """
+                ).fetchone()
+
+        self.assertEqual(category, "preference")
+        self.assertIsNone(occurred_at)
+        self.assertEqual(count, 1)
+
 
 class RemCentralityBoostTests(unittest.TestCase):
     def test_empty_candidates_return_empty_dict(self) -> None:

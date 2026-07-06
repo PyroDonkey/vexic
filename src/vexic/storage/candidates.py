@@ -69,6 +69,7 @@ class PromotionCandidate:
     last_seen_at: datetime
     rem_boost: float
     embedding: list[float]
+    occurred_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -184,8 +185,8 @@ def _insert_candidate(
         INSERT INTO memory_candidates
             (fact_text, subject, category, importance, confidence,
              source_message_ids, agent_id, editable, needs_review, review_neighbor_id,
-             best_similarity, last_seen_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+             best_similarity, occurred_at, last_seen_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """,
         (
             candidate.fact_text,
@@ -199,6 +200,7 @@ def _insert_candidate(
             needs_review,
             review_neighbor_id,
             best_similarity,
+            candidate.occurred_at,
         ),
     )
     candidate_id = int(cursor.lastrowid)
@@ -285,7 +287,8 @@ def _merge_candidate(
             source_message_ids = ?,
             importance = MAX(importance, ?),
             confidence = MAX(confidence, ?),
-            best_similarity = ?
+            best_similarity = ?,
+            occurred_at = COALESCE(NULLIF(occurred_at, ''), NULLIF(?, ''))
         WHERE id = ?
         """,
         (
@@ -293,6 +296,7 @@ def _merge_candidate(
             candidate.importance,
             candidate.confidence,
             match.similarity,
+            candidate.occurred_at,
             match.candidate_id,
         ),
     )
@@ -445,7 +449,7 @@ def _load_candidate_by_id(conn: sqlite3.Connection, candidate_id: int) -> FactCa
     row = conn.execute(
         """
         SELECT fact_text, subject, category, importance, confidence,
-               source_message_ids, editable
+               source_message_ids, editable, occurred_at
         FROM memory_candidates
         WHERE id = ?
         """,
@@ -463,6 +467,7 @@ def _load_candidate_by_id(conn: sqlite3.Connection, candidate_id: int) -> FactCa
         confidence=row[4],
         source_message_ids=_load_source_message_ids(row[5]),
         editable=bool(row[6]),
+        occurred_at=row[7],
     )
 
 
@@ -554,16 +559,33 @@ def keyword_candidate_ids(
     *,
     k: int,
     agent_id: str | None = None,
+    as_of: str | None = None,
 ) -> list[int]:
     """BM25-ranked active candidate ids for a free-text query, best first.
 
     The keyword half of the candidate-fallback hybrid retriever.
     Filters to the active-candidate predicate so promoted/retired/stale/review
     candidates never surface as unverified notes.
+
+    `as_of`, if given, restricts results to rows where
+    `COALESCE(NULLIF(c.occurred_at, ''), c.created_at) <= as_of` — a plain
+    TEXT-affinity string comparison. `occurred_at` is a partial-precision ISO
+    string; a partial string is always lexicographically `<=` any of its own
+    completions, so a candidate with an unknown exact day always passes an
+    `as_of` check for any cutoff at or after that partial period's start.
+    `created_at` is the full `"YYYY-MM-DD HH:MM:SS"` fallback used when
+    `occurred_at` is NULL or empty — callers must pass `as_of` in a directly
+    comparable shape (matching separator/precision) or same-day boundary
+    comparisons will behave unexpectedly. This is a deliberate, documented
+    approximation, not a bug.
     """
     safe_query = _fts_match_query(query, any_token=True)
     if safe_query is None:
         return []
+
+    date_clause = ""
+    if as_of is not None:
+        date_clause = "AND COALESCE(NULLIF(c.occurred_at, ''), c.created_at) <= ?"
 
     init_db(db_path)
     with closing(connect(db_path)) as conn:
@@ -576,10 +598,11 @@ def keyword_candidate_ids(
                 WHERE memory_candidates_fts MATCH ?
                     AND {_ACTIVE_CANDIDATE_PREDICATE}
                     AND c.agent_id IS ?
+                    {date_clause}
                 ORDER BY rank
                 LIMIT ?
                 """,
-                (safe_query, agent_id, k),
+                (safe_query, agent_id, *((as_of,) if as_of is not None else ()), k),
             ).fetchall()
         except (sqlite3.OperationalError, ValueError) as exc:
             # A malformed FTS MATCH is a sqlite3.OperationalError locally and a
@@ -706,16 +729,33 @@ def nearest_candidate_ids(
     *,
     k: int,
     agent_id: str | None = None,
+    as_of: str | None = None,
 ) -> list[int]:
     """sqlite-vec KNN over active candidate embeddings, nearest first.
 
     The vector half of the candidate-fallback hybrid retriever.
     sqlite-vec applies its KNN before the eligibility join, so over-fetch then
     keep the k nearest active candidates — same shape as nearest_long_term_facts.
+
+    `as_of`, if given, restricts results to rows where
+    `COALESCE(NULLIF(c.occurred_at, ''), c.created_at) <= as_of` — a plain
+    TEXT-affinity string comparison. `occurred_at` is a partial-precision ISO
+    string; a partial string is always lexicographically `<=` any of its own
+    completions, so a candidate with an unknown exact day always passes an
+    `as_of` check for any cutoff at or after that partial period's start.
+    `created_at` is the full `"YYYY-MM-DD HH:MM:SS"` fallback used when
+    `occurred_at` is NULL or empty — callers must pass `as_of` in a directly
+    comparable shape (matching separator/precision) or same-day boundary
+    comparisons will behave unexpectedly. This is a deliberate, documented
+    approximation, not a bug.
     """
     if len(embedding) != EMBEDDING_DIM:
         raise ValueError(f"Expected {EMBEDDING_DIM}-dim embedding; got {len(embedding)}.")
     normalized = _normalize_embedding(embedding)
+
+    date_clause = ""
+    if as_of is not None:
+        date_clause = "AND COALESCE(NULLIF(c.occurred_at, ''), c.created_at) <= ?"
 
     fetch_k = max(k * 4, k + 10)
     init_vector_memory(db_path)
@@ -732,10 +772,17 @@ def nearest_candidate_ids(
             JOIN memory_candidates AS c ON c.id = e._id
             WHERE {_ACTIVE_CANDIDATE_PREDICATE}
                 AND c.agent_id IS ?
+                {date_clause}
             ORDER BY e._distance
             LIMIT ?
             """,
-            (_serialize_float32(normalized), fetch_k, agent_id, k),
+            (
+                _serialize_float32(normalized),
+                fetch_k,
+                agent_id,
+                *((as_of,) if as_of is not None else ()),
+                k,
+            ),
         ).fetchall()
     return [int(row[0]) for row in rows]
 
@@ -785,7 +832,7 @@ def load_promotion_candidates(
             """
             SELECT c.id, c.fact_text, c.subject, c.category, c.confidence,
                    c.importance, c.hit_count, c.last_seen_at, c.rem_boost,
-                   e.embedding
+                   e.embedding, c.occurred_at
             FROM memory_candidates AS c
             JOIN memory_candidate_embeddings AS e ON e.candidate_id = c.id
             WHERE c.promoted = 0
@@ -810,6 +857,7 @@ def load_promotion_candidates(
             last_seen_at=_parse_db_datetime(str(row[7])),
             rem_boost=float(row[8]),
             embedding=_embedding_blob_to_list(row[9]),
+            occurred_at=row[10],
         )
         for row in rows
     ]
@@ -991,12 +1039,13 @@ def read_candidate_for_promotion(
 ) -> tuple | None:
     # Conn-scoped read the promotion module uses inside its cross-tier
     # transaction. Returns the full eligibility row, or None when the candidate
-    # is missing. Column order is the promotion module's contract.
+    # is missing. Column order is the promotion module's contract; occurred_at
+    # is appended last so the module's fixed-arity unpack keeps working.
     return conn.execute(
         """
         SELECT fact_text, subject, category, importance, confidence,
                source_message_ids, agent_id, editable, retrieved_count, used_count,
-               promoted, retired, stale
+               promoted, retired, stale, occurred_at
         FROM memory_candidates
         WHERE id = ?
         """,
