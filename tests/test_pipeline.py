@@ -25,10 +25,14 @@ from vexic.storage import (
     RemCandidate,
     commit_deep_cycle,
     commit_dream_cycle,
+    get_watermark,
     init_db,
+    load_candidates_missing_embeddings,
     load_rem_candidates,
     save_messages,
 )
+from vexic.storage.candidates import claim_candidate_for_promotion
+from vexic.storage.connection import connect
 from vexic.storage.schema import _load_vec_extension
 
 
@@ -1428,6 +1432,331 @@ class LightPhaseErrorDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ValueError", error_detail)
         self.assertNotIn(sentinel, error_detail)
         self.assertNotIn(sentinel, stdout.getvalue())
+
+
+def _cosine_vector(cos: float) -> list[float]:
+    # A unit vector whose cosine similarity to _unit_vector(1.0) (i.e. the
+    # [1, 0, 0, ...] axis) is exactly `cos`. Already unit-length, so
+    # commit-time normalization is a no-op and the stored dot product == cos.
+    return _padded_vector(cos, (1.0 - cos * cos) ** 0.5)
+
+
+class PipelineCorrectnessRegressionTests(unittest.TestCase):
+    def _commit(
+        self,
+        db_path: str,
+        candidates: list[FactCandidate],
+        embeddings: list[list[float]],
+        *,
+        last_processed_message_id: int,
+        observed_watermark: int | None = None,
+        agent_id: str | None = None,
+        started_at: str = "2026-01-01T00:00:00Z",
+    ) -> None:
+        commit_dream_cycle(
+            db_path,
+            candidates,
+            candidate_embeddings=embeddings,
+            agent_id=agent_id,
+            status="ok",
+            started_at=started_at,
+            finished_at=started_at,
+            messages_processed=len(candidates),
+            last_processed_message_id=last_processed_message_id,
+            observed_watermark=observed_watermark,
+        )
+
+    def test_superseded_watermark_commit_does_not_double_write(self) -> None:
+        # Finding 1: two Light runs reading the same watermark must not both
+        # process the window. A commit whose observed watermark no longer
+        # matches (a concurrent run advanced it between read and commit) aborts
+        # as an audit-only no-op instead of re-writing candidates / re-advancing.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+
+            # A first run advances the watermark to 5.
+            self._commit(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="Ryan cedar window one.",
+                        subject="Ryan",
+                        category="fact",
+                        importance=5,
+                        confidence=0.8,
+                        source_message_ids=[5],
+                    )
+                ],
+                [_unit_vector(1.0)],
+                last_processed_message_id=5,
+            )
+            self.assertEqual(get_watermark(db_path, agent_id=None), 5)
+
+            # A caller observes watermark=5, but a concurrent run advances it to
+            # 10 before the caller commits.
+            self._commit(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="Ryan cedar window two.",
+                        subject="Ryan",
+                        category="goal",
+                        importance=5,
+                        confidence=0.8,
+                        source_message_ids=[10],
+                    )
+                ],
+                [_padded_vector(0.0, 1.0)],
+                last_processed_message_id=10,
+                started_at="2026-01-01T00:01:00Z",
+            )
+            self.assertEqual(get_watermark(db_path, agent_id=None), 10)
+
+            # The stale caller commits with observed_watermark=5. It must NOT
+            # write its candidate nor re-advance the watermark.
+            self._commit(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="Ryan cedar superseded duplicate.",
+                        subject="Ryan",
+                        category="skill",
+                        importance=5,
+                        confidence=0.8,
+                        source_message_ids=[3],
+                    )
+                ],
+                [_padded_vector(0.0, 0.0, 1.0)],
+                last_processed_message_id=5,
+                observed_watermark=5,
+                started_at="2026-01-01T00:02:00Z",
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                candidate_count = conn.execute(
+                    "SELECT COUNT(*) FROM memory_candidates"
+                ).fetchone()[0]
+                superseded = conn.execute(
+                    "SELECT COUNT(*) FROM memory_candidates WHERE fact_text LIKE '%superseded%'"
+                ).fetchone()[0]
+
+            self.assertEqual(candidate_count, 2, "superseded commit must not write a third candidate")
+            self.assertEqual(superseded, 0)
+            self.assertEqual(
+                get_watermark(db_path, agent_id=None),
+                10,
+                "superseded commit must not re-advance the watermark",
+            )
+
+    def test_matching_watermark_commit_proceeds(self) -> None:
+        # Positive control for Finding 1: when the observed watermark still
+        # matches, the compare-and-set lets the cycle write normally.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+
+            self._commit(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="Ryan cedar first window.",
+                        subject="Ryan",
+                        category="fact",
+                        importance=5,
+                        confidence=0.8,
+                        source_message_ids=[4],
+                    )
+                ],
+                [_unit_vector(1.0)],
+                last_processed_message_id=4,
+                observed_watermark=0,
+            )
+
+            self.assertEqual(get_watermark(db_path, agent_id=None), 4)
+            with closing(sqlite3.connect(db_path)) as conn:
+                candidate_count = conn.execute(
+                    "SELECT COUNT(*) FROM memory_candidates"
+                ).fetchone()[0]
+            self.assertEqual(candidate_count, 1)
+
+    def test_same_subject_duplicate_outside_global_topk_still_merges(self) -> None:
+        # Finding 2: dedup must find the nearest MERGE-ELIGIBLE neighbor (same
+        # subject+category), not the nearest global vector. Pad the store with
+        # 12 other-subject candidates all CLOSER to the incoming vector than the
+        # one same-subject candidate, so that same-subject row ranks ~13th
+        # globally -- outside any top-10 KNN window. A KNN-before-filter dedup
+        # would miss it and wrongly insert a duplicate; filter-first merges.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+
+            # One same-subject "existing" candidate at cosine 0.86 (>= the 0.85
+            # merge threshold, but the FARTHEST of everything staged).
+            existing = FactCandidate(
+                fact_text="Ryan enjoys trail running on weekends.",
+                subject="Ryan",
+                category="fact",
+                importance=5,
+                confidence=0.8,
+                source_message_ids=[1],
+            )
+            existing_embedding = _cosine_vector(0.86)
+
+            # 12 other-subject candidates at cosine 0.88..0.99 -- all closer to
+            # the incoming [1, 0, ...] axis than the same-subject 0.86 row.
+            other_cosines = [0.88 + 0.01 * i for i in range(12)]
+            others = [
+                FactCandidate(
+                    fact_text=f"Subject {i} note.",
+                    subject=f"Subject-{i}",
+                    category="fact",
+                    importance=5,
+                    confidence=0.8,
+                    source_message_ids=[100 + i],
+                )
+                for i in range(12)
+            ]
+            other_embeddings = [_cosine_vector(cos) for cos in other_cosines]
+
+            self._commit(
+                db_path,
+                [existing, *others],
+                [existing_embedding, *other_embeddings],
+                last_processed_message_id=1,
+            )
+            with closing(sqlite3.connect(db_path)) as conn:
+                seeded = conn.execute("SELECT COUNT(*) FROM memory_candidates").fetchone()[0]
+            self.assertEqual(seeded, 13)
+
+            # Incoming candidate: same subject+category as `existing`, on the
+            # [1, 0, ...] axis -> cosine 0.86 to the existing row.
+            incoming = FactCandidate(
+                fact_text="Ryan goes trail running most weekends.",
+                subject="Ryan",
+                category="fact",
+                importance=5,
+                confidence=0.8,
+                source_message_ids=[2],
+            )
+            self._commit(
+                db_path,
+                [incoming],
+                [_unit_vector(1.0)],
+                last_processed_message_id=2,
+                started_at="2026-01-01T00:01:00Z",
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                total = conn.execute("SELECT COUNT(*) FROM memory_candidates").fetchone()[0]
+                hit_count, source_ids = conn.execute(
+                    """
+                    SELECT hit_count, source_message_ids
+                    FROM memory_candidates
+                    WHERE subject = 'Ryan'
+                    """
+                ).fetchone()
+
+            self.assertEqual(total, 13, "same-subject duplicate must merge, not insert a 14th row")
+            self.assertEqual(hit_count, 2, "merge must reinforce the existing candidate")
+            self.assertEqual(source_ids, "[1, 2]")
+
+    def test_needs_review_candidate_cannot_win_promotion_claim(self) -> None:
+        # Finding 3: a candidate flagged needs_review after selection must lose
+        # the atomic promotion claim -- both at the claim primitive and end to
+        # end, with no partial Tier 3 write.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            self._commit(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="Ryan cedar review candidate.",
+                        subject="Ryan",
+                        category="fact",
+                        importance=5,
+                        confidence=0.8,
+                        source_message_ids=[1],
+                    )
+                ],
+                [_unit_vector(1.0)],
+                last_processed_message_id=1,
+            )
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute("UPDATE memory_candidates SET needs_review = 1 WHERE id = 1")
+                conn.commit()
+
+            # Direct claim: the WHERE guard must reject a needs_review row.
+            with closing(connect(db_path)) as conn:
+                with conn:
+                    self.assertFalse(claim_candidate_for_promotion(conn, 1))
+
+            # End to end: a promotion decision must abort cleanly, writing no
+            # Tier 3 fact and leaving promoted = 0.
+            commit_deep_cycle(
+                db_path,
+                [PromotionDecision(candidate_id=1, embedding=_unit_vector(1.0))],
+                started_at="2026-01-01T00:01:00Z",
+                finished_at="2026-01-01T00:01:01Z",
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                fact_count = conn.execute("SELECT COUNT(*) FROM long_term_memory").fetchone()[0]
+                promoted = conn.execute(
+                    "SELECT promoted FROM memory_candidates WHERE id = 1"
+                ).fetchone()[0]
+
+            self.assertEqual(fact_count, 0, "needs_review candidate must not reach Tier 3")
+            self.assertEqual(promoted, 0)
+
+    def test_missing_embedding_loader_skips_non_live_candidates(self) -> None:
+        # Finding 4: embedding repair targets only live staging candidates. A
+        # promoted / retired / needs_review row missing an embedding must NOT be
+        # returned for backfill (which could merge it into an active neighbor and
+        # mutate an already-promoted row).
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            for text, category in (
+                ("Ryan live candidate.", "fact"),
+                ("Ryan promoted candidate.", "goal"),
+                ("Ryan retired candidate.", "skill"),
+                ("Ryan review candidate.", "context"),
+            ):
+                self._commit(
+                    db_path,
+                    [
+                        FactCandidate(
+                            fact_text=text,
+                            subject="Ryan",
+                            category=category,
+                            importance=5,
+                            confidence=0.8,
+                            source_message_ids=[1],
+                        )
+                    ],
+                    [_unit_vector(1.0)],
+                    last_processed_message_id=1,
+                )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                _load_vec_extension(conn)
+                # Strip every embedding so the loader would return all four if it
+                # did not filter by lifecycle.
+                conn.execute("DELETE FROM memory_candidate_embeddings")
+                conn.execute("UPDATE memory_candidates SET promoted = 1 WHERE id = 2")
+                conn.execute("UPDATE memory_candidates SET retired = 1 WHERE id = 3")
+                conn.execute("UPDATE memory_candidates SET needs_review = 1 WHERE id = 4")
+                conn.commit()
+
+            missing = load_candidates_missing_embeddings(db_path, agent_id=None)
+
+            self.assertEqual(
+                [candidate_id for candidate_id, _ in missing],
+                [1],
+                "only the live staging candidate is eligible for embedding repair",
+            )
 
 
 if __name__ == "__main__":
