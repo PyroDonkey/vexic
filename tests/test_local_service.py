@@ -308,6 +308,68 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             [fact.fact_text for fact in after.facts], ["Ryan started a new job."]
         )
 
+    async def test_search_long_term_threads_event_range_end_to_end(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        commit_dream_cycle(
+            self.db_path,
+            [
+                FactCandidate(
+                    fact_text="Ryan started an early job.",
+                    subject="Ryan",
+                    category="event",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[1],
+                    occurred_at="2025-01-01",
+                ),
+                FactCandidate(
+                    fact_text="Ryan started a mid job.",
+                    subject="Ryan",
+                    category="event",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[2],
+                    occurred_at="2025-03-01",
+                ),
+            ],
+            candidate_embeddings=[_axis_vector(0), _axis_vector(1)],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=2,
+        )
+        commit_deep_cycle(
+            self.db_path,
+            [
+                PromotionDecision(candidate_id=1, embedding=_axis_vector(0)),
+                PromotionDecision(candidate_id=2, embedding=_axis_vector(1)),
+            ],
+            started_at="2026-06-01T00:01:00+00:00",
+            finished_at="2026-06-01T00:01:01+00:00",
+        )
+
+        with patch(
+            "vexic.subagents.retrieval.embed_texts",
+            side_effect=lambda texts: [_unit_vector(1.0) for _ in texts],
+        ):
+            result = await service.search_long_term(
+                SearchLongTermRequest(
+                    scope=_scope(),
+                    query="started job",
+                    event_after="2025-02-01",
+                    event_before="2025-04-01",
+                )
+            )
+
+        self.assertEqual(
+            [fact.fact_text for fact in result.facts], ["Ryan started a mid job."]
+        )
+
     async def test_search_long_term_as_of_filters_tier2_candidate_fallback(self) -> None:
         from vexic.service import LocalMemoryService
 

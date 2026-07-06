@@ -58,18 +58,26 @@ def keyword_long_term_fact_ids(
     k: int,
     agent_id: str | None = None,
     as_of: str | None = None,
+    event_after: str | None = None,
+    event_before: str | None = None,
 ) -> list[int]:
     """BM25-ranked live Tier 3 fact ids for a free-text query, best first.
 
     `as_of`, if given, restricts results to rows where
     `COALESCE(NULLIF(occurred_at, ''), created_at) <= as_of` -- a plain
-    TEXT-affinity string comparison. `occurred_at` is a partial-precision ISO
+    TEXT-affinity string comparison. `event_after`/`event_before`, if given,
+    are the lower/upper bounds of a temporal range over the same
+    `COALESCE(NULLIF(occurred_at, ''), created_at)` fallback:
+    `... >= event_after` and/or `... <= event_before`. All three are optional
+    and independent; `event_before` and `as_of` may coexist (both `<=` clauses
+    are emitted). `occurred_at` is a partial-precision ISO
     string; a partial string is always lexicographically `<=` any of its own
     completions, so a fact with an unknown exact day always passes an `as_of`
-    check for any cutoff at or after that partial period's start. `created_at`
+    or `event_before` check for any cutoff at or after that partial period's
+    start. `created_at`
     is the full `"YYYY-MM-DD HH:MM:SS"` fallback used when `occurred_at` is
-    NULL or empty -- callers must pass `as_of` in a directly comparable shape
-    (matching separator/precision) or same-day boundary comparisons will
+    NULL or empty -- callers must pass these bounds in a directly comparable
+    shape (matching separator/precision) or same-day boundary comparisons will
     behave unexpectedly. This is a deliberate, documented approximation, not
     a bug.
     """
@@ -80,8 +88,14 @@ def keyword_long_term_fact_ids(
     date_clause = ""
     params: list[object] = [safe_query, agent_id]
     if as_of is not None:
-        date_clause = "AND COALESCE(NULLIF(l.occurred_at, ''), l.created_at) <= ?"
+        date_clause += " AND COALESCE(NULLIF(l.occurred_at, ''), l.created_at) <= ?"
         params.append(as_of)
+    if event_after is not None:
+        date_clause += " AND COALESCE(NULLIF(l.occurred_at, ''), l.created_at) >= ?"
+        params.append(event_after)
+    if event_before is not None:
+        date_clause += " AND COALESCE(NULLIF(l.occurred_at, ''), l.created_at) <= ?"
+        params.append(event_before)
     params.append(k)
 
     init_db(db_path)
@@ -323,18 +337,26 @@ def nearest_long_term_facts(
     k: int = 3,
     agent_id: str | None = None,
     as_of: str | None = None,
+    event_after: str | None = None,
+    event_before: str | None = None,
 ) -> list[LongTermNeighbor]:
     """Nearest live Tier 3 facts to `embedding` by cosine distance, best first.
 
     `as_of`, if given, restricts results to rows where
     `COALESCE(NULLIF(occurred_at, ''), created_at) <= as_of` -- a plain
-    TEXT-affinity string comparison. `occurred_at` is a partial-precision ISO
+    TEXT-affinity string comparison. `event_after`/`event_before`, if given,
+    are the lower/upper bounds of a temporal range over the same
+    `COALESCE(NULLIF(occurred_at, ''), created_at)` fallback:
+    `... >= event_after` and/or `... <= event_before`. All three are optional
+    and independent; `event_before` and `as_of` may coexist (both `<=` clauses
+    are emitted). `occurred_at` is a partial-precision ISO
     string; a partial string is always lexicographically `<=` any of its own
     completions, so a fact with an unknown exact day always passes an `as_of`
-    check for any cutoff at or after that partial period's start. `created_at`
+    or `event_before` check for any cutoff at or after that partial period's
+    start. `created_at`
     is the full `"YYYY-MM-DD HH:MM:SS"` fallback used when `occurred_at` is
-    NULL or empty -- callers must pass `as_of` in a directly comparable shape
-    (matching separator/precision) or same-day boundary comparisons will
+    NULL or empty -- callers must pass these bounds in a directly comparable
+    shape (matching separator/precision) or same-day boundary comparisons will
     behave unexpectedly. This is a deliberate, documented approximation, not
     a bug.
     """
@@ -351,8 +373,14 @@ def nearest_long_term_facts(
     date_clause = ""
     params: list[object] = [_serialize_float32(normalized), fetch_k, agent_id]
     if as_of is not None:
-        date_clause = "AND COALESCE(NULLIF(l.occurred_at, ''), l.created_at) <= ?"
+        date_clause += " AND COALESCE(NULLIF(l.occurred_at, ''), l.created_at) <= ?"
         params.append(as_of)
+    if event_after is not None:
+        date_clause += " AND COALESCE(NULLIF(l.occurred_at, ''), l.created_at) >= ?"
+        params.append(event_after)
+    if event_before is not None:
+        date_clause += " AND COALESCE(NULLIF(l.occurred_at, ''), l.created_at) <= ?"
+        params.append(event_before)
     params.append(k)
 
     init_vector_memory(db_path)

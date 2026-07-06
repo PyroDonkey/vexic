@@ -169,6 +169,30 @@ class MemoryContractScopeTests(unittest.TestCase):
 
         self.assertIsNone(request.as_of)
 
+    def test_search_long_term_request_event_bounds_round_trip(self) -> None:
+        request = SearchLongTermRequest(
+            scope=self._scope(capabilities={MemoryCapability.SEARCH}),
+            query="Ryan events",
+            event_after="2025-01-01",
+            event_before="2025-06-01",
+        )
+
+        round_tripped = SearchLongTermRequest.model_validate_json(
+            request.model_dump_json()
+        )
+
+        self.assertEqual(round_tripped.event_after, "2025-01-01")
+        self.assertEqual(round_tripped.event_before, "2025-06-01")
+
+    def test_search_long_term_request_event_bounds_default_to_none(self) -> None:
+        request = SearchLongTermRequest(
+            scope=self._scope(capabilities={MemoryCapability.SEARCH}),
+            query="x",
+        )
+
+        self.assertIsNone(request.event_after)
+        self.assertIsNone(request.event_before)
+
     def test_delete_scope_target_is_identifier_selector_not_actor_scope(self) -> None:
         actor_scope = self._scope(
             capabilities={MemoryCapability.ADMIN_LIFECYCLE},

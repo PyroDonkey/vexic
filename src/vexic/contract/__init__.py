@@ -365,6 +365,8 @@ class SearchLongTermRequest(MemoryRequest):
     query: str
     limit: int = 5
     as_of: str | None = None
+    event_after: str | None = None
+    event_before: str | None = None
 
 
 class SearchLongTermResult(MemoryResult):

@@ -581,6 +581,8 @@ class LocalMemoryService(MemoryService):
             return_k=request.limit,
             embed=self.embed,
             as_of=request.as_of,
+            event_after=request.event_after,
+            event_before=request.event_before,
         )
         if facts:
             return SearchLongTermResult(
@@ -611,6 +613,8 @@ class LocalMemoryService(MemoryService):
             return_k=request.limit,
             embed=self.embed,
             as_of=request.as_of,
+            event_after=request.event_after,
+            event_before=request.event_before,
         )
         return SearchLongTermResult(
             candidate_notes=[

@@ -92,6 +92,8 @@ class _HeaderBoundSearchBody(BaseModel):
     query: str
     limit: int = 5
     as_of: str | None = None
+    event_after: str | None = None
+    event_before: str | None = None
 
 
 class _HeaderBoundFreshContextBody(BaseModel):
@@ -314,19 +316,24 @@ async def _handle_search(
         else:
             auth = _authenticate_for_header_scope(service, api_key)
             search = _HeaderBoundSearchBody.model_validate(body)
-            if search.as_of is not None and "as_of" not in request_type.model_fields:
-                return _error_response(
-                    422,
-                    "invalid_request",
-                    "Request body does not match the Vexic contract.",
-                )
+            for field_name in ("as_of", "event_after", "event_before"):
+                if (
+                    getattr(search, field_name) is not None
+                    and field_name not in request_type.model_fields
+                ):
+                    return _error_response(
+                        422,
+                        "invalid_request",
+                        "Request body does not match the Vexic contract.",
+                    )
             search_kwargs: dict[str, Any] = {
                 "scope": _read_scope_from_headers(request, auth),
                 "query": search.query,
                 "limit": search.limit,
             }
-            if "as_of" in request_type.model_fields:
-                search_kwargs["as_of"] = search.as_of
+            for field_name in ("as_of", "event_after", "event_before"):
+                if field_name in request_type.model_fields:
+                    search_kwargs[field_name] = getattr(search, field_name)
             payload = request_type(**search_kwargs)
     except ValidationError:
         return _error_response(

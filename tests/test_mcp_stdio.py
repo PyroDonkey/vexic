@@ -155,6 +155,16 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
         properties = tools["recall_user_memory"]["inputSchema"]["properties"]
         self.assertIn("as_of", properties)
 
+    async def test_tools_list_advertises_event_bounds_on_recall_user_memory(self) -> None:
+        response = await self._request(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        )
+
+        tools = {tool["name"]: tool for tool in response["result"]["tools"]}
+        properties = tools["recall_user_memory"]["inputSchema"]["properties"]
+        self.assertIn("event_after", properties)
+        self.assertIn("event_before", properties)
+
     async def test_expand_history_is_unavailable_without_privileged_slice(self) -> None:
         response = await self._request(
             {
@@ -1160,6 +1170,65 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("cedar notes tentative", before["result"]["content"][0]["text"])
         self.assertFalse(after["result"]["isError"])
         self.assertIn("cedar notes tentative", after["result"]["content"][0]["text"])
+
+    async def test_recall_user_memory_accepts_event_bound_arguments(self) -> None:
+        """The stdio `recall_user_memory` extra-key allowlist must accept
+        `event_after`/`event_before` and thread them into
+        `SearchLongTermRequest`; an unknown key must still be rejected.
+        """
+        commit_dream_cycle(
+            self.db_path,
+            [
+                FactCandidate(
+                    fact_text="Ryan keeps cedar notes tentative.",
+                    subject="Ryan",
+                    category="fact",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[1],
+                    occurred_at="2025-03-14",
+                )
+            ],
+            candidate_embeddings=[[1.0] + [0.0] * (EMBEDDING_DIM - 1)],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+
+        async def _recall(arguments: dict[str, object]) -> dict:
+            response = await self._request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {"name": "recall_user_memory", "arguments": arguments},
+                }
+            )
+            return response["result"]
+
+        with patch(
+            "vexic.subagents.retrieval.embed_texts",
+            side_effect=lambda texts: [[1.0] + [0.0] * (EMBEDDING_DIM - 1) for _ in texts],
+        ):
+            after_excluded = await _recall({"query": "cedar notes", "event_after": "2025-04-01"})
+            after_included = await _recall({"query": "cedar notes", "event_after": "2024-01-01"})
+            before_excluded = await _recall({"query": "cedar notes", "event_before": "2024-01-01"})
+            before_included = await _recall({"query": "cedar notes", "event_before": "2025-04-01"})
+            unknown = await _recall({"query": "cedar notes", "event_between": "2025-04-01"})
+
+        self.assertFalse(after_excluded["isError"])
+        self.assertNotIn("cedar notes tentative", after_excluded["content"][0]["text"])
+        self.assertFalse(after_included["isError"])
+        self.assertIn("cedar notes tentative", after_included["content"][0]["text"])
+        self.assertFalse(before_excluded["isError"])
+        self.assertNotIn("cedar notes tentative", before_excluded["content"][0]["text"])
+        self.assertFalse(before_included["isError"])
+        self.assertIn("cedar notes tentative", before_included["content"][0]["text"])
+        self.assertTrue(unknown["isError"])
+        self.assertIn("unexpected argument", unknown["content"][0]["text"])
 
     async def test_invalid_tool_calls_return_tool_errors(self) -> None:
         cases = [

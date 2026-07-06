@@ -1558,5 +1558,502 @@ class CandidateSearchAsOfFilterTests(unittest.TestCase):
         )
 
 
+class LongTermSearchEventRangeFilterTests(unittest.TestCase):
+    # `event_after`/`event_before` bound Tier 3 keyword (FTS) and vector (KNN)
+    # search to facts whose COALESCE(NULLIF(occurred_at, ''), created_at) is
+    # >= event_after and/or <= event_before -- the same fallback the `as_of`
+    # upper bound uses. Bounds are independent (either/both/neither) and
+    # `event_before` may coexist with `as_of`.
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.temp_dir.name) / "memory.db")
+        init_db(self.db_path)
+        init_vector_memory(self.db_path)
+        self._next_candidate_id = 1
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _insert_fact(
+        self,
+        fact_text: str,
+        *,
+        occurred_at: str | None = None,
+        embedding: list[float] | None = None,
+    ) -> int:
+        candidate_id = self._next_candidate_id
+        self._next_candidate_id += 1
+        with closing(connect(self.db_path)) as conn:
+            with conn:
+                _ensure_vector_memory_schema(conn)
+                fact_id = insert_long_term_fact(
+                    conn,
+                    fact_text=fact_text,
+                    subject="Ryan",
+                    category="event",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[1],
+                    agent_id=None,
+                    promoted_from_candidate_id=candidate_id,
+                    retrieved_count=0,
+                    used_count=0,
+                    editable=True,
+                    embedding=embedding if embedding is not None else _unit_vector(1.0),
+                    occurred_at=occurred_at,
+                )
+        return fact_id
+
+    def _set_created_at(self, fact_id: int, created_at: str) -> None:
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE long_term_memory SET created_at = ? WHERE id = ?",
+                (created_at, fact_id),
+            )
+            conn.commit()
+
+    def test_keyword_event_range_keeps_only_in_window_facts(self) -> None:
+        before_id = self._insert_fact("Ryan started early.", occurred_at="2025-01-01")
+        inside_id = self._insert_fact("Ryan started mid.", occurred_at="2025-03-01")
+        after_id = self._insert_fact("Ryan started late.", occurred_at="2025-06-01")
+
+        ids = keyword_long_term_fact_ids(
+            self.db_path,
+            "Ryan started",
+            k=10,
+            event_after="2025-02-01",
+            event_before="2025-04-01",
+        )
+
+        self.assertIn(inside_id, ids)
+        self.assertNotIn(before_id, ids)
+        self.assertNotIn(after_id, ids)
+
+    def test_keyword_event_after_only_is_open_ended_lower_bound(self) -> None:
+        before_id = self._insert_fact("Ryan started early.", occurred_at="2025-01-01")
+        after_id = self._insert_fact("Ryan started late.", occurred_at="2025-06-01")
+
+        ids = keyword_long_term_fact_ids(
+            self.db_path, "Ryan started", k=10, event_after="2025-03-01"
+        )
+
+        self.assertIn(after_id, ids)
+        self.assertNotIn(before_id, ids)
+
+    def test_keyword_event_before_only_is_open_ended_upper_bound(self) -> None:
+        before_id = self._insert_fact("Ryan started early.", occurred_at="2025-01-01")
+        after_id = self._insert_fact("Ryan started late.", occurred_at="2025-06-01")
+
+        ids = keyword_long_term_fact_ids(
+            self.db_path, "Ryan started", k=10, event_before="2025-03-01"
+        )
+
+        self.assertIn(before_id, ids)
+        self.assertNotIn(after_id, ids)
+
+    def test_keyword_event_range_falls_back_to_created_at_when_occurred_at_missing(
+        self,
+    ) -> None:
+        inside_id = self._insert_fact("Ryan started mid.", occurred_at=None)
+        self._set_created_at(inside_id, "2025-03-01 00:00:00")
+        outside_id = self._insert_fact("Ryan started late.", occurred_at="")
+        self._set_created_at(outside_id, "2025-06-01 00:00:00")
+
+        ids = keyword_long_term_fact_ids(
+            self.db_path,
+            "Ryan started",
+            k=10,
+            event_after="2025-02-01",
+            event_before="2025-04-01",
+        )
+
+        self.assertIn(inside_id, ids)
+        self.assertNotIn(outside_id, ids)
+
+    def test_keyword_event_before_coexists_with_as_of(self) -> None:
+        kept_id = self._insert_fact("Ryan started mid.", occurred_at="2025-03-01")
+        after_event_before_id = self._insert_fact(
+            "Ryan started late.", occurred_at="2025-06-01"
+        )
+
+        ids = keyword_long_term_fact_ids(
+            self.db_path,
+            "Ryan started",
+            k=10,
+            as_of="2025-12-01",
+            event_before="2025-04-01",
+        )
+
+        self.assertIn(kept_id, ids)
+        self.assertNotIn(after_event_before_id, ids)
+
+    def test_keyword_event_bounds_are_inclusive_at_the_boundary(self) -> None:
+        # Guards the >= / <= semantics: a fact whose occurred_at is exactly
+        # equal to either bound must be kept. A regression to > / < would drop
+        # it and only this equality case would catch it.
+        on_bound_id = self._insert_fact("Ryan started mid.", occurred_at="2025-03-01")
+
+        after_ids = keyword_long_term_fact_ids(
+            self.db_path, "Ryan started", k=10, event_after="2025-03-01"
+        )
+        before_ids = keyword_long_term_fact_ids(
+            self.db_path, "Ryan started", k=10, event_before="2025-03-01"
+        )
+
+        self.assertIn(on_bound_id, after_ids)
+        self.assertIn(on_bound_id, before_ids)
+
+    def test_nearest_event_range_keeps_only_in_window_facts(self) -> None:
+        embedding = _unit_vector(1.0)
+        before_id = self._insert_fact(
+            "Ryan started early.", occurred_at="2025-01-01", embedding=embedding
+        )
+        inside_id = self._insert_fact(
+            "Ryan started mid.", occurred_at="2025-03-01", embedding=embedding
+        )
+        after_id = self._insert_fact(
+            "Ryan started late.", occurred_at="2025-06-01", embedding=embedding
+        )
+
+        neighbors = nearest_long_term_facts(
+            self.db_path,
+            embedding,
+            k=10,
+            event_after="2025-02-01",
+            event_before="2025-04-01",
+        )
+
+        neighbor_ids = [neighbor.fact_id for neighbor in neighbors]
+        self.assertIn(inside_id, neighbor_ids)
+        self.assertNotIn(before_id, neighbor_ids)
+        self.assertNotIn(after_id, neighbor_ids)
+
+    def test_nearest_event_after_only_is_open_ended_lower_bound(self) -> None:
+        embedding = _unit_vector(1.0)
+        before_id = self._insert_fact(
+            "Ryan started early.", occurred_at="2025-01-01", embedding=embedding
+        )
+        after_id = self._insert_fact(
+            "Ryan started late.", occurred_at="2025-06-01", embedding=embedding
+        )
+
+        neighbors = nearest_long_term_facts(
+            self.db_path, embedding, k=10, event_after="2025-03-01"
+        )
+
+        neighbor_ids = [neighbor.fact_id for neighbor in neighbors]
+        self.assertIn(after_id, neighbor_ids)
+        self.assertNotIn(before_id, neighbor_ids)
+
+    def test_nearest_event_before_only_is_open_ended_upper_bound(self) -> None:
+        embedding = _unit_vector(1.0)
+        before_id = self._insert_fact(
+            "Ryan started early.", occurred_at="2025-01-01", embedding=embedding
+        )
+        after_id = self._insert_fact(
+            "Ryan started late.", occurred_at="2025-06-01", embedding=embedding
+        )
+
+        neighbors = nearest_long_term_facts(
+            self.db_path, embedding, k=10, event_before="2025-03-01"
+        )
+
+        neighbor_ids = [neighbor.fact_id for neighbor in neighbors]
+        self.assertIn(before_id, neighbor_ids)
+        self.assertNotIn(after_id, neighbor_ids)
+
+    def test_nearest_event_range_falls_back_to_created_at_when_occurred_at_missing(
+        self,
+    ) -> None:
+        embedding = _unit_vector(1.0)
+        inside_id = self._insert_fact(
+            "Ryan started mid.", occurred_at=None, embedding=embedding
+        )
+        self._set_created_at(inside_id, "2025-03-01 00:00:00")
+        outside_id = self._insert_fact(
+            "Ryan started late.", occurred_at="", embedding=embedding
+        )
+        self._set_created_at(outside_id, "2025-06-01 00:00:00")
+
+        neighbors = nearest_long_term_facts(
+            self.db_path,
+            embedding,
+            k=10,
+            event_after="2025-02-01",
+            event_before="2025-04-01",
+        )
+
+        neighbor_ids = [neighbor.fact_id for neighbor in neighbors]
+        self.assertIn(inside_id, neighbor_ids)
+        self.assertNotIn(outside_id, neighbor_ids)
+
+
+class RetrieveLongTermFactsEventRangeThreadThroughTests(
+    unittest.IsolatedAsyncioTestCase
+):
+    # retrieve_long_term_facts must thread event_after/event_before into both
+    # the keyword and vector halves of the hybrid search -- a tracer bullet for
+    # the thread-through, not a re-test of the filtering semantics.
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.temp_dir.name) / "memory.db")
+        init_db(self.db_path)
+        init_vector_memory(self.db_path)
+        self._next_candidate_id = 1
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _insert_fact(
+        self, fact_text: str, *, occurred_at: str, embedding: list[float]
+    ) -> int:
+        candidate_id = self._next_candidate_id
+        self._next_candidate_id += 1
+        with closing(connect(self.db_path)) as conn:
+            with conn:
+                _ensure_vector_memory_schema(conn)
+                fact_id = insert_long_term_fact(
+                    conn,
+                    fact_text=fact_text,
+                    subject="Ryan",
+                    category="event",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[1],
+                    agent_id=None,
+                    promoted_from_candidate_id=candidate_id,
+                    retrieved_count=0,
+                    used_count=0,
+                    editable=True,
+                    embedding=embedding,
+                    occurred_at=occurred_at,
+                )
+        return fact_id
+
+    async def test_retrieve_long_term_facts_threads_event_bounds(self) -> None:
+        embedding = _unit_vector(1.0)
+        self._insert_fact(
+            "Ryan started early.", occurred_at="2025-01-01", embedding=embedding
+        )
+        self._insert_fact(
+            "Ryan started mid.", occurred_at="2025-03-01", embedding=embedding
+        )
+        self._insert_fact(
+            "Ryan started late.", occurred_at="2025-06-01", embedding=embedding
+        )
+
+        with patch(
+            "vexic.subagents.retrieval.embed_texts",
+            side_effect=lambda texts: [embedding for _ in texts],
+        ):
+            facts = await retrieve_long_term_facts(
+                self.db_path,
+                "Ryan started",
+                event_after="2025-02-01",
+                event_before="2025-04-01",
+            )
+
+        fact_texts = [fact.fact_text for fact in facts]
+        self.assertIn("Ryan started mid.", fact_texts)
+        self.assertNotIn("Ryan started early.", fact_texts)
+        self.assertNotIn("Ryan started late.", fact_texts)
+
+
+class CandidateSearchEventRangeFilterTests(unittest.TestCase):
+    # event_after/event_before bound Tier 2 candidate-fallback keyword (FTS)
+    # and vector (KNN) search to candidates whose
+    # COALESCE(NULLIF(occurred_at, ''), created_at) is >= event_after and/or
+    # <= event_before, mirroring the Tier 3 event-range filter.
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.temp_dir.name) / "memory.db")
+        init_db(self.db_path)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _seeded_candidate_ids(self) -> list[int]:
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            rows = conn.execute(
+                "SELECT id FROM memory_candidates ORDER BY id ASC"
+            ).fetchall()
+        return [int(row[0]) for row in rows]
+
+    def _set_created_at(self, candidate_id: int, created_at: str) -> None:
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE memory_candidates SET created_at = ? WHERE id = ?",
+                (created_at, candidate_id),
+            )
+            conn.commit()
+
+    def _seed(self, texts_and_dates: list[tuple[str, str | None]]) -> list[int]:
+        # Distinct category per candidate so the subject+category dedup in
+        # commit_dream_cycle keeps them separate (same trick the as_of
+        # candidate tests use), letting each survive with its own occurred_at.
+        embedding = _unit_vector(1.0)
+        categories = ["event", "fact", "goal", "skill", "context"]
+        commit_dream_cycle(
+            self.db_path,
+            [
+                _candidate(
+                    text,
+                    message_ids=[index + 1],
+                    category=categories[index],
+                    occurred_at=occurred_at,
+                )
+                for index, (text, occurred_at) in enumerate(texts_and_dates)
+            ],
+            candidate_embeddings=[embedding for _ in texts_and_dates],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+        return self._seeded_candidate_ids()
+
+    def test_keyword_candidate_event_range_keeps_only_in_window(self) -> None:
+        before_id, inside_id, after_id = self._seed(
+            [
+                ("Ryan adopted a greyhound.", "2025-01-01"),
+                ("Ryan adopted a parrot.", "2025-03-01"),
+                ("Ryan adopted a cat.", "2025-06-01"),
+            ]
+        )
+
+        ids = keyword_candidate_ids(
+            self.db_path,
+            "Ryan adopted",
+            k=10,
+            event_after="2025-02-01",
+            event_before="2025-04-01",
+        )
+
+        self.assertIn(inside_id, ids)
+        self.assertNotIn(before_id, ids)
+        self.assertNotIn(after_id, ids)
+
+    def test_keyword_candidate_event_after_only_open_ended(self) -> None:
+        before_id, after_id = self._seed(
+            [
+                ("Ryan adopted a greyhound.", "2025-01-01"),
+                ("Ryan adopted a cat.", "2025-06-01"),
+            ]
+        )
+
+        ids = keyword_candidate_ids(
+            self.db_path, "Ryan adopted", k=10, event_after="2025-03-01"
+        )
+
+        self.assertIn(after_id, ids)
+        self.assertNotIn(before_id, ids)
+
+    def test_keyword_candidate_event_before_only_open_ended(self) -> None:
+        before_id, after_id = self._seed(
+            [
+                ("Ryan adopted a greyhound.", "2025-01-01"),
+                ("Ryan adopted a cat.", "2025-06-01"),
+            ]
+        )
+
+        ids = keyword_candidate_ids(
+            self.db_path, "Ryan adopted", k=10, event_before="2025-03-01"
+        )
+
+        self.assertIn(before_id, ids)
+        self.assertNotIn(after_id, ids)
+
+    def test_keyword_candidate_event_range_falls_back_to_created_at(self) -> None:
+        (candidate_id,) = self._seed([("Ryan adopted a greyhound.", "")])
+        self._set_created_at(candidate_id, "2025-06-01 00:00:00")
+
+        ids = keyword_candidate_ids(
+            self.db_path,
+            "Ryan adopted",
+            k=10,
+            event_after="2025-02-01",
+            event_before="2025-04-01",
+        )
+
+        self.assertNotIn(candidate_id, ids)
+
+    def test_keyword_candidate_event_before_coexists_with_as_of(self) -> None:
+        kept_id, dropped_id = self._seed(
+            [
+                ("Ryan adopted a parrot.", "2025-03-01"),
+                ("Ryan adopted a cat.", "2025-06-01"),
+            ]
+        )
+
+        ids = keyword_candidate_ids(
+            self.db_path,
+            "Ryan adopted",
+            k=10,
+            as_of="2025-12-01",
+            event_before="2025-04-01",
+        )
+
+        self.assertIn(kept_id, ids)
+        self.assertNotIn(dropped_id, ids)
+
+    def test_nearest_candidate_event_range_keeps_only_in_window(self) -> None:
+        embedding = _unit_vector(1.0)
+        before_id, inside_id, after_id = self._seed(
+            [
+                ("Ryan learned to sail.", "2025-01-01"),
+                ("Ryan learned to weld.", "2025-03-01"),
+                ("Ryan learned to ski.", "2025-06-01"),
+            ]
+        )
+
+        ids = nearest_candidate_ids(
+            self.db_path,
+            embedding,
+            k=10,
+            event_after="2025-02-01",
+            event_before="2025-04-01",
+        )
+
+        self.assertIn(inside_id, ids)
+        self.assertNotIn(before_id, ids)
+        self.assertNotIn(after_id, ids)
+
+    def test_nearest_candidate_event_after_only_open_ended(self) -> None:
+        embedding = _unit_vector(1.0)
+        before_id, after_id = self._seed(
+            [
+                ("Ryan learned to sail.", "2025-01-01"),
+                ("Ryan learned to ski.", "2025-06-01"),
+            ]
+        )
+
+        ids = nearest_candidate_ids(
+            self.db_path, embedding, k=10, event_after="2025-03-01"
+        )
+
+        self.assertIn(after_id, ids)
+        self.assertNotIn(before_id, ids)
+
+    def test_nearest_candidate_event_range_falls_back_to_created_at(self) -> None:
+        embedding = _unit_vector(1.0)
+        (candidate_id,) = self._seed([("Ryan tried freediving.", None)])
+        self._set_created_at(candidate_id, "2025-06-01 00:00:00")
+
+        ids = nearest_candidate_ids(
+            self.db_path,
+            embedding,
+            k=10,
+            event_after="2025-02-01",
+            event_before="2025-04-01",
+        )
+
+        self.assertNotIn(candidate_id, ids)
+
+
 if __name__ == "__main__":
     unittest.main()

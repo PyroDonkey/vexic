@@ -140,6 +140,8 @@ async def retrieve_long_term_facts(
     query_rewrite_agent_factory: AgentFactory | None = None,
     embed: EmbedTexts | None = None,
     as_of: str | None = None,
+    event_after: str | None = None,
+    event_before: str | None = None,
 ) -> list[LongTermFact]:
     """Hybrid Tier 3 retrieval: FTS5 keyword + sqlite-vec KNN, fused via RRF.
 
@@ -171,6 +173,8 @@ async def retrieve_long_term_facts(
         k=retrieve_k,
         agent_id=agent_id,
         as_of=as_of,
+        event_after=event_after,
+        event_before=event_before,
     )
     vector_ids = [
         neighbor.fact_id
@@ -180,6 +184,8 @@ async def retrieve_long_term_facts(
             k=retrieve_k,
             agent_id=agent_id,
             as_of=as_of,
+            event_after=event_after,
+            event_before=event_before,
         )
     ]
 
@@ -217,6 +223,8 @@ async def retrieve_candidate_fallback(
     return_k: int = RETURN_K,
     embed: EmbedTexts | None = None,
     as_of: str | None = None,
+    event_after: str | None = None,
+    event_before: str | None = None,
 ) -> list[CandidateNote]:
     """Tier 2 candidate-fallback retrieval from the hosted MCP design.
 
@@ -230,7 +238,13 @@ async def retrieve_candidate_fallback(
     embedder = embed or embed_texts
     query_embedding = _embed_query(embedder, query)
     keyword_ids = keyword_candidate_ids(
-        db_path, query, k=retrieve_k, agent_id=agent_id, as_of=as_of
+        db_path,
+        query,
+        k=retrieve_k,
+        agent_id=agent_id,
+        as_of=as_of,
+        event_after=event_after,
+        event_before=event_before,
     )
     vector_ids = nearest_candidate_ids(
         db_path,
@@ -238,6 +252,8 @@ async def retrieve_candidate_fallback(
         k=retrieve_k,
         agent_id=agent_id,
         as_of=as_of,
+        event_after=event_after,
+        event_before=event_before,
     )
 
     fused_ids = reciprocal_rank_fusion([keyword_ids, vector_ids])[:return_k]
