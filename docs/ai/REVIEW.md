@@ -49,7 +49,9 @@ or egress); Tier-1 `messages` update/delete; a durable Tier-3 fact without
 MCP/hosted surface registering writes/export/delete/rebuild/admin by default
 (defaults are `recall_conversation_history` + `recall_user_memory` only); provider secrets
 or API keys committed, logged, or written into client/`.mcp.json` config; SQL
-built by string interpolation in a storage adapter.
+built by string interpolation in a storage adapter; a setup token exchanged
+more than once, or a raw Agent API key returned/logged anywhere but the single
+mint/exchange response (ADR 0026).
 
 **HIGH** - treating rebuildable FTS/vector projections as source of truth; core
 reading provider secrets/env or wiring provider SDKs instead of host ports (a
@@ -59,7 +61,14 @@ missing port must fail closed with `HostPortNotConfigured` via
 storage correct on SQLite but broken on libSQL/Turso - cursor lifecycle,
 iteration after a caught exception, or transaction semantics (ADR 0019); a
 missing capability check on a scoped operation; a fact or candidate destroyed
-instead of retired.
+instead of retired; a setup-token mint/exchange/revoke route catching storage
+errors before `_control_plane_storage_boundary`/the hosted error boundary can
+classify them (raw libSQL/Hrana driver text reaching the JSON error envelope),
+or an exchange failure escaping as a non-JSON 500 instead of the standard
+error envelope; rolling back setup-token consumption on a downstream mint
+failure instead of leaving it consumed (consume-before-mint is deliberately
+fail-closed - recovery is a fresh console-minted token, never a retry of a
+partially executed exchange).
 
 **MEDIUM** - boundary leak (`engine.*` import; private source-host names; Node
 package files at repo root; Console/website logic reintroduced into `src/vexic`
@@ -101,6 +110,11 @@ stdlib or a one-line solution over a new abstraction).
     `docs/architecture.md` / `docs/hosted-mvp.md` /
     `docs/memory-service-contract.md`; allowed only in provenance, ADR, runbook,
     or README pointers.
+11. Setup tokens are single-use: `exchange_setup_token` consumes before
+    minting the Agent API key, and that ordering does not roll back on a
+    downstream mint failure (fail-closed - a partially executed exchange must
+    not leave a replayable token). The raw token/key crosses the boundary only
+    in the mint/exchange response body, never logged (ADR 0026).
 
 ## Files to skip
 
@@ -165,7 +179,9 @@ and posts.
      `connect()` seam, libSQL/Turso dual-backend + cursor/transaction parity,
      projection rebuilds, append-only.
   3. Hosted & MCP - `hosted*.py`, `*_http.py`, `*_mcp.py`, Bearer + `X-Vexic-*`
-     scope binding, default read-only registration, `expand_history` gating.
+     scope binding, default read-only registration, `expand_history` gating,
+     setup-token mint/exchange/revoke single-use and error-classification
+     invariants (ADR 0026).
   4. Memory pipeline - `pipeline.py`, `promotion*`, `candidates.py`,
      `longterm.py`, `rem.py`, `deep.py`; provenance, supersession, redaction
      fail-closed.
