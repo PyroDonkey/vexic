@@ -2,6 +2,10 @@
 
 Status: accepted
 
+Note (2026-07-06): the Console client now lives in the private
+`PyroDonkey/vexic-website` repo (ADR 0012 addendum); the server-side
+control-plane adapter described here stays in this repository.
+
 ## Context
 
 ADR 0012 makes Vexic Console a control-plane client and says the hosted Vexic

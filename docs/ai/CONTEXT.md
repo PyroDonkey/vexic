@@ -41,7 +41,8 @@ _Avoid_: Memory core
 
 **Vexic Console**:
 The human-facing product surface for hosted Vexic account, organization,
-project, API-key, usage, and support workflows.
+project, API-key, usage, and support workflows. The implementation lives in
+the private `PyroDonkey/vexic-website` repo, not this one.
 _Avoid_: Memory browser, memory core
 
 **Customer Account**:

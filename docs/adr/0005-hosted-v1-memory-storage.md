@@ -2,6 +2,9 @@
 
 Status: accepted
 
+Note (2026-07-06): ADR 0019 records the landed hosted-storage implementation
+of this decision (the Turso-only storage cutover).
+
 Hosted v1 stores each customer tenant's memory data in one isolated
 SQLite-compatible Customer Memory Database. The hosted adapter may use managed
 libSQL-compatible storage for this boundary, while local SQLite remains the
