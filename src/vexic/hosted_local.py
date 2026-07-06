@@ -8,7 +8,7 @@ import secrets
 import sqlite3
 from contextlib import closing, suppress
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit
@@ -172,6 +172,52 @@ class HostedApiKeyRecord:
     created_at: str
     revoked_at: str | None = None
     last_used_at: str | None = None
+    created_via: str = "console"
+
+
+@dataclass(frozen=True)
+class HostedSetupTokenRecord:
+    token_id: str
+    tenant_id: str
+    project_id: str
+    agent_scope: str
+    session_id: str
+    created_at: str
+    expires_at: str
+    consumed_at: str | None = None
+    consumed_key_id: str | None = None
+    revoked_at: str | None = None
+
+
+@dataclass(frozen=True)
+class ProvisionedSetupToken:
+    token_id: str
+    raw_token: str
+
+
+@dataclass(frozen=True)
+class SetupTokenExchange:
+    provisioned: ProvisionedApiKey
+    key_record: HostedApiKeyRecord
+    project_id: str
+    session_id: str
+    agent_scope: str
+
+
+@dataclass(frozen=True)
+class _HostedSetupToken:
+    token_id: str
+    token_hash: str
+    tenant_id: str
+    project_id: str
+    agent_scope: str
+    session_id: str
+    created_at: str
+    expires_at: str
+    consumed_at: str | None = None
+    consumed_key_id: str | None = None
+    revoked_at: str | None = None
+    revoked_by: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1083,6 +1129,7 @@ class HostedApiKeyStore:
     ) -> None:
         self._keys: dict[str, _HostedApiKey] = {}
         self._control_metadata: dict[str, HostedApiKeyRecord] = {}
+        self._setup_tokens: dict[str, _HostedSetupToken] = {}
         self.root_path = Path(root_path) if root_path is not None else None
         self._control_target: str | Path | StorageTarget | None = None
         if control_target is not None:
@@ -1233,6 +1280,23 @@ class HostedApiKeyStore:
     ) -> tuple[ProvisionedApiKey, HostedApiKeyRecord]:
         if not name.strip():
             raise ValueError("name must not be blank.")
+        return self._mint_control_plane_key(
+            tenant_id=tenant_id,
+            project_id=project_id,
+            name=name.strip(),
+            agent_scope=agent_scope,
+            created_via="console",
+        )
+
+    def _mint_control_plane_key(
+        self,
+        *,
+        tenant_id: str,
+        project_id: str,
+        name: str,
+        agent_scope: str,
+        created_via: str,
+    ) -> tuple[ProvisionedApiKey, HostedApiKeyRecord]:
         agent_scope = agent_scope.strip() or "shared"
         provisioned = self.create_key(
             tenant_id=tenant_id,
@@ -1248,13 +1312,14 @@ class HostedApiKeyStore:
             key_id=provisioned.key_id,
             tenant_id=tenant_id,
             project_id=project_id,
-            name=name.strip(),
+            name=name,
             capability="v1-memory",
             agent_scope=agent_scope,
             prefix=prefix,
             last4=last4,
             display=f"{prefix}...{last4}",
             created_at=stored.created_at or _now(),
+            created_via=created_via,
         )
         if self._control_target is None:
             self._control_metadata[record.key_id] = record
@@ -1265,9 +1330,9 @@ class HostedApiKeyStore:
                         """
                         INSERT INTO hosted_api_key_metadata (
                             key_id, tenant_id, project_id, name, capability, agent_scope,
-                            key_prefix, last4, display, created_at
+                            key_prefix, last4, display, created_at, created_via
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             record.key_id,
@@ -1280,6 +1345,7 @@ class HostedApiKeyStore:
                             record.last4,
                             record.display,
                             record.created_at,
+                            record.created_via,
                         ),
                     )
                     conn.commit()
@@ -1324,7 +1390,7 @@ class HostedApiKeyStore:
                     meta.key_id, meta.tenant_id, meta.project_id, meta.name,
                     meta.capability, meta.agent_scope, meta.key_prefix,
                     meta.last4, meta.display, meta.created_at, keys.revoked_at,
-                    keys.last_used_at
+                    keys.last_used_at, meta.created_via
                 FROM hosted_api_key_metadata AS meta
                 JOIN hosted_api_keys AS keys ON keys.key_id = meta.key_id
                 WHERE meta.tenant_id = ? AND meta.project_id = ? {revoked_filter}
@@ -1346,6 +1412,7 @@ class HostedApiKeyStore:
                 created_at=row[9],
                 revoked_at=row[10],
                 last_used_at=row[11],
+                created_via=row[12],
             )
             for row in rows
         ]
@@ -1376,6 +1443,196 @@ class HostedApiKeyStore:
         if row is None:
             raise PermissionError("Unknown hosted API key.")
         self.revoke_key(key_id, revoked_by=revoked_by)
+
+    def create_setup_token(
+        self,
+        *,
+        tenant_id: str,
+        project_id: str,
+        agent_scope: str = "shared",
+        session_id: str = "",
+        ttl_seconds: int = 600,
+    ) -> tuple[ProvisionedSetupToken, HostedSetupTokenRecord]:
+        agent_scope = agent_scope.strip() or "shared"
+        session_id = session_id.strip() or f"setup-{secrets.token_hex(4)}"
+        token_id = secrets.token_hex(8)
+        raw_token = f"vxsetup_{token_id}_{secrets.token_urlsafe(32)}"
+        now = datetime.now(UTC)
+        created_at = _to_z(now)
+        expires_at = _to_z(now + timedelta(seconds=ttl_seconds))
+        stored = _HostedSetupToken(
+            token_id=token_id,
+            token_hash=self._hash(raw_token),
+            tenant_id=tenant_id,
+            project_id=project_id,
+            agent_scope=agent_scope,
+            session_id=session_id,
+            created_at=created_at,
+            expires_at=expires_at,
+        )
+        if self._control_target is None:
+            self._setup_tokens[token_id] = stored
+        else:
+            with closing(self._connect_control()) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO hosted_setup_tokens (
+                        token_id, token_hash, tenant_id, project_id, agent_scope,
+                        session_id, created_at, expires_at, consumed_at,
+                        consumed_key_id, revoked_at, revoked_by
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL)
+                    """,
+                    (
+                        stored.token_id,
+                        stored.token_hash,
+                        stored.tenant_id,
+                        stored.project_id,
+                        stored.agent_scope,
+                        stored.session_id,
+                        stored.created_at,
+                        stored.expires_at,
+                    ),
+                )
+                conn.commit()
+        record = HostedSetupTokenRecord(
+            token_id=token_id,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            agent_scope=agent_scope,
+            session_id=session_id,
+            created_at=created_at,
+            expires_at=expires_at,
+        )
+        return ProvisionedSetupToken(token_id=token_id, raw_token=raw_token), record
+
+    def exchange_setup_token(self, raw_token: str) -> SetupTokenExchange:
+        parts = raw_token.split("_", 2)
+        if len(parts) != 3 or parts[0] != "vxsetup" or not parts[1] or not parts[2]:
+            raise PermissionError("Invalid setup token.")
+        token_id = parts[1]
+        token_hash = self._hash(raw_token)
+        now = _now()
+        if self._control_target is None:
+            stored = self._setup_tokens.get(token_id)
+            if stored is None or not hmac.compare_digest(stored.token_hash, token_hash):
+                raise PermissionError("Invalid setup token.")
+            if (
+                stored.consumed_at is not None
+                or stored.revoked_at is not None
+                or stored.expires_at <= now
+            ):
+                raise PermissionError("Invalid setup token.")
+            self._setup_tokens[token_id] = replace(stored, consumed_at=now)
+            tenant_id = stored.tenant_id
+            project_id = stored.project_id
+            agent_scope = stored.agent_scope
+            session_id = stored.session_id
+        else:
+            with closing(self._connect_control()) as conn:
+                row = conn.execute(
+                    """
+                    SELECT token_hash, tenant_id, project_id, agent_scope, session_id
+                    FROM hosted_setup_tokens
+                    WHERE token_id = ?
+                    """,
+                    (token_id,),
+                ).fetchone()
+                if row is None or not hmac.compare_digest(row[0], token_hash):
+                    raise PermissionError("Invalid setup token.")
+                cursor = conn.execute(
+                    """
+                    UPDATE hosted_setup_tokens
+                    SET consumed_at = ?
+                    WHERE token_id = ?
+                      AND consumed_at IS NULL
+                      AND revoked_at IS NULL
+                      AND expires_at > ?
+                    """,
+                    (now, token_id, now),
+                )
+                conn.commit()
+                if cursor.rowcount != 1:
+                    raise PermissionError("Invalid setup token.")
+            tenant_id, project_id, agent_scope, session_id = row[1], row[2], row[3], row[4]
+        # Fail closed: consumption commits before key mint, so a mint failure
+        # leaves the token consumed rather than replayable. Recovery is a fresh
+        # console-minted token, never a retry of a partially executed exchange.
+        provisioned, record = self._mint_control_plane_key(
+            tenant_id=tenant_id,
+            project_id=project_id,
+            name=f"setup-{token_id}",
+            agent_scope=agent_scope,
+            created_via="setup",
+        )
+        if self._control_target is None:
+            self._setup_tokens[token_id] = replace(
+                self._setup_tokens[token_id], consumed_key_id=provisioned.key_id
+            )
+        else:
+            with closing(self._connect_control()) as conn:
+                conn.execute(
+                    """
+                    UPDATE hosted_setup_tokens
+                    SET consumed_key_id = ?
+                    WHERE token_id = ?
+                    """,
+                    (provisioned.key_id, token_id),
+                )
+                conn.commit()
+        return SetupTokenExchange(
+            provisioned=provisioned,
+            key_record=record,
+            project_id=project_id,
+            session_id=session_id,
+            agent_scope=record.agent_scope,
+        )
+
+    def revoke_setup_token(
+        self,
+        *,
+        tenant_id: str,
+        project_id: str,
+        token_id: str,
+        revoked_by: str | None = None,
+    ) -> None:
+        now = _now()
+        if self._control_target is None:
+            stored = self._setup_tokens.get(token_id)
+            if (
+                stored is None
+                or stored.tenant_id != tenant_id
+                or stored.project_id != project_id
+            ):
+                raise PermissionError("Unknown setup token.")
+            self._setup_tokens[token_id] = replace(
+                stored,
+                revoked_at=stored.revoked_at or now,
+                revoked_by=stored.revoked_by or revoked_by,
+            )
+            return
+        with closing(self._connect_control()) as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM hosted_setup_tokens
+                WHERE token_id = ? AND tenant_id = ? AND project_id = ?
+                """,
+                (token_id, tenant_id, project_id),
+            ).fetchone()
+            if row is None:
+                raise PermissionError("Unknown setup token.")
+            conn.execute(
+                """
+                UPDATE hosted_setup_tokens
+                SET
+                    revoked_at = COALESCE(revoked_at, ?),
+                    revoked_by = COALESCE(revoked_by, ?)
+                WHERE token_id = ?
+                """,
+                (now, revoked_by, token_id),
+            )
+            conn.commit()
 
     @staticmethod
     def _hash(raw_key: str) -> str:
@@ -1428,12 +1685,41 @@ class HostedApiKeyStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS hosted_setup_tokens (
+                    token_id TEXT PRIMARY KEY,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    tenant_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    agent_scope TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    consumed_at TEXT,
+                    consumed_key_id TEXT,
+                    revoked_at TEXT,
+                    revoked_by TEXT
+                )
+                """
+            )
             columns = {
                 str(row[1])
                 for row in conn.execute("PRAGMA table_info(hosted_api_keys)").fetchall()
             }
             if "last_used_at" not in columns:
                 conn.execute("ALTER TABLE hosted_api_keys ADD COLUMN last_used_at TEXT")
+            metadata_columns = {
+                str(row[1])
+                for row in conn.execute(
+                    "PRAGMA table_info(hosted_api_key_metadata)"
+                ).fetchall()
+            }
+            if "created_via" not in metadata_columns:
+                conn.execute(
+                    "ALTER TABLE hosted_api_key_metadata "
+                    "ADD COLUMN created_via TEXT NOT NULL DEFAULT 'console'"
+                )
             conn.commit()
 
     def _load_key(self, key_id: str) -> _HostedApiKey:
@@ -1532,7 +1818,11 @@ def _load_json_list(raw: str, *, allow_none: bool = False) -> list[str | None]:
 
 
 def _now() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    return _to_z(datetime.now(UTC))
+
+
+def _to_z(value: datetime) -> str:
+    return value.isoformat().replace("+00:00", "Z")
 
 
 def _last_used_is_fresh(previous: str | None, now: str) -> bool:

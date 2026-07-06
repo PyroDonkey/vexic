@@ -855,6 +855,382 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(null_name.json()["error"]["code"], "invalid_request")
         self.assertEqual(null_agent_scope.json()["error"]["code"], "invalid_request")
 
+    def test_control_plane_setup_token_mint_requires_console_credential_and_project(self) -> None:
+        client = TestClient(
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
+        )
+        project = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo"},
+        ).json()["project"]
+        mint_path = f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/setup-tokens"
+
+        missing_credential = client.post(mint_path)
+        bad_credential = client.post(
+            mint_path,
+            headers={"Authorization": "Bearer wrong-secret"},
+        )
+        unknown_project = client.post(
+            "/control/v1/clerk-orgs/org_123/projects/proj_missing/setup-tokens",
+            headers=self._control_auth(),
+        )
+        created = client.post(
+            mint_path,
+            headers=self._control_auth(),
+            json={"agentScope": "agent-a", "sessionId": "session-setup"},
+        )
+
+        self.assertEqual(missing_credential.status_code, 401)
+        self.assertEqual(missing_credential.json()["error"]["code"], "unauthorized")
+        self.assertEqual(bad_credential.status_code, 401)
+        self.assertEqual(unknown_project.status_code, 404)
+        self.assertEqual(created.status_code, 201)
+        payload = created.json()
+        self.assertTrue(payload["rawToken"].startswith("vxsetup_"))
+        token = payload["token"]
+        self.assertEqual(token["tenantId"], project["tenantId"])
+        self.assertEqual(token["projectId"], project["id"])
+        self.assertEqual(token["agentScope"], "agent-a")
+        self.assertEqual(token["sessionId"], "session-setup")
+        self.assertTrue(token["id"])
+        self.assertTrue(token["createdAt"])
+        self.assertTrue(token["expiresAt"])
+        self.assertNotIn("vx_", created.text.replace("vxsetup_", ""))
+
+    def test_control_plane_setup_token_mint_rejects_null_string_fields(self) -> None:
+        client = TestClient(
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
+        )
+        project = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo"},
+        ).json()["project"]
+        mint_path = f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/setup-tokens"
+
+        null_agent_scope = client.post(
+            mint_path,
+            headers=self._control_auth(),
+            json={"agentScope": None},
+        )
+        null_session_id = client.post(
+            mint_path,
+            headers=self._control_auth(),
+            json={"sessionId": None},
+        )
+
+        self.assertEqual(null_agent_scope.status_code, 400)
+        self.assertEqual(null_session_id.status_code, 400)
+        self.assertEqual(null_agent_scope.json()["error"]["code"], "invalid_request")
+        self.assertEqual(null_session_id.json()["error"]["code"], "invalid_request")
+
+    def test_control_plane_setup_token_revoke_is_tenant_scoped(self) -> None:
+        client = TestClient(
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
+        )
+        project = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo"},
+        ).json()["project"]
+        minted = client.post(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/setup-tokens",
+            headers=self._control_auth(),
+        ).json()
+        token_id = minted["token"]["id"]
+        other_project = client.post(
+            "/control/v1/clerk-orgs/org_456/projects",
+            headers=self._control_auth(),
+            json={"name": "Other"},
+        ).json()["project"]
+
+        cross_org = client.post(
+            f"/control/v1/clerk-orgs/org_456/projects/{other_project['id']}"
+            f"/setup-tokens/{token_id}/revoke",
+            headers=self._control_auth(),
+        )
+        revoked = client.post(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}"
+            f"/setup-tokens/{token_id}/revoke",
+            headers=self._control_auth(),
+        )
+        revoked_again = client.post(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}"
+            f"/setup-tokens/{token_id}/revoke",
+            headers=self._control_auth(),
+        )
+
+        self.assertEqual(cross_org.status_code, 404)
+        self.assertEqual(cross_org.json()["error"]["code"], "not_found")
+        self.assertEqual(revoked.status_code, 204)
+        self.assertEqual(revoked_again.status_code, 204)
+        with self.assertRaises(PermissionError):
+            self.keys.exchange_setup_token(minted["rawToken"])
+
+    def test_setup_token_routes_are_control_plane_only_and_exchange_is_core(self) -> None:
+        core_paths = {route.path for route in create_app(self.service).routes}
+
+        self.assertIn("/v1/setup/exchange", core_paths)
+        self.assertNotIn(
+            "/control/v1/clerk-orgs/{clerk_org_id}/projects/{project_id}/setup-tokens",
+            core_paths,
+        )
+        self.assertNotIn(
+            "/control/v1/clerk-orgs/{clerk_org_id}/projects/{project_id}"
+            "/setup-tokens/{token_id}/revoke",
+            core_paths,
+        )
+
+        mint_on_core = self.client.post(
+            "/control/v1/clerk-orgs/org_123/projects/project-a/setup-tokens",
+            headers=self._control_auth(),
+        )
+        exchange_on_core = self.client.post(
+            "/v1/setup/exchange",
+            json={"token": "vxsetup_bogus_bogus"},
+        )
+
+        self.assertEqual(mint_on_core.status_code, 404)
+        self.assertEqual(exchange_on_core.status_code, 401)
+
+    def test_setup_token_exchange_returns_key_project_and_session(self) -> None:
+        client = TestClient(
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
+        )
+        project = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo"},
+        ).json()["project"]
+        minted = client.post(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/setup-tokens",
+            headers=self._control_auth(),
+            json={"sessionId": "session-setup"},
+        ).json()
+
+        exchanged = client.post("/v1/setup/exchange", json={"token": minted["rawToken"]})
+
+        self.assertEqual(exchanged.status_code, 200)
+        payload = exchanged.json()
+        self.assertTrue(payload["apiKey"].startswith("vx_"))
+        self.assertTrue(payload["keyId"])
+        self.assertEqual(payload["projectId"], project["id"])
+        self.assertEqual(payload["sessionId"], "session-setup")
+        self.assertIsNone(payload["agentId"])
+
+        append_response = client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(
+                payload["apiKey"],
+                project_id=project["id"],
+                session_id=payload["sessionId"],
+            ),
+            json=self._append_body("setup exchange cedar"),
+        )
+        search_response = client.post(
+            "/v1/search_transcript",
+            headers=self._write_headers(
+                payload["apiKey"],
+                project_id=project["id"],
+                session_id=payload["sessionId"],
+            ),
+            json={"query": "cedar", "limit": 5},
+        )
+
+        self.assertEqual(append_response.status_code, 200)
+        self.assertEqual(search_response.status_code, 200)
+        self.assertEqual(
+            [hit["body"] for hit in search_response.json()["hits"]],
+            ["User: setup exchange cedar"],
+        )
+
+    def test_setup_token_exchange_replay_and_expired_return_401_uniformly(self) -> None:
+        client = TestClient(
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
+        )
+        project = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo"},
+        ).json()["project"]
+        minted = client.post(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/setup-tokens",
+            headers=self._control_auth(),
+        ).json()
+        expired, _ = self.keys.create_setup_token(
+            tenant_id=project["tenantId"],
+            project_id=project["id"],
+            ttl_seconds=0,
+        )
+
+        first = client.post("/v1/setup/exchange", json={"token": minted["rawToken"]})
+        replayed = client.post("/v1/setup/exchange", json={"token": minted["rawToken"]})
+        expired_response = client.post(
+            "/v1/setup/exchange", json={"token": expired.raw_token}
+        )
+        garbage = client.post("/v1/setup/exchange", json={"token": "vxsetup_no_such"})
+        missing = client.post("/v1/setup/exchange", json={})
+        blank = client.post("/v1/setup/exchange", json={"token": "  "})
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(replayed.status_code, 401)
+        self.assertEqual(expired_response.status_code, 401)
+        self.assertEqual(garbage.status_code, 401)
+        self.assertEqual(replayed.json(), garbage.json())
+        self.assertEqual(expired_response.json(), garbage.json())
+        self.assertEqual(
+            garbage.json(),
+            {"error": {"code": "unauthorized", "message": "Invalid setup token."}},
+        )
+        self.assertEqual(missing.status_code, 400)
+        self.assertEqual(blank.status_code, 400)
+        self.assertEqual(missing.json()["error"]["code"], "invalid_request")
+
+    def test_setup_token_mint_storage_errors_are_classified_not_echoed(self) -> None:
+        client = TestClient(
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
+        )
+        project = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo"},
+        ).json()["project"]
+
+        with patch.object(
+            type(self.keys),
+            "create_setup_token",
+            side_effect=ValueError("Hrana: `api error: ... SQLITE_BUSY: database is locked`"),
+        ):
+            response = client.post(
+                f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/setup-tokens",
+                headers=self._control_auth(),
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "storage_unavailable")
+        self.assertNotIn("SQLITE_BUSY", response.text)
+
+    def test_setup_token_exchange_storage_failure_returns_json_500(self) -> None:
+        client = TestClient(
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
+        )
+        with patch.object(
+            type(self.keys),
+            "exchange_setup_token",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            response = client.post(
+                "/v1/setup/exchange", json={"token": "vxsetup_aa_bb"}
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(
+            response.json(),
+            {"error": {"code": "internal_error", "message": "Setup token exchange failed."}},
+        )
+
+    def test_setup_token_exchanged_key_is_revocable_and_listed_with_setup_provenance(self) -> None:
+        client = TestClient(
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
+        )
+        project = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo"},
+        ).json()["project"]
+        console_key = client.post(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/keys",
+            headers=self._control_auth(),
+            json={"name": "Worker"},
+        ).json()["key"]
+        minted = client.post(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/setup-tokens",
+            headers=self._control_auth(),
+        ).json()
+        exchanged = client.post(
+            "/v1/setup/exchange", json={"token": minted["rawToken"]}
+        ).json()
+
+        listed = client.get(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/keys",
+            headers=self._control_auth(),
+        )
+        created_via = {key["id"]: key["createdVia"] for key in listed.json()["keys"]}
+
+        self.assertEqual(created_via[console_key["id"]], "console")
+        self.assertEqual(created_via[exchanged["keyId"]], "setup")
+
+        revoked = client.post(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}"
+            f"/keys/{exchanged['keyId']}/revoke",
+            headers=self._control_auth(),
+        )
+        denied = client.post(
+            "/v1/search_transcript",
+            headers=self._write_headers(
+                exchanged["apiKey"],
+                project_id=project["id"],
+                session_id=exchanged["sessionId"],
+            ),
+            json={"query": "cedar", "limit": 5},
+        )
+
+        self.assertEqual(revoked.status_code, 204)
+        self.assertEqual(denied.status_code, 401)
+
+    def test_setup_token_exchange_agent_scoped_token_binds_agent_id(self) -> None:
+        client = TestClient(
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
+        )
+        tenant = client.post(
+            "/control/v1/clerk-orgs/org_123/tenant",
+            headers=self._control_auth(),
+        ).json()["tenant"]
+        project = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo"},
+        ).json()["project"]
+        minted = client.post(
+            f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/setup-tokens",
+            headers=self._control_auth(),
+            json={"agentScope": "agent-a"},
+        ).json()
+
+        exchanged = client.post(
+            "/v1/setup/exchange", json={"token": minted["rawToken"]}
+        ).json()
+
+        self.assertEqual(exchanged["agentId"], "agent-a")
+
+        denied_scope = _scope(
+            tenant_id=tenant["tenantId"],
+            project_id=project["id"],
+            capabilities={MemoryCapability.SEARCH},
+        ).model_copy(update={"agent_id": "agent-b"})
+        allowed = client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(
+                exchanged["apiKey"],
+                project_id=project["id"],
+                session_id=exchanged["sessionId"],
+                agent_id="agent-a",
+            ),
+            json=self._append_body("agent cedar"),
+        )
+        denied = client.post(
+            "/v1/search_transcript",
+            headers=self._auth(exchanged["apiKey"]),
+            json=SearchTranscriptRequest(
+                scope=denied_scope,
+                query="cedar",
+            ).model_dump(mode="json"),
+        )
+
+        self.assertEqual(allowed.status_code, 200)
+        self.assertEqual(denied.status_code, 403)
+
     def test_control_plane_key_revoke_invalidates_v1_memory_access(self) -> None:
         client = TestClient(
             create_control_plane_app(self.service, control_plane_tokens=("console-secret",))

@@ -18,6 +18,7 @@ from vexic.hosted_http import create_service_from_env
 from vexic.hosted_local import (
     HostedApiKeyRecord,
     HostedProjectRecord,
+    HostedSetupTokenRecord,
     _CONTROL_PLANE_AGENT_CAPABILITIES,
 )
 from vexic.storage.errors import (
@@ -237,6 +238,64 @@ def register_control_plane_routes(
             )
         except PermissionError:
             return _error_response(404, "not_found", "Key not found.")
+        return Response(status_code=204)
+
+    @app.post("/control/v1/clerk-orgs/{clerk_org_id}/projects/{project_id}/setup-tokens")
+    @_control_plane_storage_boundary
+    async def create_control_plane_setup_token(
+        clerk_org_id: str,
+        project_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        if not _has_control_plane_credential(request, control_plane_tokens):
+            return _error_response(401, "unauthorized", "Invalid control-plane credential.")
+        payload = await _json_body(request)
+        try:
+            agent_scope = _string_field(payload, "agentScope", default="")
+            session_id = _string_field(payload, "sessionId", default="")
+        except ValueError as exc:
+            return _error_response(400, "invalid_request", str(exc))
+        tenant_id = _provision_control_tenant(service, clerk_org_id)
+        try:
+            service.catalog.get_control_project(tenant_id, project_id)
+        except PermissionError:
+            return _error_response(404, "not_found", "Project not found.")
+        provisioned, record = service.api_keys.create_setup_token(
+            tenant_id=tenant_id,
+            project_id=project_id,
+            agent_scope=agent_scope,
+            session_id=session_id,
+        )
+        return JSONResponse(
+            {"rawToken": provisioned.raw_token, "token": _setup_token_payload(record)},
+            status_code=201,
+        )
+
+    @app.post(
+        "/control/v1/clerk-orgs/{clerk_org_id}/projects/{project_id}"
+        "/setup-tokens/{token_id}/revoke"
+    )
+    @_control_plane_storage_boundary
+    async def revoke_control_plane_setup_token(
+        clerk_org_id: str,
+        project_id: str,
+        token_id: str,
+        request: Request,
+    ) -> Response:
+        if not _has_control_plane_credential(request, control_plane_tokens):
+            return _error_response(401, "unauthorized", "Invalid control-plane credential.")
+        tenant_id = _resolve_control_tenant(service, clerk_org_id)
+        if tenant_id is None:
+            return _error_response(404, "not_found", "Setup token not found.")
+        try:
+            service.api_keys.revoke_setup_token(
+                tenant_id=tenant_id,
+                project_id=project_id,
+                token_id=token_id,
+                revoked_by="console-service",
+            )
+        except PermissionError:
+            return _error_response(404, "not_found", "Setup token not found.")
         return Response(status_code=204)
 
     @app.get("/control/v1/clerk-orgs/{clerk_org_id}/usage")
@@ -571,8 +630,21 @@ def _key_payload(key: HostedApiKeyRecord) -> dict[str, object]:
         "last4": key.last4,
         "display": key.display,
         "createdAt": key.created_at,
+        "createdVia": key.created_via,
         "revokedAt": key.revoked_at,
         "lastUsedAt": key.last_used_at,
+    }
+
+
+def _setup_token_payload(record: HostedSetupTokenRecord) -> dict[str, str]:
+    return {
+        "id": record.token_id,
+        "tenantId": record.tenant_id,
+        "projectId": record.project_id,
+        "agentScope": record.agent_scope,
+        "sessionId": record.session_id,
+        "createdAt": record.created_at,
+        "expiresAt": record.expires_at,
     }
 
 
