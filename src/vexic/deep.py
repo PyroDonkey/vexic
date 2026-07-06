@@ -30,7 +30,7 @@ from vexic.storage import (
 from vexic.timeutil import utc_now_iso
 from vexic.usage import UsageSummary, summarize_agent_usage
 
-# 💡 Learn: half-life ≈ 69 days because 0.99^69 ≈ 0.5. Each day multiplies the
+# Learn: half-life ≈ 69 days because 0.99^69 ≈ 0.5. Each day multiplies the
 # recency signal by 0.99, so a fact not seen for ~69 days counts about half.
 RECENCY_DECAY_BASE = 0.99
 DEFAULT_TOP_N = 15
