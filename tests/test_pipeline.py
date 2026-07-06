@@ -940,7 +940,7 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                 db_path,
                 [
                     FactCandidate(
-                        fact_text="Ryan shipped COA-297 on July 5.",
+                        fact_text="Ryan shipped the release on July 5.",
                         subject="Ryan",
                         category="event",
                         importance=6,
@@ -987,7 +987,7 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                 db_path,
                 [
                     FactCandidate(
-                        fact_text="Ryan shipped COA-297 on July 5.",
+                        fact_text="Ryan shipped the release on July 5.",
                         subject="Ryan",
                         category="event",
                         importance=6,
@@ -1015,7 +1015,7 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
 
     def test_deep_commit_is_idempotent_for_legacy_promoted_event_candidate(self) -> None:
         # Regression: the event/occurred_at check originally ran before the
-        # `promoted` idempotency skip, so a candidate promoted before COA-297
+        # `promoted` idempotency skip, so a candidate promoted before event-time support
         # shipped (occurred_at forever NULL, but already promoted=1 with a
         # linked Tier 3 fact) would raise ValueError on a benign rerun instead
         # of hitting the documented idempotent no-op.
@@ -1026,7 +1026,7 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                 db_path,
                 [
                     FactCandidate(
-                        fact_text="Ryan shipped COA-297 on July 5.",
+                        fact_text="Ryan shipped the release on July 5.",
                         subject="Ryan",
                         category="event",
                         importance=6,
@@ -1053,7 +1053,7 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                         (fact_text, subject, category, importance, confidence,
                          source_message_ids, promoted_from_candidate_id)
                     VALUES (
-                        'Ryan shipped COA-297 on July 5.', 'Ryan', 'event', 6, 0.9,
+                        'Ryan shipped the release on July 5.', 'Ryan', 'event', 6, 0.9,
                         '[1]', 1
                     )
                     """
@@ -1087,7 +1087,7 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                 db_path,
                 [
                     FactCandidate(
-                        fact_text="Ryan shipped COA-297 on July 5.",
+                        fact_text="Ryan shipped the release on July 5.",
                         subject="Ryan",
                         category="event",
                         importance=6,

@@ -1,3 +1,10 @@
+"""SQLite reference implementation of the Vexic memory service contract.
+
+``LocalMemoryService`` implements the full :class:`vexic.contract.MemoryService`
+protocol against a local SQLite database (or a libSQL ``StorageTarget``). It
+is the conformance baseline: hosted adapters wrap or mirror this behavior.
+"""
+
 from __future__ import annotations
 
 import json
@@ -107,6 +114,27 @@ _TOMBSTONE_FLAG_COLUMNS = {
 
 
 class LocalMemoryService(MemoryService):
+    """Local, single-tenant implementation of ``MemoryService`` over SQLite.
+
+    Constructor arguments (keyword-only):
+
+    - ``db_path``: SQLite file path or a ``StorageTarget`` (libSQL DSN).
+    - ``tenant_id``: the tenant this database serves; requests whose scope
+      names another tenant are rejected.
+    - ``forbidden_secret_values``: service-level secrets merged into every
+      request's ``RedactionContext`` for the egress/storage guards.
+    - ``embed``: optional embedding adapter; defaults to the local embedder.
+    - ``dream_phase_ports``: host-supplied agents for the dream phases;
+      ``run_dream_phase`` fails without them.
+    - ``content_codec``: optional encrypt/decrypt codec for stored
+      transcript content (ADR 0023); ``None`` stores plaintext.
+    - ``artifact_dir``: directory for export/replay/rebuild artifacts;
+      defaults to the OS temp dir.
+
+    Call :meth:`init_schema` once after construction (and after any
+    upgrade) before invoking operations; it creates or migrates the schema.
+    """
+
     def __init__(
         self,
         *,
@@ -139,6 +167,7 @@ class LocalMemoryService(MemoryService):
         return self.content_codec.decode(stored)
 
     def init_schema(self) -> None:
+        """Create or migrate the database schema; required before first use."""
         # Thread the codec so a first-init FTS rebuild decodes encoded rows;
         # every service entrypoint routes through here (ADR 0023).
         init_db(self.db_path, content_codec=self.content_codec)

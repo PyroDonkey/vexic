@@ -27,7 +27,7 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_PROVIDER_PREFERENCES: dict[str, Any] = {
     "provider": {"data_collection": "deny"},
 }
-# ponytail: single embedding worker; add a pool only if live runs need parallel embeddings.
+# NOTE(alpha): single embedding worker; add a pool only if live runs need parallel embeddings.
 _EMBED_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 
 EXTRACTION_INSTRUCTIONS = """\

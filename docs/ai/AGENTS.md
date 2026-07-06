@@ -171,7 +171,7 @@ Each doc owns one thing. Avoid duplicate status and copied platform history.
   conventions.
 - `docs/ai/CLAUDE.md` - Claude Code prompt-context pointer.
 - `docs/ai/CONTEXT.md` - product-language glossary for planning.
-- `docs/ai/kilo-review-policy.md` - internal review-agent calibration.
+- `docs/ai/REVIEW.md` - internal review-agent calibration.
 - `docs/adr/README.md` - index of every ADR with title and one-line status.
 - `docs/adr/*` - dated architecture decision records.
 - `docs/provenance.md` - extraction provenance from the private source host.
@@ -232,7 +232,6 @@ loop against the tracking docs remains a manual step under the triggers above.
   package manager to the core package.
 - Console and website live in the private `PyroDonkey/vexic-website` repo, not
   this one. Do not add Node package files at the repository root.
-- Type annotate new public functions and models.
 - Prefer Pydantic models and structured APIs over string parsing.
 - Keep code in focused modules that match the existing package boundaries.
 - Do not add provider secrets, hosted auth, billing, public HTTP, mature remote
@@ -241,8 +240,6 @@ loop against the tracking docs remains a manual step under the triggers above.
   limited to read-only hosted adapter code.
 - Before relying on pydantic-ai import paths or behavior, verify the current
   upstream docs. The package changes quickly.
-- Keep generated docs ASCII unless an existing file has a clear reason to use
-  non-ASCII.
 
 ## Loop Bounds and Escalation
 

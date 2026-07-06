@@ -1,3 +1,16 @@
+"""Vexic memory service contract (v0.1.0).
+
+The versioned public surface shared by every Vexic memory implementation:
+the :class:`MemoryService` protocol, the request/result models for each
+operation, and the supporting scope/capability/redaction types. Pure
+pydantic models and enums -- importing this module pulls in no storage or
+model-runtime dependencies.
+
+Key types: :class:`MemoryService` (the operation protocol),
+:class:`MemoryScope` (per-request authorization context), and
+:class:`MemoryCapability` (the permission each operation requires).
+"""
+
 from __future__ import annotations
 
 from enum import StrEnum
@@ -15,10 +28,12 @@ PRIME_CONTEXT_HEADER = "Vexic memory priming:"
 
 
 class ContractVersion(StrEnum):
+    """Supported contract versions; currently only v0.1."""
     V0_1 = CONTRACT_VERSION
 
 
 class MemoryCategory(StrEnum):
+    """Kind of durable memory a promoted fact belongs to."""
     PREFERENCE = "preference"
     FACT = "fact"
     GOAL = "goal"
@@ -30,6 +45,7 @@ class MemoryCategory(StrEnum):
 
 
 class PrincipalType(StrEnum):
+    """Who (or what) is acting: human, agent, service, operator, or system."""
     HUMAN = "human"
     AGENT = "agent"
     SERVICE = "service"
@@ -38,11 +54,13 @@ class PrincipalType(StrEnum):
 
 
 class TrustBoundary(StrEnum):
+    """Where a caller sits: local trusted process or networked client."""
     LOCAL_TRUSTED = "local_trusted"
     NETWORKED = "networked"
 
 
 class MemoryCapability(StrEnum):
+    """Fine-grained permission strings gating each memory operation."""
     READ = "memory:read"
     WRITE = "memory:write"
     SEARCH = "memory:search"
@@ -56,6 +74,7 @@ class MemoryCapability(StrEnum):
 
 
 class EgressKind(StrEnum):
+    """Classification of content leaving the store (audit/egress telemetry)."""
     EXPAND_HISTORY = "expand_history"
     EXPORT = "export"
     REPLAY = "replay"
@@ -63,6 +82,7 @@ class EgressKind(StrEnum):
 
 
 class DreamPhase(StrEnum):
+    """Background consolidation phases: light, rem, deep, summarize."""
     LIGHT = "light"
     REM = "rem"
     DEEP = "deep"
@@ -70,6 +90,7 @@ class DreamPhase(StrEnum):
 
 
 class LifecycleAction(StrEnum):
+    """Scope lifecycle steps: retire, tombstone, deferred purge, purge."""
     RETIRE = "retire"
     TOMBSTONE_SCOPE = "tombstone_scope"
     PURGE_DEFERRED = "purge_deferred"
@@ -77,10 +98,12 @@ class LifecycleAction(StrEnum):
 
 
 class MemoryContractModel(BaseModel):
+    """Base model for all contract types: extra fields forbidden, enums kept as enums."""
     model_config = ConfigDict(extra="forbid", use_enum_values=False)
 
 
 class Principal(MemoryContractModel):
+    """The acting identity attached to a scope: an id plus its type."""
     principal_id: str = Field(min_length=1)
     principal_type: PrincipalType
 
@@ -99,6 +122,10 @@ def _scope_identifier_must_not_be_blank(value: str | None) -> str | None:
 
 
 class MemoryScope(MemoryContractModel):
+    """Authorization context for a request: tenant (required), optional
+    project/user/session/agent ids, the acting principal, trust boundary,
+    and the capability set the caller holds.
+    """
     tenant_id: str = Field(min_length=1)
     project_id: str | None = None
     user_id: str | None = None
@@ -123,6 +150,9 @@ class MemoryScope(MemoryContractModel):
 
 
 class MemoryScopeSelector(MemoryContractModel):
+    """Scope pattern used to target rows for lifecycle operations; ``None``
+    fields are wildcards within the tenant.
+    """
     tenant_id: str = Field(min_length=1)
     project_id: str | None = None
     user_id: str | None = None
@@ -142,6 +172,7 @@ class MemoryScopeSelector(MemoryContractModel):
 
 
 class RedactionContext(MemoryContractModel):
+    """Secret values that must never appear in stored or egressed content."""
     forbidden_values: tuple[str, ...]
 
 
@@ -151,11 +182,13 @@ def require_capability(scope: MemoryScope, capability: MemoryCapability) -> None
 
 
 class MemoryRequest(MemoryContractModel):
+    """Base request: pins the contract version and carries the caller's scope."""
     contract_version: Literal["0.1.0"] = CONTRACT_VERSION
     scope: MemoryScope
 
 
 class SessionScopedRequest(MemoryRequest):
+    """Request whose scope must include a ``session_id``."""
     @model_validator(mode="after")
     def _scope_must_include_session_id(self) -> Self:
         if self.scope.session_id is None:
@@ -164,10 +197,12 @@ class SessionScopedRequest(MemoryRequest):
 
 
 class RedactionRequiredRequest(MemoryRequest):
+    """Request that must carry a ``RedactionContext``."""
     redaction: RedactionContext
 
 
 class SessionScopedRedactionRequiredRequest(RedactionRequiredRequest):
+    """Request requiring both a ``session_id`` and a ``RedactionContext``."""
     @model_validator(mode="after")
     def _scope_must_include_session_id(self) -> Self:
         if self.scope.session_id is None:
@@ -176,10 +211,12 @@ class SessionScopedRedactionRequiredRequest(RedactionRequiredRequest):
 
 
 class MemoryResult(MemoryContractModel):
+    """Base result: echoes the contract version."""
     contract_version: Literal["0.1.0"] = CONTRACT_VERSION
 
 
 class TranscriptHit(MemoryContractModel):
+    """One transcript message matched by search or replay."""
     message_id: int
     session_id: str
     timestamp: str | None = None
@@ -187,6 +224,7 @@ class TranscriptHit(MemoryContractModel):
 
 
 class LongTermFact(MemoryContractModel):
+    """A promoted durable fact, traceable to its source message ids."""
     fact_id: int
     fact_text: str
     subject: str
@@ -201,6 +239,7 @@ class LongTermFact(MemoryContractModel):
 
 
 class CandidateNote(MemoryContractModel):
+    """A staged (not yet promoted) memory candidate."""
     candidate_id: int
     fact_text: str
     category: MemoryCategory
@@ -209,6 +248,7 @@ class CandidateNote(MemoryContractModel):
 
 
 class RetrievalEvent(MemoryContractModel):
+    """Record of one fact retrieval and its eventual usefulness verdict."""
     event_id: int
     referent_id: int
     session_id: str
@@ -219,6 +259,7 @@ class RetrievalEvent(MemoryContractModel):
 
 
 class SummaryNode(MemoryContractModel):
+    """A compacted summary covering a contiguous transcript span."""
     summary_id: int
     session_id: str
     first_message_id: int
@@ -229,15 +270,18 @@ class SummaryNode(MemoryContractModel):
 
 
 class AppendTranscriptRequest(SessionScopedRedactionRequiredRequest):
+    """Append serialized messages to a session transcript (requires WRITE)."""
     required_capability: ClassVar[MemoryCapability] = MemoryCapability.WRITE
     messages_json: list[str]
 
 
 class AppendTranscriptResult(MemoryResult):
+    """Ids assigned to the appended messages."""
     message_ids: list[int]
 
 
 class SourceTranscriptMessage(MemoryContractModel):
+    """One externally-recorded message with its source coordinates for dedup."""
     source_host: str = Field(min_length=1)
     source_session_id: str = Field(min_length=1)
     source_message_id: str = Field(min_length=1)
@@ -252,6 +296,7 @@ class SourceTranscriptMessage(MemoryContractModel):
 
 
 class SourceTranscriptIngestItemResult(MemoryContractModel):
+    """Per-message ingest outcome: inserted, skipped, or rejected."""
     source_host: str
     source_session_id: str
     source_message_id: str
@@ -262,42 +307,50 @@ class SourceTranscriptIngestItemResult(MemoryContractModel):
 
 
 class IngestSourceTranscriptRequest(SessionScopedRedactionRequiredRequest):
+    """Idempotently ingest recorder-captured messages (requires WRITE)."""
     required_capability: ClassVar[MemoryCapability] = MemoryCapability.WRITE
     messages: list[SourceTranscriptMessage]
 
 
 class IngestSourceTranscriptResult(MemoryResult):
+    """Per-item outcomes for an ingest batch."""
     items: list[SourceTranscriptIngestItemResult]
 
 
 class SearchTranscriptRequest(SessionScopedRequest):
+    """Full-text search within one session's transcript (requires SEARCH)."""
     required_capability: ClassVar[MemoryCapability] = MemoryCapability.SEARCH
     query: str
     limit: int = 5
 
 
 class SearchTranscriptResult(MemoryResult):
+    """Transcript messages matching the query."""
     hits: list[TranscriptHit]
 
 
 class ExpandHistoryRequest(SessionScopedRedactionRequiredRequest):
+    """Fetch a verbatim message-id range from the transcript (requires EXPAND_HISTORY)."""
     required_capability: ClassVar[MemoryCapability] = MemoryCapability.EXPAND_HISTORY
     first_message_id: int
     last_message_id: int
 
 
 class ExpandHistoryResult(MemoryResult):
+    """Rendered transcript text for the requested range."""
     egress_kind: EgressKind = EgressKind.EXPAND_HISTORY
     text: str
     truncated: bool = False
 
 
 class FreshContextRequest(SessionScopedRedactionRequiredRequest):
+    """Build session-start priming context within a token budget (requires FRESH_CONTEXT)."""
     required_capability: ClassVar[MemoryCapability] = MemoryCapability.FRESH_CONTEXT
     token_budget: int = 6_000
 
 
 class FreshContextResult(MemoryResult):
+    """Summaries plus recent messages rendered as priming text."""
     summaries: list[SummaryNode] = Field(default_factory=list)
     recent: list[TranscriptHit] = Field(default_factory=list)
     text: str
@@ -305,6 +358,7 @@ class FreshContextResult(MemoryResult):
 
 
 class SearchLongTermRequest(MemoryRequest):
+    """Semantic search over durable facts and candidates (requires SEARCH)."""
     required_capability: ClassVar[MemoryCapability] = MemoryCapability.SEARCH
     query: str
     limit: int = 5
@@ -312,20 +366,24 @@ class SearchLongTermRequest(MemoryRequest):
 
 
 class SearchLongTermResult(MemoryResult):
+    """Matching facts, with candidate notes as fallback."""
     facts: list[LongTermFact] = Field(default_factory=list)
     candidate_notes: list[CandidateNote] = Field(default_factory=list)
 
 
 class RecordRetrievalEventRequest(RedactionRequiredRequest):
+    """Persist a retrieval event or usefulness verdict (requires WRITE)."""
     required_capability: ClassVar[MemoryCapability] = MemoryCapability.WRITE
     event: RetrievalEvent
 
 
 class RecordRetrievalEventResult(MemoryResult):
+    """Id of the recorded retrieval event."""
     event_id: int
 
 
 class RetireFactRequest(MemoryRequest):
+    """Soft-retire a fact, optionally naming its successor (requires WRITE)."""
     required_capability: ClassVar[MemoryCapability] = MemoryCapability.WRITE
     fact_id: int
     superseded_by_fact_id: int | None = None
@@ -333,15 +391,18 @@ class RetireFactRequest(MemoryRequest):
 
 
 class RetireFactResult(MemoryResult):
+    """Whether the fact was retired."""
     retired: bool
 
 
 class RunDreamPhaseRequest(RedactionRequiredRequest):
+    """Execute one consolidation phase directly (requires ADMIN_REBUILD)."""
     required_capability: ClassVar[MemoryCapability] = MemoryCapability.ADMIN_REBUILD
     phase: DreamPhase
 
 
 class RunDreamPhaseResult(MemoryResult):
+    """Phase outcome: ok, error, or partial."""
     phase: DreamPhase
     status: Literal["ok", "error", "partial"]
 
@@ -380,33 +441,40 @@ class TriggerDreamPhaseResult(MemoryResult):
 
 
 class ExportScopeRequest(RedactionRequiredRequest):
+    """Export all scope content to an artifact (requires EXPORT)."""
     required_capability: ClassVar[MemoryCapability] = MemoryCapability.EXPORT
     egress_kind: EgressKind = EgressKind.EXPORT
 
 
 class ExportScopeResult(MemoryResult):
+    """Reference to the written export artifact."""
     artifact_ref: str
 
 
 class ReplayScopeRequest(RedactionRequiredRequest):
+    """Return the scope's transcript verbatim (requires REPLAY)."""
     required_capability: ClassVar[MemoryCapability] = MemoryCapability.REPLAY
     egress_kind: EgressKind = EgressKind.REPLAY
 
 
 class ReplayScopeResult(MemoryResult):
+    """The replayed transcript messages."""
     messages: list[TranscriptHit]
 
 
 class RebuildRequest(RedactionRequiredRequest):
+    """Rebuild derived projections from canonical rows (requires ADMIN_REBUILD)."""
     required_capability: ClassVar[MemoryCapability] = MemoryCapability.ADMIN_REBUILD
     return_artifacts: bool = False
 
 
 class RebuildResult(MemoryResult):
+    """Optional artifact reference from the rebuild."""
     artifact_ref: str | None = None
 
 
 class DeleteScopeRequest(RedactionRequiredRequest):
+    """Tombstone a scope so it is blocked from retrieval/egress (requires ADMIN_LIFECYCLE)."""
     required_capability: ClassVar[MemoryCapability] = MemoryCapability.ADMIN_LIFECYCLE
     target_scope: MemoryScopeSelector
     reason: str
@@ -419,6 +487,7 @@ class DeleteScopeRequest(RedactionRequiredRequest):
 
 
 class TombstoneRecord(MemoryContractModel):
+    """A scope tombstone: what is blocked, by whom, and why."""
     tombstone_id: str
     target_scope: MemoryScopeSelector
     created_by: Principal
@@ -431,6 +500,7 @@ class TombstoneRecord(MemoryContractModel):
 
 
 class DeleteScopeResult(MemoryResult):
+    """The tombstone created for the deleted scope."""
     tombstone: TombstoneRecord
 
 
@@ -457,6 +527,7 @@ class PurgeScopeRequest(RedactionRequiredRequest):
 
 
 class PurgeScopeResult(MemoryResult):
+    """Row counts physically purged (or that would be, on dry run)."""
     tombstone_id: str
     purged: dict[str, int]
     dry_run: bool
@@ -465,6 +536,14 @@ class PurgeScopeResult(MemoryResult):
 
 @runtime_checkable
 class MemoryService(Protocol):
+    """The Vexic memory service contract.
+
+    Structural (``Protocol``) and runtime-checkable: any object exposing
+    these async operations satisfies it. ``LocalMemoryService`` is the
+    SQLite reference implementation; hosted adapters implement the same
+    surface. Every operation takes a versioned request model carrying a
+    ``MemoryScope`` and returns the matching result model.
+    """
     async def append_transcript(
         self,
         request: AppendTranscriptRequest,

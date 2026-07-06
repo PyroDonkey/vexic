@@ -113,16 +113,29 @@ def test_console_and_website_are_not_tracked_in_this_repository() -> None:
     assert tracked == ""
 
 
-def test_superpowers_specs_do_not_embed_tracking_references() -> None:
-    tracker_name = "L" + "inear"
+def test_public_tree_does_not_embed_tracking_references() -> None:
+    """Code and non-ADR docs must not reference the private issue tracker.
+
+    Allowed locations: docs/adr/ (decision provenance), docs/provenance.md,
+    the PR template example, and dated drill/tabletop logs (historical records).
+    """
     ticket_pattern = re.compile(r"\b" + "C" + r"OA-\d+\b")
+    allowed = ("docs/adr/", "docs/provenance.md")
+    dated_log = re.compile(r"docs/runbooks/[^/]+/\d{4}-\d{2}-\d{2}-")
     offenders: list[str] = []
-    specs_dir = ROOT / "docs" / "superpowers" / "specs"
-    for path in specs_dir.glob("*.md"):
-        lines = path.read_text(encoding="utf-8").splitlines()
-        for line_number, line in enumerate(lines, 1):
-            if tracker_name in line or ticket_pattern.search(line):
-                location = f"{path.relative_to(ROOT)}:{line_number}"
-                offenders.append(f"{location}: {line.strip()}")
+    scan_dirs = ("src", "tests", "adapters", "scripts", "docs")
+    for scan in scan_dirs:
+        for path in (ROOT / scan).rglob("*"):
+            if not path.is_file() or path.suffix not in {".py", ".md"}:
+                continue
+            rel = path.relative_to(ROOT).as_posix()
+            if rel == "tests/test_public_boundary.py":
+                continue
+            if rel.startswith(allowed) or dated_log.match(rel):
+                continue
+            lines = path.read_text(encoding="utf-8").splitlines()
+            for line_number, line in enumerate(lines, 1):
+                if ticket_pattern.search(line):
+                    offenders.append(f"{rel}:{line_number}: {line.strip()}")
 
     assert offenders == []

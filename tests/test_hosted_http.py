@@ -518,7 +518,7 @@ class HostedHttpTests(unittest.TestCase):
         )
 
         # The project does not exist, so key creation fails -- but the write
-        # path still auto-provisions the tenant, as before COA-248.
+        # path still auto-provisions the tenant, preserving prior behavior.
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.json()["error"]["code"], "not_found")
         self._assert_fresh_org_provisioned("org_new")
@@ -764,7 +764,7 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(denied.status_code, 401)
 
     def test_control_plane_scope_template_capabilities_match_actual_grant(self) -> None:
-        """Kill drift between the two capability lists (COA-254): the scope
+        """Kill drift between the two capability lists: the scope
         template shown/returned by the control-plane API
         (`_CONTROL_PLANE_SCOPE_CAPABILITIES`) must always match the
         capabilities actually granted to console-created keys
@@ -778,7 +778,7 @@ class HostedHttpTests(unittest.TestCase):
 
     def test_control_plane_key_grants_fresh_context_and_dream_trigger(self) -> None:
         """Console-created keys must work with /v1/fresh_context and
-        /v1/trigger_dream_phase (COA-254): both routes bind their scope's
+        /v1/trigger_dream_phase: both routes bind their scope's
         capabilities against the KEY's granted capabilities (see
         `HostedMemoryService._bind_request`'s `scope.capabilities &
         auth.capabilities` intersection), so the console-side grant must
@@ -1212,7 +1212,7 @@ class HostedHttpTests(unittest.TestCase):
         )
 
     def test_hosted_search_long_term_header_bound_body_accepts_as_of(self) -> None:
-        """COA-298: the header-bound `_HeaderBoundSearchBody` used by
+        """The header-bound `_HeaderBoundSearchBody` used by
         `/v1/search_long_term` must accept `as_of` (not reject it as an
         unexpected key) and thread it into `SearchLongTermRequest.as_of`, so
         the filter actually reaches the storage layer.
@@ -1265,7 +1265,7 @@ class HostedHttpTests(unittest.TestCase):
         )
 
     def test_hosted_search_transcript_header_bound_body_rejects_as_of(self) -> None:
-        """COA-298: `as_of` is a `SearchLongTermRequest`-only field.
+        """`as_of` is a `SearchLongTermRequest`-only field.
         `SearchTranscriptRequest` has no `as_of`, so a header-bound
         `/v1/search_transcript` call carrying it must be rejected (422),
         not silently accepted and dropped.

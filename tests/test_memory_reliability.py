@@ -866,7 +866,7 @@ class OfflineRetrievalBaselinePreflightTests(unittest.IsolatedAsyncioTestCase):
 
 
 class OccurredAtRoundTripTests(unittest.TestCase):
-    # COA-297: `occurred_at` is a nullable, flexible ISO-ish event-time string
+    # `occurred_at` is a nullable, flexible ISO-ish event-time string
     # (e.g. "2025-03" or "2025-03-14") threaded through Tier 2 candidate
     # insert/merge/load and Tier 3 fact insert/fetch. These tests exercise the
     # SQL wiring directly; promotion.py's carry-through of occurred_at into
@@ -1105,7 +1105,7 @@ class OccurredAtRoundTripTests(unittest.TestCase):
 
 
 class LongTermSearchAsOfFilterTests(unittest.TestCase):
-    # COA-298: `as_of` restricts keyword (FTS) and vector (KNN) Tier 3 search
+    # `as_of` restricts keyword (FTS) and vector (KNN) Tier 3 search
     # to facts whose COALESCE(NULLIF(occurred_at, ''), created_at) <= as_of.
     # Facts are seeded directly via insert_long_term_fact rather than a full
     # dream->deep promotion cycle -- cheaper, and keeps this search-filtering
@@ -1295,7 +1295,7 @@ class LongTermSearchAsOfFilterTests(unittest.TestCase):
 
 
 class RetrieveLongTermFactsAsOfThreadThroughTests(unittest.IsolatedAsyncioTestCase):
-    # COA-298 step 4: retrieve_long_term_facts must thread `as_of` into both
+    # retrieve_long_term_facts must thread `as_of` into both
     # keyword_long_term_fact_ids and nearest_long_term_facts. This is a
     # tracer bullet for the thread-through, not a re-test of the filtering
     # semantics themselves (already covered by LongTermSearchAsOfFilterTests
@@ -1372,7 +1372,7 @@ class RetrieveLongTermFactsAsOfThreadThroughTests(unittest.IsolatedAsyncioTestCa
 
 
 class CandidateSearchAsOfFilterTests(unittest.TestCase):
-    # COA-298: `as_of` restricts keyword (FTS) and vector (KNN) Tier 2
+    # `as_of` restricts keyword (FTS) and vector (KNN) Tier 2
     # candidate-fallback search to candidates whose
     # COALESCE(NULLIF(occurred_at, ''), created_at) <= as_of. Candidates are
     # seeded via commit_dream_cycle (the existing dedup-aware insert path),

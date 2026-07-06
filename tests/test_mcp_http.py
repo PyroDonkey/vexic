@@ -210,7 +210,7 @@ class McpHttpTests(unittest.TestCase):
         self.assertIn("Embeddings", result["content"][0]["text"])
 
     def test_recall_user_memory_accepts_as_of_argument(self) -> None:
-        """COA-298: the `recall_user_memory` tool's extra-key allowlist
+        """The `recall_user_memory` tool's extra-key allowlist
         (`_reject_extra(arguments, {"query", "limit"})`) must accept `as_of`
         and thread it into `SearchLongTermRequest.as_of`.
         """

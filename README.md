@@ -2,7 +2,7 @@
 
 **Memory your agents can trust.**
 
-[![PyPI version](https://img.shields.io/pypi/v/vexic.svg)](https://pypi.org/project/vexic/)
+[![PyPI](https://img.shields.io/badge/PyPI-coming%20soon-lightgrey.svg)](https://pypi.org/project/vexic/)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![CI](https://github.com/PyroDonkey/vexic/actions/workflows/ci.yml/badge.svg)](https://github.com/PyroDonkey/vexic/actions/workflows/ci.yml)
 [![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-blue.svg)](https://www.python.org/)
@@ -45,6 +45,46 @@ The server exposes two read-only tools to the agent: `recall_conversation_histor
 (this session's transcript) and `recall_user_memory` (durable facts and
 preferences). See [`docs/usage.md`](docs/usage.md) for MCP client setup, the
 transcript recorder, and smoke-test examples.
+
+## Python Quickstart
+
+Use the library directly from Python — append to a session transcript, then
+search it back:
+
+```python
+import asyncio
+from pydantic_ai.messages import ModelRequest, UserPromptPart
+from vexic import (
+    AppendTranscriptRequest, LocalMemoryService, MemoryCapability, MemoryScope,
+    Principal, PrincipalType, RedactionContext, SearchTranscriptRequest, TrustBoundary,
+)
+from vexic.storage import single_message_adapter
+
+scope = MemoryScope(
+    tenant_id="local", session_id="session-1",
+    principal=Principal(principal_id="me", principal_type=PrincipalType.HUMAN),
+    trust_boundary=TrustBoundary.LOCAL_TRUSTED,
+    capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH},
+)
+
+async def main() -> None:
+    service = LocalMemoryService(db_path="memory.db", tenant_id="local")
+    service.init_schema()
+    message = ModelRequest(parts=[UserPromptPart(content="I prefer tabs over spaces.")])
+    await service.append_transcript(AppendTranscriptRequest(
+        scope=scope,
+        messages_json=[single_message_adapter.dump_json(message).decode()],
+        redaction=RedactionContext(forbidden_values=()),
+    ))
+    result = await service.search_transcript(SearchTranscriptRequest(scope=scope, query="tabs"))
+    print(result.hits[0].body)
+
+asyncio.run(main())
+```
+
+Output: `User: I prefer tabs over spaces.` All environment variables the
+package and its adapters read are listed in
+[`docs/configuration.md`](docs/configuration.md).
 
 ## Repository Map
 

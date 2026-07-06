@@ -1,3 +1,7 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "vexic"
 version = "0.1.0"
@@ -33,7 +37,22 @@ dev = [
     "httpx>=0.28.1",
     "libsql>=0.1.0",
     "pytest>=9.0.3",
+    "ruff>=0.14.9",
     "uvicorn[standard]>=0.49.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vexic"]
+
+[tool.hatch.build.targets.sdist]
+only-include = [
+    "src",
+    "tests",
+    "scripts",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "pyproject.toml",
 ]
 
 [tool.pytest.ini_options]
@@ -41,3 +60,16 @@ pythonpath = ["src", "."]
 markers = [
     "turso: live tests that require TURSO_DATABASE_URL + TURSO_AUTH_TOKEN and the libsql extra",
 ]
+
+[tool.ruff]
+target-version = "py313"
+
+[tool.ruff.lint]
+ignore = [
+    # The project rule requires annotations; it does not ban intentionally
+    # dynamic host-port/plugin boundaries.
+    "ANN401",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ANN"]

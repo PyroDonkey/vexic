@@ -285,7 +285,7 @@ class VexicSchemaOwnershipTests(unittest.TestCase):
 
 
 class OccurredAtFieldDefaultTests(unittest.TestCase):
-    """COA-297: occurred_at is a nullable, flexible event-time string that
+    """occurred_at is a nullable, flexible event-time string that
     defaults to None so existing callers that construct these types without
     it keep working."""
 

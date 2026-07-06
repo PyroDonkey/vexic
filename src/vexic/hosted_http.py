@@ -47,7 +47,7 @@ from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 
 
 class _TursoProvisioning:
-    """Injection seam for the ``turso`` factory branch (COA-273 Task 16, P4).
+    """Injection seam for the ``turso`` factory branch.
 
     Wraps the two secret-bearing pieces that ``src/vexic`` is NOT permitted to
     construct directly (ADR 0019): the ``TursoProvisioningPort`` (platform API
@@ -57,17 +57,17 @@ class _TursoProvisioning:
     with no real credentials.
     """
 
-    def build_port(self, env: dict[str, str]):
+    def build_port(self, env: dict[str, str]) -> object:
         from adapters.turso_adapter import TursoProvisioningPort
 
         return TursoProvisioningPort.from_env(env)
 
-    def build_resolver(self, token_cache, *, org: str):
+    def build_resolver(self, token_cache: object, *, org: str) -> object:
         from adapters.turso_adapter import make_customer_target_resolver
 
         return make_customer_target_resolver(token_cache, org=org)
 
-    def build_token_cache(self, port):
+    def build_token_cache(self, port: object) -> object:
         from adapters.turso_adapter import TenantTokenCache
 
         return TenantTokenCache(port)
@@ -115,7 +115,10 @@ def create_app(
     )
 
     @app.middleware("http")
-    async def cap_body(request: Request, call_next: Callable[[Request], Awaitable[object]]):
+    async def cap_body(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[object]],
+    ) -> object:
         if request.method in {"POST", "PUT", "PATCH"}:
             content_length = request.headers.get("content-length")
             if content_length is not None:
@@ -202,7 +205,7 @@ def create_service_from_env(
     ``VEXIC_HOSTED_ROOT``, with no customer-target resolver (each tenant's
     local ``db_path`` is used unchanged).
 
-    ``VEXIC_STORAGE_BACKEND=turso`` (COA-273 Task 16, P4) keeps the
+    ``VEXIC_STORAGE_BACKEND=turso`` keeps the
     control-plane (``HostedTenantCatalog``/``HostedApiKeyStore``, i.e. auth +
     tenant lookup) LOCAL/filesystem-rooted exactly as in the ``local`` branch,
     but routes customer memory to a per-tenant Turso database. It builds a
@@ -256,7 +259,7 @@ def create_service_from_env(
 
 def _ensure_dogfood_tenant_target(catalog: HostedTenantCatalog) -> None:
     """Provision a real per-tenant Turso DB for the dogfood tenant if it has
-    no ``customer_target`` yet (COA-273 Task 16, P4).
+    no ``customer_target`` yet.
 
     The dogfood tenant is named by ``VEXIC_DOGFOOD_TENANT_ID`` (unset -> no-op,
     so the ``turso`` backend is usable with tenants provisioned out of band,

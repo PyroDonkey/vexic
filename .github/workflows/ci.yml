@@ -15,6 +15,10 @@ jobs:
         uses: astral-sh/setup-uv@v5
       - name: Set up Python
         run: uv python install 3.13
+      - name: Check Python annotations
+        run: uv run ruff check --select ANN --ignore ANN401 .
+      - name: Check docs ASCII
+        run: uv run python scripts/check_docs_ascii.py docs
       - name: Check doc drift
         run: uv run python scripts/check_doc_drift.py --ci
       - name: Run tests

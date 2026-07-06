@@ -1103,7 +1103,7 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Embeddings", response["result"]["content"][0]["text"])
 
     async def test_recall_user_memory_accepts_as_of_argument(self) -> None:
-        """COA-298: the stdio `recall_user_memory` tool's extra-key
+        """The stdio `recall_user_memory` tool's extra-key
         allowlist (`_reject_extra(arguments, {"query", "limit"})`) must
         accept `as_of` and thread it into `SearchLongTermRequest.as_of`.
         """

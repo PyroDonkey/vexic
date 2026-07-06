@@ -32,7 +32,7 @@ def test_fake_rejects_named_params_and_row_factory():
 
 
 # ---------------------------------------------------------------------------
-# Task 10 (COA-273 P3): control-plane connection routed through
+# Control-plane connection routed through
 # `connect(target, auth_token)`, with the filesystem-only permission guard
 # (`os.open`/`os.chmod`) skipped for a `StorageTarget` control-plane target.
 #
@@ -327,7 +327,7 @@ def test_control_plane_round_trips_on_real_turso(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Task 12 (COA-273 P3): `activate_replacement_database` accepts EITHER a local
+# `activate_replacement_database` accepts EITHER a local
 # filesystem replacement (existing under-root/customer-file behavior) OR a
 # Turso DSN replacement (string-identity validation, no `Path`/`os` checks),
 # and bumps the catalog `generation` counter on a successful repoint of
@@ -527,7 +527,7 @@ def test_activate_replacement_database_rejects_dsn_tenant_mismatch(monkeypatch, 
 
 
 # ---------------------------------------------------------------------------
-# FIX I-1 (COA-273 final review): `_provision_control_tenant` wraps every
+# Regression guard: `_provision_control_tenant` wraps every
 # `ValueError` from `provision_customer_account` as an HTTP 400
 # `_ControlPlaneBadRequest`. Once the control plane runs on Turso, a genuine
 # constraint/operational SQL failure arrives as a BARE `ValueError` carrying a
@@ -662,7 +662,7 @@ def test_resolve_control_tenant_domain_valueerror_still_becomes_bad_request():
 
 
 # ---------------------------------------------------------------------------
-# FIX I-2 (COA-273 final review): `_replacement_migration_scope` catches only
+# Regression guard: `_replacement_migration_scope` catches only
 # `sqlite3.DatabaseError` when reading `canonical_migration_imports`. For a
 # Turso-DSN replacement whose replacement db lacks that table, the libSQL
 # driver raises a BARE `ValueError` ("no such table"), which slips past the

@@ -58,7 +58,7 @@ sanitized operational telemetry.
 
 Following the public flip (COA-276), Vexic Console and the marketing website
 moved out of this repository into a private repo, `PyroDonkey/vexic-website`
-(COA-295 — scope expanded during execution to include the marketing site
+(COA-295 -- scope expanded during execution to include the marketing site
 alongside Console; see the issue for the recorded decision). This is a
 boundary change, not a reversal of this ADR: Console remains a control-plane
 client of the hosted Vexic API, not memory-core runtime.

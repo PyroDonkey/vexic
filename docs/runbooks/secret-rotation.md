@@ -23,8 +23,8 @@
    one. Rotation invalidates active console sessions; schedule accordingly.
 2. Update `CLERK_SECRET_KEY` in the deploy platform's secret store.
 3. For local development, update the untracked `.env.local` in the private
-   `PyroDonkey/vexic-website` repo's `console/` directory (COA-295 — console
-   no longer lives in this repo).
+   `PyroDonkey/vexic-website` repo's `console/` directory (the console no
+   longer lives in this repo).
 
 ## Rotate a Turso database auth token
 

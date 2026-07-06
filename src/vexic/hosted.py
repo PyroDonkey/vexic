@@ -103,8 +103,8 @@ def register_hosted_write_routes(
     from fastapi import Request
 
     async def append_transcript(
-        request,
-        payload,
+        request: Request,
+        payload: HostedAppendTranscriptBody,
     ) -> object:
         return await _handle_hosted_write(
             "append_transcript",
@@ -122,8 +122,8 @@ def register_hosted_write_routes(
         )
 
     async def ingest_source_transcript(
-        request,
-        payload,
+        request: Request,
+        payload: HostedIngestSourceTranscriptBody,
     ) -> object:
         return await _handle_hosted_write(
             "ingest_source_transcript",
@@ -277,7 +277,7 @@ class HostedTenant:
     tenant_id: str
     db_path: str | StorageTarget
     project_ids: frozenset[str]
-    # Catalog data model only (COA-273 Task 11): `customer_target` is the DSN
+    # Catalog data model only: `customer_target` is the DSN
     # string for the tenant's customer-memory database, or `None` to use the
     # local `db_path` (unchanged behavior). NEVER a token here -- resolving
     # this into a connectable, token-bearing `StorageTarget` is P4 work.
@@ -435,7 +435,7 @@ class HostedInMemoryRateLimiter:
             for key, bucket in self._buckets.items()
             if bucket.expires_at <= now
         ]
-        # ponytail: O(n) prune is fine for staging; production needs a durable limiter.
+        # NOTE(alpha): O(n) prune is fine for staging; production needs a durable limiter.
         for key in expired:
             del self._buckets[key]
         self._next_prune_at = min(
@@ -486,7 +486,7 @@ class HostedMemoryService:
         self.telemetry = telemetry
         self.rate_limiter = rate_limiter or HostedInMemoryRateLimiter()
         self.dream_phase_ports = dream_phase_ports
-        # COA-273 Task 16 (P4): per-tenant customer-memory resolver. Given a
+        # Per-tenant customer-memory resolver. Given a
         # `HostedTenant`, it returns a connectable, token-bearing
         # `StorageTarget` for the tenant's Turso customer-memory DB (derived
         # from its catalog `customer_target` DSN), or `None` to use the local
@@ -495,7 +495,7 @@ class HostedMemoryService:
         # shared-DB / second-tenant hazard. Secrets (the minted jwt) live only
         # inside the resolver, which is built in `adapters/`.
         self._customer_target_resolver = customer_target_resolver
-        # trigger_dream_phase (COA-254 T-A / ADR 0025): per-(tenant_id,
+        # trigger_dream_phase (ADR 0025): per-(tenant_id,
         # agent_id) in-process in-flight guard so a concurrent trigger is a
         # cheap no-op (`skipped/already_running`) instead of a second
         # summarize sweep. Process-local by design (see plan D3's accepted
@@ -657,7 +657,7 @@ class HostedMemoryService:
     ) -> TriggerDreamPhaseResult:
         """Schedule a tenant(+agent)-wide summarize sweep and return at once.
 
-        THE CRITICAL ROUTING (COA-254 T-A / ADR 0025, plan D1-D3): this
+        THE CRITICAL ROUTING (ADR 0025, plan D1-D3): this
         authenticates + binds + rate-checks EXACTLY ONCE, at this trigger
         boundary, against `TriggerDreamPhaseRequest`'s own
         `MemoryCapability.DREAM_TRIGGER` -- deliberately NOT
@@ -1202,7 +1202,7 @@ def run_dream_phase_command(args: argparse.Namespace) -> int:
         rate_limiter=HostedInMemoryRateLimiter(),
         dream_phase_ports=_dream_phase_ports(args),
     )
-    # ponytail: staging CLI assumes no concurrent tenant writers; add event ids if shared.
+    # NOTE(alpha): staging CLI assumes no concurrent tenant writers; add event ids if shared.
     usage_event_offset = len(catalog.usage_events(args.tenant_id))
     runner = HostedBackgroundJobRunner(service)
     with contextlib.redirect_stdout(sys.stderr):
@@ -1234,7 +1234,7 @@ def run_dream_phase_command(args: argparse.Namespace) -> int:
     return 0
 
 
-def resolve_storage_backend(env) -> str:
+def resolve_storage_backend(env: Mapping[str, str]) -> str:
     """Resolve the non-secret ``VEXIC_STORAGE_BACKEND`` selection flag.
 
     Defaults to ``"local"`` (filesystem SQLite, unchanged behavior). ``"turso"``

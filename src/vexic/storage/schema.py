@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 from vexic.redaction import assert_no_forbidden_secret_values as _assert_no_forbidden_secret_values
 from vexic.storage.connection import connect
 
-# Process-level init-once memo (P1, COA-273): DDL against a hosted libSQL/Turso
+# Process-level init-once memo: DDL against a hosted libSQL/Turso
 # target incurs per-request remote round-trips, so re-running the full
 # init_db/init_vector_memory body on every storage call is a latency bug there
 # (harmless-but-wasteful on local sqlite). Keyed on target identity only -- an
