@@ -202,6 +202,8 @@ def create_app(
             exchange = service.api_keys.exchange_setup_token(token.strip())
         except PermissionError:
             return _error_response(401, "unauthorized", "Invalid setup token.")
+        except Exception:
+            return _error_response(500, "internal_error", "Setup token exchange failed.")
         agent_scope = exchange.agent_scope
         return JSONResponse(
             {

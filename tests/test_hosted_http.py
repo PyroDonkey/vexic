@@ -1087,6 +1087,49 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(blank.status_code, 400)
         self.assertEqual(missing.json()["error"]["code"], "invalid_request")
 
+    def test_setup_token_mint_storage_errors_are_classified_not_echoed(self) -> None:
+        client = TestClient(
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
+        )
+        project = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo"},
+        ).json()["project"]
+
+        with patch.object(
+            type(self.keys),
+            "create_setup_token",
+            side_effect=ValueError("Hrana: `api error: ... SQLITE_BUSY: database is locked`"),
+        ):
+            response = client.post(
+                f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/setup-tokens",
+                headers=self._control_auth(),
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "storage_unavailable")
+        self.assertNotIn("SQLITE_BUSY", response.text)
+
+    def test_setup_token_exchange_storage_failure_returns_json_500(self) -> None:
+        client = TestClient(
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
+        )
+        with patch.object(
+            type(self.keys),
+            "exchange_setup_token",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            response = client.post(
+                "/v1/setup/exchange", json={"token": "vxsetup_aa_bb"}
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(
+            response.json(),
+            {"error": {"code": "internal_error", "message": "Setup token exchange failed."}},
+        )
+
     def test_setup_token_exchanged_key_is_revocable_and_listed_with_setup_provenance(self) -> None:
         client = TestClient(
             create_control_plane_app(self.service, control_plane_tokens=("console-secret",))

@@ -250,20 +250,22 @@ def register_control_plane_routes(
         if not _has_control_plane_credential(request, control_plane_tokens):
             return _error_response(401, "unauthorized", "Invalid control-plane credential.")
         payload = await _json_body(request)
+        try:
+            agent_scope = _string_field(payload, "agentScope", default="")
+            session_id = _string_field(payload, "sessionId", default="")
+        except ValueError as exc:
+            return _error_response(400, "invalid_request", str(exc))
         tenant_id = _provision_control_tenant(service, clerk_org_id)
         try:
             service.catalog.get_control_project(tenant_id, project_id)
         except PermissionError:
             return _error_response(404, "not_found", "Project not found.")
-        try:
-            provisioned, record = service.api_keys.create_setup_token(
-                tenant_id=tenant_id,
-                project_id=project_id,
-                agent_scope=_string_field(payload, "agentScope", default=""),
-                session_id=_string_field(payload, "sessionId", default=""),
-            )
-        except ValueError as exc:
-            return _error_response(400, "invalid_request", str(exc))
+        provisioned, record = service.api_keys.create_setup_token(
+            tenant_id=tenant_id,
+            project_id=project_id,
+            agent_scope=agent_scope,
+            session_id=session_id,
+        )
         return JSONResponse(
             {"rawToken": provisioned.raw_token, "token": _setup_token_payload(record)},
             status_code=201,
