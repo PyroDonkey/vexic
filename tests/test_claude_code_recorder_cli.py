@@ -2844,3 +2844,195 @@ class ClaudeCodeRecorderPrimeSpawnsTriggerDreamTests(unittest.TestCase):
                 release_marker.write_text("go", encoding="utf-8")
                 for process in spawned_processes:
                     process.wait(timeout=5)
+
+
+class _FakeSetupResult:
+    def __init__(self) -> None:
+        self.settings_path = Path("/fake/settings.json")
+        self.config_path = Path("/fake/config.json")
+        self.status_path = Path("/fake/status.json")
+        self.mcp_config_path = Path("/fake/.mcp.json")
+        self.command = "fake-hook-command"
+
+
+class ClaudeCodeRecorderSetupTokenTests(unittest.TestCase):
+    def test_setup_claude_code_accepts_token_argument(self) -> None:
+        from vexic.recorders.setup_exchange import SetupExchangeResult
+
+        captured = {}
+
+        def fake_exchange(config, *, token):
+            captured["base_url"] = config.base_url
+            captured["token"] = token
+            return SetupExchangeResult(
+                api_key="vx_exchanged",
+                key_id="key-1",
+                project_id="exchanged-project",
+                session_id="exchanged-session",
+                agent_id="exchanged-agent",
+            )
+
+        install_kwargs = {}
+
+        def fake_install(**kwargs):
+            install_kwargs.update(kwargs)
+            return _FakeSetupResult()
+
+        stdout = io.StringIO()
+        with (
+            patch("vexic.recorders.cli.exchange_setup_token", fake_exchange),
+            patch("vexic.recorders.cli.install_claude_code_setup", fake_install),
+            contextlib.redirect_stdout(stdout),
+        ):
+            code = recorder_main(
+                [
+                    "setup-claude-code",
+                    "--base-url",
+                    "https://api.example.test",
+                    "--token",
+                    "vxsetup_secret",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(captured["base_url"], "https://api.example.test")
+        self.assertEqual(captured["token"], "vxsetup_secret")
+        self.assertEqual(install_kwargs["api_key"], "vx_exchanged")
+        self.assertEqual(install_kwargs["project_id"], "exchanged-project")
+        self.assertEqual(install_kwargs["session_id"], "exchanged-session")
+        self.assertEqual(install_kwargs["agent_id"], "exchanged-agent")
+
+        output = stdout.getvalue()
+        self.assertNotIn("vx_exchanged", output)
+        self.assertNotIn("vxsetup_secret", output)
+        self.assertNotIn("exchanged-session", output)
+        self.assertTrue(json.loads(output)["ok"])
+
+    def test_setup_claude_code_token_and_manual_creds_are_mutually_exclusive(self) -> None:
+        stderr = io.StringIO()
+        with (
+            patch("vexic.recorders.cli.exchange_setup_token") as exchange_mock,
+            patch("vexic.recorders.cli.install_claude_code_setup") as install_mock,
+            contextlib.redirect_stderr(stderr),
+        ):
+            code = recorder_main(
+                [
+                    "setup-claude-code",
+                    "--base-url",
+                    "https://api.example.test",
+                    "--token",
+                    "vxsetup_secret",
+                    "--api-key",
+                    "vx_manual",
+                ]
+            )
+
+        self.assertEqual(code, 2)
+        self.assertIn("mutually exclusive", stderr.getvalue())
+        self.assertNotIn("vx_manual", stderr.getvalue())
+        self.assertNotIn("vxsetup_secret", stderr.getvalue())
+        exchange_mock.assert_not_called()
+        install_mock.assert_not_called()
+
+    def test_setup_claude_code_manual_path_still_installs(self) -> None:
+        install_kwargs = {}
+
+        def fake_install(**kwargs):
+            install_kwargs.update(kwargs)
+            return _FakeSetupResult()
+
+        stdout = io.StringIO()
+        with (
+            patch("vexic.recorders.cli.exchange_setup_token") as exchange_mock,
+            patch("vexic.recorders.cli.install_claude_code_setup", fake_install),
+            contextlib.redirect_stdout(stdout),
+        ):
+            code = recorder_main(
+                [
+                    "setup-claude-code",
+                    "--base-url",
+                    "https://api.example.test",
+                    "--api-key",
+                    "vx_manual",
+                    "--project-id",
+                    "project-a",
+                    "--session-id",
+                    "session-a",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        exchange_mock.assert_not_called()
+        self.assertEqual(install_kwargs["api_key"], "vx_manual")
+        self.assertEqual(install_kwargs["project_id"], "project-a")
+        self.assertEqual(install_kwargs["session_id"], "session-a")
+        self.assertNotIn("vx_manual", stdout.getvalue())
+
+    def test_setup_claude_code_blank_token_is_rejected(self) -> None:
+        stderr = io.StringIO()
+        with (
+            patch("vexic.recorders.cli.exchange_setup_token") as exchange_mock,
+            patch("vexic.recorders.cli.install_claude_code_setup") as install_mock,
+            contextlib.redirect_stderr(stderr),
+        ):
+            code = recorder_main(
+                [
+                    "setup-claude-code",
+                    "--base-url",
+                    "https://api.example.test",
+                    "--token",
+                    "   ",
+                ]
+            )
+
+        self.assertEqual(code, 2)
+        self.assertIn("--token", stderr.getvalue())
+        exchange_mock.assert_not_called()
+        install_mock.assert_not_called()
+
+    def test_setup_claude_code_empty_token_does_not_fall_through_to_manual(self) -> None:
+        # An empty --token must not silently take the manual path; it is an
+        # explicit (invalid) request to use token exchange.
+        stderr = io.StringIO()
+        with (
+            patch("vexic.recorders.cli.exchange_setup_token") as exchange_mock,
+            patch("vexic.recorders.cli.install_claude_code_setup") as install_mock,
+            contextlib.redirect_stderr(stderr),
+        ):
+            code = recorder_main(
+                [
+                    "setup-claude-code",
+                    "--base-url",
+                    "https://api.example.test",
+                    "--token",
+                    "",
+                ]
+            )
+
+        self.assertEqual(code, 2)
+        self.assertIn("--token", stderr.getvalue())
+        exchange_mock.assert_not_called()
+        install_mock.assert_not_called()
+
+    def test_setup_claude_code_manual_path_requires_full_triad(self) -> None:
+        stderr = io.StringIO()
+        with (
+            patch("vexic.recorders.cli.install_claude_code_setup") as install_mock,
+            contextlib.redirect_stderr(stderr),
+        ):
+            code = recorder_main(
+                [
+                    "setup-claude-code",
+                    "--base-url",
+                    "https://api.example.test",
+                    "--api-key",
+                    "vx_manual",
+                ]
+            )
+
+        self.assertEqual(code, 2)
+        message = stderr.getvalue()
+        self.assertIn("--project-id", message)
+        self.assertIn("--token", message)
+        self.assertNotIn("vx_manual", message)
+        install_mock.assert_not_called()
