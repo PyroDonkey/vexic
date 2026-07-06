@@ -1303,7 +1303,10 @@ class HostedApiKeyStore:
             principal_id=agent_scope,
             capabilities=_CONTROL_PLANE_AGENT_CAPABILITIES,
             project_ids={project_id},
-            agent_ids=frozenset() if agent_scope == "shared" else {agent_scope},
+            # "shared" is the null-agent scope ONLY. Bind it to {None} so the
+            # membership check in hosted.py rejects any explicit agent_id; an
+            # empty set would read as "no agent restriction" (a wildcard).
+            agent_ids=frozenset({None}) if agent_scope == "shared" else {agent_scope},
         )
         stored = self._load_key(provisioned.key_id)
         prefix = provisioned.raw_key[:16]
