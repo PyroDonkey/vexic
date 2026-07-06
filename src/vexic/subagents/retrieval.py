@@ -8,6 +8,7 @@ scores, vector distances, and the rewrite never leave this module.
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from vexic.contract import MemoryCategory
 from vexic.embeddings import embed_texts
 from vexic.models import QueryRewrite, RetrievedFact
 from vexic.ports import AgentFactory, EmbedTexts, missing_host_port
@@ -68,6 +69,35 @@ def reciprocal_rank_fusion(
     # dicts preserve insertion order, so a stable sort keeps first-seen ids
     # ahead of later ids with equal scores.
     return sorted(scores, key=lambda fact_id: scores[fact_id], reverse=True)
+
+
+def _with_events_sorted(facts: list[LongTermFact]) -> list[LongTermFact]:
+    """Reorder event-category facts by event time, newest first, leaving
+    non-event facts in their relevance (RRF) slots.
+
+    Only the positions holding event facts are permuted among themselves;
+    every other slot keeps its fused-rank fact. The sort key is the event's
+    ``occurred_at`` (a partial-precision ISO string), falling back to
+    ``created_at`` when it is missing, truncated to day grain so a
+    full-timestamp fallback compares like-for-like with a partial event date.
+    Python's stable sort keeps equal-key events in their original RRF order.
+    """
+    result = list(facts)
+    positions = [
+        index
+        for index, fact in enumerate(result)
+        if fact.category == MemoryCategory.EVENT.value
+    ]
+    if len(positions) < 2:
+        return result
+    ordered = sorted(
+        (result[index] for index in positions),
+        key=lambda fact: ((fact.occurred_at or "").strip() or fact.created_at)[:10],
+        reverse=True,
+    )
+    for position, fact in zip(positions, ordered):
+        result[position] = fact
+    return result
 
 
 async def _rewrite_query(
@@ -155,6 +185,7 @@ async def retrieve_long_term_facts(
 
     fused_ids = reciprocal_rank_fusion([keyword_ids, vector_ids])[:return_k]
     facts = fetch_long_term_facts(db_path, fused_ids, agent_id=agent_id)
+    facts = _with_events_sorted(facts)
     event_ids = record_long_term_retrieval(
         db_path,
         [fact.fact_id for fact in facts],

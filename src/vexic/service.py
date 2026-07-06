@@ -597,6 +597,7 @@ class LocalMemoryService(MemoryService):
                         created_at=fact.created_at,
                         retrieved_count=fact.retrieved_count,
                         used_count=fact.used_count,
+                        occurred_at=fact.occurred_at,
                     )
                     for fact in facts
                 ]
