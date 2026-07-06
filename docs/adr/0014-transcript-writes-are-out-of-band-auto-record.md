@@ -27,7 +27,7 @@ Vexic does not add an MCP write tool on any surface. The MCP surface - local
 stdio and hosted `/mcp` - stays read-only: agents read memory
 (`search_transcript`, `search_long_term`) and never write through MCP.
 
-> Note: these MCP tool names were later renamed — see ADR 0021
+> Note: these MCP tool names were later renamed -- see ADR 0021
 > (`recall_conversation_history`, `recall_user_memory`). The read-only decision
 > here is unchanged.
 

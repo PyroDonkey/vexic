@@ -10,7 +10,7 @@ privacy audit re-opened that call against the product requirement that user
 chat logs must not be readable by anyone, including operators: provider disk
 encryption does not stop a holder of a database token or the platform API
 token from reading plaintext memory. The owner approved app-level envelope
-encryption for hosted canonical content — per-tenant data keys wrapped by a
+encryption for hosted canonical content -- per-tenant data keys wrapped by a
 KMS key, unwrapped at runtime in the hosted adapter, with production KMS
 decrypt denied to developers and break-glass access audited.
 
@@ -23,7 +23,7 @@ construction, and adding an optional argument later is a non-breaking change.
 
 - `vexic.ports.ContentCodec` is the seam: `encode(plaintext) -> str` before
   storage, `decode(stored) -> str` after reads. No codec configured means
-  plaintext passthrough — the local default, where the database already sits
+  plaintext passthrough -- the local default, where the database already sits
   in the user's own custody. Hosted adapters supply an encrypting codec;
   key material and KMS SDKs never enter `src/vexic` (policy-tested).
 - Codecs own their envelope: encoded values carry a codec-specific version
@@ -33,7 +33,7 @@ construction, and adding an optional argument later is a non-breaking change.
 - This ADR covers Tier 1 transcript content end-to-end:
   `messages.message_json` is encoded by `save_messages` and
   `ingest_source_messages` (after the plaintext forbidden-value guard and
-  FTS body extraction) and decoded by every reader — replay, export, history
+  FTS body extraction) and decoded by every reader -- replay, export, history
   expansion, the token-budget and batch loaders, the FTS rebuild, the ingest
   duplicate-content comparison, and the Light-phase transcript loader.
 - Search projections are a documented plaintext residue: `messages_fts.body`
@@ -73,7 +73,7 @@ purge is also a crypto-shred.
 - Local mode stays plaintext by default; an encrypted local mode (SQLCipher
   or a local codec) remains a deliberate deferral.
 - KMS latency lands on the hosted read path in 12b; key loss makes tenant
-  data unrecoverable — both are hosted-adapter concerns to size there.
+  data unrecoverable -- both are hosted-adapter concerns to size there.
 - Confidentiality claims must stay honest: with 12a, transcript canonical
   rows are codec-encoded on hosted deployments that configure a codec, while
   FTS projections and the not-yet-covered content columns remain plaintext

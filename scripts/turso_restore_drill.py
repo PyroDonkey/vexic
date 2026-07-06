@@ -47,6 +47,7 @@ import argparse
 import secrets
 import sys
 from contextlib import closing
+from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
 
@@ -94,7 +95,7 @@ def _count_rows(target: StorageTarget, table_name: str) -> int:
 
 def make_provision_replacement(
     port: TursoProvisioningPort, *, tenant_id: str
-):
+) -> Callable[[], _ReplacementHandle]:
     def provision_replacement() -> _ReplacementHandle:
         db_name = f"vexic-restore-drill-{tenant_id}-{secrets.token_hex(6)}"
         dsn, token = port.provision(db_name, expiration="30m", read_only=False)
@@ -105,7 +106,7 @@ def make_provision_replacement(
 
 def make_import_canonical(
     artifact_path: Path, *, tenant_id: str, project_id: str | None
-):
+) -> Callable[[_ReplacementHandle], None]:
     def import_canonical(replacement: _ReplacementHandle) -> None:
         import_canonical_migration(
             artifact_path,
@@ -117,7 +118,7 @@ def make_import_canonical(
     return import_canonical
 
 
-def make_verify(expected_row_counts: dict[str, int]):
+def make_verify(expected_row_counts: dict[str, int]) -> Callable[[_ReplacementHandle], bool]:
     def verify(replacement: _ReplacementHandle) -> bool:
         for table_name, expected_count in expected_row_counts.items():
             if _count_rows(replacement.target, table_name) != expected_count:
@@ -127,14 +128,16 @@ def make_verify(expected_row_counts: dict[str, int]):
     return verify
 
 
-def make_activate(catalog: HostedTenantCatalog, *, tenant_id: str):
+def make_activate(
+    catalog: HostedTenantCatalog, *, tenant_id: str
+) -> Callable[[_ReplacementHandle], None]:
     def activate(replacement: _ReplacementHandle) -> None:
         catalog.activate_replacement_database(tenant_id, replacement.target.target)
 
     return activate
 
 
-def make_destroy(port: TursoProvisioningPort):
+def make_destroy(port: TursoProvisioningPort) -> Callable[[_ReplacementHandle], None]:
     def destroy(replacement: _ReplacementHandle) -> None:
         port.destroy_database(replacement.db_name)
 

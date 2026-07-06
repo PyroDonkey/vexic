@@ -102,7 +102,7 @@ target and a local `.db` file run the same canonical-import logic; the only
 branch is that a remote `StorageTarget` has no local file to `Path.exists()`
 against, so the host-owned-table probe always connects rather than being
 skipped for a "brand-new" file. This closes the "no Postgres adapter / no
-physical file copy" note below for the libSQL case specifically — import
+physical file copy" note below for the libSQL case specifically -- import
 still writes canonical rows through SQL, never a raw file or page copy,
 against either backend.
 
@@ -121,9 +121,9 @@ it, verify it, and only then activate it (repointing the catalog and bumping
 the tenant's `generation` counter so a request-scoped service holding the
 pre-repoint handle cannot keep writing the quarantined database); if
 verification fails, the replacement is destroyed instead and the original
-stays active. This orchestration function is pure — it takes the provision/
+stays active. This orchestration function is pure -- it takes the provision/
 import/verify/activate/destroy steps as injected callables, reads no secrets,
-and does no I/O of its own — so the decision logic is unit tested with fakes
+and does no I/O of its own -- so the decision logic is unit tested with fakes
 independent of any real Turso account.
 
 Running this drill against a **real Turso point-in-time-recovery snapshot**
@@ -132,7 +132,7 @@ replacement database from a Turso PITR restore point (Turso Platform API,
 outside `src/vexic`), then wires that replacement into
 `run_restore_drill`'s `provision_replacement`/`import_canonical`/`verify`/
 `activate`/`destroy` callables. That live run has not yet been executed and
-recorded as an artifact under `docs/runbooks/restore-drills/` — only the
+recorded as an artifact under `docs/runbooks/restore-drills/` -- only the
 decision logic above is automated and covered by tests today. Record any live
 Turso PITR drill the same way the 2026-06-26 Railway alpha volume drill was
 recorded, per the "Record evidence" step above.
@@ -142,8 +142,8 @@ recorded, per the "Record evidence" step above.
 - No public import API.
 - No Postgres adapter.
 - No customer self-serve artifact upload.
-- No physical SQLite file/page copy (Turso/libSQL import is SQL-level too —
+- No physical SQLite file/page copy (Turso/libSQL import is SQL-level too --
   see "Turso/libSQL Targets" above).
 - No migration of host-owned extension tables without a separate host plan.
-- No completed live Turso PITR restore-drill run yet (decision logic only —
+- No completed live Turso PITR restore-drill run yet (decision logic only --
   see "Restore Drill (PITR)" above).

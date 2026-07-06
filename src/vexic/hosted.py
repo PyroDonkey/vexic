@@ -103,8 +103,8 @@ def register_hosted_write_routes(
     from fastapi import Request
 
     async def append_transcript(
-        request,
-        payload,
+        request: Request,
+        payload: HostedAppendTranscriptBody,
     ) -> object:
         return await _handle_hosted_write(
             "append_transcript",
@@ -122,8 +122,8 @@ def register_hosted_write_routes(
         )
 
     async def ingest_source_transcript(
-        request,
-        payload,
+        request: Request,
+        payload: HostedIngestSourceTranscriptBody,
     ) -> object:
         return await _handle_hosted_write(
             "ingest_source_transcript",
@@ -1234,7 +1234,7 @@ def run_dream_phase_command(args: argparse.Namespace) -> int:
     return 0
 
 
-def resolve_storage_backend(env) -> str:
+def resolve_storage_backend(env: Mapping[str, str]) -> str:
     """Resolve the non-secret ``VEXIC_STORAGE_BACKEND`` selection flag.
 
     Defaults to ``"local"`` (filesystem SQLite, unchanged behavior). ``"turso"``

@@ -12,10 +12,14 @@ from typing import NoReturn, ParamSpec, TypeVar
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
-from vexic.hosted import HostedMemoryService
+from vexic.hosted import HostedJobEvent, HostedMemoryService, HostedUsageEvent
 from vexic.hosted_http import create_app as create_hosted_memory_app
 from vexic.hosted_http import create_service_from_env
-from vexic.hosted_local import _CONTROL_PLANE_AGENT_CAPABILITIES
+from vexic.hosted_local import (
+    HostedApiKeyRecord,
+    HostedProjectRecord,
+    _CONTROL_PLANE_AGENT_CAPABILITIES,
+)
 from vexic.storage.errors import (
     is_operational_error,
     is_retryable_operational_error,
@@ -544,7 +548,7 @@ _CONTROL_PLANE_SCOPE_CAPABILITIES = sorted(
 )
 
 
-def _project_payload(project) -> dict[str, str]:
+def _project_payload(project: HostedProjectRecord) -> dict[str, str]:
     return {
         "id": project.project_id,
         "tenantId": project.tenant_id,
@@ -554,7 +558,7 @@ def _project_payload(project) -> dict[str, str]:
     }
 
 
-def _key_payload(key) -> dict[str, object]:
+def _key_payload(key: HostedApiKeyRecord) -> dict[str, object]:
     return {
         "id": key.key_id,
         "tenantId": key.tenant_id,
@@ -572,7 +576,7 @@ def _key_payload(key) -> dict[str, object]:
     }
 
 
-def _job_payload(event) -> dict[str, object]:
+def _job_payload(event: HostedJobEvent) -> dict[str, object]:
     return {
         "jobId": event.job_id,
         "operation": event.operation,
@@ -623,7 +627,7 @@ def _utc_iso(value: datetime) -> str:
 
 
 def _usage_payload(
-    events,
+    events: list[HostedUsageEvent],
     *,
     period_start: str,
     period_end: str,

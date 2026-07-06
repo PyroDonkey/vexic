@@ -46,12 +46,12 @@ COA-232 recorded, without a SQLite-to-Postgres rewrite of the catalog.
 
 The pure connection seam and the libSQL-using storage adapter logic live in
 `src/vexic`, consistent with the ADR 0013 precedent that hosted adapters live in
-`src/vexic`. They accept an already-resolved target — a filesystem path or an
-authenticated libSQL DSN — and never read provider secrets. The libSQL client
+`src/vexic`. They accept an already-resolved target -- a filesystem path or an
+authenticated libSQL DSN -- and never read provider secrets. The libSQL client
 is added under the `hosted` optional dependency extra.
 
-Provider-credential wiring — reading Turso database tokens from hosted
-environment or secret management and constructing the authenticated libSQL DSN —
+Provider-credential wiring -- reading Turso database tokens from hosted
+environment or secret management and constructing the authenticated libSQL DSN --
 lives in the repo-root `adapters/` directory, which `docs/ai/AGENTS.md`
 designates for provider-secret and live-model wiring rather than `src/vexic`
 (alongside the existing `adapters/openrouter_live_adapter.py`). The hosted
@@ -144,14 +144,14 @@ also stays deferred until external beta or real customer memory.
 
 ## References
 
-- ADR 0005 — Hosted v1 memory storage starts SQLite-compatible and Postgres-ready
-- ADR 0008 — Hosted data protection uses provider encryption, PITR, and drilled exports
-- ADR 0011 — Operator-run canonical migration
-- ADR 0013 — Hosted control-plane HTTP API is a console-facing adapter slice
+- ADR 0005 -- Hosted v1 memory storage starts SQLite-compatible and Postgres-ready
+- ADR 0008 -- Hosted data protection uses provider encryption, PITR, and drilled exports
+- ADR 0011 -- Operator-run canonical migration
+- ADR 0013 -- Hosted control-plane HTTP API is a console-facing adapter slice
 - COA-264 (this cutover), COA-232 (restore drills), COA-263 (durable quota), COA-27 (security-gap umbrella)
 - `docs/runbooks/hosted-migration.md`, `docs/runbooks/restore-drills/hosted-restore-drill.md`
 
-## Addendum — 2026-07-01: implementation clarifications (verification + multi-model audit)
+## Addendum -- 2026-07-01: implementation clarifications (verification + multi-model audit)
 
 This addendum refines the Decision for implementation; it does not reverse ADR
 0019. It records findings from a real-Turso verification spike and a multi-model
@@ -188,13 +188,13 @@ helpers), no named/dict parameters, and no `enable_load_extension`.
    handle.
 6. **Split-brain window acknowledged.** While customer memory is on Turso and the
    control-plane mapping could be lost, a Platform-API list-databases reconcile
-   path recovers tenant→DB mappings; accepted for internal dogfood with a manual
+   path recovers tenant->DB mappings; accepted for internal dogfood with a manual
    recovery note.
 7. **Verified safe:** `enable_load_extension` is sqlite-vec-only (chosen by
    `select_vector_backend`); `init_db`/`init_vector_memory` do not require it on
    libSQL, so no change is needed there.
 
-## Addendum 2 — 2026-07-01: implementation landed (COA-273 P0-P5 complete)
+## Addendum 2 -- 2026-07-01: implementation landed (COA-273 P0-P5 complete)
 
 All items in the Decision and the addendum above are implemented and, where
 noted, live-verified against a real Turso database; see
