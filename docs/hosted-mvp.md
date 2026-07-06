@@ -656,7 +656,7 @@ exits `0` and never affects prime's own output or exit code.
 Revoke a throwaway key by key id, not by raw key:
 
 ```powershell
-uv run --no-sync python -m vexic.hosted_http revoke-key --root /data/vexic --key-id <key-id> --revoked-by ryan
+uv run --no-sync python -m vexic.hosted_http revoke-key --root /data/vexic --key-id <key-id> --revoked-by <operator>
 ```
 
 This is internal-alpha infrastructure for throwaway data. It is not a

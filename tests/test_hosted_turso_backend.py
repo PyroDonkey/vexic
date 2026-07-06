@@ -78,7 +78,7 @@ def _tenant(customer_target: str | None) -> HostedTenant:
 
 def test_resolver_returns_none_when_customer_target_unset():
     cache = TenantTokenCache(_FakePort())
-    resolver = make_customer_target_resolver(cache, org="pyrodonkey")
+    resolver = make_customer_target_resolver(cache, org="example-org")
 
     assert resolver(_tenant(None)) is None
 
@@ -86,8 +86,8 @@ def test_resolver_returns_none_when_customer_target_unset():
 def test_resolver_builds_storage_target_and_strips_org_suffix_for_db_name():
     port = _FakePort()
     cache = TenantTokenCache(port)
-    resolver = make_customer_target_resolver(cache, org="pyrodonkey")
-    dsn = "libsql://vexic-t123-pyrodonkey.aws-us-west-2.turso.io"
+    resolver = make_customer_target_resolver(cache, org="example-org")
+    dsn = "libsql://vexic-t123-example-org.aws-us-west-2.turso.io"
 
     target = resolver(_tenant(dsn))
 
@@ -105,7 +105,7 @@ def test_resolver_db_name_without_org_suffix_is_used_verbatim():
     # label is used as-is (removesuffix is a no-op).
     port = _FakePort()
     cache = TenantTokenCache(port)
-    resolver = make_customer_target_resolver(cache, org="pyrodonkey")
+    resolver = make_customer_target_resolver(cache, org="example-org")
     dsn = "libsql://vexic-t999.aws-us-west-2.turso.io"
 
     target = resolver(_tenant(dsn))
@@ -118,12 +118,12 @@ def test_local_service_uses_resolver_target_when_present(tmp_path, monkeypatch):
     root = tmp_path
     catalog = HostedTenantCatalog(root)
     keys = HostedApiKeyStore(root)
-    dsn = "libsql://vexic-t123-pyrodonkey.aws-us-west-2.turso.io"
+    dsn = "libsql://vexic-t123-example-org.aws-us-west-2.turso.io"
     catalog.provision_tenant("tenant-a", project_ids={"project-a"}, customer_target=dsn)
     tenant = catalog.get_tenant("tenant-a")
     port = _FakePort()
     cache = TenantTokenCache(port)
-    resolver = make_customer_target_resolver(cache, org="pyrodonkey")
+    resolver = make_customer_target_resolver(cache, org="example-org")
     # `_local_service` requests schema init against the resolved target
     # (`init_db`'s process-level memo makes that cheap after the first real
     # call, but "libsql://vexic-t123-..." is never a reachable host) -- this
@@ -152,7 +152,7 @@ def test_local_service_falls_back_to_db_path_when_resolver_returns_none(tmp_path
     tenant = catalog.get_tenant("tenant-a")
     port = _FakePort()
     cache = TenantTokenCache(port)
-    resolver = make_customer_target_resolver(cache, org="pyrodonkey")
+    resolver = make_customer_target_resolver(cache, org="example-org")
 
     service = HostedMemoryService(
         catalog,
@@ -214,14 +214,14 @@ def test_factory_turso_branch_provisions_dogfood_and_wires_resolver(monkeypatch,
 
     monkeypatch.setenv("VEXIC_STORAGE_BACKEND", "turso")
     monkeypatch.setenv("VEXIC_HOSTED_ROOT", str(tmp_path))
-    monkeypatch.setenv("TURSO_ORG", "pyrodonkey")
+    monkeypatch.setenv("TURSO_ORG", "example-org")
     monkeypatch.setenv("VEXIC_DOGFOOD_TENANT_ID", "tenant-dog")
     # Pre-provision the dogfood tenant locally (no customer_target yet).
     catalog = HostedTenantCatalog(tmp_path)
     catalog.provision_tenant("tenant-dog", project_ids={"project-dog"})
 
     db_name = _customer_database_name("tenant-dog")
-    dsn = f"libsql://{db_name}-pyrodonkey.aws-us-west-2.turso.io"
+    dsn = f"libsql://{db_name}-example-org.aws-us-west-2.turso.io"
     provisioning = _FakeProvisioning(dsn)
 
     service = create_service_from_env(turso_provisioning=provisioning)
@@ -256,8 +256,8 @@ def test_factory_turso_branch_provisions_new_control_plane_tenant(monkeypatch, t
 
     monkeypatch.setenv("VEXIC_STORAGE_BACKEND", "turso")
     monkeypatch.setenv("VEXIC_HOSTED_ROOT", str(tmp_path))
-    monkeypatch.setenv("TURSO_ORG", "pyrodonkey")
-    dsn = "libsql://fresh-tenant-pyrodonkey.aws-us-west-2.turso.io"
+    monkeypatch.setenv("TURSO_ORG", "example-org")
+    dsn = "libsql://fresh-tenant-example-org.aws-us-west-2.turso.io"
     provisioning = _FakeProvisioning(dsn)
     service = create_service_from_env(turso_provisioning=provisioning)
     client = TestClient(
@@ -287,9 +287,9 @@ def test_factory_turso_branch_can_provision_existing_local_tenants(monkeypatch, 
     )
     monkeypatch.setenv("VEXIC_STORAGE_BACKEND", "turso")
     monkeypatch.setenv("VEXIC_HOSTED_ROOT", str(tmp_path))
-    monkeypatch.setenv("TURSO_ORG", "pyrodonkey")
+    monkeypatch.setenv("TURSO_ORG", "example-org")
     monkeypatch.setenv("VEXIC_PROVISION_EXISTING_TURSO_TARGETS", "1")
-    dsn = "libsql://existing-tenant-pyrodonkey.aws-us-west-2.turso.io"
+    dsn = "libsql://existing-tenant-example-org.aws-us-west-2.turso.io"
     provisioning = _FakeProvisioning(dsn)
 
     service = create_service_from_env(turso_provisioning=provisioning)
