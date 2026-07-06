@@ -131,6 +131,11 @@ def _ensure_memory_candidate_columns(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "memory_candidates", "needs_review", "needs_review BOOLEAN NOT NULL DEFAULT 0")
     _ensure_column(conn, "memory_candidates", "review_neighbor_id", "review_neighbor_id INTEGER")
     _ensure_column(conn, "memory_candidates", "best_similarity", "best_similarity REAL")
+    # TEXT, not DATETIME: DATETIME has NUMERIC column affinity in SQLite, which
+    # silently coerces a well-formed-looking value like "2025" (a valid partial-
+    # precision ISO string) into an INTEGER on write. occurred_at must round-trip
+    # as the exact string the extractor produced, at whatever precision it knew.
+    _ensure_column(conn, "memory_candidates", "occurred_at", "occurred_at TEXT")
 
     conn.execute(
         """
@@ -223,6 +228,9 @@ def _ensure_long_term_memory(conn: sqlite3.Connection) -> None:
         """
     )
     _ensure_column(conn, "long_term_memory", "agent_id", "agent_id TEXT")
+    # TEXT, not DATETIME: see the matching comment on the memory_candidates
+    # occurred_at column — NUMERIC affinity would mangle a bare-year string.
+    _ensure_column(conn, "long_term_memory", "occurred_at", "occurred_at TEXT")
     # Idempotency backstop for promotion: at most one Tier 3 fact per source
     # candidate. The atomic claim in _promote_candidate is the primary guard;
     # this UNIQUE index is the schema-level safety net so even a racy double
@@ -734,7 +742,8 @@ def init_db(
                     stale BOOLEAN NOT NULL DEFAULT 0,
                     needs_review BOOLEAN NOT NULL DEFAULT 0,
                     review_neighbor_id INTEGER,
-                    best_similarity REAL
+                    best_similarity REAL,
+                    occurred_at TEXT
                 )
                 """
             )

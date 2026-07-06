@@ -192,6 +192,7 @@ def _promote_candidate(
         promoted,
         retired,
         stale,
+        occurred_at,
     ) = row
 
     if retired or stale:
@@ -206,6 +207,19 @@ def _promote_candidate(
         raise ValueError(
             f"Candidate {decision.candidate_id} is flagged promoted but has no Tier 3 "
             "fact; refusing to skip a corrupt promotion state."
+        )
+
+    if category == "event" and not occurred_at:
+        # Invariant 11: category "event" facts must carry occurred_at. Fail
+        # loud here rather than write an undated event to Tier 3. Checked after
+        # the `promoted` skip above so a legacy already-promoted event candidate
+        # (predating this column, occurred_at still NULL) stays a benign
+        # idempotent no-op instead of raising on rerun. `not occurred_at` also
+        # treats "" as missing, matching the merge-side COALESCE(NULLIF(...))
+        # backfill semantics below.
+        raise ValueError(
+            f"Refusing to promote candidate {decision.candidate_id} with category "
+            "'event' and no occurred_at."
         )
 
     source_message_ids = sorted(set(_load_source_message_ids(source_ids_json)))
@@ -243,6 +257,7 @@ def _promote_candidate(
         used_count=used_count,
         editable=editable,
         embedding=decision.embedding,
+        occurred_at=occurred_at,
     )
     link_candidate_to_promoted_fact(conn, decision.candidate_id, fact_id)
 
