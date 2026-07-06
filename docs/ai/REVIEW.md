@@ -106,8 +106,8 @@ stdlib or a one-line solution over a new abstraction).
 
 Suppress findings on generated/vendored files: `uv.lock`,
 `node_modules/`, `.venv/`, `build/`, `dist/`,
-`*.egg-info/`, `__pycache__/`, `*.pyc`, `.pytest_cache/`, `.next/`, generated
-`pypi/` + `npm/` trees, and any `*.db` / `*.sqlite*` (e.g. `memory.db`). Still
+`*.egg-info/`, `__pycache__/`, `*.pyc`, `.pytest_cache/`, `.next/`, the
+generated `pypi/` tree, and any `*.db` / `*.sqlite*` (e.g. `memory.db`). Still
 review `pyproject.toml`, `adapters/**`, workflow YAML,
 and any intentional dependency change (spot-check new deps for supply-chain
 risk).

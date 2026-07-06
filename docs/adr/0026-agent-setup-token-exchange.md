@@ -2,6 +2,10 @@
 
 Status: accepted
 
+Note (2026-07-06): the console "Connect agent" mint UI is now a concern of the
+private `PyroDonkey/vexic-website` repo (ADR 0012 addendum); the CLI `--token`
+exchange leg remains this repository's deliverable and is still unbuilt.
+
 ## Context
 
 The COA-239 live smoke and a later external onboarding attempt (COA-252)

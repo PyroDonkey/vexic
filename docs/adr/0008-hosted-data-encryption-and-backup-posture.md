@@ -2,6 +2,15 @@
 
 Status: accepted
 
+## Addendum (2026-07-06): later decisions supersede parts of this record
+
+The Neon control-plane wording below is superseded by ADR 0019: the hosted
+storage cutover starts Turso-only, so no Neon control-plane database exists in
+the landed implementation. The statement that "Vexic does not build app-level
+searchable-memory encryption" is superseded by ADR 0023, which introduces an
+app-level ContentCodec seam for hosted content encryption; the encrypting
+adapter ships in a later phase per that ADR's rollout plan.
+
 ## Context
 
 Hosted Vexic memory will store sensitive long-running agent memory. Before real

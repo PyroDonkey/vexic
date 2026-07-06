@@ -42,7 +42,6 @@ node_modules/
 .codex/
 .superpowers/
 .impeccable/
-website/.impeccable/
 .github/hooks/impeccable.json
 .github/skills/impeccable/
 

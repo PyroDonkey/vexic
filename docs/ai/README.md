@@ -10,5 +10,6 @@ or public Vexic documentation.
   agent instructions.
 - `docs/ai/CONTEXT.md` is a product-language glossary for agent and maintainer
   planning.
-- `docs/ai/REVIEW.md` is review-agent calibration kept out of the
-  repository root.
+- `docs/ai/REVIEW.md` is review-agent calibration. It lives here rather than
+  at the repository root, where only minimal pointer files (`AGENTS.md`,
+  `CLAUDE.md`) reference the shared agent instructions.
