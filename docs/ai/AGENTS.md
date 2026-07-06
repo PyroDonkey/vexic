@@ -241,6 +241,25 @@ loop against the tracking docs remains a manual step under the triggers above.
 - Before relying on pydantic-ai import paths or behavior, verify the current
   upstream docs. The package changes quickly.
 
+## Cross-Repo Boundary (vexic-website)
+
+The Vexic Console and marketing website live in the private
+`PyroDonkey/vexic-website` repo (local checkout: `../vexic-website`). When work
+in this repo touches a surface the Console consumes, flag or mirror the change
+there:
+
+- `src/vexic/hosted_control_plane_http.py` is the control-plane HTTP API. Its
+  client is `console/lib/control-plane-client.mjs` in vexic-website; endpoint
+  or payload changes need a matching client update there.
+- ADR 0012 (Console implementation path), ADR 0013 (control-plane API), and
+  ADR 0026 (setup token exchange) decide surfaces that split across both
+  repos; the console-side legs are tracked in the Linear "Vexic Website"
+  project, the server-side legs in "Vexic Memory System".
+- `docs/ai/CONTEXT.md` is the upstream product glossary for both repos;
+  vexic-website keeps only repo-local terms in its own `CONTEXT.md`.
+- For cross-repo features (new endpoint plus console UI), land the API side
+  here first, then the vexic-website client.
+
 ## Loop Bounds and Escalation
 
 - Stop after 3 failed verification cycles on the same target. Report the failure
