@@ -84,6 +84,32 @@ class SetupExchangeTests(unittest.TestCase):
 
         self.assertIsNone(result.agent_id)
 
+    def test_exchange_normalizes_blank_agent_id_to_none(self) -> None:
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self) -> bytes:
+                return json.dumps(
+                    {
+                        "apiKey": "vx_exchanged",
+                        "keyId": "key-1",
+                        "projectId": "project-a",
+                        "sessionId": "session-a",
+                        "agentId": "   ",
+                    }
+                ).encode("utf-8")
+
+        config = SetupExchangeConfig(base_url="https://api.example.test")
+
+        with patch("vexic.recorders.setup_exchange.urlopen", lambda request, timeout: _Response()):
+            result = exchange_setup_token(config, token="vxsetup_abc")
+
+        self.assertIsNone(result.agent_id)
+
     def test_exchange_401_raises_actionable_message_without_token(self) -> None:
         config = SetupExchangeConfig(base_url="https://api.example.test")
         error = HTTPError(

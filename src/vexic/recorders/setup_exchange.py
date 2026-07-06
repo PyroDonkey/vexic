@@ -60,6 +60,8 @@ def exchange_setup_token(config: SetupExchangeConfig, *, token: str) -> SetupExc
     agent_id = body.get("agentId")
     if agent_id is not None and not isinstance(agent_id, str):
         raise RuntimeError("setup token exchange returned a malformed response")
+    if isinstance(agent_id, str) and not agent_id.strip():
+        agent_id = None
 
     return SetupExchangeResult(
         api_key=fields["apiKey"],
