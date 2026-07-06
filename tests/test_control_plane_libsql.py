@@ -760,8 +760,8 @@ def test_replacement_scope_libsql_missing_table_yields_permission_error(
 
 
 # ---------------------------------------------------------------------------
-# COA-300 Phase 1: single-use setup tokens minted by the console, exchanged
-# once by an agent for a project-scoped control-plane API key.
+# Single-use setup tokens minted by the console, exchanged once by an agent
+# for a project-scoped control-plane API key (ADR 0026).
 
 
 def _setup_token_store(monkeypatch, tmp_path):

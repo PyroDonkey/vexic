@@ -193,6 +193,26 @@ def create_app(
     async def trigger_dream_phase(request: Request, payload: dict[str, Any]) -> JSONResponse:
         return await _handle_trigger_dream_phase(request, payload, service)
 
+    @app.post("/v1/setup/exchange")
+    async def setup_exchange(payload: dict[str, Any]) -> JSONResponse:
+        token = payload.get("token")
+        if not isinstance(token, str) or not token.strip():
+            return _error_response(400, "invalid_request", "token is required.")
+        try:
+            exchange = service.api_keys.exchange_setup_token(token.strip())
+        except PermissionError:
+            return _error_response(401, "unauthorized", "Invalid setup token.")
+        agent_scope = exchange.agent_scope
+        return JSONResponse(
+            {
+                "apiKey": exchange.provisioned.raw_key,
+                "keyId": exchange.provisioned.key_id,
+                "projectId": exchange.project_id,
+                "sessionId": exchange.session_id,
+                "agentId": None if agent_scope == "shared" else agent_scope,
+            }
+        )
+
     return app
 
 
