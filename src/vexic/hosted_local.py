@@ -1637,6 +1637,72 @@ class HostedApiKeyStore:
             )
             conn.commit()
 
+    def list_setup_tokens(
+        self,
+        *,
+        tenant_id: str,
+        project_id: str,
+        include_consumed: bool = True,
+        include_revoked: bool = True,
+    ) -> list[HostedSetupTokenRecord]:
+        if self._control_target is None:
+            records = []
+            for stored in self._setup_tokens.values():
+                if stored.tenant_id != tenant_id or stored.project_id != project_id:
+                    continue
+                if stored.consumed_at is not None and not include_consumed:
+                    continue
+                if stored.revoked_at is not None and not include_revoked:
+                    continue
+                records.append(
+                    HostedSetupTokenRecord(
+                        token_id=stored.token_id,
+                        tenant_id=stored.tenant_id,
+                        project_id=stored.project_id,
+                        agent_scope=stored.agent_scope,
+                        session_id=stored.session_id,
+                        created_at=stored.created_at,
+                        expires_at=stored.expires_at,
+                        consumed_at=stored.consumed_at,
+                        consumed_key_id=stored.consumed_key_id,
+                        revoked_at=stored.revoked_at,
+                    )
+                )
+            records.sort(key=lambda record: (record.created_at, record.token_id))
+            return records
+        filters = ""
+        if not include_consumed:
+            filters += " AND consumed_at IS NULL"
+        if not include_revoked:
+            filters += " AND revoked_at IS NULL"
+        with closing(self._connect_control()) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    token_id, tenant_id, project_id, agent_scope, session_id,
+                    created_at, expires_at, consumed_at, consumed_key_id, revoked_at
+                FROM hosted_setup_tokens
+                WHERE tenant_id = ? AND project_id = ? {filters}
+                ORDER BY created_at, token_id
+                """,
+                (tenant_id, project_id),
+            ).fetchall()
+        return [
+            HostedSetupTokenRecord(
+                token_id=row[0],
+                tenant_id=row[1],
+                project_id=row[2],
+                agent_scope=row[3],
+                session_id=row[4],
+                created_at=row[5],
+                expires_at=row[6],
+                consumed_at=row[7],
+                consumed_key_id=row[8],
+                revoked_at=row[9],
+            )
+            for row in rows
+        ]
+
     @staticmethod
     def _hash(raw_key: str) -> str:
         return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()

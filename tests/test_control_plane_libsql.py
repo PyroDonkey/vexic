@@ -923,6 +923,78 @@ def test_setup_token_revoke_before_use_blocks_exchange(monkeypatch, tmp_path):
         keys.exchange_setup_token(provisioned_token.raw_token)
 
 
+def test_setup_token_list_filters_by_scope_and_reflects_state(monkeypatch, tmp_path):
+    keys, fake_conn = _setup_token_store(monkeypatch, tmp_path)
+
+    pending, _ = keys.create_setup_token(
+        tenant_id="tenant-a", project_id="project-a", session_id="pending"
+    )
+    consumed_token, consumed_record = keys.create_setup_token(
+        tenant_id="tenant-a", project_id="project-a", session_id="consumed"
+    )
+    revoked_token, revoked_record = keys.create_setup_token(
+        tenant_id="tenant-a", project_id="project-a", session_id="revoked"
+    )
+    expired_token, expired_record = keys.create_setup_token(
+        tenant_id="tenant-a", project_id="project-a", session_id="expired", ttl_seconds=0
+    )
+    # Same tenant, different project, and a different tenant: both excluded.
+    keys.create_setup_token(
+        tenant_id="tenant-a", project_id="project-b", session_id="other-project"
+    )
+    keys.create_setup_token(
+        tenant_id="tenant-b", project_id="project-a", session_id="other-tenant"
+    )
+
+    keys.exchange_setup_token(consumed_token.raw_token)
+    keys.revoke_setup_token(
+        tenant_id="tenant-a", project_id="project-a", token_id=revoked_record.token_id
+    )
+
+    listed = keys.list_setup_tokens(tenant_id="tenant-a", project_id="project-a")
+    by_id = {record.token_id: record for record in listed}
+
+    assert set(by_id) == {
+        pending.token_id,
+        consumed_record.token_id,
+        revoked_record.token_id,
+        expired_record.token_id,
+    }
+    # ORDER BY created_at, token_id -> creation order is preserved.
+    assert [record.session_id for record in listed] == [
+        "pending",
+        "consumed",
+        "revoked",
+        "expired",
+    ]
+
+    assert by_id[pending.token_id].consumed_at is None
+    assert by_id[pending.token_id].revoked_at is None
+    assert by_id[consumed_record.token_id].consumed_at is not None
+    assert by_id[consumed_record.token_id].consumed_key_id is not None
+    assert by_id[revoked_record.token_id].revoked_at is not None
+    # ttl_seconds=0 -> already expired (expires_at not in the future).
+    assert by_id[expired_record.token_id].expires_at == expired_record.created_at
+
+    # include flags narrow the result to active (unconsumed, unrevoked) tokens.
+    active_only = keys.list_setup_tokens(
+        tenant_id="tenant-a",
+        project_id="project-a",
+        include_consumed=False,
+        include_revoked=False,
+    )
+    assert {record.token_id for record in active_only} == {
+        pending.token_id,
+        expired_record.token_id,
+    }
+
+    # No raw token material ever persists or surfaces; the DTO has no hash field.
+    stored_cells = fake_conn.execute("SELECT * FROM hosted_setup_tokens").fetchall()
+    for raw in (pending.raw_token, consumed_token.raw_token, revoked_token.raw_token):
+        assert all(raw not in str(cell) for row in stored_cells for cell in row)
+    assert all(not hasattr(record, "token_hash") for record in listed)
+
+
 def test_exchanged_key_metadata_carries_setup_provenance(monkeypatch, tmp_path):
     keys, fake_conn = _setup_token_store(monkeypatch, tmp_path)
 
@@ -1038,6 +1110,23 @@ def test_setup_token_store_in_memory_branch_parity():
     )
     with pytest.raises(PermissionError, match="Invalid setup token."):
         keys.exchange_setup_token(revocable_token.raw_token)
+
+    # In-memory list branch parity: scoped, and reflects consumed/revoked state.
+    listed = {
+        r.token_id: r
+        for r in keys.list_setup_tokens(tenant_id="tenant-a", project_id="project-a")
+    }
+    assert listed[record.token_id].consumed_at is not None
+    assert listed[revocable_record.token_id].revoked_at is not None
+    assert listed[expired_token.token_id].consumed_at is None
+    assert keys.list_setup_tokens(tenant_id="tenant-a", project_id="project-b") == []
+    active_only = keys.list_setup_tokens(
+        tenant_id="tenant-a",
+        project_id="project-a",
+        include_consumed=False,
+        include_revoked=False,
+    )
+    assert {r.token_id for r in active_only} == {expired_token.token_id}
 
 
 def test_replacement_scope_unrelated_valueerror_still_propagates(monkeypatch, tmp_path):
