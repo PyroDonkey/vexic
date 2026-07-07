@@ -1,0 +1,18 @@
+# gitleaks configuration for Vexic.
+#
+# Extends the built-in gitleaks ruleset. The allowlist below only exempts
+# known, hardcoded test fixtures that are not live credentials. It matches by
+# secret value (not by path) so real secrets accidentally committed under
+# tests/ are still caught.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known non-live test fixtures"
+regexes = [
+  # tests/test_hosted_turso_backend.py placeholder auth token
+  '''jwt-for-vexic-[a-z0-9-]+''',
+  # Deterministic API-key fixture used across hosted tests
+  '''vx_deadbeefcafebabe_deterministic-secret''',
+]
