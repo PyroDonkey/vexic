@@ -48,7 +48,11 @@ trail, and `hosted_projects`/`tenants` had no working soft-delete
    `confirm_whole_scope=True`, failing before any deletion and regardless of
    `dry_run` so even a preview requires opting in. Session-scoped purges are
    unchanged. The field is additive with a safe default, so `CONTRACT_VERSION`
-   stays `0.1.0`.
+   stays `0.1.0`. The contract models set `extra="forbid"`, so strictly a
+   version-skewed old server would reject a payload carrying the new field;
+   pre-launch this cannot occur (a single first-party consumer, client and
+   server import the same contract module), so the version is deliberately held
+   at `0.1.0` and version policy is revisited at the first external release.
 
 3. **Soft-delete control-plane projects and tenants.** `hosted_projects` and
    `tenants` gain inline `retired_at`/`retired_by` columns (ALTER-guarded
