@@ -108,16 +108,25 @@ def _nearest_candidate(
     *,
     agent_id: str | None,
 ) -> DedupMatch | None:
-    backend = select_vector_backend(conn)
-    knn = backend.knn_subquery(
-        table="memory_candidate_embeddings", id_column="candidate_id"
-    )
+    # Dedup must find the nearest neighbor AMONG the merge-eligible set (same
+    # subject + category + agent, still live in staging), not the nearest global
+    # vector that happens to also be eligible. A KNN-then-filter query applies
+    # its `k`/MATCH limit before the eligibility JOIN, so an eligible duplicate
+    # ranked outside the global top-k is invisible and gets wrongly inserted as
+    # a fresh candidate — a staging duplicate, violating "reinforce/merge, don't
+    # duplicate". The eligible set here is small by construction (same subject
+    # AND category AND agent), so we filter first in plain SQL, then rank in
+    # Python. Both stored and incoming embeddings are normalized, so the dot
+    # product IS cosine similarity and equals what both vector backends'
+    # .similarity() would return (sqlite-vec: 1 - L2^2/2; libSQL: 1 - cos_dist)
+    # — this keeps backend parity without touching the vector index and does not
+    # weaken the dedup thresholds.
     rows = conn.execute(
-        f"""
-        SELECT e._id, e._distance
-        FROM ({knn}) AS e
+        """
+        SELECT e.candidate_id, e.embedding
+        FROM memory_candidate_embeddings AS e
         JOIN memory_candidates AS c
-            ON c.id = e._id
+            ON c.id = e.candidate_id
         WHERE c.subject = ?
             AND c.category = ?
             AND c.promoted = 0
@@ -125,11 +134,8 @@ def _nearest_candidate(
             AND c.stale = 0
             AND c.needs_review = 0
             AND c.agent_id IS ?
-        ORDER BY e._distance
         """,
         (
-            _serialize_float32(embedding),
-            DEDUP_NEIGHBOR_COUNT,
             candidate.subject,
             candidate.category,
             agent_id,
@@ -139,10 +145,23 @@ def _nearest_candidate(
     if not rows:
         return None
 
-    row = rows[0]
+    best_id: int | None = None
+    best_similarity = -2.0
+    for row in rows:
+        stored = _embedding_blob_to_list(row[1])
+        similarity = sum(
+            incoming_value * stored_value
+            for incoming_value, stored_value in zip(embedding, stored, strict=True)
+        )
+        if similarity > best_similarity:
+            best_similarity = similarity
+            best_id = int(row[0])
+
+    if best_id is None:
+        return None
     return DedupMatch(
-        candidate_id=int(row[0]),
-        similarity=backend.similarity(float(row[1])),
+        candidate_id=best_id,
+        similarity=max(-1.0, min(1.0, best_similarity)),
     )
 
 
@@ -828,6 +847,12 @@ def load_candidates_missing_embeddings(
     init_vector_memory(db_path)
     with closing(connect(db_path)) as conn:
         _ensure_vector_memory_schema(conn)
+        # Only live Tier-2 staging candidates are eligible for embedding repair.
+        # A promoted/retired/needs_review row has already left staging; backfill
+        # (which can merge a repaired row into an active neighbor and mark the
+        # original stale) must never mutate one — that would drift counters and
+        # rewrite an already-promoted candidate. Same active-candidate predicate
+        # the promotion/REM loaders enforce.
         rows = conn.execute(
             """
             SELECT c.id, c.fact_text
@@ -835,7 +860,10 @@ def load_candidates_missing_embeddings(
             LEFT JOIN memory_candidate_embeddings AS e
                 ON e.candidate_id = c.id
             WHERE e.candidate_id IS NULL
+                AND c.promoted = 0
+                AND c.retired = 0
                 AND c.stale = 0
+                AND c.needs_review = 0
                 AND c.agent_id IS ?
             ORDER BY c.id ASC
             """,
@@ -996,6 +1024,23 @@ def commit_rem_cycle(
     return RemStats(boosted=boosted)
 
 
+def _current_ok_watermark(conn: sqlite3.Connection, agent_id: str | None) -> int:
+    # Conn-scoped read of the Light watermark inside the open commit
+    # transaction, mirroring transcript.get_watermark's MAX-over-ok-runs query.
+    # Reading through the same locked transaction is what makes the
+    # compare-and-set below atomic against a concurrent Light run.
+    row = conn.execute(
+        """
+        SELECT MAX(last_processed_message_id)
+        FROM dream_runs
+        WHERE agent_id IS ?
+            AND status = 'ok'
+        """,
+        (agent_id,),
+    ).fetchone()
+    return row[0] if row[0] is not None else 0
+
+
 def commit_dream_cycle(
     db_path: str,
     candidates: list[FactCandidate],
@@ -1008,6 +1053,7 @@ def commit_dream_cycle(
     last_processed_message_id: int,
     error_detail: str | None = None,
     candidate_embeddings: list[list[float]] | None = None,
+    observed_watermark: int | None = None,
     model_requests: int = 0,
     input_tokens: int = 0,
     output_tokens: int = 0,
@@ -1026,9 +1072,33 @@ def commit_dream_cycle(
     assert_no_forbidden_secret_values(forbidden_secret_values, error_detail or "")
 
     with closing(connect(db_path)) as conn:
-        with conn:
+        # Explicit transaction, not the bare `with conn:` used elsewhere: the
+        # optional compare-and-set below reads the watermark and then writes in
+        # one atomic unit, and libSQL only opens a real multi-statement
+        # transaction on an explicit BEGIN (ADR 0019 caveat in connection.py).
+        # sqlite gets BEGIN IMMEDIATE so the write lock is taken before the
+        # re-read; a second concurrent Light run then blocks (or fails busy)
+        # instead of reading a stale watermark and double-writing.
+        if isinstance(conn, sqlite3.Connection):
+            conn.execute("BEGIN IMMEDIATE")
+        else:
+            conn.execute("BEGIN")
+        try:
+            # Watermark compare-and-set: if the caller observed watermark W at
+            # read time but another Light run has since advanced it, this window
+            # was already processed. Abort as an audit-only no-op rather than
+            # re-committing the same candidates (double hit_count / duplicate
+            # staging rows) and re-advancing the watermark. Only 'ok' cycles
+            # carry a watermark to defend; error/no-op audit rows never claim
+            # to have processed the window.
+            superseded = (
+                observed_watermark is not None
+                and status == "ok"
+                and _current_ok_watermark(conn, agent_id) != observed_watermark
+            )
+
             stats = DedupStats()
-            if candidates:
+            if candidates and not superseded:
                 _ensure_vector_memory_schema(conn)
                 stats = _commit_candidates_with_dedup(
                     conn,
@@ -1037,33 +1107,63 @@ def commit_dream_cycle(
                     agent_id=agent_id,
                 )
 
-            conn.execute(
-                """
-                INSERT INTO dream_runs
-                    (started_at, finished_at, status, agent_id, messages_processed,
-                     candidates_inserted, candidates_merged, candidates_review,
-                     last_processed_message_id, error_detail, model_requests,
-                     input_tokens, output_tokens, total_tokens, estimated_cost_micros)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    started_at,
-                    finished_at,
-                    status,
-                    agent_id,
-                    messages_processed,
-                    stats.inserted + stats.review,
-                    stats.merged,
-                    stats.review,
-                    last_processed_message_id,
-                    error_detail,
-                    model_requests,
-                    input_tokens,
-                    output_tokens,
-                    total_tokens,
-                    estimated_cost_micros,
-                ),
-            )
+            if superseded:
+                # A no-op audit row: no candidates, and last_processed_message_id
+                # left at 0 so it cannot lift MAX(last_processed_message_id) past
+                # the run that already advanced the watermark.
+                conn.execute(
+                    """
+                    INSERT INTO dream_runs
+                        (started_at, finished_at, status, agent_id, messages_processed,
+                         candidates_inserted, candidates_merged, candidates_review,
+                         last_processed_message_id, error_detail, model_requests,
+                         input_tokens, output_tokens, total_tokens, estimated_cost_micros)
+                    VALUES (?, ?, 'ok', ?, 0, 0, 0, 0, 0, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        started_at,
+                        finished_at,
+                        agent_id,
+                        "superseded: watermark advanced by a concurrent Light run",
+                        model_requests,
+                        input_tokens,
+                        output_tokens,
+                        total_tokens,
+                        estimated_cost_micros,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO dream_runs
+                        (started_at, finished_at, status, agent_id, messages_processed,
+                         candidates_inserted, candidates_merged, candidates_review,
+                         last_processed_message_id, error_detail, model_requests,
+                         input_tokens, output_tokens, total_tokens, estimated_cost_micros)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        started_at,
+                        finished_at,
+                        status,
+                        agent_id,
+                        messages_processed,
+                        stats.inserted + stats.review,
+                        stats.merged,
+                        stats.review,
+                        last_processed_message_id,
+                        error_detail,
+                        model_requests,
+                        input_tokens,
+                        output_tokens,
+                        total_tokens,
+                        estimated_cost_micros,
+                    ),
+                )
+        except BaseException:
+            conn.rollback()
+            raise
+        conn.commit()
 
 
 def read_candidate_for_promotion(
@@ -1094,11 +1194,19 @@ def claim_candidate_for_promotion(
     # concurrent deep cycle already flipped this candidate to promoted, rowcount
     # is 0 and the caller must abort without a duplicate Tier 3 write. Returns
     # True iff this caller won the claim.
+    #
+    # `needs_review = 0` mirrors the loader's eligibility predicate: a candidate
+    # flagged for review AFTER selection but before this claim (e.g. a
+    # concurrent backfill/merge that raised best_similarity into the review
+    # band) must not sneak into Tier 3. The read in read_candidate_for_promotion
+    # does not carry needs_review, so this claim is the only guard against that
+    # race — a lost claim returns rowcount 0 and the caller aborts cleanly.
     claim = conn.execute(
         """
         UPDATE memory_candidates
         SET promoted = 1
         WHERE id = ? AND promoted = 0 AND retired = 0 AND stale = 0
+            AND needs_review = 0
         """,
         (candidate_id,),
     )
