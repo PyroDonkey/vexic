@@ -317,6 +317,8 @@ def register_control_plane_routes(
         tokens = service.api_keys.list_setup_tokens(
             tenant_id=tenant_id,
             project_id=project_id,
+            include_consumed=_query_flag(request, "includeConsumed"),
+            include_revoked=_query_flag(request, "includeRevoked"),
         )
         now = _utc_iso(datetime.now(UTC))
         return JSONResponse(
@@ -673,9 +675,21 @@ def _setup_token_payload(record: HostedSetupTokenRecord) -> dict[str, str]:
     }
 
 
+def _query_flag(request: Request, name: str) -> bool:
+    # Setup-token listing defaults to actionable (pending) tokens; consumed and
+    # revoked history is opt-in, so an absent flag reads False.
+    value = request.query_params.get(name)
+    return value is not None and value.strip().lower() in ("1", "true", "yes")
+
+
 def _setup_token_status(record: HostedSetupTokenRecord, *, now: str) -> str:
-    # ISO-Z timestamps are lexically ordered, so a string compare matches the
-    # exchange path's `expires_at <= now` expiry check in hosted_local.
+    # ISO-Z timestamps are lexically ordered, so this string compare deliberately
+    # mirrors the exchange path's own string compare `stored.expires_at <= now`
+    # (hosted_local exchange_setup_token, in-memory and the SQL `expires_at > ?`).
+    # Matching that exact comparison is the point: a token this reports as
+    # `pending` is one exchange would still accept, and one it reports `expired`
+    # is one exchange would reject. Parsing to datetimes here would instead make
+    # the displayed status disagree with what exchange enforces.
     #
     # "consumed" wins over "revoked": once a token is exchanged, a durable Agent
     # API key exists and revoking the setup token afterward does not retract that

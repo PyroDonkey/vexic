@@ -1050,7 +1050,10 @@ class HostedHttpTests(unittest.TestCase):
 
         tokens = {
             token["id"]: token
-            for token in client.get(list_path, headers=self._control_auth()).json()["tokens"]
+            for token in client.get(
+                f"{list_path}?includeConsumed=true&includeRevoked=true",
+                headers=self._control_auth(),
+            ).json()["tokens"]
         }
         self.assertEqual(tokens[consumed["token"]["id"]]["status"], "consumed")
         self.assertIsNotNone(tokens[consumed["token"]["id"]]["consumedAt"])
@@ -1081,7 +1084,10 @@ class HostedHttpTests(unittest.TestCase):
         )
         self.assertEqual(revoke.status_code, 204)
 
-        token = client.get(list_path, headers=self._control_auth()).json()["tokens"][0]
+        token = client.get(
+            f"{list_path}?includeConsumed=true&includeRevoked=true",
+            headers=self._control_auth(),
+        ).json()["tokens"][0]
         self.assertEqual(token["status"], "consumed")
         self.assertIsNotNone(token["consumedAt"])
         self.assertIsNotNone(token["revokedAt"])
@@ -1116,6 +1122,44 @@ class HostedHttpTests(unittest.TestCase):
 
         self.assertEqual([t["id"] for t in org_a_tokens], [minted["token"]["id"]])
         self.assertEqual(org_b_tokens, [])
+
+    def test_control_plane_setup_token_list_defaults_to_actionable_tokens(self) -> None:
+        # Default list shows only actionable (unconsumed, unrevoked) tokens; the
+        # includeConsumed/includeRevoked flags opt into consumed/revoked history.
+        client = TestClient(
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
+        )
+        project = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo"},
+        ).json()["project"]
+        list_path = f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/setup-tokens"
+        pending = client.post(list_path, headers=self._control_auth()).json()
+        consumed = client.post(list_path, headers=self._control_auth()).json()
+        revoked = client.post(list_path, headers=self._control_auth()).json()
+        self.keys.exchange_setup_token(consumed["rawToken"])
+        client.post(
+            f"{list_path}/{revoked['token']['id']}/revoke", headers=self._control_auth()
+        )
+
+        default_ids = [
+            t["id"]
+            for t in client.get(list_path, headers=self._control_auth()).json()["tokens"]
+        ]
+        self.assertEqual(default_ids, [pending["token"]["id"]])
+
+        all_ids = {
+            t["id"]
+            for t in client.get(
+                f"{list_path}?includeConsumed=true&includeRevoked=true",
+                headers=self._control_auth(),
+            ).json()["tokens"]
+        }
+        self.assertEqual(
+            all_ids,
+            {pending["token"]["id"], consumed["token"]["id"], revoked["token"]["id"]},
+        )
 
     def test_setup_token_routes_are_control_plane_only_and_exchange_is_core(self) -> None:
         core_paths = {route.path for route in create_app(self.service).routes}
