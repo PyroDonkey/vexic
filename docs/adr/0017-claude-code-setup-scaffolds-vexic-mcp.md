@@ -1,6 +1,7 @@
 # Claude Code setup scaffolds a disabled Vexic MCP entry
 
-Status: accepted
+Status: superseded by ADR 0027 (install mechanism only; the no-inline-secret and
+opt-in intent carry forward)
 
 ## Context
 
