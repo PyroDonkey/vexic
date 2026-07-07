@@ -47,6 +47,8 @@ from vexic.contract import (
     TrustBoundary,
 )
 
+__version__ = "0.1.0"
+
 __all__ = [
     "CONTRACT_VERSION",
     "AppendTranscriptRequest",

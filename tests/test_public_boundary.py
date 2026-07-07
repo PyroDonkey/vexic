@@ -116,12 +116,15 @@ def test_console_and_website_are_not_tracked_in_this_repository() -> None:
 def test_public_tree_does_not_embed_tracking_references() -> None:
     """Code and non-ADR docs must not reference the private issue tracker.
 
-    Allowed locations: docs/adr/ (decision provenance), docs/provenance.md,
-    the PR template example, and dated drill/tabletop logs (historical records).
+    Allowed locations (per docs/ai/AGENTS.md): docs/adr/ (decision
+    provenance), docs/provenance.md, and docs/runbooks/ (drill/tabletop and
+    migration evidence, including dated historical logs). The match is
+    case-insensitive so a lowercase real id (e.g. coa-281) cannot slip past
+    the guard; generic placeholders like coa-<id> never match because \\d+
+    requires a digit.
     """
-    ticket_pattern = re.compile(r"\b" + "C" + r"OA-\d+\b")
-    allowed = ("docs/adr/", "docs/provenance.md")
-    dated_log = re.compile(r"docs/runbooks/[^/]+/\d{4}-\d{2}-\d{2}-")
+    ticket_pattern = re.compile(r"\b" + "C" + r"OA-\d+\b", re.IGNORECASE)
+    allowed = ("docs/adr/", "docs/provenance.md", "docs/runbooks/")
     offenders: list[str] = []
     scan_dirs = ("src", "tests", "adapters", "scripts", "docs")
     for scan in scan_dirs:
@@ -131,7 +134,7 @@ def test_public_tree_does_not_embed_tracking_references() -> None:
             rel = path.relative_to(ROOT).as_posix()
             if rel == "tests/test_public_boundary.py":
                 continue
-            if rel.startswith(allowed) or dated_log.match(rel):
+            if rel.startswith(allowed):
                 continue
             lines = path.read_text(encoding="utf-8").splitlines()
             for line_number, line in enumerate(lines, 1):

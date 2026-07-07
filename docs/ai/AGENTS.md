@@ -300,7 +300,7 @@ Work flows feature branch -> `dev` -> `main`.
   | `docs/`  | docs, ADRs, runbooks                       |
   | `chore/` | tooling, CI, cleanup                       |
 
-  Example: `feat/coa-281-turso-retry`. Use `chore/<slug>` when no Linear issue
+  Example: `feat/coa-<id>-<slug>`. Use `chore/<slug>` when no Linear issue
   exists. The `coa-<id>` in the branch name lets the Linear GitHub integration
   link the PR and move the issue automatically; also put `Fixes COA-<id>` in
   the PR description.
