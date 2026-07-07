@@ -409,6 +409,15 @@ local agent hooks may also call `scripts/check_branch_sync.py` and
 Run the LongMemEval evals with `vexic.run_evals`; see `docs/examples.md` for the
 exact command and worked behavior examples.
 
+`src/vexic/live_retrieval_baseline.py` is the maintained live-provider
+retrieval smoke harness: it runs Light -> REM -> Deep over a JSONL fixture
+through a real provider adapter, writes `retrieval_metrics.json` and
+`answer_synthesis_metrics.json`, and classifies retrieval failures. It is
+gated behind `--allow-live` with a provider-call budget cap. Invoke it with
+`python -m vexic.live_retrieval_baseline`; the command and artifacts are
+documented in `docs/usage.md`, and `docs/ai/REVIEW.md` flags it as do-not-run
+during review. Behavior is pinned by `tests/test_live_retrieval_baseline.py`.
+
 Private source-host references are allowed in `docs/provenance.md` and compatibility
 sections. They should not become Vexic runtime instructions.
 Private tracker issue references are allowed only as project-tracking,
