@@ -221,6 +221,11 @@ Memory is retained by default.
   `purged_at` plus per-table counts on the tombstone. Provider backups retain
   residual copies until their own retention expires; wording must not promise
   instantaneous global erasure.
+- A whole-scope purge (`PurgeScopeRequest` with a null `target_scope.session_id`)
+  erases every session for the target agent scope in one call. It must set
+  `confirm_whole_scope=True`; otherwise `purge_scope` fails before any deletion
+  and regardless of `dry_run` (ADR 0028). Session-scoped purges are
+  unaffected.
 - Content-bearing retrieval telemetry supports age-based expiry
   (`expire_retrieval_queries`): query text is blanked in place, rows and
   derived counters survive.

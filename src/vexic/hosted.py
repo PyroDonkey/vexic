@@ -305,6 +305,8 @@ class HostedAuditEvent:
     status: str
     recorded_at: str
     error_type: str | None = None
+    project_id: str | None = None
+    key_id: str | None = None
 
 
 @dataclass(frozen=True)
