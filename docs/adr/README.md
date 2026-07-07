@@ -32,7 +32,7 @@ index (and the reverse).
 | 0014 | Transcript writes are out-of-band auto-record, not an MCP tool   | accepted |
 | 0015 | Claude Code setup recorder is hook-triggered                   | accepted |
 | 0016 | Local embedding and deferrable contradiction lower the LLM floor | accepted |
-| 0017 | Claude Code setup scaffolds a disabled Vexic MCP entry           | accepted |
+| 0017 | Claude Code setup scaffolds a disabled Vexic MCP entry           | superseded by ADR 0027 |
 | 0018 | Claude Code read path splits SessionStart priming and MCP on-demand pull | accepted |
 | 0019 | Hosted storage cutover starts Turso-only, Neon deferred         | accepted |
 | 0020 | Heuristic REM lowers the dream-phase LLM floor                  | accepted |
@@ -42,6 +42,7 @@ index (and the reverse).
 | 0024 | Hosted fresh-conversation context ships as a Summarize dream phase plus a dedicated fresh_context capability | accepted |
 | 0025 | Automatic summarize triggering ships as an async trigger endpoint, hourly cron, and a detached SessionStart backstop | accepted |
 | 0026 | Agent setup uses a short-lived setup token exchange             | accepted |
+| 0027 | Agent MCP connect uses each client's own `mcp add` command, opt-in | accepted |
 
 Notes:
 
@@ -84,7 +85,9 @@ Notes:
   config) rather than auto-installing a live entry, keeps raw keys out of Claude
   config, and requires no hosted MCP server changes. It builds on the COA-250 /
   COA-253 evidence and affirms ADR 0010 and ADR 0015. A follow-up implementation
-  issue owns the scaffold install/uninstall, built test-first.
+  issue owns the scaffold install/uninstall, built test-first. Its install
+  mechanism is superseded by ADR 0027; the no-inline-secret and opt-in intent
+  carry forward.
 - 0018 settles COA-262: the default Claude Code read path is SessionStart
   priming from the existing recorder config plus an opt-in MCP on-demand pull
   leg. UserPromptSubmit relevance injection and a dedicated no-query priming
@@ -122,6 +125,14 @@ Notes:
   CLI for a scoped Agent API key, so the raw key never transits the browser.
   Full device-code/OAuth stays deferred per ADR 0010. Follow-up issues own the
   token store/endpoints, console UI, and CLI exchange path.
+- 0027 settles COA-303's connect posture: agent MCP connect uses each client's
+  own `mcp add` command (Claude Code, Codex) and stays opt-in -- `vexic setup`
+  writes the owner-only credential file and prints the vendor command rather than
+  auto-writing client config; the user running it is the deliberate enable step.
+  It supersedes the install mechanism of ADR 0017 (keeping its no-inline-secret
+  and opt-in intent) and requires no server changes. The generic path covers
+  clients without a dedicated installer; recorder generalization is tracked
+  separately.
 - These numbers are the Vexic `docs/adr/` series and are self-contained.
   `src/vexic` source no longer carries any `upstream ADR-00NN` extraction-source
   labels (they were removed when the COA boundary policy was clarified), so there
