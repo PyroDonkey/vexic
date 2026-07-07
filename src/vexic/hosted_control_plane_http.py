@@ -298,6 +298,31 @@ def register_control_plane_routes(
             return _error_response(404, "not_found", "Setup token not found.")
         return Response(status_code=204)
 
+    @app.get("/control/v1/clerk-orgs/{clerk_org_id}/projects/{project_id}/setup-tokens")
+    @_control_plane_storage_boundary
+    async def list_control_plane_setup_tokens(
+        clerk_org_id: str,
+        project_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        if not _has_control_plane_credential(request, control_plane_tokens):
+            return _error_response(401, "unauthorized", "Invalid control-plane credential.")
+        tenant_id = _resolve_control_tenant(service, clerk_org_id)
+        if tenant_id is None:
+            return _error_response(404, "not_found", "Project not found.")
+        try:
+            service.catalog.get_control_project(tenant_id, project_id)
+        except PermissionError:
+            return _error_response(404, "not_found", "Project not found.")
+        tokens = service.api_keys.list_setup_tokens(
+            tenant_id=tenant_id,
+            project_id=project_id,
+        )
+        now = _utc_iso(datetime.now(UTC))
+        return JSONResponse(
+            {"tokens": [_setup_token_list_payload(token, now=now) for token in tokens]}
+        )
+
     @app.get("/control/v1/clerk-orgs/{clerk_org_id}/usage")
     @_control_plane_storage_boundary
     async def get_control_plane_tenant_usage(
@@ -645,6 +670,29 @@ def _setup_token_payload(record: HostedSetupTokenRecord) -> dict[str, str]:
         "sessionId": record.session_id,
         "createdAt": record.created_at,
         "expiresAt": record.expires_at,
+    }
+
+
+def _setup_token_status(record: HostedSetupTokenRecord, *, now: str) -> str:
+    # ISO-Z timestamps are lexically ordered, so a string compare matches the
+    # exchange path's `expires_at <= now` expiry check in hosted_local.
+    if record.revoked_at is not None:
+        return "revoked"
+    if record.consumed_at is not None:
+        return "consumed"
+    if record.expires_at <= now:
+        return "expired"
+    return "pending"
+
+
+def _setup_token_list_payload(
+    record: HostedSetupTokenRecord, *, now: str
+) -> dict[str, str | None]:
+    return {
+        **_setup_token_payload(record),
+        "consumedAt": record.consumed_at,
+        "revokedAt": record.revoked_at,
+        "status": _setup_token_status(record, now=now),
     }
 
 

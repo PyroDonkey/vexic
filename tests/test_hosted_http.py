@@ -968,8 +968,136 @@ class HostedHttpTests(unittest.TestCase):
         with self.assertRaises(PermissionError):
             self.keys.exchange_setup_token(minted["rawToken"])
 
+    def test_control_plane_setup_token_list_requires_console_credential_and_project(
+        self,
+    ) -> None:
+        client = TestClient(
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
+        )
+        project = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo"},
+        ).json()["project"]
+        list_path = f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/setup-tokens"
+        minted = client.post(
+            list_path,
+            headers=self._control_auth(),
+            json={"agentScope": "agent-a", "sessionId": "session-setup"},
+        ).json()
+
+        missing_credential = client.get(list_path)
+        bad_credential = client.get(
+            list_path,
+            headers={"Authorization": "Bearer wrong-secret"},
+        )
+        unknown_project = client.get(
+            "/control/v1/clerk-orgs/org_123/projects/proj_missing/setup-tokens",
+            headers=self._control_auth(),
+        )
+        unknown_org = client.get(
+            "/control/v1/clerk-orgs/org_missing/projects/proj_missing/setup-tokens",
+            headers=self._control_auth(),
+        )
+        listed = client.get(list_path, headers=self._control_auth())
+
+        self.assertEqual(missing_credential.status_code, 401)
+        self.assertEqual(missing_credential.json()["error"]["code"], "unauthorized")
+        self.assertEqual(bad_credential.status_code, 401)
+        self.assertEqual(unknown_project.status_code, 404)
+        self.assertEqual(unknown_org.status_code, 404)
+        self.assertEqual(listed.status_code, 200)
+        tokens = listed.json()["tokens"]
+        self.assertEqual(len(tokens), 1)
+        token = tokens[0]
+        self.assertEqual(token["id"], minted["token"]["id"])
+        self.assertEqual(token["tenantId"], project["tenantId"])
+        self.assertEqual(token["projectId"], project["id"])
+        self.assertEqual(token["agentScope"], "agent-a")
+        self.assertEqual(token["sessionId"], "session-setup")
+        self.assertEqual(token["status"], "pending")
+        self.assertIsNone(token["consumedAt"])
+        self.assertIsNone(token["revokedAt"])
+        self.assertTrue(token["createdAt"])
+        self.assertTrue(token["expiresAt"])
+        # No raw token or hash material ever leaves the list endpoint.
+        self.assertNotIn("vxsetup_", listed.text)
+        self.assertNotIn("vx_", listed.text)
+        self.assertNotIn("token_hash", listed.text)
+        self.assertNotIn("tokenHash", listed.text)
+
+    def test_control_plane_setup_token_list_reflects_consumed_and_revoked_state(
+        self,
+    ) -> None:
+        client = TestClient(
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
+        )
+        project = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo"},
+        ).json()["project"]
+        list_path = f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/setup-tokens"
+        consumed = client.post(list_path, headers=self._control_auth()).json()
+        revoked = client.post(list_path, headers=self._control_auth()).json()
+
+        self.keys.exchange_setup_token(consumed["rawToken"])
+        revoke = client.post(
+            f"{list_path}/{revoked['token']['id']}/revoke",
+            headers=self._control_auth(),
+        )
+        self.assertEqual(revoke.status_code, 204)
+
+        tokens = {
+            token["id"]: token
+            for token in client.get(list_path, headers=self._control_auth()).json()["tokens"]
+        }
+        self.assertEqual(tokens[consumed["token"]["id"]]["status"], "consumed")
+        self.assertIsNotNone(tokens[consumed["token"]["id"]]["consumedAt"])
+        self.assertEqual(tokens[revoked["token"]["id"]]["status"], "revoked")
+        self.assertIsNotNone(tokens[revoked["token"]["id"]]["revokedAt"])
+
+    def test_control_plane_setup_token_list_is_tenant_scoped(self) -> None:
+        client = TestClient(
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
+        )
+        project_a = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo"},
+        ).json()["project"]
+        project_b = client.post(
+            "/control/v1/clerk-orgs/org_456/projects",
+            headers=self._control_auth(),
+            json={"name": "Other"},
+        ).json()["project"]
+        minted = client.post(
+            f"/control/v1/clerk-orgs/org_123/projects/{project_a['id']}/setup-tokens",
+            headers=self._control_auth(),
+        ).json()
+
+        org_a_tokens = client.get(
+            f"/control/v1/clerk-orgs/org_123/projects/{project_a['id']}/setup-tokens",
+            headers=self._control_auth(),
+        ).json()["tokens"]
+        org_b_tokens = client.get(
+            f"/control/v1/clerk-orgs/org_456/projects/{project_b['id']}/setup-tokens",
+            headers=self._control_auth(),
+        ).json()["tokens"]
+
+        self.assertEqual([t["id"] for t in org_a_tokens], [minted["token"]["id"]])
+        self.assertEqual(org_b_tokens, [])
+
     def test_setup_token_routes_are_control_plane_only_and_exchange_is_core(self) -> None:
         core_paths = {route.path for route in create_app(self.service).routes}
+        control_app = create_control_plane_app(
+            self.service, control_plane_tokens=("console-secret",)
+        )
+        control_methods = {
+            (route.path, method)
+            for route in control_app.routes
+            for method in getattr(route, "methods", set())
+        }
 
         self.assertIn("/v1/setup/exchange", core_paths)
         self.assertNotIn(
@@ -981,11 +1109,23 @@ class HostedHttpTests(unittest.TestCase):
             "/setup-tokens/{token_id}/revoke",
             core_paths,
         )
+        self.assertIn(
+            (
+                "/control/v1/clerk-orgs/{clerk_org_id}/projects/{project_id}/setup-tokens",
+                "GET",
+            ),
+            control_methods,
+        )
 
         mint_on_core = self.client.post(
             "/control/v1/clerk-orgs/org_123/projects/project-a/setup-tokens",
             headers=self._control_auth(),
         )
+        list_on_core = self.client.get(
+            "/control/v1/clerk-orgs/org_123/projects/project-a/setup-tokens",
+            headers=self._control_auth(),
+        )
+        self.assertEqual(list_on_core.status_code, 404)
         exchange_on_core = self.client.post(
             "/v1/setup/exchange",
             json={"token": "vxsetup_bogus_bogus"},
