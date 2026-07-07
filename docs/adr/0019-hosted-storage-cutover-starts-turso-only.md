@@ -249,3 +249,26 @@ tracked as fix-soon items rather than open decisions):
   import/verify failure swallows its own exception so it can never mask the
   original failure, which means a broken teardown could silently leave a
   replacement database behind. Documented and accepted, not fixed.
+
+## Addendum 3 -- 2026-07-06: read-then-write serialization on libSQL (COA-311)
+
+The promotion pipeline has two atomic read-then-write paths where a stale read
+followed by a dependent write would corrupt Tier-2 state under concurrent Light
+runs: the watermark compare-and-set in `commit_dream_cycle` (COA-310) and the
+per-candidate liveness recheck in `backfill_missing_candidate_embeddings`
+(COA-311). Both open their transaction through the shared
+`storage.candidates._begin_write_txn` helper.
+
+The two backends reach serialization differently, and this is a deliberate
+reliance, not an oversight:
+
+- **sqlite** gets `BEGIN IMMEDIATE`, which takes the write lock before the read,
+  so a second concurrent writer blocks or fails busy rather than reading stale
+  state. This branch is covered by the sqlite regression tests in
+  `tests/test_pipeline.py`.
+- **managed libSQL/Turso** gets a plain `BEGIN` (it has no local pre-read write
+  lock; see the transaction caveat above). Concurrent-Light safety there relies
+  on the Turso server rejecting the stale write at commit via its conflict
+  detection. This branch is exercised only by a creds-gated live test and is
+  therefore unverified in the default creds-free CI run. Both edges bite only
+  under multi-worker Light, which v0.1 does not run.
