@@ -59,10 +59,12 @@ representative at an online or offline event.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the community leaders responsible for enforcement through GitHub's
-private vulnerability reporting on the repository's **Security** tab, or by
-contacting the maintainer directly. All complaints will be reviewed and
-investigated promptly and fairly.
+reported to the community leaders responsible for enforcement. For sensitive
+reports, use GitHub's private vulnerability reporting on the repository's
+**Security** tab (https://github.com/PyroDonkey/vexic/security/advisories/new).
+Otherwise, contact the maintainer through their GitHub profile at
+https://github.com/PyroDonkey. All complaints will be reviewed and investigated
+promptly and fairly.
 
 All community leaders are obligated to respect the privacy and security of the
 reporter of any incident.

@@ -2,8 +2,8 @@
 
 **Memory your agents can trust.**
 
-[![PyPI](https://img.shields.io/badge/PyPI-coming%20soon-lightgrey.svg)](https://pypi.org/project/vexic/)
-[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![PyPI](https://img.shields.io/pypi/v/vexic.svg)](https://pypi.org/project/vexic/)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/PyroDonkey/vexic/blob/main/LICENSE)
 [![CI](https://github.com/PyroDonkey/vexic/actions/workflows/ci.yml/badge.svg)](https://github.com/PyroDonkey/vexic/actions/workflows/ci.yml)
 [![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-blue.svg)](https://www.python.org/)
 
@@ -20,31 +20,44 @@ your machine: it reads and writes a local database and never exfiltrates data.
 > surfaces in this repository are internal-alpha adapter code, not a public
 > service contract.
 
-## Quick Start
-
-Install and test the Python memory core with `uv`
-([install uv](https://docs.astral.sh/uv/)):
+## Install
 
 ```bash
-uv run pytest
+pip install vexic
 ```
 
-Run the local read-only MCP server against a Vexic database:
+Or with [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv add vexic
+```
+
+## Quick Start
+
+Installing the package puts the `vexic` command on your `PATH`. Run the local
+read-only MCP server against a Vexic database:
 
 ```bash
 # POSIX shells (bash/zsh)
-uv run python scripts/vexic-mcp-stdio.py --db-path ./memory.db --tenant-id local --session-id default
+vexic mcp-stdio --db-path ./memory.db --tenant-id local --session-id default
 ```
 
 ```powershell
 # PowerShell
-uv run python scripts\vexic-mcp-stdio.py --db-path .\memory.db --tenant-id local --session-id default
+vexic mcp-stdio --db-path .\memory.db --tenant-id local --session-id default
 ```
 
 The server exposes two read-only tools to the agent: `recall_conversation_history`
 (this session's transcript) and `recall_user_memory` (durable facts and
-preferences). See [`docs/usage.md`](docs/usage.md) for MCP client setup, the
-transcript recorder, and smoke-test examples.
+preferences). See
+[`docs/usage.md`](https://github.com/PyroDonkey/vexic/blob/main/docs/usage.md)
+for MCP client setup, the transcript recorder, and smoke-test examples.
+
+From a source checkout (no install), run the same server through `uv`:
+
+```bash
+uv run python scripts/vexic-mcp-stdio.py --db-path ./memory.db --tenant-id local --session-id default
+```
 
 ## Python Quickstart
 
@@ -84,7 +97,7 @@ asyncio.run(main())
 
 Output: `User: I prefer tabs over spaces.` All environment variables the
 package and its adapters read are listed in
-[`docs/configuration.md`](docs/configuration.md).
+[`docs/configuration.md`](https://github.com/PyroDonkey/vexic/blob/main/docs/configuration.md).
 
 ## Repository Map
 
@@ -99,7 +112,7 @@ package and its adapters read are listed in
 
 Vexic Console and the marketing website live in the private
 `PyroDonkey/vexic-website` repository (open-core boundary) — see
-[ADR 0012's addendum](docs/adr/0012-vexic-console-implementation-path.md).
+[ADR 0012's addendum](https://github.com/PyroDonkey/vexic/blob/main/docs/adr/0012-vexic-console-implementation-path.md).
 
 ## Package Boundary
 
@@ -110,10 +123,22 @@ isolate anymore.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and the branch workflow,
-[SECURITY.md](SECURITY.md) for reporting vulnerabilities, and
-[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community expectations.
+Working from a source checkout? Clone the repository and run the test suite with
+[uv](https://docs.astral.sh/uv/):
+
+```bash
+uv run pytest
+```
+
+See
+[CONTRIBUTING.md](https://github.com/PyroDonkey/vexic/blob/main/CONTRIBUTING.md)
+for setup and the branch workflow,
+[SECURITY.md](https://github.com/PyroDonkey/vexic/blob/main/SECURITY.md) for
+reporting vulnerabilities, and
+[CODE_OF_CONDUCT.md](https://github.com/PyroDonkey/vexic/blob/main/CODE_OF_CONDUCT.md)
+for community expectations.
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Apache-2.0. See
+[LICENSE](https://github.com/PyroDonkey/vexic/blob/main/LICENSE).
