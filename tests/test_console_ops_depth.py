@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -8,6 +9,15 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from vexic.contract import (
+    FreshContextRequest,
+    MemoryCapability,
+    MemoryScope,
+    Principal,
+    PrincipalType,
+    RedactionContext,
+    TrustBoundary,
+)
 from vexic.hosted import (
     HostedInMemoryRateLimiter,
     HostedJobEvent,
@@ -429,6 +439,97 @@ class JobsEndpointTests(ConsoleOpsDepthHarness):
         )
 
         self.assertEqual(response.json()["jobs"], [])
+
+
+class SharedScopeAgentBindingTests(ConsoleOpsDepthHarness):
+    """Regression: a shared/null-agent scope key must NOT act as an agent wildcard.
+
+    "shared" means the null-agent (agent_id=None) scope ONLY. A shared-scope
+    key is minted with agent_ids={None}, so the membership check in
+    HostedMemoryService._bind_request rejects any request carrying an explicit
+    agent_id and admits only agent_id=None.
+    """
+
+    def _shared_scope_request(self, project_id: str, agent_id: str | None):
+        return FreshContextRequest(
+            scope=MemoryScope(
+                tenant_id=self._tenant_id,
+                project_id=project_id,
+                session_id="default",
+                agent_id=agent_id,
+                principal=Principal(
+                    principal_id="caller-supplied",
+                    principal_type=PrincipalType.HUMAN,
+                ),
+                trust_boundary=TrustBoundary.LOCAL_TRUSTED,
+                capabilities={MemoryCapability.FRESH_CONTEXT},
+            ),
+            redaction=RedactionContext(forbidden_values=()),
+        )
+
+    def _authenticate_shared_key(self, project_id: str):
+        created = self._create_key("org_123", project_id, name="shared-key")
+        auth = self.keys.authenticate(created["rawKey"])
+        self._tenant_id = auth.tenant_id
+        return auth
+
+    def test_shared_scope_key_persists_null_agent_id(self) -> None:
+        project = self._create_project()
+        auth = self._authenticate_shared_key(project["id"])
+
+        # {None} (the shared/null-agent scope), never an empty wildcard set.
+        self.assertEqual(auth.agent_ids, frozenset({None}))
+
+        with contextlib.closing(self._control_db()) as conn:
+            row = conn.execute(
+                "SELECT agent_ids FROM hosted_api_keys WHERE key_id = ?",
+                (auth.key_id,),
+            ).fetchone()
+        # None must survive the JSON round-trip through storage.
+        self.assertEqual(json.loads(row[0]), [None])
+
+    def test_shared_scope_key_rejects_explicit_agent_id(self) -> None:
+        project = self._create_project()
+        auth = self._authenticate_shared_key(project["id"])
+
+        request = self._shared_scope_request(project["id"], agent_id="agent-x")
+        with self.assertRaises(PermissionError):
+            self.service._bind_request(
+                auth, request, MemoryCapability.FRESH_CONTEXT
+            )
+
+    def test_shared_scope_key_admits_null_agent(self) -> None:
+        project = self._create_project()
+        auth = self._authenticate_shared_key(project["id"])
+
+        request = self._shared_scope_request(project["id"], agent_id=None)
+        # Authorization must pass for the null-agent scope (no PermissionError).
+        bound, _tenant = self.service._bind_request(
+            auth, request, MemoryCapability.FRESH_CONTEXT
+        )
+        self.assertIsNone(bound.scope.agent_id)
+
+    def test_setup_token_exchange_shared_scope_rejects_explicit_agent_id(self) -> None:
+        project = self._create_project()
+        # Resolve the tenant id the console binds to this org.
+        tenant_id = self._authenticate_shared_key(project["id"]).tenant_id
+
+        provisioned, _record = self.keys.create_setup_token(
+            tenant_id=tenant_id,
+            project_id=project["id"],
+            agent_scope="shared",
+        )
+        exchange = self.keys.exchange_setup_token(provisioned.raw_token)
+        auth = self.keys.authenticate(exchange.provisioned.raw_key)
+        self._tenant_id = auth.tenant_id
+
+        self.assertEqual(auth.agent_ids, frozenset({None}))
+
+        request = self._shared_scope_request(project["id"], agent_id="agent-x")
+        with self.assertRaises(PermissionError):
+            self.service._bind_request(
+                auth, request, MemoryCapability.FRESH_CONTEXT
+            )
 
 
 if __name__ == "__main__":
