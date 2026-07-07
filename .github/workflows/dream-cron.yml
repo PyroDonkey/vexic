@@ -28,11 +28,11 @@ on:
 # a repo/environment variable so an unconfigured repo skips cleanly (a skipped
 # job reports neutral/success, never a red failure). Set the `VEXIC_DREAM_ENABLED`
 # repository variable to `true` alongside the VEXIC_DREAM_* secrets to arm the
-# sweep. `workflow_dispatch` runs are gated the same way; flip the variable to
-# hand-test.
+# sweep. `workflow_dispatch` bypasses the gate so the job can be hand-tested
+# with secrets before arming the hourly schedule.
 jobs:
   trigger-summarize:
-    if: vars.VEXIC_DREAM_ENABLED == 'true'
+    if: github.event_name == 'workflow_dispatch' || vars.VEXIC_DREAM_ENABLED == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Trigger summarize dream phase

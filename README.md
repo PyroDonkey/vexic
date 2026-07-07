@@ -49,7 +49,8 @@ vexic mcp-stdio --db-path .\memory.db --tenant-id local --session-id default
 
 The server exposes two read-only tools to the agent: `recall_conversation_history`
 (this session's transcript) and `recall_user_memory` (durable facts and
-preferences). See
+preferences). `recall_user_memory` embeds the query locally; install the
+optional extra with `pip install "vexic[local-embed]"` to enable it. See
 [`docs/usage.md`](https://github.com/PyroDonkey/vexic/blob/main/docs/usage.md)
 for MCP client setup, the transcript recorder, and smoke-test examples.
 
