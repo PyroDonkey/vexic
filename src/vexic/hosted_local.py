@@ -628,16 +628,19 @@ class HostedTenantCatalog:
                 """,
                 (_now(), retired_by, tenant_id),
             )
-            conn.commit()
-        self.record_audit_event(
-            HostedAuditEvent(
-                operation="retire_tenant",
-                tenant_id=tenant_id,
-                principal_id=retired_by,
-                status="ok",
-                recorded_at=_now(),
+            # Audit in the same transaction as the retirement so the destructive
+            # state and its audit row commit or roll back together.
+            _insert_audit_event(
+                conn,
+                HostedAuditEvent(
+                    operation="retire_tenant",
+                    tenant_id=tenant_id,
+                    principal_id=retired_by,
+                    status="ok",
+                    recorded_at=_now(),
+                ),
             )
-        )
+            conn.commit()
 
     def retire_control_project(
         self,
@@ -670,17 +673,20 @@ class HostedTenantCatalog:
                 """,
                 (_now(), retired_by, tenant_id, project_id),
             )
-            conn.commit()
-        self.record_audit_event(
-            HostedAuditEvent(
-                operation="retire_project",
-                tenant_id=tenant_id,
-                principal_id=retired_by,
-                status="ok",
-                recorded_at=_now(),
-                project_id=project_id,
+            # Audit in the same transaction as the retirement (commit/rollback
+            # together) so a retired row never lacks its audit record.
+            _insert_audit_event(
+                conn,
+                HostedAuditEvent(
+                    operation="retire_project",
+                    tenant_id=tenant_id,
+                    principal_id=retired_by,
+                    status="ok",
+                    recorded_at=_now(),
+                    project_id=project_id,
+                ),
             )
-        )
+            conn.commit()
 
     def upsert_control_project(
         self,
@@ -1357,47 +1363,63 @@ class HostedApiKeyStore:
                 stored = self._keys[key_id]
             except KeyError as exc:
                 raise PermissionError("Unknown hosted API key.") from exc
+            newly_revoked = stored.revoked_at is None
             self._keys[key_id] = replace(
                 stored,
                 active=False,
                 revoked_at=stored.revoked_at or _now(),
                 revoked_by=stored.revoked_by or revoked_by,
             )
-            tenant_id, principal_id = stored.tenant_id, stored.principal_id
-        else:
-            with closing(self._connect_control()) as conn:
-                row = conn.execute(
-                    """
-                    SELECT tenant_id, principal_id
-                    FROM hosted_api_keys
-                    WHERE key_id = ?
-                    """,
-                    (key_id,),
-                ).fetchone()
-                if row is None:
-                    raise PermissionError("Unknown hosted API key.")
-                tenant_id, principal_id = row[0], row[1]
-                conn.execute(
-                    """
-                    UPDATE hosted_api_keys
-                    SET
-                        revoked_at = COALESCE(revoked_at, ?),
-                        revoked_by = COALESCE(revoked_by, ?)
-                    WHERE key_id = ?
-                    """,
-                    (_now(), revoked_by, key_id),
+            if newly_revoked:
+                self._record_audit_event(
+                    HostedAuditEvent(
+                        operation="revoke_key",
+                        tenant_id=stored.tenant_id,
+                        principal_id=stored.principal_id,
+                        status="ok",
+                        recorded_at=_now(),
+                        key_id=key_id,
+                    )
                 )
-                conn.commit()
-        self._record_audit_event(
-            HostedAuditEvent(
-                operation="revoke_key",
-                tenant_id=tenant_id,
-                principal_id=principal_id,
-                status="ok",
-                recorded_at=_now(),
-                key_id=key_id,
+            return
+        with closing(self._connect_control()) as conn:
+            row = conn.execute(
+                """
+                SELECT tenant_id, principal_id, revoked_at
+                FROM hosted_api_keys
+                WHERE key_id = ?
+                """,
+                (key_id,),
+            ).fetchone()
+            if row is None:
+                raise PermissionError("Unknown hosted API key.")
+            tenant_id, principal_id, already_revoked_at = row[0], row[1], row[2]
+            conn.execute(
+                """
+                UPDATE hosted_api_keys
+                SET
+                    revoked_at = COALESCE(revoked_at, ?),
+                    revoked_by = COALESCE(revoked_by, ?)
+                WHERE key_id = ?
+                """,
+                (_now(), revoked_by, key_id),
             )
-        )
+            # Audit only the NULL -> revoked transition, on the same transaction
+            # as the revoke, so a real delete never lands without its audit row
+            # and a repeated (no-op) revoke does not forge a second one.
+            if already_revoked_at is None:
+                _insert_audit_event(
+                    conn,
+                    HostedAuditEvent(
+                        operation="revoke_key",
+                        tenant_id=tenant_id,
+                        principal_id=principal_id,
+                        status="ok",
+                        recorded_at=_now(),
+                        key_id=key_id,
+                    ),
+                )
+            conn.commit()
 
     def create_control_plane_key(
         self,
@@ -1729,6 +1751,14 @@ class HostedApiKeyStore:
         revoked_by: str | None = None,
     ) -> None:
         now = _now()
+        audit = HostedAuditEvent(
+            operation="revoke_setup_token",
+            tenant_id=tenant_id,
+            principal_id=None,
+            status="ok",
+            recorded_at=now,
+            project_id=project_id,
+        )
         if self._control_target is None:
             stored = self._setup_tokens.get(token_id)
             if (
@@ -1737,44 +1767,41 @@ class HostedApiKeyStore:
                 or stored.project_id != project_id
             ):
                 raise PermissionError("Unknown setup token.")
+            newly_revoked = stored.revoked_at is None
             self._setup_tokens[token_id] = replace(
                 stored,
                 revoked_at=stored.revoked_at or now,
                 revoked_by=stored.revoked_by or revoked_by,
             )
-        else:
-            with closing(self._connect_control()) as conn:
-                row = conn.execute(
-                    """
-                    SELECT 1
-                    FROM hosted_setup_tokens
-                    WHERE token_id = ? AND tenant_id = ? AND project_id = ?
-                    """,
-                    (token_id, tenant_id, project_id),
-                ).fetchone()
-                if row is None:
-                    raise PermissionError("Unknown setup token.")
-                conn.execute(
-                    """
-                    UPDATE hosted_setup_tokens
-                    SET
-                        revoked_at = COALESCE(revoked_at, ?),
-                        revoked_by = COALESCE(revoked_by, ?)
-                    WHERE token_id = ?
-                    """,
-                    (now, revoked_by, token_id),
-                )
-                conn.commit()
-        self._record_audit_event(
-            HostedAuditEvent(
-                operation="revoke_setup_token",
-                tenant_id=tenant_id,
-                principal_id=None,
-                status="ok",
-                recorded_at=_now(),
-                project_id=project_id,
+            if newly_revoked:
+                self._record_audit_event(audit)
+            return
+        with closing(self._connect_control()) as conn:
+            row = conn.execute(
+                """
+                SELECT revoked_at
+                FROM hosted_setup_tokens
+                WHERE token_id = ? AND tenant_id = ? AND project_id = ?
+                """,
+                (token_id, tenant_id, project_id),
+            ).fetchone()
+            if row is None:
+                raise PermissionError("Unknown setup token.")
+            already_revoked_at = row[0]
+            conn.execute(
+                """
+                UPDATE hosted_setup_tokens
+                SET
+                    revoked_at = COALESCE(revoked_at, ?),
+                    revoked_by = COALESCE(revoked_by, ?)
+                WHERE token_id = ?
+                """,
+                (now, revoked_by, token_id),
             )
-        )
+            # Same-transaction audit, only on the NULL -> revoked transition.
+            if already_revoked_at is None:
+                _insert_audit_event(conn, audit)
+            conn.commit()
 
     def list_setup_tokens(
         self,

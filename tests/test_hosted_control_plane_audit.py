@@ -56,6 +56,16 @@ class ControlPlaneAuditTests(unittest.TestCase):
         self.assertEqual(events[0].key_id, provisioned.key_id)
         self.assertEqual(events[0].status, "ok")
 
+    def test_repeated_revoke_audits_once(self) -> None:
+        # Revocation is idempotent; a no-op second revoke must not forge a
+        # second destructive audit row.
+        provisioned = self._create_key()
+        self.keys.revoke_key(provisioned.key_id)
+        self.keys.revoke_key(provisioned.key_id)
+
+        events = [e for e in self._audit() if e.operation == "revoke_key"]
+        self.assertEqual(len(events), 1)
+
     def test_audit_event_never_contains_raw_credential(self) -> None:
         provisioned = self._create_key()
         self.keys.revoke_key(provisioned.key_id)

@@ -71,6 +71,18 @@ trail, and `hosted_projects`/`tenants` had no working soft-delete
   storage layer, so the infra safety net (PITR/backups, tracked separately)
   remains the primary control. This ADR narrows the accidental and
   single-action blast radius inside the core.
+- `retire_control_project`/`retire_tenant` are the recoverable soft-delete
+  primitive, not a full removal path. They mark the row (listing + audit +
+  `active = 0` for tenants) but deliberately do not yet cut live access:
+  `retire_control_project` leaves the `tenant_projects` routing membership and
+  existing key bindings intact, and the active-project readers filter only
+  `hosted_projects.retired_at` (not the owning tenant's state). A future
+  removal/off-boarding path builds access revocation on top of these
+  primitives; until it exists these methods have no runtime callers.
+- Audit rows for the destructive ops commit in the same transaction as the
+  state change, and revocation audits fire only on the `NULL -> revoked`
+  transition, so a repeated (idempotent) revoke does not forge a second event
+  and a committed delete never lacks its audit row.
 - The migrations are idempotent and non-destructive: a pre-COA-320
   `control-plane.db` is ALTERed in place and existing rows are preserved.
 - Deferred to their own workstreams: read-only default tenant tokens and a
