@@ -14,6 +14,14 @@ def main(argv: list[str] | None = None) -> int:
         from vexic.recorders.cli import main as recorder_main
 
         return recorder_main(["setup-claude-code", *args[2:]])
+    if len(args) >= 2 and args[:2] == ["setup", "codex"]:
+        from vexic.recorders.cli import main as recorder_main
+
+        return recorder_main(["setup-codex", *args[2:]])
+    if len(args) >= 2 and args[:2] == ["setup", "mcp-client"]:
+        from vexic.recorders.cli import main as recorder_main
+
+        return recorder_main(["setup-mcp-client", *args[2:]])
     if args and args[0] == "mcp-stdio":
         from vexic.mcp_stdio import main as stdio_main
 
@@ -26,6 +34,8 @@ def main(argv: list[str] | None = None) -> int:
             "subcommands:\n"
             "  recorder            host recorder commands\n"
             "  setup claude-code   install the Claude Code recorder hooks\n"
+            "  setup codex         print the opt-in `codex mcp add` connect command\n"
+            "  setup mcp-client    print the opt-in connect command for a generic MCP client\n"
             "  mcp-stdio           run the read-only stdio MCP server"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,

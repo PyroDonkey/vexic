@@ -146,21 +146,25 @@ config:
 uv run --with-editable . python -m vexic.cli setup claude-code --base-url https://api.vexic.dev --api-key <raw-key> --project-id project-a --session-id session-a
 ```
 
-The setup command updates the user's Claude Code hook config, writes a Vexic
-recorder config outside the repository, and scaffolds `.mcp.json` in the
-current project. It installs a Stop hook for writes and a SessionStart hook for
-best-effort read priming on `startup` and `clear`; `resume` is skipped to avoid
-duplicate context dumps. The MCP entry launches `scripts/vexic-mcp-stdio.py`
-with `--recorder-config`, so `.mcp.json` does not contain the raw API key.
-Claude Code treats the project MCP server as pending until you approve/enable
-it in Claude Code.
+The setup command updates the user's Claude Code hook config and writes a Vexic
+recorder config outside the repository. It installs a Stop hook for writes and a
+SessionStart hook for best-effort read priming on `startup` and `clear`;
+`resume` is skipped to avoid duplicate context dumps. No `.mcp.json` is written.
+
+Read-only memory search is opt-in (ADR 0027). Instead of writing any client
+config, setup *prints* a `claude mcp add vexic -- ...` command and leaves it to
+you to run. That command names the local stdio launcher plus the *path* to the
+recorder config, so it never contains the raw API key; the credentials are read
+fresh from the owner-only recorder config each run. Memory search stays off
+until you run the printed command, which is the deliberate enable step.
 
 Setup also works from a plain `pip install vexic` (no source checkout and no
 `uv` required): run `python -m vexic.cli setup claude-code ...` and the hooks
-invoke the installing interpreter directly, while `.mcp.json` launches
-`python -m vexic.mcp_stdio_main --recorder-config ...`. Long-term semantic
-search through the local MCP server needs the embedding extra, so install with
-`pip install 'vexic[local-embed]'` if you want `search_long_term` available.
+invoke the installing interpreter directly, while the printed connect command
+launches `python -m vexic.mcp_stdio_main --recorder-config ...`. Long-term
+semantic search through the local MCP server needs the embedding extra, so
+install with `pip install 'vexic[local-embed]'` if you want `search_long_term`
+available.
 
 On Claude Code stop events, the recorder reads the JSONL transcript, keeps
 visible user/assistant text, maps source keys as
@@ -196,6 +200,55 @@ The importer is a repo-local host transcript recorder. It reads Claude Code
 JSONL, keeps visible user/assistant text, maps source keys as
 `claude-code`/`sessionId`/`uuid`, and delegates writes to
 `LocalMemoryService.ingest_source_transcript`. It does not expose MCP writes.
+
+## Connect Codex
+
+Codex gets the read-only MCP connect leg only; the transcript recorder (write
+path) stays Claude-Code-only for now. Setup writes an owner-only credential file
+and *prints* Codex's own `codex mcp add` command; running that command is the
+deliberate, opt-in enable step (ADR 0027).
+
+```powershell
+uv run --with-editable . python -m vexic.cli setup codex --base-url https://api.vexic.dev --api-key <raw-key> --project-id project-a --session-id session-a
+```
+
+Pass a single-use console setup token with `--token <token>` instead of the
+manual `--api-key`/`--project-id`/`--session-id` credentials; the two are
+mutually exclusive. Setup writes `~/.vexic/codex-mcp.json` (owner-only, holding
+the same `base_url`/`api_key`/`project_id`/`session_id`/`agent_id?` shape the
+stdio proxy reads) and prints a `codex mcp add vexic -- ...` command that names
+only the local stdio launcher plus the *path* to that credential file, so the
+raw key never appears in the command or in any client config. No hooks,
+`settings.json`, or `.mcp.json` are written. Memory search stays off until you
+run the printed command.
+
+To disconnect, delete the credential file and remove the MCP entry:
+
+```powershell
+uv run --with-editable . python -m vexic.cli recorder uninstall-codex
+```
+
+That prints `codex mcp remove vexic` for you to run.
+
+## Connect a generic MCP client
+
+Clients without a dedicated installer use the generic path. It writes
+`~/.vexic/<name>-mcp.json` (owner-only, same shape) and prints the local stdio
+launcher command plus instructions to register it as an MCP server named
+`vexic` in whatever config that client uses:
+
+```powershell
+uv run --with-editable . python -m vexic.cli setup mcp-client myagent --base-url https://api.vexic.dev --api-key <raw-key> --project-id project-a --session-id session-a
+```
+
+`<name>` must be a safe filename component (letters, digits, `.`, `_`, `-`; no
+path separators). `--token` exchange works here too, mutually exclusive with the
+manual credentials. As with Codex, no raw key appears in the printed command,
+and no client config is mutated. Remove the credential file with:
+
+```powershell
+uv run --with-editable . python -m vexic.cli recorder uninstall-mcp-client myagent
+```
 
 <!-- memory-reliability-gate -->
 
@@ -322,21 +375,25 @@ memory. This consolidates pieces otherwise spread across `README.md`,
    `trust_boundary`, and capabilities; keep it for step 4.
 
 3. **Point your MCP client at the hosted API** with that key. For Claude Code,
-   the setup command scaffolds the hook, recorder config, and a project
-   `.mcp.json` entry (the raw key is stored in the recorder config, not in
-   `.mcp.json`):
+   the setup command installs the hook and recorder config (the raw key is
+   stored in the owner-only recorder config), then prints the opt-in
+   `claude mcp add vexic -- ...` command to enable read-only memory search:
 
    ```powershell
    uv run --with-editable . python -m vexic.cli setup claude-code --base-url https://api.vexic.dev --api-key <raw-key> --project-id project-a --session-id session-a
    ```
 
-   Claude Code treats the project MCP server as pending until you approve/enable
-   it. See [Claude Code Transcript Import](#claude-code-transcript-import) for
-   what the hook and recorder do. Copying the raw key into this command is the
-   current interim path; the accepted target is a console-minted, single-use
-   setup token exchanged by the CLI (ADR 0026), owned by follow-up issues.
+   No `.mcp.json` is written and no client config is auto-mutated. Memory search
+   is off until you run the printed `claude mcp add` command -- running it is the
+   deliberate, per-client opt-in (ADR 0027). The command references only the
+   recorder-config *path*, never the raw key. See
+   [Claude Code Transcript Import](#claude-code-transcript-import) for what the
+   hook and recorder do. Copying the raw key into this command is the current
+   interim path; the accepted target is a console-minted, single-use setup token
+   exchanged by the CLI (ADR 0026), owned by follow-up issues.
 
-4. **Make the first read.** Once approved, the agent has two read-only MCP
+4. **Make the first read.** Once you have run the printed connect command, the
+   agent has two read-only MCP
    tools: `recall_conversation_history` (this and earlier conversations with the
    user) and `recall_user_memory` (durable facts, preferences, and decisions).
    Results come back as **prose the model presents in its own words**, not JSON
