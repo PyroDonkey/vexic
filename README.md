@@ -98,7 +98,7 @@ package and its adapters read are listed in
 - `docs/ai/README.md` - internal automation and maintainer tooling docs.
 
 Vexic Console and the marketing website live in the private
-`PyroDonkey/vexic-website` repository (COA-295: open-core boundary) — see
+`PyroDonkey/vexic-website` repository (open-core boundary) — see
 [ADR 0012's addendum](docs/adr/0012-vexic-console-implementation-path.md).
 
 ## Package Boundary

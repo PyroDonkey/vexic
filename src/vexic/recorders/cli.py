@@ -23,6 +23,7 @@ from vexic.recorders.hosted_prime import (
     post_trigger_dream_phase,
 )
 from vexic.recorders.hosted_ingest import HostedIngestConfig, post_source_messages
+from vexic.recorders.setup_exchange import SetupExchangeConfig, exchange_setup_token
 from vexic.recorders.status import RecorderStatus, write_status
 
 
@@ -157,9 +158,10 @@ def _parser() -> argparse.ArgumentParser:
         help="Project directory where .mcp.json should be written.",
     )
     setup.add_argument("--base-url", required=True)
-    setup.add_argument("--api-key", required=True)
-    setup.add_argument("--project-id", required=True)
-    setup.add_argument("--session-id", required=True)
+    setup.add_argument("--token")
+    setup.add_argument("--api-key")
+    setup.add_argument("--project-id")
+    setup.add_argument("--session-id")
     setup.add_argument("--agent-id")
     setup.add_argument(
         "--hook-command",
@@ -391,13 +393,62 @@ def _prime(args: argparse.Namespace) -> int:
 
 
 def _setup_claude_code(args: argparse.Namespace) -> int:
+    if args.token is not None:
+        if not args.token.strip():
+            raise ValueError(
+                "--token must not be blank; paste the console setup token or "
+                "omit --token to use manual credentials"
+            )
+        conflicting = [
+            option
+            for option, value in (
+                ("--api-key", args.api_key),
+                ("--project-id", args.project_id),
+                ("--session-id", args.session_id),
+                ("--agent-id", args.agent_id),
+            )
+            if value
+        ]
+        if conflicting:
+            raise ValueError(
+                "--token and manual credentials are mutually exclusive; "
+                f"drop {conflicting[0]} or omit --token"
+            )
+        exchange = exchange_setup_token(
+            SetupExchangeConfig(base_url=args.base_url),
+            token=args.token,
+        )
+        api_key = exchange.api_key
+        project_id = exchange.project_id
+        session_id = exchange.session_id
+        agent_id = exchange.agent_id
+    else:
+        missing = [
+            option
+            for option, value in (
+                ("--api-key", args.api_key),
+                ("--project-id", args.project_id),
+                ("--session-id", args.session_id),
+            )
+            if not isinstance(value, str) or not value.strip()
+        ]
+        if missing:
+            raise ValueError(
+                f"missing required setup option: {missing[0]} "
+                "(or pass --token to exchange a console setup token)"
+            )
+        api_key = args.api_key
+        project_id = args.project_id
+        session_id = args.session_id
+        agent_id = args.agent_id
+
     result = install_claude_code_setup(
         home=args.home,
         base_url=args.base_url,
-        api_key=args.api_key,
-        project_id=args.project_id,
-        session_id=args.session_id,
-        agent_id=args.agent_id,
+        api_key=api_key,
+        project_id=project_id,
+        session_id=session_id,
+        agent_id=agent_id,
         command=args.hook_command or default_recorder_hook_command(),
         prime_command=args.prime_hook_command,
         project_root=args.project_root,

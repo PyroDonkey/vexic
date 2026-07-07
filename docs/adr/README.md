@@ -1,5 +1,8 @@
 # Architecture Decision Records
 
+> `COA-###` references throughout these ADRs are internal issue-tracker IDs,
+> kept for provenance only. They are not publicly resolvable.
+
 This index is the canonical in-repo list of Vexic ADRs. It is authoritative
 over any downstream tracking view (the project roadmap/todo). When an ADR is
 added, changed, or its status moves, update this index in the same change and

@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0] - 2026-07-06
 
 Initial public release of the Vexic memory core.
 
@@ -22,4 +22,4 @@ Initial public release of the Vexic memory core.
   `recall_user_memory`.
 - Conformance and reliability test suite.
 
-[Unreleased]: https://github.com/PyroDonkey/vexic/compare/v0.0.0...HEAD
+[0.1.0]: https://github.com/PyroDonkey/vexic/releases/tag/v0.1.0

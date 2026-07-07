@@ -117,6 +117,7 @@ async def run_rem_phase(
                 forbidden_secret_values=forbidden_secret_values,
             )
         except Exception:
+            # Best-effort status write; the original error is surfaced below.
             pass
         print(
             f"REM phase: ERROR -- {type(exc).__name__}. "

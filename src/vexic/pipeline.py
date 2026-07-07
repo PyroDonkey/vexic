@@ -179,6 +179,7 @@ async def run_light_phase(
                 finished_at=utc_now_iso(),
                 messages_processed=0,
                 last_processed_message_id=watermark,
+                observed_watermark=watermark,
                 forbidden_secret_values=forbidden,
             )
             print("Light phase: no new messages. No-op.")
@@ -227,6 +228,7 @@ async def run_light_phase(
             messages_processed=len(rows),
             last_processed_message_id=max(window_ids),
             candidate_embeddings=candidate_embeddings,
+            observed_watermark=watermark,
             model_requests=usage.model_requests,
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
@@ -254,6 +256,7 @@ async def run_light_phase(
                 forbidden_secret_values=forbidden,
             )
         except Exception:
+            # Best-effort status write; the original error is re-raised below.
             pass
         print(
             f"Light phase: ERROR -- {type(exc).__name__}. Watermark held; will retry."

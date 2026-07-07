@@ -942,6 +942,28 @@ class HostedMemoryService:
                 raise PermissionError("Memory scope project_id is not allowed for API key.")
         if auth.agent_ids and request.scope.agent_id not in auth.agent_ids:
             raise PermissionError("Memory scope agent_id is not allowed for API key.")
+        target_scope = getattr(request, "target_scope", None)
+        if target_scope is not None:
+            # target_scope.tenant_id == scope.tenant_id is enforced by the
+            # request model validator; scope.tenant_id is checked above. Bind
+            # target_scope.project_id against the same allowed-projects rules as
+            # the actor scope so a project-scoped key cannot tombstone another
+            # project (including via a None/wildcard target) in its tenant.
+            target_project_id = target_scope.project_id
+            if target_project_id is None:
+                if auth.project_ids:
+                    raise PermissionError(
+                        "Target scope project_id is required for project-scoped API key."
+                    )
+            else:
+                if target_project_id not in tenant.project_ids:
+                    raise PermissionError(
+                        "Target scope project_id is not provisioned for tenant."
+                    )
+                if target_project_id not in auth.project_ids:
+                    raise PermissionError(
+                        "Target scope project_id is not allowed for API key."
+                    )
         effective_capabilities = request.scope.capabilities & auth.capabilities
         if capability not in effective_capabilities:
             raise PermissionError(f"Memory capability required: {capability.value}")
@@ -1082,6 +1104,7 @@ class HostedMemoryService:
                 )
             )
         except Exception:
+            # Best-effort telemetry; recording must never fail the job itself.
             pass
 
 
@@ -1163,6 +1186,7 @@ class HostedBackgroundJobRunner:
         try:
             self.telemetry.record_job_event(event)
         except Exception:
+            # Best-effort telemetry; recording must never fail the job itself.
             pass
 
 
