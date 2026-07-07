@@ -254,6 +254,7 @@ async def run_light_phase(
                 forbidden_secret_values=forbidden,
             )
         except Exception:
+            # Best-effort status write; the original error is re-raised below.
             pass
         print(
             f"Light phase: ERROR -- {type(exc).__name__}. Watermark held; will retry."

@@ -8,10 +8,11 @@ See docs/branch-sync.md for the command sequences.
 
 <!-- What changed and why, in a sentence or two. -->
 
-## Linear
+## Linear (maintainers only)
 
-<!-- Link the issue so Linear auto-closes it on merge, e.g. "Fixes COA-123".
-     Delete this section if there is no issue (chore/* branches). -->
+<!-- Maintainers: link the internal issue so Linear auto-closes it on merge,
+     e.g. "Fixes COA-123". External contributors: delete this section --
+     reference a GitHub issue in the summary instead if one exists. -->
 
 Fixes COA-
 
