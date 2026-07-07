@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -23,8 +24,13 @@ from vexic.recorders.hosted_prime import (
     post_trigger_dream_phase,
 )
 from vexic.recorders.hosted_ingest import HostedIngestConfig, post_source_messages
+from vexic.recorders.mcp_connect import install_codex_connect, install_generic_connect
 from vexic.recorders.setup_exchange import SetupExchangeConfig, exchange_setup_token
 from vexic.recorders.status import RecorderStatus, write_status
+
+# Client names become the `~/.vexic/<name>-mcp.json` creds filename, so keep
+# them to a safe single filename component (no path separators or traversal).
+_CLIENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 class MissingIngestOption(ValueError):
@@ -148,15 +154,12 @@ def _parser() -> argparse.ArgumentParser:
 
     setup = subparsers.add_parser(
         "setup-claude-code",
-        description="Install Claude Code recording and scaffold the project Vexic MCP entry.",
+        description=(
+            "Install Claude Code recording and print the opt-in "
+            "`claude mcp add` command for read-only memory search."
+        ),
     )
     setup.add_argument("--home", type=Path, default=Path.home())
-    setup.add_argument(
-        "--project-root",
-        type=Path,
-        default=Path.cwd(),
-        help="Project directory where .mcp.json should be written.",
-    )
     setup.add_argument("--base-url", required=True)
     setup.add_argument("--token")
     setup.add_argument("--api-key")
@@ -172,16 +175,53 @@ def _parser() -> argparse.ArgumentParser:
 
     uninstall = subparsers.add_parser(
         "uninstall-claude-code",
-        description="Remove Claude Code recording and the project Vexic MCP entry.",
+        description="Remove the Claude Code Vexic recorder hooks.",
     )
     uninstall.add_argument("--home", type=Path, default=Path.home())
-    uninstall.add_argument(
-        "--project-root",
-        type=Path,
-        default=Path.cwd(),
-        help="Project directory containing .mcp.json.",
+
+    setup_codex = subparsers.add_parser(
+        "setup-codex",
+        description=(
+            "Write the Vexic MCP credential file and print the opt-in "
+            "`codex mcp add` command for read-only memory search."
+        ),
     )
+    _add_setup_credential_args(setup_codex)
+
+    setup_mcp_client = subparsers.add_parser(
+        "setup-mcp-client",
+        description=(
+            "Write the Vexic MCP credential file and print the launcher command "
+            "to add a generic MCP client for read-only memory search."
+        ),
+    )
+    setup_mcp_client.add_argument("name")
+    _add_setup_credential_args(setup_mcp_client)
+
+    uninstall_codex = subparsers.add_parser(
+        "uninstall-codex",
+        description="Delete the Codex MCP credential file and print `codex mcp remove`.",
+    )
+    uninstall_codex.add_argument("--home", type=Path, default=Path.home())
+
+    uninstall_mcp_client = subparsers.add_parser(
+        "uninstall-mcp-client",
+        description="Delete a generic MCP credential file and print `<name> mcp remove`.",
+    )
+    uninstall_mcp_client.add_argument("name")
+    uninstall_mcp_client.add_argument("--home", type=Path, default=Path.home())
     return parser
+
+
+def _add_setup_credential_args(parser: argparse.ArgumentParser) -> None:
+    """Add the shared `--base-url`/`--token`/manual-cred flags for setup commands."""
+    parser.add_argument("--home", type=Path, default=Path.home())
+    parser.add_argument("--base-url", required=True)
+    parser.add_argument("--token")
+    parser.add_argument("--api-key")
+    parser.add_argument("--project-id")
+    parser.add_argument("--session-id")
+    parser.add_argument("--agent-id")
 
 
 def _load_config(path: Path) -> _RecorderIngestConfigFile:
@@ -392,7 +432,14 @@ def _prime(args: argparse.Namespace) -> int:
     return 0
 
 
-def _setup_claude_code(args: argparse.Namespace) -> int:
+def _resolve_setup_credentials(
+    args: argparse.Namespace,
+) -> tuple[str, str, str, str | None]:
+    """Resolve (api_key, project_id, session_id, agent_id) for a `setup <client>`.
+
+    Shared by every setup command: either exchange a single-use `--token` or
+    accept manual credentials, the two being mutually exclusive.
+    """
     if args.token is not None:
         if not args.token.strip():
             raise ValueError(
@@ -418,29 +465,41 @@ def _setup_claude_code(args: argparse.Namespace) -> int:
             SetupExchangeConfig(base_url=args.base_url),
             token=args.token,
         )
-        api_key = exchange.api_key
-        project_id = exchange.project_id
-        session_id = exchange.session_id
-        agent_id = exchange.agent_id
-    else:
-        missing = [
-            option
-            for option, value in (
-                ("--api-key", args.api_key),
-                ("--project-id", args.project_id),
-                ("--session-id", args.session_id),
-            )
-            if not isinstance(value, str) or not value.strip()
-        ]
-        if missing:
-            raise ValueError(
-                f"missing required setup option: {missing[0]} "
-                "(or pass --token to exchange a console setup token)"
-            )
-        api_key = args.api_key
-        project_id = args.project_id
-        session_id = args.session_id
-        agent_id = args.agent_id
+        return (
+            exchange.api_key,
+            exchange.project_id,
+            exchange.session_id,
+            exchange.agent_id,
+        )
+
+    missing = [
+        option
+        for option, value in (
+            ("--api-key", args.api_key),
+            ("--project-id", args.project_id),
+            ("--session-id", args.session_id),
+        )
+        if not isinstance(value, str) or not value.strip()
+    ]
+    if missing:
+        raise ValueError(
+            f"missing required setup option: {missing[0]} "
+            "(or pass --token to exchange a console setup token)"
+        )
+    return (args.api_key, args.project_id, args.session_id, args.agent_id)
+
+
+def _validate_client_name(name: str) -> str:
+    if not name or not name.strip() or not _CLIENT_NAME_RE.fullmatch(name):
+        raise ValueError(
+            "mcp-client name must be a safe filename component "
+            "(letters, digits, '.', '_', '-'; no path separators or traversal)"
+        )
+    return name
+
+
+def _setup_claude_code(args: argparse.Namespace) -> int:
+    api_key, project_id, session_id, agent_id = _resolve_setup_credentials(args)
 
     result = install_claude_code_setup(
         home=args.home,
@@ -451,7 +510,6 @@ def _setup_claude_code(args: argparse.Namespace) -> int:
         agent_id=agent_id,
         command=args.hook_command or default_recorder_hook_command(),
         prime_command=args.prime_hook_command,
-        project_root=args.project_root,
     )
     print(
         json.dumps(
@@ -460,19 +518,102 @@ def _setup_claude_code(args: argparse.Namespace) -> int:
                 "settings_path": str(result.settings_path),
                 "config_path": str(result.config_path),
                 "status_path": str(result.status_path),
-                "mcp_config_path": str(result.mcp_config_path) if result.mcp_config_path else None,
+                "connect_command": result.connect_command,
                 "hook_command": result.command,
             },
             sort_keys=True,
         )
     )
+    # Read-only memory search is opt-in (ADR 0027): the recorder is installed,
+    # but memory search stays off until the user runs the printed command.
+    print(
+        "Vexic recorder installed. To enable read-only memory search (opt-in), run:\n"
+        f"  {result.connect_command}\n"
+        f"It reads credentials from {result.config_path}.",
+        file=sys.stderr,
+    )
     return 0
 
 
 def _uninstall_claude_code(args: argparse.Namespace) -> int:
-    removed = uninstall_claude_code_setup(home=args.home, project_root=args.project_root)
+    removed = uninstall_claude_code_setup(home=args.home)
     print(json.dumps({"ok": True, "removed": removed}, sort_keys=True))
     return 0
+
+
+def _print_connect_result(creds_path: Path, command: str) -> None:
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "creds_path": str(creds_path),
+                "connect_command": command,
+            },
+            sort_keys=True,
+        )
+    )
+
+
+def _setup_codex(args: argparse.Namespace) -> int:
+    api_key, project_id, session_id, agent_id = _resolve_setup_credentials(args)
+    result = install_codex_connect(
+        home=args.home,
+        base_url=args.base_url,
+        api_key=api_key,
+        project_id=project_id,
+        session_id=session_id,
+        agent_id=agent_id,
+    )
+    _print_connect_result(result.creds_path, result.command)
+    # Read-only memory search is opt-in (ADR 0027): the creds file is written,
+    # but memory search stays off until the user runs the printed command.
+    print(
+        "Vexic credentials written. To enable read-only memory search (opt-in), run:\n"
+        f"  {result.command}\n"
+        f"It reads credentials from {result.creds_path}.",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def _setup_mcp_client(args: argparse.Namespace) -> int:
+    name = _validate_client_name(args.name)
+    api_key, project_id, session_id, agent_id = _resolve_setup_credentials(args)
+    result = install_generic_connect(
+        home=args.home,
+        name=name,
+        base_url=args.base_url,
+        api_key=api_key,
+        project_id=project_id,
+        session_id=session_id,
+        agent_id=agent_id,
+    )
+    _print_connect_result(result.creds_path, result.command)
+    lines = ["Vexic credentials written. To enable read-only memory search (opt-in):"]
+    if result.instructions:
+        lines.append(f"  {result.instructions}")
+    lines.append(f"  Launcher command: {result.command}")
+    lines.append(f"It reads credentials from {result.creds_path}.")
+    print("\n".join(lines), file=sys.stderr)
+    return 0
+
+
+def _uninstall_connect(home: Path, creds_name: str, client_binary: str) -> int:
+    creds_path = home / ".vexic" / creds_name
+    removed = creds_path.exists()
+    creds_path.unlink(missing_ok=True)
+    print(json.dumps({"ok": True, "removed": removed}, sort_keys=True))
+    print(f"{client_binary} mcp remove vexic", file=sys.stderr)
+    return 0
+
+
+def _uninstall_codex(args: argparse.Namespace) -> int:
+    return _uninstall_connect(args.home, "codex-mcp.json", "codex")
+
+
+def _uninstall_mcp_client(args: argparse.Namespace) -> int:
+    name = _validate_client_name(args.name)
+    return _uninstall_connect(args.home, f"{name}-mcp.json", name)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -506,6 +647,14 @@ def main(argv: list[str] | None = None) -> int:
             return _setup_claude_code(args)
         if args.command == "uninstall-claude-code":
             return _uninstall_claude_code(args)
+        if args.command == "setup-codex":
+            return _setup_codex(args)
+        if args.command == "setup-mcp-client":
+            return _setup_mcp_client(args)
+        if args.command == "uninstall-codex":
+            return _uninstall_codex(args)
+        if args.command == "uninstall-mcp-client":
+            return _uninstall_mcp_client(args)
         raise ValueError(f"unknown command: {args.command}")
     except Exception as exc:
         _try_write_status(

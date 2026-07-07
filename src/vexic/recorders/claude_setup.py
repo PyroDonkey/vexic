@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import shutil
@@ -12,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from vexic.fs_permissions import ensure_owner_only
+from vexic.recorders.mcp_connect import build_mcp_add_command
 
 VEXIC_HOOK_ID = "vexic-claude-code-recorder"
 
@@ -22,7 +22,7 @@ class ClaudeCodeSetupResult:
     config_path: Path
     status_path: Path
     command: str
-    mcp_config_path: Path | None = None
+    connect_command: str
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -149,10 +149,6 @@ def _prime_command(command: str) -> str:
     raise ValueError("prime_command is required when command does not end with recorder ingest")
 
 
-def _mcp_stdio_launcher(repo_root: Path) -> Path:
-    return repo_root / "scripts" / "vexic-mcp-stdio.py"
-
-
 def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
     text = json.dumps(payload, sort_keys=True)
     temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -162,85 +158,6 @@ def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
     except Exception:
         temp_path.unlink(missing_ok=True)
         raise
-
-
-def _write_mcp_config(
-    project_root: Path,
-    config_path: Path,
-    home: Path,
-    uv_executable: str,
-    repo_root: Path | None,
-    config: dict[str, Any] | None = None,
-) -> Path:
-    if not project_root.is_dir():
-        raise ValueError("project_root must be an existing directory")
-    mcp_path = project_root / ".mcp.json"
-    next_config = dict(_load_json(mcp_path) if config is None else config)
-    servers = next_config.get("mcpServers")
-    if not isinstance(servers, dict):
-        servers = {}
-    else:
-        servers = dict(servers)
-    next_config["mcpServers"] = servers
-    if repo_root is None:
-        servers["vexic"] = {
-            "command": sys.executable,
-            "args": [
-                "-m",
-                "vexic.mcp_stdio_main",
-                "--recorder-config",
-                _recorder_config_arg(config_path, home),
-            ],
-        }
-    else:
-        servers["vexic"] = {
-            "command": uv_executable,
-            "args": [
-                "run",
-                "--with-editable",
-                # Install the local-embed extra so search_long_term can embed queries.
-                f"{repo_root}[local-embed]",
-                "python",
-                str(_mcp_stdio_launcher(repo_root)),
-                "--recorder-config",
-                _recorder_config_arg(config_path, home),
-            ],
-        }
-    _write_json_atomic(mcp_path, next_config)
-    return mcp_path
-
-
-def _remove_mcp_config(project_root: Path) -> bool:
-    mcp_path = project_root / ".mcp.json"
-    config = _load_json(mcp_path)
-    servers = config.get("mcpServers")
-    if not isinstance(servers, dict) or "vexic" not in servers:
-        return False
-    del servers["vexic"]
-    _write_json_atomic(mcp_path, config)
-    return True
-
-
-def _set_mcpjson_disabled(settings: dict[str, Any], name: str) -> None:
-    disabled = settings.get("disabledMcpjsonServers")
-    disabled_names = disabled if isinstance(disabled, list) else []
-    settings["disabledMcpjsonServers"] = [
-        item for item in disabled_names if item != name
-    ] + [name]
-
-    enabled = settings.get("enabledMcpjsonServers")
-    if isinstance(enabled, list):
-        settings["enabledMcpjsonServers"] = [item for item in enabled if item != name]
-
-
-def _remove_mcpjson_choice(settings: dict[str, Any], name: str) -> bool:
-    changed = False
-    for key in ("disabledMcpjsonServers", "enabledMcpjsonServers"):
-        values = settings.get(key)
-        if isinstance(values, list) and name in values:
-            settings[key] = [item for item in values if item != name]
-            changed = True
-    return changed
 
 
 def _without_vexic_hook(stop_groups: Any) -> tuple[list[dict[str, Any]], bool]:
@@ -288,7 +205,6 @@ def install_claude_code_setup(
     agent_id: str | None,
     command: str,
     prime_command: str | None = None,
-    project_root: Path | None = None,
 ) -> ClaudeCodeSetupResult:
     base_url = _require_nonblank("base_url", base_url)
     api_key = _require_nonblank("api_key", api_key)
@@ -297,12 +213,13 @@ def install_claude_code_setup(
     settings_path, config_path, status_path = _paths(home)
     hook_command = _hook_command(command, config_path)
     prime_hook_command = _hook_command(prime_command or _prime_command(command), config_path)
-    repo_root = _repo_root()
-    uv_executable = _uv_executable() if (project_root and repo_root is not None) else ""
-    if project_root and not project_root.is_dir():
-        raise ValueError("project_root must be an existing directory")
-    if project_root and not os.access(project_root, os.W_OK):
-        raise PermissionError("project_root must be writable")
+    # The read-only memory-search connect step is opt-in (ADR 0027): setup
+    # writes the owner-only recorder config (which is also the MCP creds source)
+    # and prints the `claude mcp add` command for the user to run. Derived only
+    # from the creds path, so no raw key can appear.
+    connect_command = build_mcp_add_command(
+        "claude", _recorder_config_arg(config_path, home), _repo_root()
+    )
 
     settings = _load_json(settings_path)
     hooks = settings.get("hooks")
@@ -339,14 +256,8 @@ def install_claude_code_setup(
         }
     )
     hooks["SessionStart"] = session_start_groups
-    if project_root:
-        _set_mcpjson_disabled(settings, "vexic")
-    mcp_path = project_root / ".mcp.json" if project_root else None
-    mcp_config = _load_json(mcp_path) if mcp_path else None
 
     previous_config = config_path.read_bytes() if config_path.exists() else None
-    previous_mcp = mcp_path.read_bytes() if mcp_path and mcp_path.exists() else None
-    mcp_config_path = None
     try:
         _write_secret_json(
             config_path,
@@ -359,22 +270,9 @@ def install_claude_code_setup(
                 "status_path": str(status_path),
             },
         )
-        mcp_config_path = (
-            _write_mcp_config(
-                project_root, config_path, home, uv_executable, repo_root, mcp_config
-            )
-            if project_root
-            else None
-        )
         settings_path.parent.mkdir(parents=True, exist_ok=True)
         _write_json_atomic(settings_path, settings)
     except Exception:
-        if mcp_config_path is not None:
-            with contextlib.suppress(Exception):
-                if previous_mcp is None:
-                    mcp_config_path.unlink(missing_ok=True)
-                else:
-                    mcp_config_path.write_bytes(previous_mcp)
         _restore_secret_config(config_path, previous_config)
         raise
 
@@ -383,21 +281,17 @@ def install_claude_code_setup(
         config_path=config_path,
         status_path=status_path,
         command=hook_command,
-        mcp_config_path=mcp_config_path,
+        connect_command=connect_command,
     )
 
 
-def uninstall_claude_code_setup(*, home: Path, project_root: Path | None = None) -> bool:
+def uninstall_claude_code_setup(*, home: Path) -> bool:
     settings_path, _config_path, _status_path = _paths(home)
     settings = _load_json(settings_path)
     hooks = settings.get("hooks")
-    mcp_changed = _remove_mcp_config(project_root) if project_root else False
-    choice_changed = _remove_mcpjson_choice(settings, "vexic") if project_root else False
     if not isinstance(hooks, dict):
-        if choice_changed:
-            _write_json_atomic(settings_path, settings)
-        return mcp_changed or choice_changed
-    changed = choice_changed
+        return False
+    changed = False
     for name in ("Stop", "SessionStart"):
         groups, hook_changed = _without_vexic_hook(hooks.get(name))
         if hook_changed:
@@ -405,4 +299,4 @@ def uninstall_claude_code_setup(*, home: Path, project_root: Path | None = None)
             changed = True
     if changed:
         _write_json_atomic(settings_path, settings)
-    return changed or mcp_changed
+    return changed
