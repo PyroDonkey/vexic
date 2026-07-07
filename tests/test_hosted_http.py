@@ -1057,6 +1057,35 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(tokens[revoked["token"]["id"]]["status"], "revoked")
         self.assertIsNotNone(tokens[revoked["token"]["id"]]["revokedAt"])
 
+    def test_control_plane_setup_token_list_reports_consumed_even_after_revoke(
+        self,
+    ) -> None:
+        # A token exchanged (consumed) and then revoked still granted access: the
+        # minted Agent API key stays valid, so "consumed" must win over "revoked"
+        # or the operator view implies setup failed when it did not.
+        client = TestClient(
+            create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
+        )
+        project = client.post(
+            "/control/v1/clerk-orgs/org_123/projects",
+            headers=self._control_auth(),
+            json={"name": "Solo"},
+        ).json()["project"]
+        list_path = f"/control/v1/clerk-orgs/org_123/projects/{project['id']}/setup-tokens"
+        minted = client.post(list_path, headers=self._control_auth()).json()
+
+        self.keys.exchange_setup_token(minted["rawToken"])
+        revoke = client.post(
+            f"{list_path}/{minted['token']['id']}/revoke",
+            headers=self._control_auth(),
+        )
+        self.assertEqual(revoke.status_code, 204)
+
+        token = client.get(list_path, headers=self._control_auth()).json()["tokens"][0]
+        self.assertEqual(token["status"], "consumed")
+        self.assertIsNotNone(token["consumedAt"])
+        self.assertIsNotNone(token["revokedAt"])
+
     def test_control_plane_setup_token_list_is_tenant_scoped(self) -> None:
         client = TestClient(
             create_control_plane_app(self.service, control_plane_tokens=("console-secret",))

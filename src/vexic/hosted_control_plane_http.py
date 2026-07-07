@@ -676,10 +676,15 @@ def _setup_token_payload(record: HostedSetupTokenRecord) -> dict[str, str]:
 def _setup_token_status(record: HostedSetupTokenRecord, *, now: str) -> str:
     # ISO-Z timestamps are lexically ordered, so a string compare matches the
     # exchange path's `expires_at <= now` expiry check in hosted_local.
-    if record.revoked_at is not None:
-        return "revoked"
+    #
+    # "consumed" wins over "revoked": once a token is exchanged, a durable Agent
+    # API key exists and revoking the setup token afterward does not retract that
+    # access. Reporting a consumed-then-revoked token as "revoked" would imply the
+    # setup granted nothing, which is wrong.
     if record.consumed_at is not None:
         return "consumed"
+    if record.revoked_at is not None:
+        return "revoked"
     if record.expires_at <= now:
         return "expired"
     return "pending"
