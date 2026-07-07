@@ -38,7 +38,7 @@ trail, and `hosted_projects`/`tenants` had no working soft-delete
    `provision_project`, `create_key`, `create_setup_token`) is deliberately
    *not* audited in this slice: the ticket's audit goal is recording deletes,
    and the existing data-plane telemetry philosophy already excludes creation
-   from the audit ledger. The sanitization invariant is unchanged — no raw
+   from the audit ledger. The sanitization invariant is unchanged -- no raw
    credential appears in an audit row.
 
 2. **Confirm whole-scope purge.** `PurgeScopeRequest` gains

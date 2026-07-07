@@ -615,11 +615,13 @@ class HostedTenantCatalog:
         """
         with closing(self._connect_control()) as conn:
             row = conn.execute(
-                "SELECT 1 FROM tenants WHERE tenant_id = ? AND retired_at IS NULL",
+                "SELECT retired_at FROM tenants WHERE tenant_id = ?",
                 (tenant_id,),
             ).fetchone()
             if row is None:
                 raise PermissionError("Unknown hosted tenant.")
+            if row[0] is not None:
+                raise PermissionError("Hosted tenant already retired.")
             conn.execute(
                 """
                 UPDATE tenants
@@ -657,14 +659,16 @@ class HostedTenantCatalog:
         with closing(self._connect_control()) as conn:
             row = conn.execute(
                 """
-                SELECT 1
+                SELECT retired_at
                 FROM hosted_projects
-                WHERE tenant_id = ? AND project_id = ? AND retired_at IS NULL
+                WHERE tenant_id = ? AND project_id = ?
                 """,
                 (tenant_id, project_id),
             ).fetchone()
             if row is None:
                 raise PermissionError("Unknown hosted project.")
+            if row[0] is not None:
+                raise PermissionError("Hosted project already retired.")
             conn.execute(
                 """
                 UPDATE hosted_projects

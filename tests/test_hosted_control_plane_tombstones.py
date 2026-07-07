@@ -76,6 +76,11 @@ class ControlPlaneTombstoneTests(unittest.TestCase):
         with self.assertRaises(PermissionError):
             self.catalog.retire_control_project("tenant-a", "no-such-project")
 
+    def test_re_retire_project_raises_already_retired(self) -> None:
+        self.catalog.retire_control_project("tenant-a", self.project.project_id)
+        with self.assertRaisesRegex(PermissionError, "already retired"):
+            self.catalog.retire_control_project("tenant-a", self.project.project_id)
+
     def test_retire_tenant_marks_inactive_but_row_survives_and_audits(self) -> None:
         self.catalog.retire_tenant("tenant-a", retired_by="admin")
 
@@ -111,3 +116,8 @@ class ControlPlaneTombstoneTests(unittest.TestCase):
     def test_retire_unknown_tenant_raises(self) -> None:
         with self.assertRaises(PermissionError):
             self.catalog.retire_tenant("no-such-tenant")
+
+    def test_re_retire_tenant_raises_already_retired(self) -> None:
+        self.catalog.retire_tenant("tenant-a")
+        with self.assertRaisesRegex(PermissionError, "already retired"):
+            self.catalog.retire_tenant("tenant-a")
