@@ -500,6 +500,50 @@ def _candidate_agent_id(conn: sqlite3.Connection, candidate_id: int) -> str | No
     return row[0]
 
 
+def _begin_write_txn(conn: sqlite3.Connection) -> None:
+    # sqlite: BEGIN IMMEDIATE takes the write lock before any read so a
+    # concurrent writer blocks (or fails busy) instead of racing between a read
+    # and its dependent write. libSQL only opens a real multi-statement
+    # transaction on an explicit BEGIN (ADR 0019 caveat in connection.py); the
+    # managed-Turso server rejects a stale write at commit via conflict
+    # detection rather than a local pre-read lock. Callers that read-then-write
+    # atomically (watermark CAS, backfill liveness recheck) must open the
+    # transaction through this helper.
+    if isinstance(conn, sqlite3.Connection):
+        conn.execute("BEGIN IMMEDIATE")
+    else:
+        conn.execute("BEGIN")
+
+
+def _candidate_still_missing_embedding(
+    conn: sqlite3.Connection, candidate_id: int, agent_id: str | None
+) -> bool:
+    # Re-check, inside the held write transaction, the same active-candidate
+    # predicate load_candidates_missing_embeddings enforces at read time. A
+    # concurrent Light run may have repaired (embedded), promoted, retired, or
+    # staled the candidate between the loader read and this backfill commit; if
+    # so this run's (candidate_id, embedding) entry is stale and must be skipped
+    # rather than re-embedded (self-merge / hit_count drift) or merged into a
+    # row another run already moved out of staging.
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM memory_candidates AS c
+        LEFT JOIN memory_candidate_embeddings AS e
+            ON e.candidate_id = c.id
+        WHERE c.id = ?
+            AND e.candidate_id IS NULL
+            AND c.promoted = 0
+            AND c.retired = 0
+            AND c.stale = 0
+            AND c.needs_review = 0
+            AND c.agent_id IS ?
+        """,
+        (candidate_id, agent_id),
+    ).fetchone()
+    return row is not None
+
+
 def backfill_missing_candidate_embeddings(
     db_path: str,
     candidate_embeddings: list[tuple[int, list[float]]],
@@ -508,12 +552,23 @@ def backfill_missing_candidate_embeddings(
 ) -> int:
     init_vector_memory(db_path)
     with closing(connect(db_path)) as conn:
-        with conn:
+        # Explicit write transaction (not the bare `with conn:` autocommit used
+        # for single-statement writes): each candidate is re-checked for
+        # liveness and then mutated in one atomic unit, so the recheck and the
+        # merge/insert must share the pre-read write lock. Mirrors the
+        # commit_dream_cycle watermark CAS.
+        _begin_write_txn(conn)
+        try:
             _ensure_vector_memory_schema(conn)
             count = 0
             for candidate_id, embedding in candidate_embeddings:
                 if len(embedding) != EMBEDDING_DIM:
                     raise ValueError(f"Expected {EMBEDDING_DIM}-dim embedding; got {len(embedding)}.")
+                agent_id = _candidate_agent_id(conn, candidate_id)
+                if not _candidate_still_missing_embedding(conn, candidate_id, agent_id):
+                    # A concurrent Light run already repaired or moved this
+                    # candidate out of live staging; skip the stale entry.
+                    continue
                 candidate = _load_candidate_by_id(conn, candidate_id)
                 _guard_candidate_texts(forbidden_secret_values, [candidate])
                 embedding = _normalize_embedding(embedding)
@@ -521,7 +576,7 @@ def backfill_missing_candidate_embeddings(
                     conn,
                     candidate,
                     embedding,
-                    agent_id=_candidate_agent_id(conn, candidate_id),
+                    agent_id=agent_id,
                 )
 
                 if match is None or match.similarity < DEDUP_NO_MATCH_THRESHOLD:
@@ -569,7 +624,11 @@ def backfill_missing_candidate_embeddings(
                         incoming_source_message_ids=candidate.source_message_ids,
                     )
                 count += 1
-            return count
+        except BaseException:
+            conn.rollback()
+            raise
+        conn.commit()
+        return count
 
 
 def keyword_candidate_ids(
@@ -1074,15 +1133,11 @@ def commit_dream_cycle(
     with closing(connect(db_path)) as conn:
         # Explicit transaction, not the bare `with conn:` used elsewhere: the
         # optional compare-and-set below reads the watermark and then writes in
-        # one atomic unit, and libSQL only opens a real multi-statement
-        # transaction on an explicit BEGIN (ADR 0019 caveat in connection.py).
-        # sqlite gets BEGIN IMMEDIATE so the write lock is taken before the
-        # re-read; a second concurrent Light run then blocks (or fails busy)
-        # instead of reading a stale watermark and double-writing.
-        if isinstance(conn, sqlite3.Connection):
-            conn.execute("BEGIN IMMEDIATE")
-        else:
-            conn.execute("BEGIN")
+        # one atomic unit, so the re-read and the writes must share one pre-read
+        # write lock. A second concurrent Light run then blocks (or fails busy /
+        # loses the Turso conflict-detection race) instead of reading a stale
+        # watermark and double-writing.
+        _begin_write_txn(conn)
         try:
             # Watermark compare-and-set: if the caller observed watermark W at
             # read time but another Light run has since advanced it, this window

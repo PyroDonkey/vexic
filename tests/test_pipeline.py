@@ -23,6 +23,7 @@ from vexic.storage import (
     CandidateRetirementDecision,
     PromotionDecision,
     RemCandidate,
+    backfill_missing_candidate_embeddings,
     commit_deep_cycle,
     commit_dream_cycle,
     get_watermark,
@@ -1756,6 +1757,138 @@ class PipelineCorrectnessRegressionTests(unittest.TestCase):
                 [candidate_id for candidate_id, _ in missing],
                 [1],
                 "only the live staging candidate is eligible for embedding repair",
+            )
+
+    def test_backfill_skips_candidate_whose_embedding_was_backfilled_concurrently(
+        self,
+    ) -> None:
+        # Concurrent embedding backfill: two concurrent Light runs both load
+        # candidate 1 as missing its embedding. Run A backfills it; run B then
+        # calls backfill with its now-stale (candidate_id, embedding) list.
+        # Backfill must re-check, under the write transaction, that the
+        # candidate is still missing an embedding before mutating it. Otherwise
+        # run B's _nearest_candidate matches candidate 1's own freshly-inserted
+        # embedding (self-merge: hit_count drift, the live row wrongly staled).
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+
+            self._commit(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="Ryan cedar window.",
+                        subject="Ryan",
+                        category="fact",
+                        importance=5,
+                        confidence=0.8,
+                        source_message_ids=[1],
+                    )
+                ],
+                [_unit_vector(1.0)],
+                last_processed_message_id=1,
+            )
+            with closing(sqlite3.connect(db_path)) as conn:
+                _load_vec_extension(conn)
+                # Strip the embedding so candidate 1 is eligible for repair.
+                conn.execute("DELETE FROM memory_candidate_embeddings")
+                conn.commit()
+
+            # Both runs captured the same stale list before either wrote.
+            missing = load_candidates_missing_embeddings(db_path, agent_id=None)
+            self.assertEqual([cid for cid, _ in missing], [1])
+            stale_list = [(1, _unit_vector(1.0))]
+
+            # Run A repairs candidate 1.
+            self.assertEqual(
+                backfill_missing_candidate_embeddings(db_path, stale_list),
+                1,
+                "run A backfills the one missing embedding",
+            )
+            with closing(sqlite3.connect(db_path)) as conn:
+                baseline_hit_count = conn.execute(
+                    "SELECT hit_count FROM memory_candidates WHERE id = 1"
+                ).fetchone()[0]
+
+            # Run B replays the same stale list. Candidate 1 is no longer
+            # missing its embedding, so backfill must skip it entirely.
+            self.assertEqual(
+                backfill_missing_candidate_embeddings(db_path, stale_list),
+                0,
+                "run B must skip the already-repaired candidate",
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                _load_vec_extension(conn)
+                embedding_rows = conn.execute(
+                    "SELECT COUNT(*) FROM memory_candidate_embeddings "
+                    "WHERE candidate_id = 1"
+                ).fetchone()[0]
+                hit_count, stale = conn.execute(
+                    "SELECT hit_count, stale FROM memory_candidates WHERE id = 1"
+                ).fetchone()
+
+            self.assertEqual(embedding_rows, 1, "candidate keeps exactly one embedding")
+            self.assertEqual(
+                hit_count, baseline_hit_count, "no self-merge hit_count drift"
+            )
+            self.assertEqual(
+                stale, 0, "live candidate must not be staled by a stale replay"
+            )
+
+    def test_backfill_skips_candidate_staled_by_concurrent_run(self) -> None:
+        # Backfill lifecycle recheck: a concurrent Light run may merge/stale (or
+        # promote / retire / flag-for-review) the candidate between the loader
+        # read and this backfill commit. Backfill must not embed a row that has
+        # left live staging — that would resurrect an already-superseded
+        # candidate.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+
+            self._commit(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="Ryan cedar window.",
+                        subject="Ryan",
+                        category="fact",
+                        importance=5,
+                        confidence=0.8,
+                        source_message_ids=[1],
+                    )
+                ],
+                [_unit_vector(1.0)],
+                last_processed_message_id=1,
+            )
+            with closing(sqlite3.connect(db_path)) as conn:
+                _load_vec_extension(conn)
+                conn.execute("DELETE FROM memory_candidate_embeddings")
+                conn.commit()
+
+            missing = load_candidates_missing_embeddings(db_path, agent_id=None)
+            self.assertEqual([cid for cid, _ in missing], [1])
+            stale_list = [(1, _unit_vector(1.0))]
+
+            # A concurrent run staled the candidate after this run built its list.
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute("UPDATE memory_candidates SET stale = 1 WHERE id = 1")
+                conn.commit()
+
+            self.assertEqual(
+                backfill_missing_candidate_embeddings(db_path, stale_list),
+                0,
+                "a candidate no longer in live staging must be skipped",
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                _load_vec_extension(conn)
+                embedding_rows = conn.execute(
+                    "SELECT COUNT(*) FROM memory_candidate_embeddings "
+                    "WHERE candidate_id = 1"
+                ).fetchone()[0]
+            self.assertEqual(
+                embedding_rows, 0, "a staled candidate must not be re-embedded"
             )
 
 
