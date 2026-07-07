@@ -29,7 +29,26 @@ def test_locked_dependencies_clear_known_supply_chain_advisories() -> None:
 
     # Exact range: floor clears the 1.102.0 advisory, ceiling protects
     # downstream installs from an untested 2.x.
-    assert "pydantic-ai-slim>=1.102,<2" in root_project["project"]["dependencies"]
+    base_dependencies = root_project["project"]["dependencies"]
+    assert "pydantic-ai-slim>=1.102,<2" in base_dependencies
+
+    # The slim swap exists to keep the fat pydantic-ai meta-package (and its
+    # provider-SDK tree) out of the base install. Guard against a regression
+    # that re-adds it alongside slim. Match the package name exactly: a bare
+    # "pydantic-ai" or "pydantic-ai" followed by a version specifier, extras
+    # bracket, or environment marker, without false-positiving on
+    # "pydantic-ai-slim".
+    fat_boundaries = {"=", "<", ">", "!", "~", " ", "[", ";"}
+
+    def _is_fat_pydantic_ai(dep: str) -> bool:
+        name = "pydantic-ai"
+        if dep == name:
+            return True
+        return dep.startswith(name) and dep[len(name) : len(name) + 1] in fat_boundaries
+
+    assert not any(_is_fat_pydantic_ai(dep) for dep in base_dependencies)
 
     python_packages = {package["name"]: package["version"] for package in root_lock["package"]}
     assert _version_tuple(python_packages["pydantic-ai-slim"]) >= (1, 102, 0)
+    # The fat meta-package was dropped from the resolved set entirely.
+    assert "pydantic-ai" not in python_packages
