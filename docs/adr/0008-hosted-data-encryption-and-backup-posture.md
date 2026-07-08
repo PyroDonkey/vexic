@@ -149,8 +149,8 @@ For v1 customer beta:
   day restore.
 - No external SLA is claimed until timed drills prove the numbers.
 
-The hosted restore drill runbook lives at
-`docs/runbooks/restore-drills/hosted-restore-drill.md`.
+The hosted restore drill runbook is maintained in the private hosted-ops
+repository.
 
 ## Rebuild And Replay
 
@@ -167,7 +167,7 @@ source, the documented RPO remains the true data-loss bound.
 
 ## Compromised Credentials
 
-The rotation procedure lives in `docs/runbooks/secret-rotation.md`. Database
+The rotation procedure is maintained in the private hosted-ops repository. Database
 tokens are minted short-lived with an `exp` claim; a token without `exp` is
 itself a rotation trigger. Live secrets live in deploy-platform secret
 management, never in a working-tree file.
