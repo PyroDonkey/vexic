@@ -1,6 +1,6 @@
 # Contributing to Vexic
 
-Thanks for your interest in Vexic — a local-first, provenance-first memory core
+Thanks for your interest in Vexic, a local-first, provenance-first memory core
 for long-running AI agents. This guide covers local setup, the branch workflow,
 and the checks we expect before a change lands.
 
@@ -63,9 +63,9 @@ change makes a decision worth recording.
 
 ## Documentation
 
-Repo docs describe architecture, the contract, glossary, and runbooks — not
-project status or delivery tracking (that lives in the issue tracker, not the
-repo). Keep docs downstream of code: when behavior changes, update the docs that
+Repo docs describe architecture, the contract, glossary, and runbooks. They do
+not carry project status or delivery tracking; that lives in the issue tracker,
+not the repo. Keep docs downstream of code: when behavior changes, update the docs that
 describe it in the same change.
 
 ## Reporting bugs and requesting features

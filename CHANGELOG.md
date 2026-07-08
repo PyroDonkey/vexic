@@ -15,7 +15,7 @@ contract is unchanged; `CONTRACT_VERSION` stays `0.1.0`.
 - `confirm_whole_scope` opt-in on the control-plane purge request. A null
   `target_scope.session_id` erases every session for an agent scope, so that
   whole-scope erasure now requires an explicit flag and can never happen by
-  omission — the guard fails before any deletion and even under `dry_run`
+  omission: the guard fails before any deletion, even under `dry_run`
   (ADR 0028).
 
 ### Changed
