@@ -9,14 +9,14 @@
 
 Vexic is a local-first memory core for long-running AI agents. It stores cleaned
 conversation history, stages candidate memories for review, and promotes durable
-facts — every one traceable to the messages it came from.
+facts, each one traceable to the messages it came from.
 
-**Status:** v0.1.1 — initial public release. The current package is a Python 3.13
+**Status:** v0.1.1: initial public release. The current package is a Python 3.13
 core with a SQLite reference service, public contract models, retrieval
 primitives, and conformance tests. It runs entirely on your machine: it reads and
 writes a local database and never exfiltrates data.
 
-> **Local MCP works today. A hosted service is coming** — see
+> **Local MCP works today. A hosted service is coming.** See
 > [vexic.dev](https://vexic.dev) to learn more and join the waitlist. Hosted
 > surfaces in this repository are internal-alpha adapter code, not a public
 > service contract.
@@ -63,8 +63,8 @@ uv run python scripts/vexic-mcp-stdio.py --db-path ./memory.db --tenant-id local
 
 ## Python Quickstart
 
-Use the library directly from Python — append to a session transcript, then
-search it back:
+Use the library directly from Python: append to a session transcript, then
+search it back.
 
 ```python
 import asyncio
@@ -114,14 +114,14 @@ package and its adapters read are listed in
   (repo-root source of truth); `docs/ai/README.md` indexes the supporting notes.
 
 Vexic Console and the marketing website live in the private
-`PyroDonkey/vexic-website` repository (open-core boundary) — see
+`PyroDonkey/vexic-website` repository (open-core boundary); see
 [ADR 0012's addendum](https://github.com/PyroDonkey/vexic/blob/main/docs/adr/0012-vexic-console-implementation-path.md).
 
 ## Package Boundary
 
 The repository root remains `uv`-managed; do not add Node package files at the
 root. Console and website ownership moved out of this repository entirely
-(see Repository Map above) — there is no in-repo Node package surface to
+(see Repository Map above). There is no in-repo Node package surface to
 isolate anymore.
 
 ## Contributing
