@@ -2,4 +2,4 @@
 
 Root pointer for Claude Code working in this repository.
 
-@docs/ai/AGENTS.md
+@AGENTS.md

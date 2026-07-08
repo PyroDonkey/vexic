@@ -116,7 +116,7 @@ def test_console_and_website_are_not_tracked_in_this_repository() -> None:
 def test_public_tree_does_not_embed_tracking_references() -> None:
     """Code and non-ADR docs must not reference the private issue tracker.
 
-    Allowed locations (per docs/ai/AGENTS.md): docs/adr/ (decision
+    Allowed locations (per AGENTS.md): docs/adr/ (decision
     provenance) and docs/provenance.md. The match is case-insensitive so a
     lowercase real id (e.g. coa-281) cannot slip past the guard; generic
     placeholders like coa-<id> never match because \\d+ requires a digit.
@@ -125,18 +125,22 @@ def test_public_tree_does_not_embed_tracking_references() -> None:
     allowed = ("docs/adr/", "docs/provenance.md")
     offenders: list[str] = []
     scan_dirs = ("src", "tests", "adapters", "scripts", "docs")
-    for scan in scan_dirs:
-        for path in (ROOT / scan).rglob("*"):
-            if not path.is_file() or path.suffix not in {".py", ".md"}:
-                continue
-            rel = path.relative_to(ROOT).as_posix()
-            if rel == "tests/test_public_boundary.py":
-                continue
-            if rel.startswith(allowed):
-                continue
-            lines = path.read_text(encoding="utf-8").splitlines()
-            for line_number, line in enumerate(lines, 1):
-                if ticket_pattern.search(line):
-                    offenders.append(f"{rel}:{line_number}: {line.strip()}")
+    # Root-level agent docs (AGENTS.md is the repo-root source of truth, CLAUDE.md
+    # its pointer) are public and non-ADR, so they get the same tracker-leak guard.
+    root_docs = (ROOT / "AGENTS.md", ROOT / "CLAUDE.md")
+    scanned = [p for scan in scan_dirs for p in (ROOT / scan).rglob("*")]
+    scanned.extend(root_docs)
+    for path in scanned:
+        if not path.is_file() or path.suffix not in {".py", ".md"}:
+            continue
+        rel = path.relative_to(ROOT).as_posix()
+        if rel == "tests/test_public_boundary.py":
+            continue
+        if rel.startswith(allowed):
+            continue
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for line_number, line in enumerate(lines, 1):
+            if ticket_pattern.search(line):
+                offenders.append(f"{rel}:{line_number}: {line.strip()}")
 
     assert offenders == []

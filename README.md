@@ -110,7 +110,8 @@ package and its adapters read are listed in
 - `docs/architecture.md` and `docs/memory-service-contract.md` - architecture
   and contract references.
 - `docs/adr/` - accepted architecture decision records.
-- `docs/ai/README.md` - contributor and maintainer workflow docs for coding agents.
+- `AGENTS.md` - contributor and maintainer workflow rules for coding agents
+  (repo-root source of truth); `docs/ai/README.md` indexes the supporting notes.
 
 Vexic Console and the marketing website live in the private
 `PyroDonkey/vexic-website` repository (open-core boundary) — see

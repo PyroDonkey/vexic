@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Fail closed against Vexic memory invariants for optional local agent hooks.
 
-The memory invariants in docs/ai/AGENTS.md are enforced in code and tests, but not at
+The memory invariants in AGENTS.md are enforced in code and tests, but not at
 the agent harness layer. This hook closes the harness-layer gap by denying a
 narrow set of high-confidence, irreversible violations issued through the
 project's `sqlite3` CLI (the only direct DB write path, gated by the
@@ -96,32 +96,32 @@ _CREATE_HOST_TABLE = re.compile(
 _RULES: list[tuple[re.Pattern[str], str]] = [
     (
         _UPDATE_MESSAGES,
-        "Tier 1 `messages` is append-only (docs/ai/AGENTS.md Memory Invariant #1): "
+        "Tier 1 `messages` is append-only (AGENTS.md Memory Invariant #1): "
         "never UPDATE transcript rows.",
     ),
     (
         _DELETE_MESSAGES,
-        "Tier 1 `messages` is append-only (docs/ai/AGENTS.md Memory Invariant #1): "
+        "Tier 1 `messages` is append-only (AGENTS.md Memory Invariant #1): "
         "never DELETE transcript rows.",
     ),
     (
         _REPLACE_MESSAGES,
-        "Tier 1 `messages` is append-only (docs/ai/AGENTS.md Memory Invariant #1): "
+        "Tier 1 `messages` is append-only (AGENTS.md Memory Invariant #1): "
         "INSERT OR REPLACE / REPLACE INTO deletes the existing transcript row.",
     ),
     (
         _UPSERT_MESSAGES,
-        "Tier 1 `messages` is append-only (docs/ai/AGENTS.md Memory Invariant #1): "
+        "Tier 1 `messages` is append-only (AGENTS.md Memory Invariant #1): "
         "an ON CONFLICT DO UPDATE upsert mutates an existing transcript row.",
     ),
     (
         _MUTATE_HOST_TABLE,
-        "`background_tool_audit` is a host-owned extension table (docs/ai/AGENTS.md "
+        "`background_tool_audit` is a host-owned extension table (AGENTS.md "
         "Architecture Boundaries): Vexic must not drop, alter, or truncate it.",
     ),
     (
         _CREATE_HOST_TABLE,
-        "`background_tool_audit` is a host-owned extension table (docs/ai/AGENTS.md "
+        "`background_tool_audit` is a host-owned extension table (AGENTS.md "
         "Architecture Boundaries): Vexic schema init must not create or take "
         "ownership of it.",
     ),

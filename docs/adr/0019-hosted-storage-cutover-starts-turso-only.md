@@ -52,7 +52,7 @@ is added under the `hosted` optional dependency extra.
 
 Provider-credential wiring -- reading Turso database tokens from hosted
 environment or secret management and constructing the authenticated libSQL DSN --
-lives in the repo-root `adapters/` directory, which `docs/ai/AGENTS.md`
+lives in the repo-root `adapters/` directory, which `AGENTS.md`
 designates for provider-secret and live-model wiring rather than `src/vexic`
 (alongside the existing `adapters/openrouter_live_adapter.py`). The hosted
 service factory may read a non-secret backend-selection flag in `src/vexic`, but

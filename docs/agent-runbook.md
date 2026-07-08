@@ -3,14 +3,14 @@
 > Role: how a coding agent should operate inside the Vexic repository during
 > its own work sessions.
 > Companion: `docs/examples.md` for worked behavior examples.
-> Authority: `docs/ai/AGENTS.md` and `docs/adr/*` remain the source of truth for
+> Authority: `AGENTS.md` and `docs/adr/*` remain the source of truth for
 > architecture boundaries and the human gates referenced below.
 
 ## Scope Of This Runbook
 
 This runbook is about the agent's own work sessions in this repository: editing
 code and docs, running verification, and committing on a feature branch or
-`dev` per the Branching Model in `docs/ai/AGENTS.md`. It is operational hygiene
+`dev` per the Branching Model in `AGENTS.md`. It is operational hygiene
 for the agent, not a product feature.
 
 It is deliberately distinct from Vexic's product behavior. Vexic the product is
@@ -21,7 +21,7 @@ not to customer memory data. Nothing in this runbook adds, removes, or changes a
 `MemoryService` operation, a storage table, or a contract field. Do not confuse
 an agent-run record with a Tier 1 transcript row, a `dream_runs` audit row, or a
 `retrieval_events` row; those are product tables governed by the Memory
-Invariants in `docs/ai/AGENTS.md`.
+Invariants in `AGENTS.md`.
 
 ## Agent-Run Audit Logging
 
@@ -33,7 +33,7 @@ markdown note, the session report, or the commit body is enough.
 A run record should capture:
 
 - Session identity: date, branch worked on (a feature branch per the naming
-  scheme in `docs/ai/AGENTS.md`, or `dev` for trivial direct commits), and the
+  scheme in `AGENTS.md`, or `dev` for trivial direct commits), and the
   requested task in one or two sentences.
 - Actions taken: the ordered, high-level steps the agent performed.
 - Tool calls: the meaningful read and search calls used to orient, and any
@@ -41,7 +41,7 @@ A run record should capture:
 - Files touched: every path created, edited, or deleted, with absolute or
   repo-relative paths.
 - Verification commands run plus their results: the exact commands from the
-  Verification section of `docs/ai/AGENTS.md` (for example `uv run pytest`) and whether
+  Verification section of `AGENTS.md` (for example `uv run pytest`) and whether
   they passed, including the observed test count when a tracking doc cites one.
 - Decisions escalated to the requester: any point where the agent stopped at a human
   gate, surfaced a trade-off, or asked before changing a settled boundary, and
@@ -53,7 +53,7 @@ made and where a human made the call.
 
 Keep run records metadata-and-action oriented. Do not paste secrets, provider
 keys, or configured forbidden values into a run record, consistent with the
-fail-closed redaction posture in `docs/ai/AGENTS.md`.
+fail-closed redaction posture in `AGENTS.md`.
 
 ## Loop Bounds And Escalation
 
@@ -64,7 +64,7 @@ Verification failures are normal; spinning on them is not.
   escalate to the requester instead of attempting a 4th blind cycle. A "cycle" is one
   edit-plus-verify attempt at fixing that target.
 - Never spin in a destructive retry loop. Do not repeatedly reset, force, stash,
-  or delete to make a command pass. `docs/ai/AGENTS.md` already forbids
+  or delete to make a command pass. `AGENTS.md` already forbids
   stashing, resetting, or committing user work without requester direction, and
   forbids destructive branch repair unless the requester names the branch. A
   retry loop must not
@@ -74,7 +74,7 @@ Verification failures are normal; spinning on them is not.
   and report. State what was tried, the last command output, and the suspected
   cause.
 
-This mirrors the existing "stop and report" human gates in `docs/ai/AGENTS.md`. Those
+This mirrors the existing "stop and report" human gates in `AGENTS.md`. Those
 gates already require the agent to stop rather than improvise when:
 
 - a `git pull --ff-only` fails and branches have diverged;
@@ -84,7 +84,7 @@ gates already require the agent to stop rather than improvise when:
   and the post-release fast-forward in `docs/branch-sync.md` does not resolve
   it, or `gh api ... compare/main...dev` lists unintended files;
 - a dirty worktree blocks branch sync;
-- a request conflicts with a rule in `docs/ai/AGENTS.md`, in which case the agent names
+- a request conflicts with a rule in `AGENTS.md`, in which case the agent names
   the violated rule and offers a Vexic-compatible path.
 
 A failed verification loop is the same shape of event. Treat the retry cap as
@@ -97,16 +97,16 @@ to retry. When the same class of failure shows up across cycles or sessions, the
 fix belongs in the harness or the rules, not only in the working tree.
 
 - If the agent keeps making the same mistake because guidance is missing or
-  ambiguous, propose a change to `docs/ai/AGENTS.md` (or the relevant doc) so
+  ambiguous, propose a change to `AGENTS.md` (or the relevant doc) so
   the next session starts with the corrected rule. Editing
-  `docs/ai/AGENTS.md` is a settled-rule change; surface it to the requester
+  `AGENTS.md` is a settled-rule change; surface it to the requester
   rather than rewriting boundaries unilaterally.
 - If the failure is a drift that a check could have caught, prefer a check.
   The repository already has `scripts/check_doc_drift.py` for ADR/service
   surface drift and `scripts/check_branch_sync.py` for read-only branch drift
   reporting. Local agent hooks may call these scripts, but hook configuration
   stays out of Git.
-- Close the loop in-session where the triggers fire. `docs/ai/AGENTS.md` lists
+- Close the loop in-session where the triggers fire. `AGENTS.md` lists
   reconciliation triggers (a new or changed ADR, a change to the
   `LocalMemoryService` operation surface, or a test-count change) that must be
   reconciled against the in-repo source of truth in the same work session.
@@ -117,9 +117,9 @@ next iteration cannot repeat it, rather than another isolated retry.
 ## External Tracking Session Ritual
 
 The external tracking system is project tracking only and is downstream of the
-repo (see "Docs Are Downstream Of Code" in `docs/ai/AGENTS.md`). The boundary
+repo (see "Docs Are Downstream Of Code" in `AGENTS.md`). The boundary
 rule - no tracker SDKs, secrets, imports, or runtime dependencies in
-`src/vexic` - stays in `docs/ai/AGENTS.md`; this section is the per-session
+`src/vexic` - stays in `AGENTS.md`; this section is the per-session
 workflow only.
 
 - At the start of each work session, review relevant project issues through the
@@ -132,7 +132,7 @@ workflow only.
   the `LocalMemoryService` operation surface, or a test-count change), reconcile
   the affected roadmap/todo against the in-repo source of truth before finishing.
 - At finish, update the issue with the branch, PR, commit, verification result
-  (fresh verification per `docs/ai/AGENTS.md`), and any generated follow-up
+  (fresh verification per `AGENTS.md`), and any generated follow-up
   issues. Status transitions themselves are automated by the tracker's GitHub
   integration when the branch name carries the issue id and the PR says
   `Fixes COA-<id>`; do not duplicate them by hand.

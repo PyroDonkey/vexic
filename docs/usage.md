@@ -114,7 +114,7 @@ Vexic-connected agent:
 ```
 
 Alternatively, launch Claude Code with `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`.
-`docs/ai/CLAUDE.md` remains useful project instruction context, but it is prompt
+`CLAUDE.md` remains useful project instruction context, but it is prompt
 context rather than storage enforcement.
 
 For Codex/local agents, keep Codex memories disabled for the Vexic profile. If a

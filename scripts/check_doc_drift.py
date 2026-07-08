@@ -6,16 +6,16 @@ exits 1 so a drifting PR cannot merge.
 
 Read-only. It checks two in-repo invariants and reports drift; it never edits
 files. A hook cannot read an external tracking system, so this only enforces the
-in-repo half of the "Docs Are Downstream Of Code" loop in docs/ai/AGENTS.md:
+in-repo half of the "Docs Are Downstream Of Code" loop in AGENTS.md:
 
 1. docs/adr/README.md lists every ADR file under docs/adr/ (and no phantom
    entries), so "the index lists 0001-0004 but nine ADRs exist" cannot recur.
 2. The MemoryService contract Protocol and LocalMemoryService expose the same
-   operation surface, and docs/ai/AGENTS.md mentions each operation, so an
+   operation surface, and AGENTS.md mentions each operation, so an
    operation added in code without a doc update is surfaced.
 
 Closing the loop against the downstream tracking roadmap/todo stays a manual
-step under the reconciliation triggers in docs/ai/AGENTS.md.
+step under the reconciliation triggers in AGENTS.md.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ ADR_DIR = REPO_ROOT / "docs" / "adr"
 ADR_INDEX = ADR_DIR / "README.md"
 CONTRACT = REPO_ROOT / "src" / "vexic" / "contract" / "__init__.py"
 SERVICE = REPO_ROOT / "src" / "vexic" / "service.py"
-AGENTS = REPO_ROOT / "docs" / "ai" / "AGENTS.md"
+AGENTS = REPO_ROOT / "AGENTS.md"
 
 ADR_FILE_RE = re.compile(r"^(\d{4})-.+\.md$")
 ADR_INDEX_RE = re.compile(r"^\|\s*(\d{4})\s*\|")
@@ -89,7 +89,7 @@ def _check_adr_index(warnings: list[str]) -> None:
 
 
 def _service_surface_section(agents_text: str) -> str:
-    """Return the body of the service-surface section of docs/ai/AGENTS.md.
+    """Return the body of the service-surface section of AGENTS.md.
 
     Slices from the section header to the next markdown heading or horizontal
     rule. Raises if the header is absent so the caller records a "could not
@@ -99,7 +99,7 @@ def _service_surface_section(agents_text: str) -> str:
     start = agents_text.find(header)
     if start == -1:
         raise ValueError(
-            "'### v0.1 Local Service Surface' section not found in docs/ai/AGENTS.md"
+            "'### v0.1 Local Service Surface' section not found in AGENTS.md"
         )
     rest = agents_text[start + len(header):]
     end = len(rest)
@@ -139,11 +139,11 @@ def _check_service_surface(warnings: list[str]) -> None:
     undocumented = sorted(op for op in service_ops if f"`{op}`" not in surface)
     if undocumented:
         warnings.append(
-            "The 'v0.1 Local Service Surface' section of docs/ai/AGENTS.md does not "
+            "The 'v0.1 Local Service Surface' section of AGENTS.md does not "
             "list service operation(s) present in code: "
             + ", ".join(undocumented)
             + ". Update that section and reconcile the downstream tracking "
-            "roadmap/todo (see docs/ai/AGENTS.md)."
+            "roadmap/todo (see AGENTS.md)."
         )
 
 
@@ -187,7 +187,7 @@ def main(ci: bool = False) -> int:
     body = "Doc drift check (read-only):\n\n" + "\n\n".join(notes + warnings)
     if warnings:
         system_message = (
-            "In-repo doc drift detected; reconcile per docs/ai/AGENTS.md."
+            "In-repo doc drift detected; reconcile per AGENTS.md."
         )
     else:
         # Only "could not run" notes (e.g. partial checkout): do not imply drift.
