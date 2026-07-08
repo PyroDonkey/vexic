@@ -12,7 +12,7 @@ latest released version on the `0.1.x` line.
 
 ## Reporting a vulnerability
 
-Please report security issues privately — do **not** open a public issue for a
+Please report security issues privately. Do **not** open a public issue for a
 suspected vulnerability.
 
 Use GitHub's private vulnerability reporting: go to the repository's **Security**
