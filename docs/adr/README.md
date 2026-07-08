@@ -43,6 +43,7 @@ index (and the reverse).
 | 0025 | Automatic summarize triggering ships as an async trigger endpoint, hourly cron, and a detached SessionStart backstop | accepted |
 | 0026 | Agent setup uses a short-lived setup token exchange             | accepted |
 | 0027 | Agent MCP connect uses each client's own `mcp add` command, opt-in | accepted |
+| 0028 | Control-plane destructive ops are audited, confirmed, and soft-deleted | accepted |
 
 Notes:
 
@@ -133,6 +134,13 @@ Notes:
   and opt-in intent) and requires no server changes. The generic path covers
   clients without a dedicated installer; recorder generalization is tracked
   separately.
+- 0028 settles COA-320's in-repo control-plane hardening: destructive
+  control-plane ops record `hosted_audit_events` (with new `project_id`/`key_id`
+  columns), a whole-scope purge (`PurgeScopeRequest` with a null session)
+  requires `confirm_whole_scope=True`, and `hosted_projects`/`tenants` gain
+  inline `retired_at`/`retired_by` soft-delete. Extends ADR 0022. Infra
+  controls (PITR/backups, Railway SSH) and the `adapters/` credential-scoping
+  work stay deferred to their own workstreams.
 - These numbers are the Vexic `docs/adr/` series and are self-contained.
   `src/vexic` source no longer carries any `upstream ADR-00NN` extraction-source
   labels (they were removed when the COA boundary policy was clarified), so there

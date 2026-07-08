@@ -232,7 +232,13 @@ class PurgeScopeTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-    async def _purge(self, session_id: str | None, *, dry_run: bool = False):
+    async def _purge(
+        self,
+        session_id: str | None,
+        *,
+        dry_run: bool = False,
+        confirm_whole_scope: bool = False,
+    ):
         return await self.service.purge_scope(
             PurgeScopeRequest(
                 scope=_scope({MemoryCapability.ADMIN_LIFECYCLE}),
@@ -240,6 +246,7 @@ class PurgeScopeTests(unittest.IsolatedAsyncioTestCase):
                 reason="user requested erasure",
                 redaction=RedactionContext(forbidden_values=()),
                 dry_run=dry_run,
+                confirm_whole_scope=confirm_whole_scope,
             )
         )
 
@@ -400,6 +407,41 @@ class PurgeScopeTests(unittest.IsolatedAsyncioTestCase):
     async def test_purge_requires_existing_tombstone(self) -> None:
         with self.assertRaisesRegex(ValueError, "tombstone"):
             await self._purge("session-1")
+
+    async def test_whole_scope_purge_rejected_without_confirmation(self) -> None:
+        # A null-session target purges every session for the agent scope in one
+        # call (ADR 0028 mass-delete surface); it must not proceed accidentally.
+        await self._tombstone(None)
+        with self.assertRaisesRegex(ValueError, "confirm_whole_scope"):
+            await self._purge(None)
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(self._count(conn, "SELECT COUNT(*) FROM messages"), 2)
+
+    async def test_dry_run_whole_scope_still_requires_confirmation(self) -> None:
+        # The confirmation gate precedes dry_run: you cannot even preview a
+        # whole-scope purge without opting in.
+        await self._tombstone(None)
+        with self.assertRaisesRegex(ValueError, "confirm_whole_scope"):
+            await self._purge(None, dry_run=True)
+
+    async def test_whole_scope_purge_allowed_with_confirmation(self) -> None:
+        await self._tombstone(None)
+        result = await self._purge(None, confirm_whole_scope=True)
+
+        self.assertFalse(result.dry_run)
+        self.assertIsNotNone(result.purged_at)
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(self._count(conn, "SELECT COUNT(*) FROM messages"), 0)
+
+    async def test_session_scoped_purge_needs_no_confirmation(self) -> None:
+        # Confirmation is only required for the whole-scope (null-session) path.
+        await self._tombstone("session-1")
+        result = await self._purge("session-1")
+
+        self.assertFalse(result.dry_run)
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(self._count(conn, "SELECT COUNT(*) FROM messages"), 1)
 
     async def test_purge_requires_admin_lifecycle_capability(self) -> None:
         await self._tombstone("session-1")

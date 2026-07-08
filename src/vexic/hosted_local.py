@@ -49,7 +49,9 @@ _CONTROL_PLANE_SCHEMA_STATEMENTS: tuple[str, ...] = (
         active INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         customer_target TEXT,
-        generation INTEGER NOT NULL DEFAULT 1
+        generation INTEGER NOT NULL DEFAULT 1,
+        retired_at TEXT,
+        retired_by TEXT
     )
     """,
     """
@@ -75,6 +77,8 @@ _CONTROL_PLANE_SCHEMA_STATEMENTS: tuple[str, ...] = (
         name TEXT NOT NULL,
         environment TEXT NOT NULL,
         created_at TEXT NOT NULL,
+        retired_at TEXT,
+        retired_by TEXT,
         FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
     )
     """,
@@ -86,7 +90,9 @@ _CONTROL_PLANE_SCHEMA_STATEMENTS: tuple[str, ...] = (
         principal_id TEXT,
         status TEXT NOT NULL,
         recorded_at TEXT NOT NULL,
-        error_type TEXT
+        error_type TEXT,
+        project_id TEXT,
+        key_id TEXT
     )
     """,
     """
@@ -304,6 +310,33 @@ class ReplacementTarget:
         return ReplacementTarget._validate_local(root_path, replacement)
 
 
+def _insert_audit_event(conn: sqlite3.Connection, event: HostedAuditEvent) -> None:
+    """Append one row to the shared control-plane ``hosted_audit_events`` ledger.
+
+    Used by both the tenant catalog and the API-key store, which write to the
+    same ``control-plane.db``. Callers own the surrounding transaction/commit.
+    """
+    conn.execute(
+        """
+        INSERT INTO hosted_audit_events (
+            operation, tenant_id, principal_id, status, recorded_at,
+            error_type, project_id, key_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            event.operation,
+            event.tenant_id,
+            event.principal_id,
+            event.status,
+            event.recorded_at,
+            event.error_type,
+            event.project_id,
+            event.key_id,
+        ),
+    )
+
+
 class HostedTenantCatalog:
     def __init__(
         self,
@@ -369,7 +402,7 @@ class HostedTenantCatalog:
             conn.execute(
                 """
                 UPDATE tenants
-                SET active = 1
+                SET active = 1, retired_at = NULL, retired_by = NULL
                 WHERE tenant_id = ?
                 """,
                 (tenant_id,),
@@ -536,7 +569,7 @@ class HostedTenantCatalog:
                 """
                 SELECT project_id, tenant_id, name, environment, created_at
                 FROM hosted_projects
-                WHERE tenant_id = ?
+                WHERE tenant_id = ? AND retired_at IS NULL
                 ORDER BY created_at, project_id
                 """,
                 (tenant_id,),
@@ -558,7 +591,7 @@ class HostedTenantCatalog:
                 """
                 SELECT project_id, tenant_id, name, environment, created_at
                 FROM hosted_projects
-                WHERE tenant_id = ? AND project_id = ?
+                WHERE tenant_id = ? AND project_id = ? AND retired_at IS NULL
                 """,
                 (tenant_id, project_id),
             ).fetchone()
@@ -571,6 +604,93 @@ class HostedTenantCatalog:
             environment=row[3],
             created_at=row[4],
         )
+
+    def retire_tenant(self, tenant_id: str, *, retired_by: str | None = None) -> None:
+        """Soft-delete a tenant in place (ADR 0028).
+
+        Non-destructive: marks the tenant inactive (so the existing
+        ``active = 1`` gates exclude it) and stamps ``retired_at``/``retired_by``
+        while the row and its customer-DB pointer survive. ``provision_tenant``
+        reactivates and clears the retirement stamp.
+        """
+        with closing(self._connect_control()) as conn:
+            row = conn.execute(
+                "SELECT retired_at FROM tenants WHERE tenant_id = ?",
+                (tenant_id,),
+            ).fetchone()
+            if row is None:
+                raise PermissionError("Unknown hosted tenant.")
+            if row[0] is not None:
+                raise PermissionError("Hosted tenant already retired.")
+            conn.execute(
+                """
+                UPDATE tenants
+                SET active = 0, retired_at = ?, retired_by = ?
+                WHERE tenant_id = ?
+                """,
+                (_now(), retired_by, tenant_id),
+            )
+            # Audit in the same transaction as the retirement so the destructive
+            # state and its audit row commit or roll back together.
+            _insert_audit_event(
+                conn,
+                HostedAuditEvent(
+                    operation="retire_tenant",
+                    tenant_id=tenant_id,
+                    principal_id=retired_by,
+                    status="ok",
+                    recorded_at=_now(),
+                ),
+            )
+            conn.commit()
+
+    def retire_control_project(
+        self,
+        tenant_id: str,
+        project_id: str,
+        *,
+        retired_by: str | None = None,
+    ) -> None:
+        """Soft-delete a control-plane project in place (ADR 0028).
+
+        Non-destructive: stamps ``retired_at``/``retired_by`` so the project
+        drops out of active listings while the row survives for recovery/audit.
+        """
+        with closing(self._connect_control()) as conn:
+            row = conn.execute(
+                """
+                SELECT retired_at
+                FROM hosted_projects
+                WHERE tenant_id = ? AND project_id = ?
+                """,
+                (tenant_id, project_id),
+            ).fetchone()
+            if row is None:
+                raise PermissionError("Unknown hosted project.")
+            if row[0] is not None:
+                raise PermissionError("Hosted project already retired.")
+            conn.execute(
+                """
+                UPDATE hosted_projects
+                SET retired_at = ?, retired_by = ?
+                WHERE tenant_id = ? AND project_id = ?
+                """,
+                (_now(), retired_by, tenant_id, project_id),
+            )
+            # Audit in the same transaction as the retirement (commit/rollback
+            # together) so a retired row never lacks its audit record.
+            _insert_audit_event(
+                conn,
+                HostedAuditEvent(
+                    operation="retire_project",
+                    tenant_id=tenant_id,
+                    principal_id=retired_by,
+                    status="ok",
+                    recorded_at=_now(),
+                    project_id=project_id,
+                ),
+            )
+            conn.commit()
 
     def upsert_control_project(
         self,
@@ -754,22 +874,7 @@ class HostedTenantCatalog:
 
     def record_audit_event(self, event: HostedAuditEvent) -> None:
         with closing(self._connect_control()) as conn:
-            conn.execute(
-                """
-                INSERT INTO hosted_audit_events (
-                    operation, tenant_id, principal_id, status, recorded_at, error_type
-                )
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event.operation,
-                    event.tenant_id,
-                    event.principal_id,
-                    event.status,
-                    event.recorded_at,
-                    event.error_type,
-                ),
-            )
+            _insert_audit_event(conn, event)
             conn.commit()
 
     def record_usage_event(self, event: HostedUsageEvent) -> None:
@@ -831,7 +936,8 @@ class HostedTenantCatalog:
             if tenant_id is None:
                 rows = conn.execute(
                     """
-                    SELECT operation, tenant_id, principal_id, status, recorded_at, error_type
+                    SELECT operation, tenant_id, principal_id, status, recorded_at,
+                           error_type, project_id, key_id
                     FROM hosted_audit_events
                     WHERE tenant_id IS NULL
                     ORDER BY id
@@ -840,7 +946,8 @@ class HostedTenantCatalog:
             else:
                 rows = conn.execute(
                     """
-                    SELECT operation, tenant_id, principal_id, status, recorded_at, error_type
+                    SELECT operation, tenant_id, principal_id, status, recorded_at,
+                           error_type, project_id, key_id
                     FROM hosted_audit_events
                     WHERE tenant_id = ?
                     ORDER BY id
@@ -1005,6 +1112,14 @@ class HostedTenantCatalog:
                 conn.execute("ALTER TABLE hosted_usage_events ADD COLUMN project_id TEXT")
             if "key_id" not in columns:
                 conn.execute("ALTER TABLE hosted_usage_events ADD COLUMN key_id TEXT")
+            audit_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(hosted_audit_events)").fetchall()
+            }
+            if "project_id" not in audit_columns:
+                conn.execute("ALTER TABLE hosted_audit_events ADD COLUMN project_id TEXT")
+            if "key_id" not in audit_columns:
+                conn.execute("ALTER TABLE hosted_audit_events ADD COLUMN key_id TEXT")
             job_columns = {
                 str(row[1])
                 for row in conn.execute("PRAGMA table_info(hosted_job_events)").fetchall()
@@ -1021,6 +1136,18 @@ class HostedTenantCatalog:
                 conn.execute(
                     "ALTER TABLE tenants ADD COLUMN generation INTEGER NOT NULL DEFAULT 1"
                 )
+            if "retired_at" not in tenant_columns:
+                conn.execute("ALTER TABLE tenants ADD COLUMN retired_at TEXT")
+            if "retired_by" not in tenant_columns:
+                conn.execute("ALTER TABLE tenants ADD COLUMN retired_by TEXT")
+            project_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(hosted_projects)").fetchall()
+            }
+            if "retired_at" not in project_columns:
+                conn.execute("ALTER TABLE hosted_projects ADD COLUMN retired_at TEXT")
+            if "retired_by" not in project_columns:
+                conn.execute("ALTER TABLE hosted_projects ADD COLUMN retired_by TEXT")
             conn.commit()
 
     def _allocate_db_filename(self, conn: sqlite3.Connection) -> str:
@@ -1240,17 +1367,29 @@ class HostedApiKeyStore:
                 stored = self._keys[key_id]
             except KeyError as exc:
                 raise PermissionError("Unknown hosted API key.") from exc
+            newly_revoked = stored.revoked_at is None
             self._keys[key_id] = replace(
                 stored,
                 active=False,
                 revoked_at=stored.revoked_at or _now(),
                 revoked_by=stored.revoked_by or revoked_by,
             )
+            if newly_revoked:
+                self._record_audit_event(
+                    HostedAuditEvent(
+                        operation="revoke_key",
+                        tenant_id=stored.tenant_id,
+                        principal_id=stored.principal_id,
+                        status="ok",
+                        recorded_at=_now(),
+                        key_id=key_id,
+                    )
+                )
             return
         with closing(self._connect_control()) as conn:
             row = conn.execute(
                 """
-                SELECT 1
+                SELECT tenant_id, principal_id, revoked_at
                 FROM hosted_api_keys
                 WHERE key_id = ?
                 """,
@@ -1258,6 +1397,7 @@ class HostedApiKeyStore:
             ).fetchone()
             if row is None:
                 raise PermissionError("Unknown hosted API key.")
+            tenant_id, principal_id, already_revoked_at = row[0], row[1], row[2]
             conn.execute(
                 """
                 UPDATE hosted_api_keys
@@ -1268,6 +1408,21 @@ class HostedApiKeyStore:
                 """,
                 (_now(), revoked_by, key_id),
             )
+            # Audit only the NULL -> revoked transition, on the same transaction
+            # as the revoke, so a real delete never lands without its audit row
+            # and a repeated (no-op) revoke does not forge a second one.
+            if already_revoked_at is None:
+                _insert_audit_event(
+                    conn,
+                    HostedAuditEvent(
+                        operation="revoke_key",
+                        tenant_id=tenant_id,
+                        principal_id=principal_id,
+                        status="ok",
+                        recorded_at=_now(),
+                        key_id=key_id,
+                    ),
+                )
             conn.commit()
 
     def create_control_plane_key(
@@ -1600,6 +1755,14 @@ class HostedApiKeyStore:
         revoked_by: str | None = None,
     ) -> None:
         now = _now()
+        audit = HostedAuditEvent(
+            operation="revoke_setup_token",
+            tenant_id=tenant_id,
+            principal_id=None,
+            status="ok",
+            recorded_at=now,
+            project_id=project_id,
+        )
         if self._control_target is None:
             stored = self._setup_tokens.get(token_id)
             if (
@@ -1608,16 +1771,19 @@ class HostedApiKeyStore:
                 or stored.project_id != project_id
             ):
                 raise PermissionError("Unknown setup token.")
+            newly_revoked = stored.revoked_at is None
             self._setup_tokens[token_id] = replace(
                 stored,
                 revoked_at=stored.revoked_at or now,
                 revoked_by=stored.revoked_by or revoked_by,
             )
+            if newly_revoked:
+                self._record_audit_event(audit)
             return
         with closing(self._connect_control()) as conn:
             row = conn.execute(
                 """
-                SELECT 1
+                SELECT revoked_at
                 FROM hosted_setup_tokens
                 WHERE token_id = ? AND tenant_id = ? AND project_id = ?
                 """,
@@ -1625,6 +1791,7 @@ class HostedApiKeyStore:
             ).fetchone()
             if row is None:
                 raise PermissionError("Unknown setup token.")
+            already_revoked_at = row[0]
             conn.execute(
                 """
                 UPDATE hosted_setup_tokens
@@ -1635,6 +1802,9 @@ class HostedApiKeyStore:
                 """,
                 (now, revoked_by, token_id),
             )
+            # Same-transaction audit, only on the NULL -> revoked transition.
+            if already_revoked_at is None:
+                _insert_audit_event(conn, audit)
             conn.commit()
 
     def list_setup_tokens(
@@ -1719,6 +1889,15 @@ class HostedApiKeyStore:
             raise RuntimeError("Hosted API key store is not durable.")
         return _connect_control_db(self._control_target)
 
+    def _record_audit_event(self, event: HostedAuditEvent) -> None:
+        # In-memory (non-durable) key stores have no control-plane ledger to
+        # write to; audit is a hosted-durability concern, so skip silently.
+        if self._control_target is None:
+            return
+        with closing(self._connect_control()) as conn:
+            _insert_audit_event(conn, event)
+            conn.commit()
+
     def _init_control_plane_schema(self) -> None:
         with closing(self._connect_control()) as conn:
             conn.execute(
@@ -1772,6 +1951,31 @@ class HostedApiKeyStore:
                 )
                 """
             )
+            # Shared with HostedTenantCatalog on the same control-plane.db; created
+            # here too so a standalone key store can still record audit events.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS hosted_audit_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    operation TEXT NOT NULL,
+                    tenant_id TEXT,
+                    principal_id TEXT,
+                    status TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL,
+                    error_type TEXT,
+                    project_id TEXT,
+                    key_id TEXT
+                )
+                """
+            )
+            audit_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(hosted_audit_events)").fetchall()
+            }
+            if "project_id" not in audit_columns:
+                conn.execute("ALTER TABLE hosted_audit_events ADD COLUMN project_id TEXT")
+            if "key_id" not in audit_columns:
+                conn.execute("ALTER TABLE hosted_audit_events ADD COLUMN key_id TEXT")
             columns = {
                 str(row[1])
                 for row in conn.execute("PRAGMA table_info(hosted_api_keys)").fetchall()
