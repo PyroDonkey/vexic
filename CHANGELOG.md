@@ -5,6 +5,26 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-07-07
+
+Hardening patch for the internal-alpha hosted control plane. The public memory
+contract is unchanged; `CONTRACT_VERSION` stays `0.1.0`.
+
+### Added
+
+- `confirm_whole_scope` opt-in on the control-plane purge request. A null
+  `target_scope.session_id` erases every session for an agent scope, so that
+  whole-scope erasure now requires an explicit flag and can never happen by
+  omission — the guard fails before any deletion and even under `dry_run`
+  (ADR 0028).
+
+### Changed
+
+- Control-plane destructive operations record their audit atomically under a
+  transition-guarded write, and the re-retire path returns a clearer error.
+
+[0.1.1]: https://github.com/PyroDonkey/vexic/releases/tag/v0.1.1
+
 ## [0.1.0] - 2026-07-06
 
 Initial public release of the Vexic memory core.
