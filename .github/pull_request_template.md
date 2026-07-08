@@ -20,5 +20,5 @@ Fixes COA-
 
 - [ ] `uv run pytest` passes fresh (after the final edit)
 - [ ] ADR touched? `docs/adr/README.md` index updated
-- [ ] `LocalMemoryService` surface changed? "v0.1 Local Service Surface" in `docs/ai/AGENTS.md` updated
-- [ ] Reconciliation triggers checked (see "Docs Are Downstream Of Code" in `docs/ai/AGENTS.md`)
+- [ ] `LocalMemoryService` surface changed? "v0.1 Local Service Surface" in `AGENTS.md` updated
+- [ ] Reconciliation triggers checked (see "Docs Are Downstream Of Code" in `AGENTS.md`)
