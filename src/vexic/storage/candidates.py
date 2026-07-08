@@ -730,7 +730,7 @@ def record_candidate_retrieval(
     """
     if not candidate_ids:
         return []
-    # Persistence secret guard (docs/ai/AGENTS.md): the query is the one new piece of
+    # Persistence secret guard (AGENTS.md): the query is the one new piece of
     # text this path persists, so it fails closed exactly like save_messages.
     assert_no_forbidden_secret_values(forbidden_secret_values, query)
     event_ids: list[int] = []

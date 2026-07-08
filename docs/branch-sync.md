@@ -3,7 +3,7 @@
 > Role: the operational git command sequences for the feature -> `dev` ->
 > `main` workflow and for keeping `dev` and `main` from drifting.
 > Authority: the always-loaded hard-stops, the branching model, and the naming
-> scheme live in `docs/ai/AGENTS.md` (Repository Workflow). This doc holds only
+> scheme live in `AGENTS.md` (Repository Workflow). This doc holds only
 > the command steps; it does not relax any rule there.
 
 ## Before mutable work
@@ -20,14 +20,14 @@ it. Do not continue implementation work on `main`.
 
 If any `git pull --ff-only` fails, stop and report the divergence. Do not merge,
 rebase, or reset without explicit requester direction. (Always-loaded hard-stop;
-see `docs/ai/AGENTS.md`.)
+see `AGENTS.md`.)
 
 ## Starting a feature branch
 
 From fresh `dev` (sequence above):
 
 1. `git switch -c <type>/coa-<id>-<slug> dev` (naming scheme in
-   `docs/ai/AGENTS.md`; `chore/<slug>` when no Linear issue exists).
+   `AGENTS.md`; `chore/<slug>` when no Linear issue exists).
 2. Work, verify, commit on the feature branch.
 3. `git push -u origin <branch>` and open a PR into `dev` with
    `Fixes COA-<id>` in the description. Squash-merge; the branch auto-deletes.

@@ -1,17 +1,17 @@
 # Agent Behavior Examples
 
 > Role: short worked examples of correct in-repo agent behavior.
-> Authority: every example is derived from rules in `docs/ai/AGENTS.md`. When
-> this file and `docs/ai/AGENTS.md` disagree, `docs/ai/AGENTS.md` wins and this
+> Authority: every example is derived from rules in `AGENTS.md`. When
+> this file and `AGENTS.md` disagree, `AGENTS.md` wins and this
 > file is reconciled.
 > Companion: `docs/agent-runbook.md` for the operating discipline behind these.
 
 These examples show the expected shape of correct behavior. They are not new
-rules and they do not relax any rule in `docs/ai/AGENTS.md`.
+rules and they do not relax any rule in `AGENTS.md`.
 
 ## Example 1: Branch Sync And A Clean dev -> main Reconciliation
 
-Per the Branch Sync rules in `docs/ai/AGENTS.md`, all Vexic project work happens on
+Per the Branch Sync rules in `AGENTS.md`, all Vexic project work happens on
 `dev`, and `dev` must not be behind `origin/main` before opening or claiming a
 `dev` to `main` PR is ready.
 
@@ -52,7 +52,7 @@ create a branch to repair PR shape unless the requester names the branch to crea
 
 ## Example 2: A Good Commit Message
 
-`docs/ai/AGENTS.md` directs the agent to commit on `dev` only after fresh verification,
+`AGENTS.md` directs the agent to commit on `dev` only after fresh verification,
 and to prefer a new commit over amending. Commits in this repo use a
 Conventional-Commits-style subject. If the agent harness defines a co-author
 trailer convention, end the message with that trailer.
@@ -62,7 +62,7 @@ docs: add agent operations runbook and behavior examples
 
 Add docs/agent-runbook.md and docs/examples.md to cover agent-run audit
 logging, loop bounds and escalation, and the failure-to-rule feedback path.
-Examples are grounded in the docs/ai/AGENTS.md Branch Sync commands and the host-port
+Examples are grounded in the AGENTS.md Branch Sync commands and the host-port
 boundary. Verified with uv run pytest.
 
 Co-Authored-By: <Agent Name> <noreply@example.com>
@@ -73,7 +73,7 @@ Notes:
 - The subject is a short, type-prefixed summary in the imperative mood.
 - The body explains what changed and why, and records that verification ran.
 - The `Co-Authored-By` trailer is a harness/commit convention, not a
-  `docs/ai/AGENTS.md` rule. Use the exact name and address your own harness
+  `AGENTS.md` rule. Use the exact name and address your own harness
   specifies (for example, Claude Code sets
   `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`); omit it if your
   harness defines none.
@@ -82,7 +82,7 @@ Notes:
 
 ## Example 3: A Model-Backed Op Fails Closed With HostPortNotConfigured
 
-`docs/ai/AGENTS.md` settles `run_dream_phase` as a host-port operation in v0.1.
+`AGENTS.md` settles `run_dream_phase` as a host-port operation in v0.1.
 `LocalMemoryService` applies the local authorization and tombstone checks, then
 executes only when explicit dream-phase host ports are supplied. When those local
 checks pass and no host adapter is provided, it fails closed with
@@ -117,7 +117,7 @@ that work.
 
 ## Example 4: Running The LongMemEval Evals
 
-`docs/ai/AGENTS.md` names `vexic.run_evals` as the eval runner for the
+`AGENTS.md` names `vexic.run_evals` as the eval runner for the
 LongMemEval datasets. Run the smoke dataset with:
 
 ```powershell
