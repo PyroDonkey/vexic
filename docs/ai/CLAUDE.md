@@ -1,5 +1,5 @@
 # Claude Code prompt context
 
-Internal tooling doc for Claude Code; not public product documentation.
+Claude Code prompt context for this repository.
 
 @AGENTS.md

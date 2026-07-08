@@ -1,5 +1,5 @@
 # Claude Code prompt context
 
-Root pointer for Claude Code; not public product documentation.
+Root pointer for Claude Code working in this repository.
 
 @docs/ai/AGENTS.md

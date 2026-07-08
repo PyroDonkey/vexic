@@ -522,6 +522,10 @@ class PurgeScopeRequest(RedactionRequiredRequest):
     target_scope: MemoryScopeSelector
     reason: str
     dry_run: bool = False
+    # A null ``target_scope.session_id`` purges every session for the target
+    # agent scope in one call. That whole-scope erasure must be opted into
+    # explicitly so a bulk delete can never happen by omission (ADR 0028).
+    confirm_whole_scope: bool = False
 
     @model_validator(mode="after")
     def _target_scope_must_match_actor_tenant(self) -> Self:

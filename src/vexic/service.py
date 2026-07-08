@@ -841,6 +841,15 @@ class LocalMemoryService(MemoryService):
         self._authorize(request.scope, request.required_capability)
         if request.target_scope.tenant_id != self.tenant_id:
             raise PermissionError("target_scope tenant_id does not match opened database.")
+        if request.target_scope.session_id is None and not request.confirm_whole_scope:
+            # Guard the mass-delete surface: a null session_id erases every
+            # session for the target agent scope. Fail before any deletion and
+            # regardless of dry_run so even a preview requires opting in.
+            raise ValueError(
+                "Whole-scope purge (null target_scope.session_id) erases every "
+                "session for the target agent scope; set confirm_whole_scope=True "
+                "to proceed."
+            )
         assert_no_forbidden_secret_values(
             self._redaction_values(request.redaction),
             request.reason,

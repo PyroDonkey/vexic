@@ -1,7 +1,7 @@
 # Vexic Agent Instructions
 
-Internal tooling doc for automated agents and maintainers; not public product
-documentation.
+Contributor and maintainer guidance for automated agents working in this
+repository. This is engineering workflow documentation, not the product README.
 
 Single source of truth for agents working in this repository.
 Plain markdown, no tool-specific syntax.
@@ -249,12 +249,12 @@ in this repo touches a surface the Console consumes, flag or mirror the change
 there:
 
 - `src/vexic/hosted_control_plane_http.py` is the control-plane HTTP API. Its
-  client is `console/lib/control-plane-client.mjs` in vexic-website; endpoint
-  or payload changes need a matching client update there.
+  client lives in the companion Console repo; endpoint or payload changes need a
+  matching client update there.
 - ADR 0012 (Console implementation path), ADR 0013 (control-plane API), and
   ADR 0026 (setup token exchange) decide surfaces that split across both
-  repos; the console-side legs are tracked in the Linear "Vexic Website"
-  project, the server-side legs in "Vexic Memory System".
+  repos; the console-side legs are tracked in the companion Console repo's
+  project tracker, the server-side legs in this repo's tracker.
 - `docs/ai/CONTEXT.md` is the upstream product glossary for both repos;
   vexic-website keeps only repo-local terms in its own `CONTEXT.md`.
 - For cross-repo features (new endpoint plus console UI), land the API side
@@ -399,7 +399,9 @@ For boundary-sensitive changes, inspect these explicitly:
 
 ```powershell
 rg -n "^(from|import) engine\\." src/vexic tests
-rg -n "C[o]alescent|A[g]entOS|Telegram|Blog Writer|teammate" docs/ai/AGENTS.md README.md docs src/vexic tests
+# Also scan for any reintroduced legacy predecessor product names. The
+# maintainer keeps the current ban-list; none of those names should appear
+# outside an explicit compatibility note.
 ```
 
 `scripts/check_doc_drift.py --ci` is the committed doc-drift gate. Optional
@@ -409,11 +411,20 @@ local agent hooks may also call `scripts/check_branch_sync.py` and
 Run the LongMemEval evals with `vexic.run_evals`; see `docs/examples.md` for the
 exact command and worked behavior examples.
 
+`src/vexic/live_retrieval_baseline.py` is the maintained live-provider
+retrieval smoke harness: it runs Light -> REM -> Deep over a JSONL fixture
+through a real provider adapter, writes `retrieval_metrics.json` and
+`answer_synthesis_metrics.json`, and classifies retrieval failures. It is
+gated behind `--allow-live` with a provider-call budget cap. Invoke it with
+`python -m vexic.live_retrieval_baseline`; the command and artifacts are
+documented in `docs/usage.md`, and `docs/ai/REVIEW.md` flags it as do-not-run
+during review. Behavior is pinned by `tests/test_live_retrieval_baseline.py`.
+
 Private source-host references are allowed in `docs/provenance.md` and compatibility
 sections. They should not become Vexic runtime instructions.
 Private tracker issue references are allowed only as project-tracking,
-traceability, or evidence pointers in `README.md`, `docs/provenance.md`,
-`docs/adr/**`, and `docs/runbooks/**`. Do not allow private tracker or
+traceability, or evidence pointers in `README.md`, `docs/provenance.md`, and
+`docs/adr/**`. Do not allow private tracker or
 private-host issue IDs in `src/vexic`, `tests`, schema values,
 public contract fields, `docs/architecture.md`, `docs/hosted-mvp.md`, or
 `docs/memory-service-contract.md`, except in explicit provenance or

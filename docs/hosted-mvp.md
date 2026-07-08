@@ -242,7 +242,7 @@ native durable memory where possible.
 this as host integration policy, not Vexic core behavior: Vexic cannot stop
 Claude Code, Codex, or another runtime from writing its own local memory. Use
 the local setup guidance in
-[README.md](../README.md#native-agent-memory); if suppression is unavailable,
+[usage.md](usage.md#native-agent-memory); if suppression is unavailable,
 treat Vexic as authoritative only for memory that reaches Vexic through the
 hosted HTTP append route, recorder, or importer path. Claude Code hosted
 auto-recording uses `vexic setup claude-code`; the command installs user-local
@@ -253,7 +253,7 @@ injects capped hosted memory context on `startup` and `clear`; approved MCP
 reads go through the read-only hosted `/mcp` route for targeted on-demand
 search. The Claude Code host transcript
 recorder flow is documented in
-[README.md](../README.md#claude-code-transcript-import) and
+[usage.md](usage.md#claude-code-transcript-import) and
 [ADR 0002](adr/0002-host-recorders-ingest-complete-cleaned-transcripts.md).
 
 Smoke each configured client with the same sequence:
@@ -394,9 +394,9 @@ directory does that, per ADR 0008/0013 precedent.
   `generation`) only when `verify` returns `True`; otherwise it destroys the
   replacement and leaves the original active. The decision logic is unit
   tested with fakes. Actually restoring from a real Turso point-in-time-recovery
-  snapshot against production data remains a manual/operator-run step (see
-  `docs/runbooks/hosted-migration.md`); only the automated decision logic
-  above is exercised in CI.
+  snapshot against production data remains a manual/operator-run step (the
+  hosted-migration runbook is maintained in the private hosted-ops repository);
+  only the automated decision logic above is exercised in CI.
 
 Known follow-ups, deliberately not built in this cutover:
 
@@ -467,37 +467,24 @@ GitHub Actions deploy trigger:
   `https://api.vexic.dev/health` with bounded curl timeouts and retries.
 - Required GitHub secret: `RAILWAY_TOKEN`, a Railway project token scoped to
   the `production` environment.
-- Required GitHub variable: `RAILWAY_PROJECT_ID=1dcc4bac-613a-4291-af84-56bf7dec2b79`.
+- Required GitHub variable: `RAILWAY_PROJECT_ID=<railway-project-id>`.
 - Railway GitHub autodeploys for the service should stay disabled so GitHub
   Actions is the test gate before deploy.
 - Roll back from the Railway service deployments tab by selecting a previous
   successful deployment and using Railway's rollback action. Railway restores
   that deployment's Docker image and custom variables, subject to retention.
 
-Verified internal-alpha evidence through 2026-06-25:
+Internal-alpha smoke has exercised this shell end to end (concrete
+deployment identifiers and drill evidence are tracked in the private ops
+repository, not here):
 
-- Railway project `Vexic` runs service `vexic` in the `production`
-  environment at `https://api.vexic.dev`.
-- Deployment
-  `83a04e5a-199c-4671-bd15-7d01e3a3181b` at commit
-  `f8b22637ab6ad31ac055b469b568243869627b90` was verified during the
-  2026-06-25 alpha smoke. Do not treat this historical deployment id as the
-  current live deploy without a fresh Railway check.
-- `/health` returns `200` with contract version `0.1.0`.
-- `vexic-volume` is mounted at `/data/vexic`; append/search persistence
-  survived a redeploy.
-- API-key auth rejects missing and invalid keys. A throwaway tester key proved
-  hosted HTTP append/search, then hosted-API-backed stdio MCP search. An
-  agent-B scoped MCP search did not see the agent-A marker.
-- A hosted alpha smoke verified Light/REM/Deep promotion/search against the alpha
-  deployment with a host-owned OpenRouter adapter and temporary provider key:
-  Light extracted one candidate, REM boosted it, Deep promoted it, tenant A
-  `search_long_term` returned the promoted marker fact, tenant B search did
-  not expose it, and hosted job usage counters were recorded for all three
-  phases. The throwaway Vexic API keys and temporary provider key were revoked
-  after the smoke. (Note, 2026-07-02: that smoke ran REM as a model-backed
-  phase. REM is now a local heuristic per ADR 0020, so a fresh smoke would
-  record zero REM model usage.)
+- `/health` returns `200` with the current contract version.
+- The persistent volume survives a redeploy; append/search state persists.
+- API-key auth rejects missing and invalid keys, and cross-agent scoped MCP
+  search does not leak another agent's markers.
+- A full Light/REM/Deep promotion/search path passed with tenant isolation
+  intact and hosted job usage counters recorded. (REM is a local heuristic per
+  ADR 0020, so a fresh smoke records zero REM model usage.)
 - Tester keys are alpha-only and should be revoked after each check.
 
 One-off key issuance can run against the same volume:
@@ -732,9 +719,9 @@ reliability, and product planning within the 400-day retention window.
 
 ### Incident Response And Security Review
 
-The hosted incident response and pre-beta security review runbook lives
-at `docs/runbooks/hosted-incident-response.md`. The first synthetic scoped-key
-tabletop artifact lives under `docs/runbooks/incident-tabletops/`.
+The hosted incident response and pre-beta security review runbook, and the
+first synthetic scoped-key tabletop artifact, are maintained in the private
+hosted-ops repository.
 These artifacts satisfy documentation/tabletop evidence only; they do
 not close the hosted readiness gate or make hosted Vexic external/customer-data
 ready.
@@ -750,8 +737,8 @@ Not production/customer-data ready yet:
 - no customer-readiness restore drill signed off end-to-end, incident
   tabletop/security-review signoff, network hardening, distributed rate
   limiting, or implemented support-access workflow; the Railway-volume alpha
-  restore drill passed with caveats in the 2026-06-26 Railway alpha volume
-  restore-drill artifact under `docs/runbooks/restore-drills/`. The Turso
+  restore drill passed with caveats (recorded in the private hosted-ops
+  repository restore-drill artifact). The Turso
   restore-drill *decision logic* (`vexic.restore.run_restore_drill`:
   provision -> import -> verify -> activate-or-destroy) is implemented and
   unit tested, but an actual live run against a real Turso PITR snapshot is a

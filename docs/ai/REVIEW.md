@@ -1,7 +1,6 @@
 # Kilo review policy
 
-Internal tooling doc for review agents and maintainers; not public product
-documentation.
+Contributor and maintainer guidance for review agents working in this repository.
 
 This policy was formerly the repo-root `REVIEW.md`. It is preserved here for
 manual review-agent configuration and Vexic-specific review calibration. Prefer

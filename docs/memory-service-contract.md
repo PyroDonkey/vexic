@@ -101,11 +101,12 @@ behavioral contract and the current `LocalMemoryService` v0.1 surface.
 | Record retrieval event | `RecordRetrievalEventRequest` | `memory:write` | Implemented |
 | Retire fact | `RetireFactRequest` | `memory:write` | Implemented |
 | Run dream phase | `RunDreamPhaseRequest` | `memory:admin:rebuild` | Host-port backed |
-| Trigger dream phase | `TriggerDreamPhaseRequest` | `memory:dream:trigger` | Host-port backed (async, summarize-only in v1) |
 | Export scope | `ExportScopeRequest` | `memory:export` | Implemented |
 | Replay scope | `ReplayScopeRequest` | `memory:replay` | Implemented |
 | Rebuild | `RebuildRequest` | `memory:admin:rebuild` | Implemented |
 | Delete scope | `DeleteScopeRequest` | `memory:admin:lifecycle` | Implemented |
+| Purge scope | `PurgeScopeRequest` | `memory:admin:lifecycle` | Implemented |
+| Trigger dream phase | `TriggerDreamPhaseRequest` | `memory:dream:trigger` | Hosted adapter only (not on `LocalMemoryService`; async, summarize-only in v1) |
 
 Host-port backed means `LocalMemoryService` authorizes and checks lifecycle
 state, then executes Light, REM, or Deep only when a host supplies explicit
@@ -221,6 +222,11 @@ Memory is retained by default.
   `purged_at` plus per-table counts on the tombstone. Provider backups retain
   residual copies until their own retention expires; wording must not promise
   instantaneous global erasure.
+- A whole-scope purge (`PurgeScopeRequest` with a null `target_scope.session_id`)
+  erases every session for the target agent scope in one call. It must set
+  `confirm_whole_scope=True`; otherwise `purge_scope` fails before any deletion
+  and regardless of `dry_run` (ADR 0028). Session-scoped purges are
+  unaffected.
 - Content-bearing retrieval telemetry supports age-based expiry
   (`expire_retrieval_queries`): query text is blanked in place, rows and
   derived counters survive.
