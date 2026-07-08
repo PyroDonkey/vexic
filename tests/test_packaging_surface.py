@@ -16,7 +16,7 @@ def _project_version() -> str:
 
 
 def test_version_is_declared() -> None:
-    assert vexic.__version__ == "0.1.0"
+    assert vexic.__version__ == "0.1.1"
 
 
 def test_version_matches_pyproject() -> None:
