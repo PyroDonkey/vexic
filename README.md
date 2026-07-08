@@ -11,7 +11,7 @@ Vexic is a local-first memory core for long-running AI agents. It stores cleaned
 conversation history, stages candidate memories for review, and promotes durable
 facts — every one traceable to the messages it came from.
 
-**Status:** v0.1.0 — initial public release. The current package is a Python 3.13
+**Status:** v0.1.1 — initial public release. The current package is a Python 3.13
 core with a SQLite reference service, public contract models, retrieval
 primitives, and conformance tests. It runs entirely on your machine: it reads and
 writes a local database and never exfiltrates data.
