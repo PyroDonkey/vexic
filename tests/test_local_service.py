@@ -1436,7 +1436,7 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-    async def test_init_schema_preserves_coalescent_extension_table(self) -> None:
+    async def test_init_schema_preserves_predecessor_extension_table(self) -> None:
         from vexic.service import LocalMemoryService
 
         with closing(sqlite3.connect(self.db_path)) as conn:

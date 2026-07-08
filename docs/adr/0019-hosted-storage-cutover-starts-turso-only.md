@@ -149,7 +149,7 @@ also stays deferred until external beta or real customer memory.
 - ADR 0011 -- Operator-run canonical migration
 - ADR 0013 -- Hosted control-plane HTTP API is a console-facing adapter slice
 - COA-264 (this cutover), COA-232 (restore drills), COA-263 (durable quota), COA-27 (security-gap umbrella)
-- `docs/runbooks/hosted-migration.md`, `docs/runbooks/restore-drills/hosted-restore-drill.md`
+- Hosted migration and restore-drill runbooks (maintained in the private hosted-ops repository)
 
 ## Addendum -- 2026-07-01: implementation clarifications (verification + multi-model audit)
 
@@ -199,8 +199,9 @@ helpers), no named/dict parameters, and no `enable_load_extension`.
 All items in the Decision and the addendum above are implemented and, where
 noted, live-verified against a real Turso database; see
 `docs/hosted-mvp.md#tursolibsql-storage-backend-coa-273` for the
-implementation-facing writeup and `docs/runbooks/hosted-migration.md` for the
-operator-facing migration/restore-drill procedure. Summary of what landed:
+implementation-facing writeup; the operator-facing migration/restore-drill
+procedure is maintained in the private hosted-ops repository. Summary of what
+landed:
 
 - The `StorageTarget`/`connect(target, auth_token=...)` seam (point 1 above),
   the per-target init-once schema memo (point 3), and the local-only
@@ -240,8 +241,8 @@ tracked as fix-soon items rather than open decisions):
   remote libSQL.
 - A live run of the restore drill against a real Turso point-in-time-recovery
   snapshot has not been executed; only the drill's decision logic is
-  automated and tested. Recording that live run as a
-  `docs/runbooks/restore-drills/` artifact remains outstanding.
+  automated and tested. Recording that live run as a restore-drill artifact
+  (in the private hosted-ops repository) remains outstanding.
 - `TenantTokenCache` has no size-bounded eviction (an unbounded in-process
   dict).
 - Some adapter type-annotation precision cleanup is outstanding.

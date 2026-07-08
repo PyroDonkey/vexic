@@ -6,7 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_vexic_runtime_does_not_import_coalescent_engine() -> None:
+def test_vexic_runtime_does_not_import_predecessor_engine() -> None:
     source_files = (ROOT / "src" / "vexic").rglob("*.py")
     offenders: list[str] = []
     for path in source_files:
@@ -117,14 +117,12 @@ def test_public_tree_does_not_embed_tracking_references() -> None:
     """Code and non-ADR docs must not reference the private issue tracker.
 
     Allowed locations (per docs/ai/AGENTS.md): docs/adr/ (decision
-    provenance), docs/provenance.md, and docs/runbooks/ (drill/tabletop and
-    migration evidence, including dated historical logs). The match is
-    case-insensitive so a lowercase real id (e.g. coa-281) cannot slip past
-    the guard; generic placeholders like coa-<id> never match because \\d+
-    requires a digit.
+    provenance) and docs/provenance.md. The match is case-insensitive so a
+    lowercase real id (e.g. coa-281) cannot slip past the guard; generic
+    placeholders like coa-<id> never match because \\d+ requires a digit.
     """
     ticket_pattern = re.compile(r"\b" + "C" + r"OA-\d+\b", re.IGNORECASE)
-    allowed = ("docs/adr/", "docs/provenance.md", "docs/runbooks/")
+    allowed = ("docs/adr/", "docs/provenance.md")
     offenders: list[str] = []
     scan_dirs = ("src", "tests", "adapters", "scripts", "docs")
     for scan in scan_dirs:

@@ -1,7 +1,6 @@
 # Vexic Context
 
-Internal tooling doc for agent and maintainer planning; not public product
-documentation.
+Contributor and maintainer planning glossary for this repository.
 
 Vexic is a provenance-first memory product for long-running agents. This
 glossary pins down the product language used while moving from a local memory

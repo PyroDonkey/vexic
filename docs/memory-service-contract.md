@@ -101,11 +101,12 @@ behavioral contract and the current `LocalMemoryService` v0.1 surface.
 | Record retrieval event | `RecordRetrievalEventRequest` | `memory:write` | Implemented |
 | Retire fact | `RetireFactRequest` | `memory:write` | Implemented |
 | Run dream phase | `RunDreamPhaseRequest` | `memory:admin:rebuild` | Host-port backed |
-| Trigger dream phase | `TriggerDreamPhaseRequest` | `memory:dream:trigger` | Host-port backed (async, summarize-only in v1) |
 | Export scope | `ExportScopeRequest` | `memory:export` | Implemented |
 | Replay scope | `ReplayScopeRequest` | `memory:replay` | Implemented |
 | Rebuild | `RebuildRequest` | `memory:admin:rebuild` | Implemented |
 | Delete scope | `DeleteScopeRequest` | `memory:admin:lifecycle` | Implemented |
+| Purge scope | `PurgeScopeRequest` | `memory:admin:lifecycle` | Implemented |
+| Trigger dream phase | `TriggerDreamPhaseRequest` | `memory:dream:trigger` | Hosted adapter only (not on `LocalMemoryService`; async, summarize-only in v1) |
 
 Host-port backed means `LocalMemoryService` authorizes and checks lifecycle
 state, then executes Light, REM, or Deep only when a host supplies explicit
