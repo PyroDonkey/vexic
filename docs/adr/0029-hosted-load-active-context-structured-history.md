@@ -7,7 +7,7 @@ Status: accepted
 Coalescent/AgentOS is cutting over to hosted Vexic for both chat history and
 memory (COA-341): the host stops keeping a local transcript and must
 reconstruct each turn's model message history from the hosted service. No
-existing surface returns replayable structure — `search_transcript` returns
+existing surface returns replayable structure -- `search_transcript` returns
 text hits, `expand_history` returns rendered text, and `fresh_context`
 (ADR 0024) returns rendered priming text. The storage layer already holds
 everything needed: `messages.message_json` stores each cleaned message as one
@@ -29,19 +29,19 @@ The service method composes the existing storage primitives; it introduces no
 new storage behavior.
 
 - Request: session-scoped, redaction-required, `token_budget` (default
-  `24_000`, HTTP layer enforces the shared fresh-context range of 1–24,000)
+  `24_000`, HTTP layer enforces the shared fresh-context range of 1-24,000)
   and `timezone_name` (default `"UTC"`) for the fresh-window boundary
   heuristic.
-- Result: `messages_json` — individually serialized transcript messages in
+- Result: `messages_json` -- individually serialized transcript messages in
   transcript-storage form (validate each with the transcript message adapter
-  to replay them as model messages), ordered oldest-first; `recap_text` — the
-  rendered summary-frontier recap or `None`; `truncated` — `True` when
+  to replay them as model messages), ordered oldest-first; `recap_text` -- the
+  rendered summary-frontier recap or `None`; `truncated` -- `True` when
   earlier session messages exist that the returned window omits.
 
 ### Capability: reuse `memory:fresh-context`, not `memory:expand` or a new one
 
-Load active context serves the same purpose and trust tier as fresh context —
-turn-start priming over the caller's own current session — differing only in
+Load active context serves the same purpose and trust tier as fresh context --
+turn-start priming over the caller's own current session -- differing only in
 returning replayable structure instead of rendered text. Both read the same
 underlying rows. `memory:expand` would be wrong (that capability gates
 arbitrary-range verbatim reads across the session's past, not the bounded

@@ -193,7 +193,7 @@ hosts that replay conversation state from Vexic instead of keeping their own
 transcript (ADR 0029). It is session-scoped and redaction-required, carries a
 `token_budget` (default `24_000`, HTTP-capped to the fresh-context range) and
 a `timezone_name` (default `"UTC"`) used by the fresh-window boundary
-heuristic. It requires `memory:fresh-context` — same trust tier and purpose
+heuristic. It requires `memory:fresh-context` -- same trust tier and purpose
 as fresh context (turn-start priming over the caller's own session), returning
 replayable structure instead of rendered text.
 
