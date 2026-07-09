@@ -179,12 +179,14 @@ class DreamSweeper:
 
         if DreamPhase.SUMMARIZE in phases:
             report.summarize_scheduled += len(scheduled)
-            await asyncio.to_thread(
-                catalog.record_summarize_watermark, tenant_id, watermark
-            )
         if dream_due:
             report.dreams_scheduled += 1
-            self._record_dream_completion_after(tenant_id, scheduled, now)
+        self._record_sweep_state_after(
+            tenant_id,
+            scheduled,
+            watermark=watermark if DreamPhase.SUMMARIZE in phases else None,
+            dream_completed_at=now.isoformat() if dream_due else None,
+        )
 
     def _dream_capable(self) -> bool:
         ports = self._service.dream_phase_ports
@@ -207,16 +209,23 @@ class DreamSweeper:
         elapsed = (now - last_at).total_seconds()
         return elapsed >= self._config.dream_interval_seconds
 
-    def _record_dream_completion_after(
+    def _record_sweep_state_after(
         self,
         tenant_id: str,
         tasks: list["asyncio.Task[None]"],
-        now: datetime,
+        *,
+        watermark: int | None,
+        dream_completed_at: str | None,
     ) -> None:
-        """Stamp the tenant's dream completion once every scope's chain ends.
+        """Advance the tenant's sweep state once every scope's job ends.
 
-        The stamp is written even when a phase inside the chain failed: the
-        chain ran and its job events carry the error detail, and re-dreaming
+        State is written after the scheduled jobs finish, never at schedule
+        time: a process stop mid-job then leaves the watermark unadvanced and
+        the next tick simply retries, keeping the module's "a lost tick or
+        restart loses nothing" posture.
+
+        The write still happens when a phase inside a job failed in-band: the
+        job ran and its job events carry the error detail, and re-running
         every tick on a persistently failing tenant would burn model spend
         without an operator in the loop.
         """
@@ -225,11 +234,16 @@ class DreamSweeper:
         async def _await_and_record() -> None:
             await asyncio.gather(*tasks, return_exceptions=True)
             try:
-                await asyncio.to_thread(
-                    catalog.record_dream_completed, tenant_id, now.isoformat()
-                )
+                if watermark is not None:
+                    await asyncio.to_thread(
+                        catalog.record_summarize_watermark, tenant_id, watermark
+                    )
+                if dream_completed_at is not None:
+                    await asyncio.to_thread(
+                        catalog.record_dream_completed, tenant_id, dream_completed_at
+                    )
             except Exception:
-                logger.exception("Recording dream completion failed.")
+                logger.exception("Recording dream sweep state failed.")
 
         recorder = asyncio.create_task(_await_and_record())
         self._service._background_tasks.add(recorder)
