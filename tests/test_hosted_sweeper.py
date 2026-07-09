@@ -1,0 +1,308 @@
+"""Tests for the in-server per-tenant dream sweeper (ADR 0030).
+
+The sweeper is the thin periodic loop over the machinery that already
+shipped with the trigger endpoint: pre-bound execution, per-(tenant, agent)
+in-flight dedup, worker-thread event-loop isolation, and per-tenant budgets.
+These tests drive `DreamSweeper.tick` directly with a fixed clock; background
+jobs are awaited via `service._background_tasks` exactly like the trigger
+endpoint's own tests.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import sqlite3
+import tempfile
+import unittest
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
+
+from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+from vexic.hosted import HostedMemoryService
+from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
+from vexic.hosted_sweeper import (
+    DreamSweeper,
+    DreamSweeperConfig,
+    sweeper_config_from_env,
+)
+from vexic.ports import DreamPhasePorts
+from vexic.storage import save_messages
+
+NOW = datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc)
+
+
+class _FakeAgent:
+    """Factory-compatible fake for summary/extraction agents."""
+
+    def __init__(self, output: object) -> None:
+        self._output = output
+
+    async def run(self, prompt: str, **kwargs: object) -> object:
+        return SimpleNamespace(
+            output=self._output,
+            usage=lambda: SimpleNamespace(
+                requests=1, input_tokens=6, output_tokens=4, total_tokens=10
+            ),
+        )
+
+
+EMBEDDING_DIM = 384
+
+
+def _fake_embed(texts: list[str]) -> list[list[float]]:
+    vectors = []
+    for text in texts:
+        vector = [0.0] * EMBEDDING_DIM
+        vector[hash(text) % EMBEDDING_DIM] = 1.0
+        vectors.append(vector)
+    return vectors
+
+
+def _summary_ports() -> DreamPhasePorts:
+    return DreamPhasePorts(
+        model_group="fake",
+        embed=_fake_embed,
+        summary_agent_factory=lambda *_a, **_k: _FakeAgent("a fake summary"),
+    )
+
+
+def _seed_compactable_span(db_path: object, *, agent_id: str | None = None) -> None:
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    save_messages(
+        db_path,
+        [ModelRequest(parts=[UserPromptPart(content="first summarize span")])],
+        session_id="default",
+        agent_id=agent_id,
+        timestamp=start.isoformat(),
+    )
+    save_messages(
+        db_path,
+        [ModelRequest(parts=[UserPromptPart(content="second summarize span")])],
+        session_id="default",
+        agent_id=agent_id,
+        timestamp=(start + timedelta(hours=3)).isoformat(),
+    )
+
+
+def _summary_row_count(db_path: object) -> int:
+    with closing(sqlite3.connect(db_path)) as conn:
+        return conn.execute("SELECT COUNT(*) FROM session_summaries").fetchone()[0]
+
+
+class DreamSweeperTickTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.catalog = HostedTenantCatalog(self.root)
+        self.keys = HostedApiKeyStore(self.root)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _service(self, ports: DreamPhasePorts | None) -> HostedMemoryService:
+        return HostedMemoryService(
+            self.catalog,
+            self.keys,
+            telemetry=self.catalog,
+            dream_phase_ports=ports,
+        )
+
+    def _sweeper(self, service: HostedMemoryService, **overrides: object) -> DreamSweeper:
+        config = DreamSweeperConfig(stagger_seconds=0.0, **overrides)
+        return DreamSweeper(service, config)
+
+    async def _drain_background(self, service: HostedMemoryService) -> None:
+        while service._background_tasks:
+            await asyncio.gather(*list(service._background_tasks))
+
+    async def test_tick_schedules_summarize_for_tenant_with_new_messages(self) -> None:
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        service = self._service(_summary_ports())
+        sweeper = self._sweeper(service)
+
+        report = await sweeper.tick(now=NOW)
+        await self._drain_background(service)
+
+        self.assertEqual(report.summarize_scheduled, 1)
+        self.assertGreater(_summary_row_count(tenant.db_path), 0)
+
+    async def test_second_tick_skips_when_no_new_messages(self) -> None:
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        service = self._service(_summary_ports())
+        sweeper = self._sweeper(service)
+
+        await sweeper.tick(now=NOW)
+        await self._drain_background(service)
+        report = await sweeper.tick(now=NOW + timedelta(minutes=30))
+
+        self.assertEqual(report.summarize_scheduled, 0)
+        self.assertEqual(report.skipped_no_new_messages, 1)
+
+    async def test_disabled_tenant_is_skipped(self) -> None:
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        self.catalog.set_dream_scheduling("tenant-a", enabled=False)
+        service = self._service(_summary_ports())
+        sweeper = self._sweeper(service)
+
+        report = await sweeper.tick(now=NOW)
+
+        self.assertEqual(report.summarize_scheduled, 0)
+        self.assertEqual(report.skipped_disabled, 1)
+        self.assertEqual(_summary_row_count(tenant.db_path), 0)
+
+    async def test_sweeps_each_recorded_agent_scope(self) -> None:
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path, agent_id=None)
+        _seed_compactable_span(tenant.db_path, agent_id="agent-b")
+        service = self._service(_summary_ports())
+        sweeper = self._sweeper(service)
+
+        report = await sweeper.tick(now=NOW)
+        await self._drain_background(service)
+
+        self.assertEqual(report.summarize_scheduled, 2)
+
+    async def test_broken_tenant_does_not_stop_the_tick(self) -> None:
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        tenant_b = self.catalog.provision_tenant("tenant-b", project_ids={"project-b"})
+        _seed_compactable_span(tenant_b.db_path)
+        service = self._service(_summary_ports())
+        # Break tenant-a's memory database path resolution.
+        original_get_tenant = self.catalog.get_tenant
+
+        def broken_get_tenant(tenant_id: str):
+            if tenant_id == "tenant-a":
+                raise RuntimeError("catalog corruption")
+            return original_get_tenant(tenant_id)
+
+        self.catalog.get_tenant = broken_get_tenant  # type: ignore[method-assign]
+        sweeper = self._sweeper(service)
+
+        report = await sweeper.tick(now=NOW)
+        await self._drain_background(service)
+
+        self.assertEqual(report.errors, 1)
+        self.assertEqual(report.summarize_scheduled, 1)
+        self.assertGreater(_summary_row_count(tenant_b.db_path), 0)
+
+    async def test_missing_summary_port_skips_without_crashing(self) -> None:
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        service = self._service(None)
+        sweeper = self._sweeper(service)
+
+        report = await sweeper.tick(now=NOW)
+
+        self.assertEqual(report.summarize_scheduled, 0)
+        self.assertEqual(_summary_row_count(tenant.db_path), 0)
+
+    async def test_full_dream_runs_when_due_and_records_completion(self) -> None:
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _FakeAgent("a fake summary"),
+            extraction_agent_factory=lambda *_a, **_k: _FakeAgent([]),
+        )
+        service = self._service(ports)
+        sweeper = self._sweeper(service)
+
+        report = await sweeper.tick(now=NOW)
+        await self._drain_background(service)
+
+        self.assertEqual(report.dreams_scheduled, 1)
+        with closing(sqlite3.connect(tenant.db_path)) as conn:
+            dream_rows = conn.execute("SELECT COUNT(*) FROM dream_runs").fetchone()[0]
+        self.assertGreater(dream_rows, 0)
+
+        # Not due again within the interval: second tick schedules no dream.
+        report_two = await sweeper.tick(now=NOW + timedelta(hours=1))
+        await self._drain_background(service)
+        self.assertEqual(report_two.dreams_scheduled, 0)
+
+        # Due again after the interval passes.
+        report_three = await sweeper.tick(now=NOW + timedelta(hours=25))
+        await self._drain_background(service)
+        self.assertEqual(report_three.dreams_scheduled, 1)
+
+    async def test_summarize_only_ports_never_schedule_full_dreams(self) -> None:
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        service = self._service(_summary_ports())
+        sweeper = self._sweeper(service)
+
+        report = await sweeper.tick(now=NOW)
+        await self._drain_background(service)
+
+        self.assertEqual(report.dreams_scheduled, 0)
+
+
+class SweeperLifespanTests(unittest.TestCase):
+    def test_app_lifespan_runs_and_stops_the_sweeper(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from vexic.hosted_http import create_app
+
+        class _SweeperDouble:
+            def __init__(self) -> None:
+                self.started = False
+                self.stopped = False
+
+            async def run(self, stop: asyncio.Event) -> None:
+                self.started = True
+                await stop.wait()
+                self.stopped = True
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            service = HostedMemoryService(
+                HostedTenantCatalog(root),
+                HostedApiKeyStore(root),
+                telemetry=None,
+            )
+            double = _SweeperDouble()
+            app = create_app(service, sweeper=double)
+
+            with TestClient(app) as client:
+                self.assertEqual(client.get("/health").status_code, 200)
+                self.assertTrue(double.started)
+
+            self.assertTrue(double.stopped)
+
+
+class SweeperConfigTests(unittest.TestCase):
+    def test_defaults_enabled_with_documented_cadence(self) -> None:
+        config = sweeper_config_from_env({})
+
+        self.assertIsNotNone(config)
+        self.assertEqual(config.tick_seconds, 1800)
+        self.assertEqual(config.dream_interval_seconds, 86_400)
+
+    def test_off_switch_disables_the_sweeper(self) -> None:
+        for value in ("off", "0", "false", "OFF"):
+            with self.subTest(value=value):
+                self.assertIsNone(
+                    sweeper_config_from_env({"VEXIC_DREAM_SWEEPER": value})
+                )
+
+    def test_intervals_are_env_tunable(self) -> None:
+        config = sweeper_config_from_env(
+            {
+                "VEXIC_DREAM_SWEEP_TICK_SECONDS": "600",
+                "VEXIC_DREAM_INTERVAL_SECONDS": "43200",
+            }
+        )
+
+        self.assertEqual(config.tick_seconds, 600)
+        self.assertEqual(config.dream_interval_seconds, 43_200)
+
+
+if __name__ == "__main__":
+    unittest.main()

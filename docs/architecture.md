@@ -182,11 +182,13 @@ rebuildable derived projection, not source of truth -- they can be
 regenerated from Tier 1. A daily span budget bounds how many rows a
 tenant(+agent) can add per UTC day.
 
-Summarize now has automatic producers rather than only a manual CLI run: an
-hourly cron workflow and a detached, fire-and-forget subprocess spawned from
-the Claude Code SessionStart recorder prime both call `POST
-/v1/trigger_dream_phase` (capability `memory:dream:trigger`), which schedules
-an async summarize sweep and returns at once (see ADR 0025 and
+Summarize now has automatic producers rather than only a manual CLI run: the
+in-server dream sweeper walks active tenants every tick and schedules
+summarize sweeps for scopes with new transcript rows plus a nightly full
+Light -> REM -> Deep -> Summarize chain per tenant (ADR 0030), and a
+detached, fire-and-forget subprocess spawned from the Claude Code
+SessionStart recorder prime calls `POST /v1/trigger_dream_phase` (capability
+`memory:dream:trigger`) as a between-tick backstop (see ADR 0025 and
 `docs/hosted-mvp.md`).
 
 ## Retrieval
