@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import tempfile
+import threading
 import unittest
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
@@ -29,7 +30,7 @@ from vexic.hosted_sweeper import (
     sweeper_config_from_env,
 )
 from vexic.ports import DreamPhasePorts
-from vexic.storage import save_messages
+from vexic.storage import max_message_id, save_messages
 
 NOW = datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc)
 
@@ -47,6 +48,35 @@ class _FakeAgent:
                 requests=1, input_tokens=6, output_tokens=4, total_tokens=10
             ),
         )
+
+
+class _GatedAgent:
+    """Fake agent that blocks until a threading gate opens.
+
+    The gate is a `threading.Event` because the sweeper's jobs run on their
+    own event loop inside a worker thread; a main-loop asyncio primitive
+    cannot be awaited there.
+    """
+
+    def __init__(self, gate: threading.Event, output: object) -> None:
+        self._gate = gate
+        self._output = output
+
+    async def run(self, prompt: str, **kwargs: object) -> object:
+        await asyncio.to_thread(self._gate.wait)
+        return SimpleNamespace(
+            output=self._output,
+            usage=lambda: SimpleNamespace(
+                requests=1, input_tokens=6, output_tokens=4, total_tokens=10
+            ),
+        )
+
+
+class _FailingAgent:
+    """Fake agent whose every run raises."""
+
+    async def run(self, prompt: str, **kwargs: object) -> object:
+        raise RuntimeError("model call failed")
 
 
 EMBEDDING_DIM = 384
@@ -231,6 +261,87 @@ class DreamSweeperTickTests(unittest.IsolatedAsyncioTestCase):
         report_three = await sweeper.tick(now=NOW + timedelta(hours=25))
         await self._drain_background(service)
         self.assertEqual(report_three.dreams_scheduled, 1)
+
+    async def test_summarize_watermark_advances_only_after_job_completes(self) -> None:
+        """The watermark is sweep state for finished work, not scheduled work.
+
+        Writing it at schedule time would let a process stop mid-job strand
+        those rows: the next tick would see no new messages and skip them,
+        breaking the module's "a lost tick or restart loses nothing" posture.
+        """
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        gate = threading.Event()
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _GatedAgent(gate, "a fake summary"),
+        )
+        service = self._service(ports)
+        sweeper = self._sweeper(service)
+
+        report = await sweeper.tick(now=NOW)
+
+        self.assertEqual(report.summarize_scheduled, 1)
+        state = self.catalog.dream_sweep_state("tenant-a")
+        self.assertEqual(state.last_summarize_watermark, 0)
+
+        gate.set()
+        await self._drain_background(service)
+
+        state = self.catalog.dream_sweep_state("tenant-a")
+        self.assertEqual(
+            state.last_summarize_watermark, max_message_id(tenant.db_path)
+        )
+
+    async def test_failed_summarize_run_still_advances_watermark(self) -> None:
+        """Deliberate spend posture: the job ran, its errors are in job
+        events, and re-sweeping a persistently failing tenant every tick
+        would burn model spend without an operator in the loop."""
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _FailingAgent(),
+        )
+        service = self._service(ports)
+        sweeper = self._sweeper(service)
+
+        await sweeper.tick(now=NOW)
+        await self._drain_background(service)
+
+        self.assertEqual(_summary_row_count(tenant.db_path), 0)
+        state = self.catalog.dream_sweep_state("tenant-a")
+        self.assertEqual(
+            state.last_summarize_watermark, max_message_id(tenant.db_path)
+        )
+
+    async def test_failed_dream_chain_still_records_completion(self) -> None:
+        """Pins the deliberate stamp-on-failure posture for dream chains
+        (see `_record_sweep_state_after`): a failing chain must not re-dream
+        every tick; retry waits for the full dream interval."""
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _FakeAgent("a fake summary"),
+            extraction_agent_factory=lambda *_a, **_k: _FailingAgent(),
+        )
+        service = self._service(ports)
+        sweeper = self._sweeper(service)
+
+        report = await sweeper.tick(now=NOW)
+        await self._drain_background(service)
+
+        self.assertEqual(report.dreams_scheduled, 1)
+        state = self.catalog.dream_sweep_state("tenant-a")
+        self.assertEqual(state.last_dream_completed_at, NOW.isoformat())
+
+        report_two = await sweeper.tick(now=NOW + timedelta(hours=1))
+        await self._drain_background(service)
+        self.assertEqual(report_two.dreams_scheduled, 0)
 
     async def test_summarize_only_ports_never_schedule_full_dreams(self) -> None:
         tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
