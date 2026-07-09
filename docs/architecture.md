@@ -233,6 +233,22 @@ and the egress redaction guard applies to the assembled text before it
 returns. `FreshContextResult` carries `summaries`, `recent`, the assembled
 `text`, and a `truncated` flag.
 
+### Load Active Context
+
+Load active context is the structured sibling of fresh context for hosts that
+replay conversation state from Vexic instead of keeping a local transcript
+(ADR 0029). `LoadActiveContextRequest` is session-scoped, redaction-required,
+carries a `token_budget` (default 24,000) and a `timezone_name` for the
+fresh-window boundary heuristic, and requires the same `memory:fresh-context`
+capability. `LocalMemoryService.load_active_context` reuses
+`load_active_context_messages` (token-budgeted raw tail, cut at the idle-gap /
+local-3am boundary when the summary frontier covers the prefix) and
+`render_session_recap`, returning `messages_json` (individually serialized
+transcript messages a host can validate back into model messages),
+`recap_text`, and a `truncated` flag set when earlier session messages were
+omitted. Every serialized message and the recap pass the egress redaction
+guard before return.
+
 ## Redaction
 
 Redaction is a persistence and egress guard. Callers pass configured forbidden

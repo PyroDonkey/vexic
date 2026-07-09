@@ -19,6 +19,7 @@ from vexic.contract import (
     ExpandHistoryResult,
     ExpandHistoryRequest,
     FreshContextRequest,
+    LoadActiveContextRequest,
     MemoryCapability,
     MemoryRequest,
     MemoryResult,
@@ -100,6 +101,14 @@ class _HeaderBoundFreshContextBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     token_budget: int = 6_000
+    redaction: RedactionContext = RedactionContext(forbidden_values=())
+
+
+class _HeaderBoundLoadActiveContextBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token_budget: int = 24_000
+    timezone_name: str = "UTC"
     redaction: RedactionContext = RedactionContext(forbidden_values=())
 
 
@@ -188,6 +197,12 @@ def create_app(
     @app.post("/v1/fresh_context")
     async def fresh_context(request: Request, payload: dict[str, Any]) -> JSONResponse:
         return await _handle_fresh_context(request, payload, service)
+
+    @app.post("/v1/load_active_context")
+    async def load_active_context(
+        request: Request, payload: dict[str, Any]
+    ) -> JSONResponse:
+        return await _handle_load_active_context(request, payload, service)
 
     @app.post("/v1/trigger_dream_phase")
     async def trigger_dream_phase(request: Request, payload: dict[str, Any]) -> JSONResponse:
@@ -410,6 +425,43 @@ async def _handle_fresh_context(
     return await _handle_payload(api_key, payload, service.fresh_context)
 
 
+async def _handle_load_active_context(
+    request: Request,
+    body: dict[str, Any],
+    service: HostedMemoryService,
+) -> JSONResponse:
+    api_key = _api_key(request)
+    if api_key is None:
+        return _error_response(401, "unauthorized", "Missing hosted API key.")
+    try:
+        if "scope" in body:
+            payload = LoadActiveContextRequest.model_validate(body)
+        else:
+            auth = _authenticate_for_header_scope(service, api_key)
+            parsed = _HeaderBoundLoadActiveContextBody.model_validate(body)
+            payload = LoadActiveContextRequest(
+                scope=_fresh_context_scope_from_headers(request, auth),
+                token_budget=parsed.token_budget,
+                timezone_name=parsed.timezone_name,
+                redaction=parsed.redaction,
+            )
+    except ValidationError:
+        return _error_response(
+            422,
+            "invalid_request",
+            "Request body does not match the Vexic contract.",
+        )
+    except PermissionError as exc:
+        if str(exc) == "Invalid hosted API key.":
+            return _error_response(401, "unauthorized", "Invalid hosted API key.")
+        return _error_response(403, "permission_denied", str(exc))
+    except ValueError as exc:
+        return _error_response(400, "invalid_request", str(exc))
+    except Exception:
+        return _error_response(500, "internal_error", "Hosted memory request failed.")
+    return await _handle_payload(api_key, payload, service.load_active_context)
+
+
 def _fresh_context_scope_from_headers(request: Request, auth: HostedAuthContext) -> MemoryScope:
     project_id = request.headers.get("x-vexic-project-id")
     if project_id is None or not project_id.strip():
@@ -592,7 +644,7 @@ def _cap_error(payload: MemoryRequest) -> JSONResponse | None:
                 "invalid_request",
                 "first_message_id must be less than or equal to last_message_id.",
             )
-    if isinstance(payload, FreshContextRequest):
+    if isinstance(payload, (FreshContextRequest, LoadActiveContextRequest)):
         if not (
             MIN_FRESH_CONTEXT_TOKEN_BUDGET
             <= payload.token_budget
