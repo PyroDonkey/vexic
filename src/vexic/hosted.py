@@ -33,6 +33,8 @@ from vexic.contract import (
     FreshContextResult,
     IngestSourceTranscriptRequest,
     IngestSourceTranscriptResult,
+    LoadActiveContextRequest,
+    LoadActiveContextResult,
     RunDreamPhaseRequest,
     RunDreamPhaseResult,
     TriggerDreamPhaseRequest,
@@ -369,6 +371,7 @@ class _RateBucket:
 _EXPENSIVE_OPERATION_LIMITS = {
     "expand_history": HostedRateLimitRule(limit=30, window_seconds=60),
     "fresh_context": HostedRateLimitRule(limit=30, window_seconds=60),
+    "load_active_context": HostedRateLimitRule(limit=30, window_seconds=60),
     "run_dream_phase": HostedRateLimitRule(limit=6, window_seconds=3600),
     "export_scope": HostedRateLimitRule(limit=6, window_seconds=3600),
     "replay_scope": HostedRateLimitRule(limit=6, window_seconds=3600),
@@ -585,6 +588,19 @@ class HostedMemoryService:
             request,
             request.required_capability,
             lambda bound, tenant: self._local_service(tenant).fresh_context(bound),
+        )
+
+    async def load_active_context(
+        self,
+        api_key: str,
+        request: LoadActiveContextRequest,
+    ) -> LoadActiveContextResult:
+        return await self._call(
+            "load_active_context",
+            api_key,
+            request,
+            request.required_capability,
+            lambda bound, tenant: self._local_service(tenant).load_active_context(bound),
         )
 
     async def search_long_term(

@@ -32,6 +32,8 @@ from vexic.contract import (
     ExportScopeResult,
     FreshContextRequest,
     FreshContextResult,
+    LoadActiveContextRequest,
+    LoadActiveContextResult,
     IngestSourceTranscriptRequest,
     IngestSourceTranscriptResult,
     MemoryCapability,
@@ -68,9 +70,12 @@ from vexic.storage import (
     TranscriptRangeTooLarge,
     SourceTranscriptInput,
     ingest_source_messages,
+    count_session_messages,
     init_db,
+    load_active_context_messages,
     load_fresh_context_rows,
     load_messages_in_id_range,
+    render_session_recap,
     message_search_text,
     render_recap_blocks,
     save_messages,
@@ -563,6 +568,46 @@ class LocalMemoryService(MemoryService):
         text = "\n\n".join(sections)
         assert_no_forbidden_secret_values(redaction_values, text)
         return FreshContextResult(summaries=summaries, recent=recent, text=text)
+
+    async def load_active_context(
+        self,
+        request: LoadActiveContextRequest,
+    ) -> LoadActiveContextResult:
+        self._authorize(request.scope, request.required_capability)
+        self._assert_not_tombstoned(request.scope, "retrieval")
+        session_id = request.scope.session_id or "default"
+        messages = load_active_context_messages(
+            self.db_path,
+            token_budget=request.token_budget,
+            session_id=session_id,
+            agent_id=request.scope.agent_id,
+            timezone_name=request.timezone_name,
+            content_codec=self.content_codec,
+        )
+        messages_json = [
+            single_message_adapter.dump_json(message).decode()
+            for message in messages
+        ]
+        redaction_values = self._redaction_values(request.redaction)
+        for item in messages_json:
+            assert_no_forbidden_secret_values(redaction_values, item)
+        recap = render_session_recap(
+            self.db_path,
+            session_id=session_id,
+            agent_id=request.scope.agent_id,
+            forbidden_secret_values=redaction_values,
+            content_codec=self.content_codec,
+        )
+        total = count_session_messages(
+            self.db_path,
+            session_id=session_id,
+            agent_id=request.scope.agent_id,
+        )
+        return LoadActiveContextResult(
+            messages_json=messages_json,
+            recap_text=recap or None,
+            truncated=len(messages) < total,
+        )
 
     async def search_long_term(
         self,

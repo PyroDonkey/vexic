@@ -156,6 +156,7 @@ The HTTP API accepts `Authorization: Bearer <raw-key>` or `X-Vexic-Api-Key` on
 - `POST /v1/search_long_term`
 - `POST /v1/expand_history`
 - `POST /v1/fresh_context`
+- `POST /v1/load_active_context`
 - `POST /mcp`
 - `/control/v1/*` when started through `vexic.hosted_control_plane_http`
 

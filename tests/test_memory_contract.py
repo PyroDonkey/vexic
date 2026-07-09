@@ -15,6 +15,8 @@ from vexic.contract import (
     ExpandHistoryRequest,
     IngestSourceTranscriptRequest,
     LifecycleAction,
+    LoadActiveContextRequest,
+    LoadActiveContextResult,
     LongTermFact,
     MemoryCapability,
     MemoryCategory,
@@ -541,6 +543,52 @@ class MemoryContractModelTests(unittest.TestCase):
             )
 
 
+class LoadActiveContextContractTests(unittest.TestCase):
+    def _scope(self, capabilities: set[MemoryCapability]) -> MemoryScope:
+        return MemoryScope(
+            tenant_id="tenant-a",
+            session_id="session-a",
+            principal=Principal(
+                principal_id="agent-1",
+                principal_type=PrincipalType.AGENT,
+            ),
+            trust_boundary=TrustBoundary.NETWORKED,
+            capabilities=capabilities,
+        )
+
+    def test_request_requires_fresh_context_capability_and_session(self) -> None:
+        request = LoadActiveContextRequest(
+            scope=self._scope({MemoryCapability.FRESH_CONTEXT}),
+            redaction=RedactionContext(forbidden_values=()),
+        )
+
+        self.assertIs(
+            request.required_capability, MemoryCapability.FRESH_CONTEXT
+        )
+        self.assertGreater(request.token_budget, 0)
+
+        with self.assertRaises(ValidationError):
+            LoadActiveContextRequest(
+                scope=self._scope({MemoryCapability.FRESH_CONTEXT}).model_copy(
+                    update={"session_id": None}
+                ),
+                redaction=RedactionContext(forbidden_values=()),
+            )
+
+    def test_result_carries_structured_messages_and_recap(self) -> None:
+        result = LoadActiveContextResult(
+            messages_json=['{"kind": "request"}'],
+            recap_text="[Recap of messages 1-2 -- verbatim via expand_history]\nrecap",
+        )
+
+        self.assertEqual(result.messages_json, ['{"kind": "request"}'])
+        self.assertIn("recap", result.recap_text or "")
+        self.assertFalse(result.truncated)
+
+        empty = LoadActiveContextResult(messages_json=[])
+        self.assertIsNone(empty.recap_text)
+
+
 class MemoryContractProtocolTests(unittest.TestCase):
     def test_protocol_methods_accept_scope_and_return_typed_results(self) -> None:
         for method_name in (
@@ -549,6 +597,7 @@ class MemoryContractProtocolTests(unittest.TestCase):
             "search_transcript",
             "expand_history",
             "fresh_context",
+            "load_active_context",
             "search_long_term",
             "run_dream_phase",
             "export_scope",

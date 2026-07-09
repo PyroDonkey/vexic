@@ -234,6 +234,25 @@ def load_messages(
         return _trim_unpaired_tool_messages(messages)
 
 
+def count_session_messages(
+    db_path: str,
+    *,
+    session_id: str = "default",
+    agent_id: str | None = None,
+) -> int:
+    with closing(connect(db_path)) as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM messages
+            WHERE session_id = ?
+                AND agent_id IS ?
+            """,
+            (session_id, agent_id),
+        ).fetchone()
+        return int(row[0])
+
+
 def _message_token_estimate(msg: ModelMessage) -> int:
     sanitized = strip_prompt_payloads(msg)
     return estimate_tokens(single_message_adapter.dump_json(sanitized).decode())
