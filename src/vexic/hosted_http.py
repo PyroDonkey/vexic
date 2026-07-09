@@ -124,9 +124,15 @@ def create_app(
     service: HostedMemoryService | None = None,
     *,
     mcp_forbidden_secret_values: tuple[str, ...] = (),
+    sweeper: object | None = None,
 ) -> FastAPI:
     service = service or create_service_from_env()
-    app = FastAPI(title="Vexic Hosted Memory", version=CONTRACT_VERSION)
+    lifespan = _sweeper_lifespan(sweeper) if sweeper is not None else None
+    app = FastAPI(
+        title="Vexic Hosted Memory",
+        version=CONTRACT_VERSION,
+        lifespan=lifespan,
+    )
     register_mcp_routes(
         app,
         service,
@@ -711,6 +717,30 @@ def _cap_error(payload: MemoryRequest) -> JSONResponse | None:
                 f"{MAX_FRESH_CONTEXT_TOKEN_BUDGET}.",
             )
     return None
+
+
+def _sweeper_lifespan(sweeper: object):
+    """App lifespan that runs the dream sweeper loop (ADR 0030) beside the
+    serving loop and stops it cleanly on shutdown. `sweeper` is any object
+    with `async run(stop: asyncio.Event)` — the `DreamSweeper` in production,
+    a double in tests."""
+    import asyncio
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        stop = asyncio.Event()
+        task = asyncio.create_task(sweeper.run(stop))  # type: ignore[attr-defined]
+        try:
+            yield
+        finally:
+            stop.set()
+            try:
+                await asyncio.wait_for(task, timeout=10)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                task.cancel()
+
+    return lifespan
 
 
 def _cap_result(result: _ResultT) -> _ResultT:

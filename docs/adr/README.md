@@ -45,6 +45,7 @@ index (and the reverse).
 | 0027 | Agent MCP connect uses each client's own `mcp add` command, opt-in | accepted |
 | 0028 | Control-plane destructive ops are audited, confirmed, and soft-deleted | accepted |
 | 0029 | Hosted load_active_context returns structured session history under the fresh-context capability | accepted |
+| 0030 | The hosted service schedules per-tenant dreaming itself with an in-server sweeper | accepted |
 
 Notes:
 

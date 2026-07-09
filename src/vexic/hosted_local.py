@@ -146,6 +146,14 @@ _CONTROL_PLANE_SCHEMA_STATEMENTS: tuple[str, ...] = (
     CREATE INDEX IF NOT EXISTS idx_hosted_job_events_tenant_id
         ON hosted_job_events(tenant_id)
     """,
+    """
+    CREATE TABLE IF NOT EXISTS dream_sweep_state (
+        tenant_id TEXT PRIMARY KEY,
+        last_summarize_watermark INTEGER NOT NULL DEFAULT 0,
+        last_dream_completed_at TEXT,
+        FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
+    )
+    """,
 )
 
 
@@ -153,6 +161,16 @@ _CONTROL_PLANE_SCHEMA_STATEMENTS: tuple[str, ...] = (
 class ProvisionedApiKey:
     key_id: str
     raw_key: str
+
+
+@dataclass(frozen=True)
+class DreamSweepState:
+    """Per-tenant sweeper bookkeeping in the control database (ADR 0030):
+    the last transcript watermark a summarize sweep was scheduled for, and
+    when the last full dream chain completed."""
+
+    last_summarize_watermark: int = 0
+    last_dream_completed_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -872,6 +890,82 @@ class HostedTenantCatalog:
                 raise PermissionError("Unknown hosted tenant.")
             return self._tenant_from_filename(conn, tenant_id, row[0])
 
+    def list_active_tenant_ids(self) -> list[str]:
+        """All non-retired tenant ids, ordered for deterministic sweep order."""
+        with closing(self._connect_control()) as conn:
+            rows = conn.execute(
+                """
+                SELECT tenant_id
+                FROM tenants
+                WHERE active = 1
+                ORDER BY tenant_id
+                """
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def dream_scheduling_enabled(self, tenant_id: str) -> bool:
+        with closing(self._connect_control()) as conn:
+            row = conn.execute(
+                "SELECT dream_scheduling FROM tenants WHERE tenant_id = ?",
+                (tenant_id,),
+            ).fetchone()
+        if row is None:
+            raise PermissionError("Unknown hosted tenant.")
+        return bool(row[0])
+
+    def set_dream_scheduling(self, tenant_id: str, *, enabled: bool) -> None:
+        with closing(self._connect_control()) as conn:
+            cursor = conn.execute(
+                "UPDATE tenants SET dream_scheduling = ? WHERE tenant_id = ?",
+                (1 if enabled else 0, tenant_id),
+            )
+            if cursor.rowcount == 0:
+                raise PermissionError("Unknown hosted tenant.")
+            conn.commit()
+
+    def dream_sweep_state(self, tenant_id: str) -> "DreamSweepState":
+        with closing(self._connect_control()) as conn:
+            row = conn.execute(
+                """
+                SELECT last_summarize_watermark, last_dream_completed_at
+                FROM dream_sweep_state
+                WHERE tenant_id = ?
+                """,
+                (tenant_id,),
+            ).fetchone()
+        if row is None:
+            return DreamSweepState()
+        return DreamSweepState(
+            last_summarize_watermark=int(row[0]),
+            last_dream_completed_at=row[1],
+        )
+
+    def record_summarize_watermark(self, tenant_id: str, watermark: int) -> None:
+        with closing(self._connect_control()) as conn:
+            conn.execute(
+                """
+                INSERT INTO dream_sweep_state (tenant_id, last_summarize_watermark)
+                VALUES (?, ?)
+                ON CONFLICT(tenant_id) DO UPDATE
+                    SET last_summarize_watermark = excluded.last_summarize_watermark
+                """,
+                (tenant_id, watermark),
+            )
+            conn.commit()
+
+    def record_dream_completed(self, tenant_id: str, completed_at: str) -> None:
+        with closing(self._connect_control()) as conn:
+            conn.execute(
+                """
+                INSERT INTO dream_sweep_state (tenant_id, last_dream_completed_at)
+                VALUES (?, ?)
+                ON CONFLICT(tenant_id) DO UPDATE
+                    SET last_dream_completed_at = excluded.last_dream_completed_at
+                """,
+                (tenant_id, completed_at),
+            )
+            conn.commit()
+
     def record_audit_event(self, event: HostedAuditEvent) -> None:
         with closing(self._connect_control()) as conn:
             _insert_audit_event(conn, event)
@@ -1140,6 +1234,10 @@ class HostedTenantCatalog:
                 conn.execute("ALTER TABLE tenants ADD COLUMN retired_at TEXT")
             if "retired_by" not in tenant_columns:
                 conn.execute("ALTER TABLE tenants ADD COLUMN retired_by TEXT")
+            if "dream_scheduling" not in tenant_columns:
+                conn.execute(
+                    "ALTER TABLE tenants ADD COLUMN dream_scheduling INTEGER NOT NULL DEFAULT 1"
+                )
             project_columns = {
                 str(row[1])
                 for row in conn.execute("PRAGMA table_info(hosted_projects)").fetchall()
