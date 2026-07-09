@@ -161,6 +161,7 @@ class DreamSweeper:
             return
 
         scheduled: list[asyncio.Task[None]] = []
+        skipped_locked = False
         for agent_id in agent_ids:
             try:
                 task = self._service.schedule_system_dream(
@@ -172,7 +173,9 @@ class DreamSweeper:
                 # Fail closed and content-free; other tenants still sweep.
                 logger.warning("Dream sweep skipped: dream ports not configured.")
                 return
-            if task is not None:
+            if task is None:
+                skipped_locked = True
+            else:
                 scheduled.append(task)
         if not scheduled:
             return
@@ -181,6 +184,16 @@ class DreamSweeper:
             report.summarize_scheduled += len(scheduled)
         if dream_due:
             report.dreams_scheduled += 1
+        if skipped_locked:
+            # A scope skipped by the per-(tenant, agent) in-flight lock never
+            # ran this tick's phases, so advancing tenant-wide sweep state
+            # would strand its rows (watermark) or its Light -> REM -> Deep
+            # chain (completion stamp) until the next interval. Leave state
+            # unadvanced and let the next tick retry every scope; scopes that
+            # did complete recompute ripeness downstream and no-op. This is
+            # distinct from the in-band failure posture in
+            # `_record_sweep_state_after`, which applies only when the job ran.
+            return
         self._record_sweep_state_after(
             tenant_id,
             scheduled,
