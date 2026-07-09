@@ -22,6 +22,7 @@ from types import SimpleNamespace
 
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
+from vexic.contract import DreamPhase
 from vexic.hosted import HostedMemoryService
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 from vexic.hosted_sweeper import (
@@ -342,6 +343,90 @@ class DreamSweeperTickTests(unittest.IsolatedAsyncioTestCase):
         report_two = await sweeper.tick(now=NOW + timedelta(hours=1))
         await self._drain_background(service)
         self.assertEqual(report_two.dreams_scheduled, 0)
+
+    async def test_locked_scope_blocks_watermark_advance(self) -> None:
+        """A scope skipped by the in-flight lock never ran this tick's job,
+        so the tenant-wide watermark must not advance over its rows: the
+        next tick has to see them as new and retry, keeping the module's
+        "a lost tick or restart loses nothing" posture. This differs from
+        the in-band failure posture, where the job did run."""
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path, agent_id=None)
+        _seed_compactable_span(tenant.db_path, agent_id="agent-b")
+        gate = threading.Event()
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _GatedAgent(gate, "a fake summary"),
+        )
+        service = self._service(ports)
+        sweeper = self._sweeper(service)
+
+        # Hold agent-b's per-(tenant, agent) lock with an in-flight job so
+        # the tick's schedule attempt for that scope returns None.
+        held = service.schedule_system_dream(
+            "tenant-a", agent_id="agent-b", phases=(DreamPhase.SUMMARIZE,)
+        )
+        self.assertIsNotNone(held)
+
+        report = await sweeper.tick(now=NOW)
+        self.assertEqual(report.summarize_scheduled, 1)
+
+        gate.set()
+        await self._drain_background(service)
+
+        state = self.catalog.dream_sweep_state("tenant-a")
+        self.assertEqual(state.last_summarize_watermark, 0)
+
+        # Lock released: the next tick retries both scopes and only then
+        # advances the watermark.
+        report_two = await sweeper.tick(now=NOW + timedelta(minutes=30))
+        await self._drain_background(service)
+        self.assertEqual(report_two.summarize_scheduled, 2)
+        state = self.catalog.dream_sweep_state("tenant-a")
+        self.assertEqual(
+            state.last_summarize_watermark, max_message_id(tenant.db_path)
+        )
+
+    async def test_locked_scope_blocks_dream_completion_stamp(self) -> None:
+        """A due dream that skipped a locked scope is not stamped completed:
+        the skipped scope's Light -> REM -> Deep chain would otherwise wait
+        a full dream interval instead of the next tick."""
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path, agent_id=None)
+        _seed_compactable_span(tenant.db_path, agent_id="agent-b")
+        gate = threading.Event()
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _GatedAgent(gate, "a fake summary"),
+            extraction_agent_factory=lambda *_a, **_k: _FakeAgent([]),
+        )
+        service = self._service(ports)
+        sweeper = self._sweeper(service)
+
+        held = service.schedule_system_dream(
+            "tenant-a", agent_id="agent-b", phases=(DreamPhase.SUMMARIZE,)
+        )
+        self.assertIsNotNone(held)
+
+        report = await sweeper.tick(now=NOW)
+        self.assertEqual(report.dreams_scheduled, 1)
+
+        gate.set()
+        await self._drain_background(service)
+
+        state = self.catalog.dream_sweep_state("tenant-a")
+        self.assertIsNone(state.last_dream_completed_at)
+
+        # Lock released: the dream is still due next tick, runs every scope,
+        # and only then records completion.
+        later = NOW + timedelta(minutes=30)
+        report_two = await sweeper.tick(now=later)
+        await self._drain_background(service)
+        self.assertEqual(report_two.dreams_scheduled, 1)
+        state = self.catalog.dream_sweep_state("tenant-a")
+        self.assertEqual(state.last_dream_completed_at, later.isoformat())
 
     async def test_summarize_only_ports_never_schedule_full_dreams(self) -> None:
         tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
