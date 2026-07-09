@@ -2786,6 +2786,52 @@ class HostedHttpTests(unittest.TestCase):
         self.assertIn("alpha recap", body["recap_text"])
         self.assertFalse(body["truncated"])
 
+    def test_expand_history_header_bound_returns_range_text(self) -> None:
+        api_key = self._api_key(
+            capabilities={MemoryCapability.WRITE, MemoryCapability.EXPAND_HISTORY}
+        )
+        message_ids = self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key),
+            json=self._append_body("expandable cedar detail"),
+        ).json()["message_ids"]
+
+        response = self.client.post(
+            "/v1/expand_history",
+            headers=self._write_headers(api_key),
+            json={
+                "first_message_id": message_ids[0],
+                "last_message_id": message_ids[0],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("expandable cedar detail", response.json()["text"])
+
+    def test_expand_history_header_bound_requires_scope_headers(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.EXPAND_HISTORY})
+
+        response = self.client.post(
+            "/v1/expand_history",
+            headers=self._auth(api_key),
+            json={"first_message_id": 1, "last_message_id": 1},
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_expand_history_header_bound_rejects_key_without_capability(self) -> None:
+        api_key = self._api_key(
+            capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH}
+        )
+
+        response = self.client.post(
+            "/v1/expand_history",
+            headers=self._write_headers(api_key),
+            json={"first_message_id": 1, "last_message_id": 1},
+        )
+
+        self.assertEqual(response.status_code, 403)
+
     def test_load_active_context_requires_api_key(self) -> None:
         response = self.client.post("/v1/load_active_context", json={})
 

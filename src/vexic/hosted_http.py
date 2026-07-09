@@ -112,6 +112,14 @@ class _HeaderBoundLoadActiveContextBody(BaseModel):
     redaction: RedactionContext = RedactionContext(forbidden_values=())
 
 
+class _HeaderBoundExpandHistoryBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    first_message_id: int
+    last_message_id: int
+    redaction: RedactionContext = RedactionContext(forbidden_values=())
+
+
 def create_app(
     service: HostedMemoryService | None = None,
     *,
@@ -183,16 +191,8 @@ def create_app(
         )
 
     @app.post("/v1/expand_history")
-    async def expand_history(request: Request, payload: ExpandHistoryRequest) -> JSONResponse:
-        return await _handle(
-            request,
-            payload,
-            lambda api_key, body: service.expand_history(
-                api_key,
-                body,
-                max_rows=MAX_EXPAND_HISTORY_MESSAGES,
-            ),
-        )
+    async def expand_history(request: Request, payload: dict[str, Any]) -> JSONResponse:
+        return await _handle_expand_history(request, payload, service)
 
     @app.post("/v1/fresh_context")
     async def fresh_context(request: Request, payload: dict[str, Any]) -> JSONResponse:
@@ -404,7 +404,7 @@ async def _handle_fresh_context(
             auth = _authenticate_for_header_scope(service, api_key)
             fresh = _HeaderBoundFreshContextBody.model_validate(body)
             payload = FreshContextRequest(
-                scope=_fresh_context_scope_from_headers(request, auth),
+                scope=_session_scope_from_headers(request, auth),
                 token_budget=fresh.token_budget,
                 redaction=fresh.redaction,
             )
@@ -425,6 +425,55 @@ async def _handle_fresh_context(
     return await _handle_payload(api_key, payload, service.fresh_context)
 
 
+async def _handle_expand_history(
+    request: Request,
+    body: dict[str, Any],
+    service: HostedMemoryService,
+) -> JSONResponse:
+    api_key = _api_key(request)
+    if api_key is None:
+        return _error_response(401, "unauthorized", "Missing hosted API key.")
+    try:
+        if "scope" in body:
+            payload = ExpandHistoryRequest.model_validate(body)
+        else:
+            auth = _authenticate_for_header_scope(service, api_key)
+            parsed = _HeaderBoundExpandHistoryBody.model_validate(body)
+            payload = ExpandHistoryRequest(
+                scope=_session_scope_from_headers(
+                    request,
+                    auth,
+                    capability=MemoryCapability.EXPAND_HISTORY,
+                ),
+                first_message_id=parsed.first_message_id,
+                last_message_id=parsed.last_message_id,
+                redaction=parsed.redaction,
+            )
+    except ValidationError:
+        return _error_response(
+            422,
+            "invalid_request",
+            "Request body does not match the Vexic contract.",
+        )
+    except PermissionError as exc:
+        if str(exc) == "Invalid hosted API key.":
+            return _error_response(401, "unauthorized", "Invalid hosted API key.")
+        return _error_response(403, "permission_denied", str(exc))
+    except ValueError as exc:
+        return _error_response(400, "invalid_request", str(exc))
+    except Exception:
+        return _error_response(500, "internal_error", "Hosted memory request failed.")
+    return await _handle_payload(
+        api_key,
+        payload,
+        lambda key, body_payload: service.expand_history(
+            key,
+            body_payload,
+            max_rows=MAX_EXPAND_HISTORY_MESSAGES,
+        ),
+    )
+
+
 async def _handle_load_active_context(
     request: Request,
     body: dict[str, Any],
@@ -440,7 +489,7 @@ async def _handle_load_active_context(
             auth = _authenticate_for_header_scope(service, api_key)
             parsed = _HeaderBoundLoadActiveContextBody.model_validate(body)
             payload = LoadActiveContextRequest(
-                scope=_fresh_context_scope_from_headers(request, auth),
+                scope=_session_scope_from_headers(request, auth),
                 token_budget=parsed.token_budget,
                 timezone_name=parsed.timezone_name,
                 redaction=parsed.redaction,
@@ -462,7 +511,12 @@ async def _handle_load_active_context(
     return await _handle_payload(api_key, payload, service.load_active_context)
 
 
-def _fresh_context_scope_from_headers(request: Request, auth: HostedAuthContext) -> MemoryScope:
+def _session_scope_from_headers(
+    request: Request,
+    auth: HostedAuthContext,
+    *,
+    capability: MemoryCapability = MemoryCapability.FRESH_CONTEXT,
+) -> MemoryScope:
     project_id = request.headers.get("x-vexic-project-id")
     if project_id is None or not project_id.strip():
         raise ValueError("X-Vexic-Project-Id header is required.")
@@ -479,7 +533,7 @@ def _fresh_context_scope_from_headers(request: Request, auth: HostedAuthContext)
         agent_id=agent_id,
         principal=auth.principal,
         trust_boundary=TrustBoundary.NETWORKED,
-        capabilities={MemoryCapability.FRESH_CONTEXT},
+        capabilities={capability},
     )
 
 
