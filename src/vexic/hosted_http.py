@@ -719,16 +719,17 @@ def _cap_error(payload: MemoryRequest) -> JSONResponse | None:
     return None
 
 
-def _sweeper_lifespan(sweeper: object):
+def _sweeper_lifespan(sweeper: object) -> Callable[[FastAPI], Any]:
     """App lifespan that runs the dream sweeper loop (ADR 0030) beside the
     serving loop and stops it cleanly on shutdown. `sweeper` is any object
-    with `async run(stop: asyncio.Event)` — the `DreamSweeper` in production,
+    with `async run(stop: asyncio.Event)` -- the `DreamSweeper` in production,
     a double in tests."""
     import asyncio
     from contextlib import asynccontextmanager
+    from collections.abc import AsyncIterator
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI):
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         stop = asyncio.Event()
         task = asyncio.create_task(sweeper.run(stop))  # type: ignore[attr-defined]
         try:
