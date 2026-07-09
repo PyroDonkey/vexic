@@ -28,7 +28,8 @@ from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.text_utils import estimate_tokens
 from vexic.text_utils import TAU_SOFT
 from vexic.usage import UsageSummary
-from vexic.storage.connection import connect
+from vexic.storage.connection import StorageTarget, connect
+from vexic.storage.errors import is_operational_error
 
 SessionSummaryKind = Literal["leaf", "condensed"]
 
@@ -503,6 +504,12 @@ def _load_messages_after_id_by_token_budget(
     return _trim_unpaired_tool_messages([row.message for row in rows])
 
 
+# Rows fetched per round-trip while walking a session newest-first for the
+# active-context window. Big enough that a normal window fills in one chunk,
+# small enough that a huge session never streams wholesale.
+_ACTIVE_CONTEXT_FETCH_CHUNK = 200
+
+
 def _load_active_context_rows_by_token_budget(
     db_path: str,
     *,
@@ -519,39 +526,57 @@ def _load_active_context_rows_by_token_budget(
 
     selected: list[_ActiveContextRow] = []
     total = 0
-    where_clause = "session_id = ? AND agent_id IS ?"
-    params: tuple[object, ...] = (session_id, agent_id)
-    if after_id is not None:
-        where_clause = "session_id = ? AND agent_id IS ? AND id > ?"
-        params = (session_id, agent_id, after_id)
 
+    # Page newest-first in bounded chunks instead of fetching the whole
+    # session: the walk usually stops within the first chunk once the token
+    # budget fills, and a long session must not be transferred wholesale per
+    # request (this path now serves the hosted load_active_context endpoint,
+    # potentially over libSQL).
     with closing(connect(db_path)) as conn:
-        rows = conn.execute(
-            f"""
-            SELECT id, timestamp, message_json
-            FROM messages
-            WHERE {where_clause}
-            ORDER BY id DESC
-            """,
-            params,
-        ).fetchall()
-        for row in rows:
-            msg = strip_prompt_payloads(
-                single_message_adapter.validate_python(
-                    json.loads(_decode_stored(content_codec, row[2]))
-                )
-            )
-            estimate = _message_token_estimate(msg)
-            if selected and total + estimate > token_budget:
+        cursor_id: int | None = None
+        done = False
+        while not done:
+            where_clause = "session_id = ? AND agent_id IS ?"
+            params: tuple[object, ...] = (session_id, agent_id)
+            if after_id is not None:
+                where_clause += " AND id > ?"
+                params = (*params, after_id)
+            if cursor_id is not None:
+                where_clause += " AND id < ?"
+                params = (*params, cursor_id)
+            rows = conn.execute(
+                f"""
+                SELECT id, timestamp, message_json
+                FROM messages
+                WHERE {where_clause}
+                ORDER BY id DESC
+                LIMIT {_ACTIVE_CONTEXT_FETCH_CHUNK}
+                """,
+                params,
+            ).fetchall()
+            if not rows:
                 break
-            selected.append(
-                _ActiveContextRow(
-                    id=int(row[0]),
-                    timestamp=_parse_timestamp(row[1]),
-                    message=msg,
+            for row in rows:
+                msg = strip_prompt_payloads(
+                    single_message_adapter.validate_python(
+                        json.loads(_decode_stored(content_codec, row[2]))
+                    )
                 )
-            )
-            total += estimate
+                estimate = _message_token_estimate(msg)
+                if selected and total + estimate > token_budget:
+                    done = True
+                    break
+                selected.append(
+                    _ActiveContextRow(
+                        id=int(row[0]),
+                        timestamp=_parse_timestamp(row[1]),
+                        message=msg,
+                    )
+                )
+                total += estimate
+            cursor_id = int(rows[-1][0])
+            if len(rows) < _ACTIVE_CONTEXT_FETCH_CHUNK:
+                break
 
     selected.reverse()
     return selected
@@ -642,7 +667,7 @@ def render_recap_blocks(
 
 
 def render_session_recap(
-    db_path: str,
+    db_path: str | StorageTarget,
     *,
     session_id: str,
     agent_id: str | None = None,
@@ -651,7 +676,10 @@ def render_session_recap(
 ) -> str:
     if session_id.startswith("onboarding:"):
         return ""
-    if not os.path.exists(db_path):
+    # The missing-file fast path only makes sense for filesystem databases; a
+    # hosted StorageTarget (libSQL/Turso) is not a path and must go straight
+    # to the query below.
+    if isinstance(db_path, str) and not os.path.exists(db_path):
         return ""
     try:
         frontier = fetch_session_summary_frontier(
@@ -660,8 +688,13 @@ def render_session_recap(
             agent_id=agent_id,
             content_codec=content_codec,
         )
-    except sqlite3.Error:
-        return ""
+    except Exception as exc:
+        # Recap is best-effort rendering over a rebuildable projection: an
+        # operational error (either backend) degrades to "no recap" instead
+        # of failing the caller. Anything else is a real bug and re-raises.
+        if isinstance(exc, sqlite3.Error) or is_operational_error(exc):
+            return ""
+        raise
     if not frontier:
         return ""
 

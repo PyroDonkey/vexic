@@ -148,13 +148,19 @@ _CONTROL_PLANE_SCHEMA_STATEMENTS: tuple[str, ...] = (
     """,
     """
     CREATE TABLE IF NOT EXISTS dream_sweep_state (
-        tenant_id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL DEFAULT '',
         last_summarize_watermark INTEGER NOT NULL DEFAULT 0,
         last_dream_completed_at TEXT,
+        PRIMARY KEY (tenant_id, agent_id),
         FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
     )
     """,
 )
+
+# The NULL/shared agent scope stored in `dream_sweep_state.agent_id` -- SQLite
+# primary keys cannot contain NULL, so the shared scope uses this sentinel.
+_SHARED_AGENT_SENTINEL = ""
 
 
 @dataclass(frozen=True)
@@ -165,9 +171,10 @@ class ProvisionedApiKey:
 
 @dataclass(frozen=True)
 class DreamSweepState:
-    """Per-tenant sweeper bookkeeping in the control database (ADR 0030):
-    the last transcript watermark a summarize sweep was scheduled for, and
-    when the last full dream chain completed."""
+    """Per-(tenant, agent) sweeper bookkeeping in the control database
+    (ADR 0030): the highest transcript watermark whose summarize job has run
+    to completion for the scope, and when the scope's last full dream chain
+    finished running."""
 
     last_summarize_watermark: int = 0
     last_dream_completed_at: str | None = None
@@ -923,15 +930,19 @@ class HostedTenantCatalog:
                 raise PermissionError("Unknown hosted tenant.")
             conn.commit()
 
-    def dream_sweep_state(self, tenant_id: str) -> "DreamSweepState":
+    def dream_sweep_state(
+        self,
+        tenant_id: str,
+        agent_id: str | None,
+    ) -> "DreamSweepState":
         with closing(self._connect_control()) as conn:
             row = conn.execute(
                 """
                 SELECT last_summarize_watermark, last_dream_completed_at
                 FROM dream_sweep_state
-                WHERE tenant_id = ?
+                WHERE tenant_id = ? AND agent_id = ?
                 """,
-                (tenant_id,),
+                (tenant_id, agent_id or _SHARED_AGENT_SENTINEL),
             ).fetchone()
         if row is None:
             return DreamSweepState()
@@ -940,29 +951,54 @@ class HostedTenantCatalog:
             last_dream_completed_at=row[1],
         )
 
-    def record_summarize_watermark(self, tenant_id: str, watermark: int) -> None:
+    def record_summarize_watermark(
+        self,
+        tenant_id: str,
+        agent_id: str | None,
+        watermark: int,
+    ) -> None:
+        # Monotonic: a stale recorder (older tick finishing late) must never
+        # rewind a newer watermark.
         with closing(self._connect_control()) as conn:
             conn.execute(
                 """
-                INSERT INTO dream_sweep_state (tenant_id, last_summarize_watermark)
-                VALUES (?, ?)
-                ON CONFLICT(tenant_id) DO UPDATE
-                    SET last_summarize_watermark = excluded.last_summarize_watermark
+                INSERT INTO dream_sweep_state
+                    (tenant_id, agent_id, last_summarize_watermark)
+                VALUES (?, ?, ?)
+                ON CONFLICT(tenant_id, agent_id) DO UPDATE
+                    SET last_summarize_watermark = MAX(
+                        dream_sweep_state.last_summarize_watermark,
+                        excluded.last_summarize_watermark
+                    )
                 """,
-                (tenant_id, watermark),
+                (tenant_id, agent_id or _SHARED_AGENT_SENTINEL, watermark),
             )
             conn.commit()
 
-    def record_dream_completed(self, tenant_id: str, completed_at: str) -> None:
+    def record_dream_completed(
+        self,
+        tenant_id: str,
+        agent_id: str | None,
+        completed_at: str,
+    ) -> None:
+        # Monotonic on the ISO-8601 UTC timestamp (lexicographic order matches
+        # chronological order for the uniform format this codebase writes).
         with closing(self._connect_control()) as conn:
             conn.execute(
                 """
-                INSERT INTO dream_sweep_state (tenant_id, last_dream_completed_at)
-                VALUES (?, ?)
-                ON CONFLICT(tenant_id) DO UPDATE
-                    SET last_dream_completed_at = excluded.last_dream_completed_at
+                INSERT INTO dream_sweep_state
+                    (tenant_id, agent_id, last_dream_completed_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(tenant_id, agent_id) DO UPDATE
+                    SET last_dream_completed_at = CASE
+                        WHEN dream_sweep_state.last_dream_completed_at IS NULL
+                            OR excluded.last_dream_completed_at
+                                > dream_sweep_state.last_dream_completed_at
+                        THEN excluded.last_dream_completed_at
+                        ELSE dream_sweep_state.last_dream_completed_at
+                    END
                 """,
-                (tenant_id, completed_at),
+                (tenant_id, agent_id or _SHARED_AGENT_SENTINEL, completed_at),
             )
             conn.commit()
 
@@ -1238,6 +1274,17 @@ class HostedTenantCatalog:
                 conn.execute(
                     "ALTER TABLE tenants ADD COLUMN dream_scheduling INTEGER NOT NULL DEFAULT 1"
                 )
+            # Sweep state moved from tenant-keyed to (tenant, agent)-scoped
+            # before any release shipped the table. The state is disposable
+            # bookkeeping (worst case: one redundant sweep), so an old-shape
+            # table is dropped and recreated rather than migrated.
+            sweep_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(dream_sweep_state)").fetchall()
+            }
+            if sweep_columns and "agent_id" not in sweep_columns:
+                conn.execute("DROP TABLE dream_sweep_state")
+                conn.execute(_CONTROL_PLANE_SCHEMA_STATEMENTS[-1])
             project_columns = {
                 str(row[1])
                 for row in conn.execute("PRAGMA table_info(hosted_projects)").fetchall()

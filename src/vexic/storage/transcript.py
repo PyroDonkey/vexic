@@ -234,20 +234,16 @@ def load_messages(
         return _trim_unpaired_tool_messages(messages)
 
 
-def max_message_id(db_path: str | StorageTarget) -> int:
-    """Highest transcript row id, or 0 for an empty store. The sweeper's
-    cheap new-messages watermark check (ADR 0030)."""
+def agent_watermarks(db_path: str | StorageTarget) -> list[tuple[str | None, int]]:
+    """Highest transcript row id per recorded agent scope (including the NULL
+    shared scope), one cheap aggregate query. The sweeper's per-scope
+    new-messages watermark check (ADR 0030); sweeps match ``agent_id``
+    exactly, so each scope is tracked individually."""
     with closing(connect(db_path)) as conn:
-        row = conn.execute("SELECT MAX(id) FROM messages").fetchone()
-        return int(row[0]) if row and row[0] is not None else 0
-
-
-def distinct_agent_ids(db_path: str | StorageTarget) -> list[str | None]:
-    """Every distinct recorded agent scope (including the NULL shared scope).
-    Sweeps match ``agent_id`` exactly, so each scope is swept individually."""
-    with closing(connect(db_path)) as conn:
-        rows = conn.execute("SELECT DISTINCT agent_id FROM messages").fetchall()
-    return [row[0] for row in rows]
+        rows = conn.execute(
+            "SELECT agent_id, MAX(id) FROM messages GROUP BY agent_id"
+        ).fetchall()
+    return [(row[0], int(row[1])) for row in rows]
 
 
 def count_session_messages(

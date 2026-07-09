@@ -944,6 +944,19 @@ class HostedMemoryService:
 
                 try:
                     _result, usage = await asyncio.to_thread(_run_in_worker_thread)
+                except asyncio.CancelledError:
+                    # Shutdown cancellation: the worker thread cannot be
+                    # interrupted and may still be finishing its phase, so
+                    # record the orchestration as errored (callers must not
+                    # treat the chain as swept) and propagate.
+                    self._record_dream_trigger_job(
+                        job_id,
+                        request,
+                        auth,
+                        status="error",
+                        error_type="CancelledError",
+                    )
+                    raise
                 except Exception as exc:
                     self._record_dream_trigger_job(
                         job_id,
