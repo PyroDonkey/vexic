@@ -1929,6 +1929,8 @@ class LongMemEvalCliTests(unittest.TestCase):
         summary = unittest.mock.MagicMock()
         summary.judged_recall_total = None
         summary.judged_recall_supported = None
+        summary.questions_started = 1
+        summary.questions_completed = 1
         summary.questions_failed = 0
         runner = AsyncMock(return_value=summary)
 
@@ -1983,6 +1985,20 @@ class LongMemEvalCliTests(unittest.TestCase):
         self.assertTrue(callable(kwargs["contradiction_agent_factory"]))
         self.assertTrue(callable(kwargs["judge_agent_factory"]))
         self.assertTrue(callable(kwargs["embed"]))
+
+    def test_cli_returns_nonzero_when_any_question_incomplete(self) -> None:
+        summary = unittest.mock.MagicMock()
+        summary.judged_recall_total = None
+        summary.judged_recall_supported = None
+        summary.questions_started = 2
+        summary.questions_completed = 1
+        summary.questions_failed = 0
+        runner = AsyncMock(return_value=summary)
+
+        with patch("vexic.longmemeval.run_longmemeval_subset", new=runner):
+            exit_code = longmemeval_main(self._base_argv("--skip-dream"))
+
+        self.assertEqual(exit_code, 1)
 
     def test_cli_returns_nonzero_when_any_question_failed(self) -> None:
         summary = unittest.mock.MagicMock()
