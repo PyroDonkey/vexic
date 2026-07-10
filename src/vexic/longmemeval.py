@@ -403,3 +403,194 @@ def _fallback_question_id(raw: Mapping[str, Any], row_number: int) -> str:
     value = raw.get("question_id")
     question_id = value if isinstance(value, str) and value else "<unknown>"
     return f"row-{row_number}:{question_id}"
+
+
+async def drain_light_then_consolidate(
+    db_path: str,
+    model_group: str,
+    *,
+    message_count: int,
+    secrets: Mapping[str, str] | None = None,
+    max_light_cycles: int | None = None,
+    deep_top_n: int = 15,
+    extraction_agent_factory: AgentFactory | None = None,
+    embed: EmbedTexts | None = None,
+    contradiction_agent_factory: AgentFactory | None = None,
+) -> LongMemEvalDreamResult:
+    """Drain Light to a watermark fixpoint, then run REM and Deep once."""
+
+    cycle_cap = max_light_cycles or ceil(message_count / LIGHT_PHASE_BATCH_SIZE) + 1
+    previous_watermark = get_watermark(db_path, agent_id=None)
+    current_watermark = previous_watermark
+    cycles = 0
+    for _ in range(cycle_cap):
+        await run_light_phase(
+            db_path,
+            model_group,
+            secrets=secrets,
+            extraction_agent_factory=extraction_agent_factory,
+            embed=embed,
+        )
+        cycles += 1
+        current_watermark = get_watermark(db_path, agent_id=None)
+        if current_watermark == previous_watermark:
+            await run_rem_phase(db_path)
+            candidate_scoring_time = datetime.now(timezone.utc)
+            await run_deep_phase(
+                db_path,
+                model_group,
+                secrets=secrets,
+                top_n=deep_top_n,
+                now=candidate_scoring_time,
+                contradiction_agent_factory=contradiction_agent_factory,
+            )
+            return LongMemEvalDreamResult(
+                status="ok",
+                light_cycles=cycles,
+                rem_ran=True,
+                deep_ran=True,
+                final_watermark=current_watermark,
+                consolidation_count=1,
+                candidate_scoring_time=candidate_scoring_time.isoformat(),
+            )
+        previous_watermark = current_watermark
+
+    return LongMemEvalDreamResult(
+        status="incomplete",
+        light_cycles=cycles,
+        rem_ran=False,
+        deep_ran=False,
+        final_watermark=current_watermark,
+        consolidation_count=1,
+        error="Light phase did not reach a stable watermark before max_light_cycles.",
+    )
+
+
+async def _ingest_then_consolidate_incrementally(
+    db_path: str,
+    instance: LongMemEvalInstance,
+    model_group: str,
+    *,
+    secrets: Mapping[str, str] | None = None,
+    forbidden_secret_values: list[str] | tuple[str, ...] = (),
+    max_light_cycles: int | None = None,
+    deep_top_n: int = 15,
+    dream_session_batch_size: int = 1,
+    extraction_agent_factory: AgentFactory | None = None,
+    embed: EmbedTexts | None = None,
+    contradiction_agent_factory: AgentFactory | None = None,
+) -> LongMemEvalDreamResult:
+    """Ingest sessions chronologically and run one consolidation cycle per batch."""
+
+    if dream_session_batch_size < 1:
+        raise ValueError("dream_session_batch_size must be at least 1.")
+    init_db(db_path)
+    light_cycles = 0
+    rem_ran = False
+    deep_ran = False
+    final_watermark = get_watermark(db_path, agent_id=None)
+    consolidation_count = 0
+    candidate_scoring_time: str | None = None
+    sorted_sessions = _sorted_sessions(instance)
+    for start_index in range(0, len(sorted_sessions), dream_session_batch_size):
+        batch = sorted_sessions[start_index : start_index + dream_session_batch_size]
+        batch_message_count = 0
+        for session in batch:
+            _save_instance_session(
+                db_path,
+                instance,
+                session,
+                forbidden_secret_values=forbidden_secret_values,
+            )
+            batch_message_count += len(session.turns)
+        dream = await drain_light_then_consolidate(
+            db_path,
+            model_group,
+            message_count=batch_message_count,
+            secrets=secrets,
+            max_light_cycles=max_light_cycles,
+            deep_top_n=deep_top_n,
+            extraction_agent_factory=extraction_agent_factory,
+            embed=embed,
+            contradiction_agent_factory=contradiction_agent_factory,
+        )
+        consolidation_count += 1
+        light_cycles += dream.light_cycles
+        rem_ran = rem_ran or dream.rem_ran
+        deep_ran = deep_ran or dream.deep_ran
+        final_watermark = dream.final_watermark
+        dream_scoring_time = getattr(dream, "candidate_scoring_time", None)
+        if dream_scoring_time is not None:
+            candidate_scoring_time = dream_scoring_time
+        if dream.status != "ok":
+            return LongMemEvalDreamResult(
+                status="incomplete",
+                light_cycles=light_cycles,
+                rem_ran=rem_ran,
+                deep_ran=deep_ran,
+                final_watermark=final_watermark,
+                consolidation_count=consolidation_count,
+                candidate_scoring_time=candidate_scoring_time,
+                error=dream.error,
+            )
+
+    return LongMemEvalDreamResult(
+        status="ok",
+        light_cycles=light_cycles,
+        rem_ran=rem_ran,
+        deep_ran=deep_ran,
+        final_watermark=final_watermark,
+        consolidation_count=consolidation_count,
+        candidate_scoring_time=candidate_scoring_time,
+    )
+
+
+async def drain_light_then_rem(
+    db_path: str,
+    model_group: str,
+    *,
+    message_count: int,
+    secrets: Mapping[str, str] | None = None,
+    max_light_cycles: int | None = None,
+    extraction_agent_factory: AgentFactory | None = None,
+    embed: EmbedTexts | None = None,
+) -> LongMemEvalDreamResult:
+    """Drain Light to a watermark fixpoint, then run REM without Deep promotion."""
+
+    cycle_cap = max_light_cycles or ceil(message_count / LIGHT_PHASE_BATCH_SIZE) + 1
+    previous_watermark = get_watermark(db_path, agent_id=None)
+    current_watermark = previous_watermark
+    cycles = 0
+    for _ in range(cycle_cap):
+        await run_light_phase(
+            db_path,
+            model_group,
+            secrets=secrets,
+            extraction_agent_factory=extraction_agent_factory,
+            embed=embed,
+        )
+        cycles += 1
+        current_watermark = get_watermark(db_path, agent_id=None)
+        if current_watermark == previous_watermark:
+            await run_rem_phase(db_path)
+            candidate_scoring_time = datetime.now(timezone.utc).isoformat()
+            return LongMemEvalDreamResult(
+                status="ok",
+                light_cycles=cycles,
+                rem_ran=True,
+                deep_ran=False,
+                final_watermark=current_watermark,
+                consolidation_count=1,
+                candidate_scoring_time=candidate_scoring_time,
+            )
+        previous_watermark = current_watermark
+
+    return LongMemEvalDreamResult(
+        status="incomplete",
+        light_cycles=cycles,
+        rem_ran=False,
+        deep_ran=False,
+        final_watermark=current_watermark,
+        consolidation_count=1,
+        error="Light phase did not reach a stable watermark before max_light_cycles.",
+    )

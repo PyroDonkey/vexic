@@ -11,6 +11,8 @@ from unittest.mock import AsyncMock, patch
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 
 from vexic.longmemeval import (
+    drain_light_then_consolidate,
+    drain_light_then_rem,
     ingest_instance,
     create_run_paths,
     parse_longmemeval_instance,
@@ -248,6 +250,120 @@ class LongMemEvalIsolationTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "already exists"):
             question_db_path(paths.run_dir, "q-duplicate")
+
+
+class LongMemEvalDreamDrainTests(unittest.IsolatedAsyncioTestCase):
+    async def test_light_drains_to_watermark_fixpoint_before_rem_and_deep(self) -> None:
+        light = AsyncMock()
+        rem = AsyncMock()
+        deep = AsyncMock()
+
+        with (
+            patch("vexic.longmemeval.get_watermark", side_effect=[0, 50, 100, 100]),
+            patch("vexic.longmemeval.run_light_phase", light),
+            patch("vexic.longmemeval.run_rem_phase", rem),
+            patch("vexic.longmemeval.run_deep_phase", deep),
+        ):
+            result = await drain_light_then_consolidate(
+                "memory.db",
+                "glm",
+                message_count=100,
+                deep_top_n=7,
+            )
+
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.light_cycles, 3)
+        self.assertIsNotNone(result.candidate_scoring_time)
+        self.assertEqual(light.await_count, 3)
+        rem.assert_awaited_once_with("memory.db")
+        deep.assert_awaited_once()
+        self.assertEqual(deep.await_args.args, ("memory.db", "glm"))
+        self.assertEqual(deep.await_args.kwargs["secrets"], None)
+        self.assertEqual(deep.await_args.kwargs["top_n"], 7)
+        self.assertIsNotNone(deep.await_args.kwargs["now"])
+
+    async def test_light_drain_stops_incomplete_when_watermark_never_stabilizes(self) -> None:
+        light = AsyncMock()
+        rem = AsyncMock()
+        deep = AsyncMock()
+
+        with (
+            patch("vexic.longmemeval.get_watermark", side_effect=[0, 1, 2]),
+            patch("vexic.longmemeval.run_light_phase", light),
+            patch("vexic.longmemeval.run_rem_phase", rem),
+            patch("vexic.longmemeval.run_deep_phase", deep),
+        ):
+            result = await drain_light_then_consolidate(
+                "memory.db",
+                "glm",
+                message_count=100,
+                max_light_cycles=2,
+            )
+
+        self.assertEqual(result.status, "incomplete")
+        self.assertEqual(result.light_cycles, 2)
+        self.assertFalse(result.rem_ran)
+        self.assertFalse(result.deep_ran)
+        rem.assert_not_awaited()
+        deep.assert_not_awaited()
+
+    async def test_light_drain_can_stop_after_rem_for_tier2_diagnostics(self) -> None:
+        light = AsyncMock()
+        rem = AsyncMock()
+        deep = AsyncMock()
+
+        with (
+            patch("vexic.longmemeval.get_watermark", side_effect=[0, 50, 50]),
+            patch("vexic.longmemeval.run_light_phase", light),
+            patch("vexic.longmemeval.run_rem_phase", rem),
+            patch("vexic.longmemeval.run_deep_phase", deep),
+        ):
+            result = await drain_light_then_rem(
+                "memory.db",
+                "glm",
+                message_count=50,
+            )
+
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.light_cycles, 2)
+        self.assertTrue(result.rem_ran)
+        self.assertFalse(result.deep_ran)
+        self.assertIsNotNone(result.candidate_scoring_time)
+        rem.assert_awaited_once_with("memory.db")
+        deep.assert_not_awaited()
+
+    async def test_drain_passes_host_ports_through_to_phases(self) -> None:
+        light = AsyncMock()
+        rem = AsyncMock()
+        deep = AsyncMock()
+        extraction_factory = object()
+        contradiction_factory = object()
+        embed = object()
+
+        with (
+            patch("vexic.longmemeval.get_watermark", side_effect=[0, 0]),
+            patch("vexic.longmemeval.run_light_phase", light),
+            patch("vexic.longmemeval.run_rem_phase", rem),
+            patch("vexic.longmemeval.run_deep_phase", deep),
+        ):
+            result = await drain_light_then_consolidate(
+                "memory.db",
+                "glm",
+                message_count=10,
+                extraction_agent_factory=extraction_factory,
+                embed=embed,
+                contradiction_agent_factory=contradiction_factory,
+            )
+
+        self.assertEqual(result.status, "ok")
+        self.assertIs(
+            light.await_args.kwargs["extraction_agent_factory"], extraction_factory
+        )
+        self.assertIs(light.await_args.kwargs["embed"], embed)
+        self.assertIs(
+            deep.await_args.kwargs["contradiction_agent_factory"],
+            contradiction_factory,
+        )
 
 
 if __name__ == "__main__":
