@@ -45,6 +45,7 @@ from vexic.mcp_http import register_mcp_routes
 from vexic.mcp_http import _scope_from_headers as _read_scope_from_headers
 from vexic.ports import HostPortNotConfigured
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
+from vexic.storage.errors import is_operational_error, is_retryable_operational_error
 
 
 class _TursoProvisioning:
@@ -673,6 +674,18 @@ async def _handle_payload(
             return _error_response(401, "unauthorized", "Invalid hosted API key.")
         return _error_response(403, "permission_denied", str(exc))
     except ValueError as exc:
+        # The hosted libSQL/Turso driver raises bare ValueError for SQL errors
+        # (ADR 0019), so a storage fault mid-operation must not surface as a
+        # client-fault 400. Classify it as a server-side condition and never
+        # echo the Hrana payload.
+        if is_retryable_operational_error(exc):
+            return _error_response(
+                503,
+                "storage_unavailable",
+                "Hosted storage is temporarily unavailable.",
+            )
+        if is_operational_error(exc):
+            return _error_response(500, "internal_error", "Hosted memory request failed.")
         return _error_response(400, "invalid_request", str(exc))
     except Exception:
         return _error_response(500, "internal_error", "Hosted memory request failed.")

@@ -131,6 +131,60 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "hosted ingest failed: HTTP 403"):
                 post_source_messages(config, messages=[], forbidden_values=())
 
+    def test_post_source_messages_http_error_includes_server_error_detail(self) -> None:
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+        body = io.BytesIO(
+            json.dumps(
+                {
+                    "error": {
+                        "code": "storage_unavailable",
+                        "message": "Hosted storage is temporarily unavailable.",
+                    }
+                }
+            ).encode("utf-8")
+        )
+        error = HTTPError(
+            url="https://api.example.test/v1/ingest_source_transcript",
+            code=503,
+            msg="Service Unavailable",
+            hdrs={},
+            fp=body,
+        )
+
+        with patch("vexic.recorders.hosted_ingest.urlopen", side_effect=error):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"hosted ingest failed: HTTP 503 \(storage_unavailable: "
+                r"Hosted storage is temporarily unavailable\.\)",
+            ):
+                post_source_messages(config, messages=[], forbidden_values=())
+
+    def test_post_source_messages_http_error_without_json_body_stays_bare(self) -> None:
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+        error = HTTPError(
+            url="https://api.example.test/v1/ingest_source_transcript",
+            code=400,
+            msg="Bad Request",
+            hdrs={},
+            fp=io.BytesIO(b"<html>not json</html>"),
+        )
+
+        with patch("vexic.recorders.hosted_ingest.urlopen", side_effect=error):
+            with self.assertRaisesRegex(RuntimeError, r"hosted ingest failed: HTTP 400$"):
+                post_source_messages(config, messages=[], forbidden_values=())
+
     def test_post_source_messages_rejects_forbidden_value_before_egress(self) -> None:
         config = HostedIngestConfig(
             base_url="https://api.example.test",
