@@ -139,6 +139,15 @@ class DreamSweeper:
                 # Content-free by design: tenant memory text must never
                 # reach shared server logs.
                 logger.exception("Dream sweep failed for one tenant; continuing.")
+        if report.errors and report.errors == report.tenants_seen:
+            # Every tenant failed: this is a sweeper/config-level fault (e.g.
+            # storage misresolution), not per-tenant noise. Surface it
+            # distinctly so it cannot fail silently tick after tick.
+            logger.error(
+                "Dream sweep failed for every tenant this tick (%d of %d).",
+                report.errors,
+                report.tenants_seen,
+            )
         return report
 
     async def _sweep_tenant(
@@ -153,7 +162,10 @@ class DreamSweeper:
             report.skipped_disabled += 1
             return
         tenant = await asyncio.to_thread(catalog.get_tenant, tenant_id)
-        watermarks = await asyncio.to_thread(agent_watermarks, tenant.db_path)
+        # Resolve through the service seam, never `tenant.db_path` directly:
+        # under the Turso backend the local path is a vestigial empty file.
+        storage = self._service.storage_target_for(tenant)
+        watermarks = await asyncio.to_thread(agent_watermarks, storage)
         if not watermarks:
             report.skipped_no_new_messages += 1
             return
