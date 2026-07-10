@@ -161,6 +161,7 @@ class DreamSweeper:
         summarize = self._summarize_capable()
         dream_capable = self._dream_capable()
         scheduled_any = False
+        scope_was_locked = False
         for agent_id, watermark in watermarks:
             state = await asyncio.to_thread(
                 catalog.dream_sweep_state, tenant_id, agent_id
@@ -202,6 +203,7 @@ class DreamSweeper:
                 # advances the scope's state, so leave it untouched and let
                 # the next tick re-evaluate.
                 report.skipped_locked += 1
+                scope_was_locked = True
                 continue
 
             scheduled_any = True
@@ -217,7 +219,7 @@ class DreamSweeper:
                 dream_completed=dream_due,
             )
 
-        if not scheduled_any:
+        if not scheduled_any and not scope_was_locked:
             report.skipped_no_new_messages += 1
 
     def _dream_capable(self) -> bool:
