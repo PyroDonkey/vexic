@@ -1,0 +1,61 @@
+# Free-tier DR for the hosted Turso databases (control-plane + per-tenant
+# customer memory). Turso's free tier has no point-in-time recovery, so this
+# workflow takes scheduled SQL dumps of every database in the org and keeps
+# them as private Actions artifacts. See ADR 0019 Addendum 5.
+#
+# Setup: add a repository secret TURSO_API_TOKEN (create one with
+#   `turso auth api-tokens create vexic-backup`).
+# The dumps contain API-key hashes and tenant routing DSNs; they are only ever
+# stored as artifacts on this private repo. Do not make this repo public
+# without moving the dumps to an access-controlled store.
+name: Turso backup
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # daily at 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    env:
+      TURSO_API_TOKEN: ${{ secrets.TURSO_API_TOKEN }}
+    steps:
+      - name: Install Turso CLI
+        run: |
+          curl -sSfL https://get.tur.so/install.sh | bash
+          echo "$HOME/.turso" >> "$GITHUB_PATH"
+
+      - name: Dump every database
+        run: |
+          set -euo pipefail
+          if [ -z "${TURSO_API_TOKEN:-}" ]; then
+            echo "TURSO_API_TOKEN secret is not set; add it in repo settings." >&2
+            exit 1
+          fi
+          mkdir -p dumps
+          stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+          # `turso db list` prints a NAME/TYPE/GROUP/URL table; take column 1
+          # past the header row.
+          mapfile -t dbs < <(turso db list | awk 'NR > 1 && NF > 0 { print $1 }')
+          if [ "${#dbs[@]}" -eq 0 ]; then
+            echo "No databases returned by 'turso db list'." >&2
+            exit 1
+          fi
+          for db in "${dbs[@]}"; do
+            echo "Dumping ${db}"
+            turso db shell "${db}" ".dump" > "dumps/${db}-${stamp}.sql"
+          done
+          echo "Dumped ${#dbs[@]} database(s):"
+          ls -la dumps
+
+      - name: Upload dumps
+        uses: actions/upload-artifact@v4
+        with:
+          name: turso-dumps-${{ github.run_id }}
+          path: dumps/
+          retention-days: 90
+          if-no-files-found: error
