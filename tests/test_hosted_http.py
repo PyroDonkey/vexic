@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
+from pydantic import BaseModel, ValidationError
 from pydantic_ai.messages import ModelRequest, ModelResponse, ToolCallPart, UserPromptPart
 
 from vexic.hosted_control_plane_http import create_app as create_control_plane_app
@@ -2084,6 +2085,232 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(ingest_response.status_code, 200)
         self.assertEqual(ingest_response.json()["items"][0]["status"], "rejected")
         self.assertEqual(search_response.json()["hits"], [])
+
+    def _ingest_body(self, text: str = "hello") -> dict[str, object]:
+        message_json = single_message_adapter.dump_json(
+            ModelRequest(parts=[UserPromptPart(content=text)])
+        ).decode()
+        return {
+            "messages": [
+                {
+                    "source_host": "claude-code",
+                    "source_session_id": "source-session-a",
+                    "source_message_id": "msg-1",
+                    "message_json": message_json,
+                }
+            ],
+            "redaction": {"forbidden_values": []},
+        }
+
+    def test_hosted_ingest_maps_retryable_storage_valueerror_to_503(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE})
+
+        with patch.object(
+            type(self.service),
+            "ingest_source_transcript",
+            side_effect=ValueError(
+                'Hrana: `stream error: `Error { message: "SQLite error: '
+                'database is locked", code: "SQLITE_BUSY" }``'
+            ),
+        ):
+            response = self.client.post(
+                "/v1/ingest_source_transcript",
+                headers=self._write_headers(api_key),
+                json=self._ingest_body(),
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "storage_unavailable")
+        self.assertNotIn("SQLITE_BUSY", response.text)
+
+    def test_hosted_ingest_maps_nonretryable_storage_valueerror_to_500(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE})
+
+        with patch.object(
+            type(self.service),
+            "ingest_source_transcript",
+            side_effect=ValueError(
+                'Hrana: `stream error: `Error { message: "SQLite error: '
+                'no such table: messages_fts", code: "SQLITE_ERROR" }``'
+            ),
+        ):
+            response = self.client.post(
+                "/v1/ingest_source_transcript",
+                headers=self._write_headers(api_key),
+                json=self._ingest_body(),
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["error"]["code"], "internal_error")
+        self.assertNotIn("SQLITE_ERROR", response.text)
+
+    def test_hosted_ingest_maps_constraint_storage_valueerror_to_500(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE})
+
+        with patch.object(
+            type(self.service),
+            "ingest_source_transcript",
+            side_effect=ValueError(
+                'Hrana: `stream error: `Error { message: "SQLite error: '
+                "UNIQUE constraint failed: source_transcript_ledger.source_host"
+                '", code: "SQLITE_CONSTRAINT" }``'
+            ),
+        ):
+            response = self.client.post(
+                "/v1/ingest_source_transcript",
+                headers=self._write_headers(api_key),
+                json=self._ingest_body(),
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["error"]["code"], "internal_error")
+        self.assertNotIn("SQLITE_CONSTRAINT", response.text)
+        self.assertNotIn("Hrana", response.text)
+
+    def test_hosted_ingest_validation_error_with_storage_marker_stays_400(self) -> None:
+        class _MarkerModel(BaseModel):
+            limit: int
+
+        try:
+            _MarkerModel.model_validate({"limit": "database is locked"})
+        except ValidationError as exc:
+            validation_error = exc
+
+        with patch.object(
+            type(self.service),
+            "ingest_source_transcript",
+            side_effect=validation_error,
+        ):
+            response = self.client.post(
+                "/v1/ingest_source_transcript",
+                headers=self._write_headers(
+                    self._api_key(capabilities={MemoryCapability.WRITE})
+                ),
+                json=self._ingest_body(),
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], "invalid_request")
+
+    def test_hosted_ingest_storage_valueerror_mapping_logs_sanitized_category(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE})
+
+        with patch.object(
+            type(self.service),
+            "ingest_source_transcript",
+            side_effect=ValueError(
+                'Hrana: `stream error: `Error { message: "SQLite error: '
+                'database is locked", code: "SQLITE_BUSY" }``'
+            ),
+        ):
+            with self.assertLogs("vexic.hosted_http", level="WARNING") as logs:
+                response = self.client.post(
+                    "/v1/ingest_source_transcript",
+                    headers=self._write_headers(api_key),
+                    json=self._ingest_body(),
+                )
+
+        self.assertEqual(response.status_code, 503)
+        log_text = "\n".join(logs.output)
+        self.assertIn("category=retryable_operational", log_text)
+        self.assertIn("exception_type=ValueError", log_text)
+        self.assertNotIn("SQLITE_BUSY", log_text)
+        self.assertNotIn("database is locked", log_text)
+
+    def test_trigger_dream_phase_maps_retryable_storage_valueerror_to_503(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.DREAM_TRIGGER})
+
+        with patch.object(
+            type(self.service),
+            "trigger_dream_phase",
+            side_effect=ValueError(
+                'Hrana: `stream error: `Error { message: "SQLite error: '
+                'database is locked", code: "SQLITE_BUSY" }``'
+            ),
+        ):
+            response = self.client.post(
+                "/v1/trigger_dream_phase",
+                headers=self._write_headers(api_key),
+                json={"phase": "summarize"},
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "storage_unavailable")
+        self.assertNotIn("SQLITE_BUSY", response.text)
+
+    def test_trigger_dream_phase_maps_nonretryable_storage_valueerror_to_500(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.DREAM_TRIGGER})
+
+        with patch.object(
+            type(self.service),
+            "trigger_dream_phase",
+            side_effect=ValueError(
+                'Hrana: `stream error: `Error { message: "SQLite error: '
+                'no such table: memory_candidates", code: "SQLITE_ERROR" }``'
+            ),
+        ):
+            response = self.client.post(
+                "/v1/trigger_dream_phase",
+                headers=self._write_headers(api_key),
+                json={"phase": "summarize"},
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["error"]["code"], "internal_error")
+        self.assertNotIn("SQLITE_ERROR", response.text)
+
+    def test_header_bound_search_maps_auth_storage_valueerror_to_503(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.SEARCH})
+
+        with patch.object(
+            type(self.keys),
+            "authenticate",
+            side_effect=ValueError(
+                'Hrana: `stream error: `Error { message: "SQLite error: '
+                'database is locked", code: "SQLITE_BUSY" }``'
+            ),
+        ):
+            response = self.client.post(
+                "/v1/search_transcript",
+                headers=self._write_headers(api_key),
+                json={"query": "lookup", "limit": 5},
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "storage_unavailable")
+        self.assertNotIn("SQLITE_BUSY", response.text)
+
+    def test_header_bound_search_missing_session_header_still_returns_400(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.SEARCH})
+
+        response = self.client.post(
+            "/v1/search_transcript",
+            headers={**self._auth(api_key), "X-Vexic-Project-Id": "project-a"},
+            json={"query": "lookup", "limit": 5},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], "invalid_request")
+        self.assertIn("X-Vexic-Session-Id", response.json()["error"]["message"])
+
+    def test_hosted_ingest_contract_valueerror_still_returns_400(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE})
+
+        with patch.object(
+            type(self.service),
+            "ingest_source_transcript",
+            side_effect=ValueError(
+                "Refusing to persist message containing a forbidden secret value."
+            ),
+        ):
+            response = self.client.post(
+                "/v1/ingest_source_transcript",
+                headers=self._write_headers(api_key),
+                json=self._ingest_body(),
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], "invalid_request")
 
     def test_control_plane_routes_and_keys_are_tenant_isolated(self) -> None:
         client = TestClient(

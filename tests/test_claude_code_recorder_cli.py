@@ -131,6 +131,127 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "hosted ingest failed: HTTP 403"):
                 post_source_messages(config, messages=[], forbidden_values=())
 
+    def test_post_source_messages_4xx_error_includes_server_error_detail(self) -> None:
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+        body = io.BytesIO(
+            json.dumps(
+                {
+                    "error": {
+                        "code": "invalid_request",
+                        "message": "limit must be between 1 and 20.",
+                    }
+                }
+            ).encode("utf-8")
+        )
+        error = HTTPError(
+            url="https://api.example.test/v1/ingest_source_transcript",
+            code=400,
+            msg="Bad Request",
+            hdrs={},
+            fp=body,
+        )
+
+        with patch("vexic.recorders.hosted_ingest.urlopen", side_effect=error):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"hosted ingest failed: HTTP 400 \(invalid_request: "
+                r"limit must be between 1 and 20\.\)",
+            ):
+                post_source_messages(config, messages=[], forbidden_values=())
+
+    def test_post_source_messages_5xx_error_surfaces_code_only(self) -> None:
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+        body = io.BytesIO(
+            json.dumps(
+                {
+                    "error": {
+                        "code": "storage_unavailable",
+                        "message": "SQLITE_BUSY: backend storage detail",
+                    }
+                }
+            ).encode("utf-8")
+        )
+        error = HTTPError(
+            url="https://api.example.test/v1/ingest_source_transcript",
+            code=503,
+            msg="Service Unavailable",
+            hdrs={},
+            fp=body,
+        )
+
+        with patch("vexic.recorders.hosted_ingest.urlopen", side_effect=error):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"hosted ingest failed: HTTP 503 \(storage_unavailable\)$",
+            ):
+                post_source_messages(config, messages=[], forbidden_values=())
+
+    def test_post_source_messages_http_error_without_json_body_stays_bare(self) -> None:
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+        error = HTTPError(
+            url="https://api.example.test/v1/ingest_source_transcript",
+            code=400,
+            msg="Bad Request",
+            hdrs={},
+            fp=io.BytesIO(b"<html>not json</html>"),
+        )
+
+        with patch("vexic.recorders.hosted_ingest.urlopen", side_effect=error):
+            with self.assertRaisesRegex(RuntimeError, r"hosted ingest failed: HTTP 400$"):
+                post_source_messages(config, messages=[], forbidden_values=())
+
+    def test_post_source_messages_oversized_error_body_is_not_fully_read(self) -> None:
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+        huge = b'{"error": {"code": "' + b"a" * (10 * 1024 * 1024) + b'"}}'
+        read_sizes: list[int | None] = []
+
+        class _TrackingBody(io.BytesIO):
+            def read(self, size: int | None = -1) -> bytes:
+                read_sizes.append(size)
+                return super().read(size)
+
+        error = HTTPError(
+            url="https://api.example.test/v1/ingest_source_transcript",
+            code=502,
+            msg="Bad Gateway",
+            hdrs={},
+            fp=_TrackingBody(huge),
+        )
+
+        with patch("vexic.recorders.hosted_ingest.urlopen", side_effect=error):
+            with self.assertRaisesRegex(RuntimeError, r"hosted ingest failed: HTTP 502$"):
+                post_source_messages(config, messages=[], forbidden_values=())
+
+        self.assertTrue(read_sizes)
+        for size in read_sizes:
+            self.assertIsNotNone(size)
+            self.assertGreaterEqual(size, 0)
+            self.assertLessEqual(size, 1024 * 1024)
+
     def test_post_source_messages_rejects_forbidden_value_before_egress(self) -> None:
         config = HostedIngestConfig(
             base_url="https://api.example.test",

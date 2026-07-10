@@ -56,6 +56,45 @@ def post_source_messages(
         with urlopen(request, timeout=config.timeout_seconds) as response:
             return json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
-        raise RuntimeError(f"hosted ingest failed: HTTP {exc.code}") from exc
+        detail = _error_body_detail(exc)
+        suffix = f" ({detail})" if detail else ""
+        raise RuntimeError(f"hosted ingest failed: HTTP {exc.code}{suffix}") from exc
     except URLError as exc:
         raise RuntimeError(f"hosted ingest failed: {type(exc.reason).__name__}") from exc
+
+
+_ERROR_DETAIL_MAX_CHARS = 300
+_ERROR_BODY_MAX_BYTES = 64 * 1024
+
+
+def _error_body_detail(exc: HTTPError) -> str | None:
+    """Extract detail from a Vexic hosted error body, else None.
+
+    Only the server's structured error envelope is surfaced -- an HTML or
+    unparseable body is dropped so the raised message never echoes arbitrary
+    proxy output. The read is bounded so a huge body from a misbehaving proxy
+    is never buffered whole; anything over the cap cannot be the hosted
+    envelope and is dropped. Client-fault 4xx responses surface
+    `code: message` because the message carries the actionable detail;
+    5xx responses surface only the stable error code so server-side text
+    never reaches the recorder's status output.
+    """
+    try:
+        raw = exc.read(_ERROR_BODY_MAX_BYTES + 1)
+        if len(raw) > _ERROR_BODY_MAX_BYTES:
+            return None
+        body = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(error, dict):
+        return None
+    code = error.get("code")
+    message = error.get("message")
+    if not isinstance(code, str) or not code:
+        return None
+    if exc.code >= 500 or not isinstance(message, str) or not message:
+        detail = code
+    else:
+        detail = f"{code}: {message}"
+    return detail[:_ERROR_DETAIL_MAX_CHARS]

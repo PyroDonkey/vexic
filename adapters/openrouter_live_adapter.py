@@ -15,6 +15,10 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
 
 from vexic.embeddings import EMBEDDING_DIM
+from vexic.longmemeval import (
+    LONGMEMEVAL_RECALL_JUDGE_PROMPT,
+    LongMemEvalRecallJudgeVerdict,
+)
 from vexic.models import ContradictionJudgment, FactCandidate
 
 
@@ -124,6 +128,21 @@ def _model_name(model_group: str) -> str:
     return "deepseek/deepseek-v4-pro"
 
 
+def _judge_model_name(model_group: str) -> str:
+    # Recall verdicts must never be graded by the implicit deepseek default:
+    # diagnostics label the run with the judge model group, so a silent
+    # fallback would attribute scores to the wrong judge. Require an explicit
+    # model instead of falling through like `_model_name`.
+    group_env = f"VEXIC_LIVE_{_env_key(model_group)}_MODEL"
+    if group_model := os.environ.get(group_env):
+        return _require_openrouter_model(group_model, group_env)
+    if default_model := os.environ.get("VEXIC_LIVE_MODEL"):
+        return _require_openrouter_model(default_model, "VEXIC_LIVE_MODEL")
+    raise RuntimeError(
+        f"Recall judging requires an explicit model: set {group_env} or VEXIC_LIVE_MODEL."
+    )
+
+
 def _summary_model_name() -> str:
     model = os.environ.get("VEXIC_SUMMARY_MODEL")
     if model:
@@ -196,6 +215,26 @@ def build_summary_agent(
     # model group like the other agent builders in this module.
     _reject_passed_secrets(secrets)
     return _agent_with_model(_summary_model_name(), str, SUMMARY_INSTRUCTIONS)
+
+
+def build_longmemeval_recall_judge_agent(
+    model_group: str,
+    secrets: Mapping[str, str] | None = None,
+) -> Agent[None, LongMemEvalRecallJudgeVerdict]:
+    # Recall judging is deterministic grading, not generation: pin temperature 0
+    # on top of the shared env-driven settings. The shared 512-token output cap
+    # is dropped so a long structured verdict reason cannot truncate into a
+    # judge error.
+    _reject_passed_secrets(secrets)
+    settings = _model_settings()
+    settings["temperature"] = 0
+    settings.pop("max_tokens", None)
+    return Agent(
+        OpenAIChatModel(_judge_model_name(model_group), provider=_provider()),
+        output_type=LongMemEvalRecallJudgeVerdict,
+        instructions=LONGMEMEVAL_RECALL_JUDGE_PROMPT,
+        model_settings=settings,
+    )
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:

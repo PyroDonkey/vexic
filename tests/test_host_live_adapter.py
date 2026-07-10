@@ -269,3 +269,60 @@ def test_live_adapter_embedding_can_run_inside_active_event_loop(
         return adapter.embed_texts(["hello"])
 
     assert asyncio.run(run()) == [[1.0] + [0.0] * 383]
+
+
+def test_live_adapter_builds_longmemeval_recall_judge_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vexic.longmemeval import (
+        LONGMEMEVAL_RECALL_JUDGE_PROMPT,
+        LongMemEvalRecallJudgeVerdict,
+    )
+
+    adapter = _load_adapter()
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
+    monkeypatch.delenv("VEXIC_LIVE_MODEL", raising=False)
+    monkeypatch.setenv("VEXIC_LIVE_CLAUDE_MODEL", "anthropic/claude-sonnet-5")
+
+    # Capture Agent construction kwargs instead of reaching into pydantic_ai
+    # internals, so the assertions survive upstream attribute renames.
+    captured: dict[str, object] = {}
+
+    class _RecordingAgent:
+        def __init__(self, model: object, **kwargs: object) -> None:
+            captured["model"] = model
+            captured.update(kwargs)
+
+    monkeypatch.setattr(adapter, "Agent", _RecordingAgent)
+
+    adapter.build_longmemeval_recall_judge_agent("claude")
+
+    assert captured["output_type"] is LongMemEvalRecallJudgeVerdict
+    assert captured["instructions"] == LONGMEMEVAL_RECALL_JUDGE_PROMPT
+    settings = captured["model_settings"]
+    assert settings["temperature"] == 0
+    assert "max_tokens" not in settings
+
+
+def test_live_adapter_judge_agent_requires_explicit_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _load_adapter()
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
+    monkeypatch.delenv("VEXIC_LIVE_MODEL", raising=False)
+    monkeypatch.delenv("VEXIC_LIVE_CLAUDE_MODEL", raising=False)
+
+    with pytest.raises(RuntimeError, match="VEXIC_LIVE_CLAUDE_MODEL"):
+        adapter.build_longmemeval_recall_judge_agent("claude")
+
+
+def test_live_adapter_judge_agent_rejects_passed_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _load_adapter()
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
+
+    with pytest.raises(RuntimeError, match="reads provider secrets from environment variables only"):
+        adapter.build_longmemeval_recall_judge_agent(
+            "claude", secrets={"OPENROUTER_API_KEY": "x"}
+        )
