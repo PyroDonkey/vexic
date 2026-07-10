@@ -1130,14 +1130,21 @@ class HostedMemoryService:
         )
         return request.model_copy(update={"scope": scope}), tenant
 
-    def _local_service(self, tenant: HostedTenant) -> LocalMemoryService:
+    def storage_target_for(self, tenant: HostedTenant) -> str | StorageTarget:
+        """Resolve a tenant's memory storage: the customer-target resolver's
+        `StorageTarget` (Turso backend) when configured, else the local
+        `db_path`. Every read of tenant memory storage must go through this
+        seam; reading `tenant.db_path` directly bypasses the Turso backend."""
         target = (
             self._customer_target_resolver(tenant)
             if self._customer_target_resolver is not None
             else None
         )
-        db_path: str | StorageTarget = target if target is not None else tenant.db_path
-        needs_schema_init = target is not None
+        return target if target is not None else tenant.db_path
+
+    def _local_service(self, tenant: HostedTenant) -> LocalMemoryService:
+        db_path = self.storage_target_for(tenant)
+        needs_schema_init = isinstance(db_path, StorageTarget)
         service = LocalMemoryService(
             db_path=db_path,
             tenant_id=tenant.tenant_id,
