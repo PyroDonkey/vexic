@@ -539,6 +539,36 @@ class SweeperLifespanTests(unittest.TestCase):
             self.assertTrue(double.stopped)
 
 
+class SweeperObservabilityTests(unittest.TestCase):
+    def test_control_plane_app_enables_sweeper_info_logging(self) -> None:
+        # The deployed process is the uvicorn worker built through the
+        # control-plane create_app factory; the entrypoint parent execs
+        # uvicorn, so logging must be configured here or the sweeper's
+        # "Dream sweep tick" INFO telemetry never reaches stdout.
+        import logging
+
+        from vexic.hosted_control_plane_http import (
+            create_app as create_control_plane_app,
+        )
+
+        root_logger = logging.getLogger()
+        previous_level = root_logger.level
+        self.addCleanup(root_logger.setLevel, previous_level)
+        root_logger.setLevel(logging.WARNING)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = HostedMemoryService(
+                HostedTenantCatalog(Path(temp_dir)),
+                HostedApiKeyStore(Path(temp_dir)),
+                telemetry=None,
+            )
+            create_control_plane_app(service, control_plane_tokens=("token",))
+
+        self.assertTrue(
+            logging.getLogger("vexic.hosted_sweeper").isEnabledFor(logging.INFO)
+        )
+
+
 class SweeperConfigTests(unittest.TestCase):
     def test_defaults_enabled_with_documented_cadence(self) -> None:
         config = sweeper_config_from_env({})

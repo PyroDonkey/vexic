@@ -271,6 +271,87 @@ def test_live_adapter_embedding_can_run_inside_active_event_loop(
     assert asyncio.run(run()) == [[1.0] + [0.0] * 383]
 
 
+def test_live_adapter_extraction_request_carries_raised_max_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Wire-level proof for the dream-phase output cap: the extraction agent's
+    # outgoing request must carry max_tokens, and the cap must leave room for
+    # a reasoning model to think before emitting the structured candidate
+    # list (512 starved deepseek/deepseek-v4-pro into finish_reason=length).
+    from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+    adapter = _load_adapter()
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
+    monkeypatch.delenv("VEXIC_LIVE_MAX_OUTPUT_TOKENS", raising=False)
+    monkeypatch.delenv("VEXIC_LIVE_MODEL", raising=False)
+    monkeypatch.delenv("VEXIC_LIVE_RETRIEVAL_SMOKE_MODEL", raising=False)
+
+    captured: dict[str, object] = {}
+
+    class _RequestSeen(Exception):
+        pass
+
+    def record_request(messages: object, info: AgentInfo) -> object:
+        captured["model_settings"] = info.model_settings
+        raise _RequestSeen
+
+    agent = adapter.build_extraction_agent("retrieval-smoke")
+    with pytest.raises(_RequestSeen):
+        agent.run_sync(
+            "[message_id=1] user: hello", model=FunctionModel(record_request)
+        )
+
+    settings = captured["model_settings"]
+    assert settings is not None, "no model settings reached the request"
+    assert settings["max_tokens"] == 8192
+
+
+def test_live_adapter_per_agent_output_caps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Each dream agent gets an output budget sized to its job: extraction
+    # emits a structured candidate list after reasoning, summary emits prose,
+    # contradiction emits a single boolean judgment.
+    adapter = _load_adapter()
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
+    monkeypatch.delenv("VEXIC_LIVE_MAX_OUTPUT_TOKENS", raising=False)
+    monkeypatch.delenv("VEXIC_LIVE_MODEL", raising=False)
+    monkeypatch.delenv("VEXIC_LIVE_RETRIEVAL_SMOKE_MODEL", raising=False)
+    monkeypatch.delenv("VEXIC_SUMMARY_MODEL", raising=False)
+
+    assert (
+        adapter.build_extraction_agent("retrieval-smoke").model_settings["max_tokens"]
+        == 8192
+    )
+    assert (
+        adapter.build_summary_agent("summarize").model_settings["max_tokens"] == 4096
+    )
+    assert (
+        adapter.build_contradiction_agent("retrieval-smoke").model_settings[
+            "max_tokens"
+        ]
+        == 512
+    )
+
+
+def test_live_adapter_max_output_tokens_env_overrides_all_agents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _load_adapter()
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
+    monkeypatch.setenv("VEXIC_LIVE_MAX_OUTPUT_TOKENS", "1234")
+    monkeypatch.delenv("VEXIC_LIVE_MODEL", raising=False)
+    monkeypatch.delenv("VEXIC_LIVE_RETRIEVAL_SMOKE_MODEL", raising=False)
+    monkeypatch.delenv("VEXIC_SUMMARY_MODEL", raising=False)
+
+    for agent in (
+        adapter.build_extraction_agent("retrieval-smoke"),
+        adapter.build_summary_agent("summarize"),
+        adapter.build_contradiction_agent("retrieval-smoke"),
+    ):
+        assert agent.model_settings["max_tokens"] == 1234
+
+
 def test_live_adapter_builds_longmemeval_recall_judge_agent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
