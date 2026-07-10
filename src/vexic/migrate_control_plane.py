@@ -3,10 +3,12 @@ targets.
 
 The as-shipped move is the local ``control-plane.db`` on the Railway volume ->
 a managed Turso/libSQL control-plane database, activated by
-``VEXIC_CONTROL_PLANE_TARGET=turso``. The copy is idempotent
-(``INSERT OR IGNORE`` keyed on each table's own primary key), so re-running it
-is safe and converges. It reports only per-table row counts and never emits
-API-key hashes, tokens, or DSNs.
+``VEXIC_CONTROL_PLANE_TARGET=turso``. The copy requires an empty target
+(raises ``TargetNotEmptyError`` otherwise), walks tables parents-first so
+foreign-key enforcement cannot reject a child row, and uses plain ``INSERT``
+so any constraint conflict surfaces instead of being silently dropped.
+Completeness is then an exact per-table row-count match. It reports only
+per-table row counts and never emits API-key hashes, tokens, or DSNs.
 
 ``src/vexic`` never reads provider secrets: ``migrate_control_plane`` takes an
 already-resolved target (a filesystem ``Path``/``str`` or a ``StorageTarget``).
