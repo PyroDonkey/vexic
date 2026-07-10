@@ -2900,6 +2900,29 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(response.json()["messages_json"], [])
         self.assertNotIn("tenant a secret", response.text)
 
+    def test_load_active_context_recap_is_capped(self) -> None:
+        # recap_text rides outside the token budget, so the HTTP layer gives
+        # it the same hard character cap as other rendered-text egress.
+        from vexic.contract import LoadActiveContextResult
+        from vexic.hosted_http import MAX_EXPAND_HISTORY_CHARS, _cap_result
+
+        result = _cap_result(
+            LoadActiveContextResult(
+                messages_json=[],
+                recap_text="x" * (MAX_EXPAND_HISTORY_CHARS + 1),
+            )
+        )
+
+        self.assertEqual(len(result.recap_text or ""), MAX_EXPAND_HISTORY_CHARS)
+        self.assertTrue(result.truncated)
+
+    def test_load_active_context_models_are_top_level_exports(self) -> None:
+        import vexic
+
+        self.assertTrue(hasattr(vexic, "LoadActiveContextRequest"))
+        self.assertTrue(hasattr(vexic, "LoadActiveContextResult"))
+        self.assertIn("LoadActiveContextRequest", vexic.__all__)
+
     def test_load_active_context_has_rate_limit_rule(self) -> None:
         api_key = self._api_key(capabilities={MemoryCapability.FRESH_CONTEXT})
         service = HostedMemoryService(

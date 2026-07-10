@@ -613,9 +613,10 @@ staggered within a tick; a broken tenant or missing dream ports skips
 content-free without affecting the rest of the tick. Per-tenant opt-out:
 `dream_scheduling = 0` on the tenant catalog row
 (`HostedTenantCatalog.set_dream_scheduling`). Kill switch:
-`VEXIC_DREAM_SWEEPER=off`. Sweeper bookkeeping (last summarize watermark,
-last dream completion) lives in the control database's `dream_sweep_state`
-table.
+`VEXIC_DREAM_SWEEPER=off`. Sweeper bookkeeping (last completed summarize
+watermark and last dream completion, per (tenant, agent) scope, advanced
+monotonically and only after the scheduled job finishes) lives in the control
+database's `dream_sweep_state` table.
 
 ### Recorder-side backstop trigger
 

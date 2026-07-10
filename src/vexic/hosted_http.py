@@ -127,7 +127,7 @@ def create_app(
     sweeper: object | None = None,
 ) -> FastAPI:
     service = service or create_service_from_env()
-    lifespan = _sweeper_lifespan(sweeper) if sweeper is not None else None
+    lifespan = _sweeper_lifespan(sweeper, service) if sweeper is not None else None
     app = FastAPI(
         title="Vexic Hosted Memory",
         version=CONTRACT_VERSION,
@@ -719,7 +719,10 @@ def _cap_error(payload: MemoryRequest) -> JSONResponse | None:
     return None
 
 
-def _sweeper_lifespan(sweeper: object) -> Callable[[FastAPI], Any]:
+def _sweeper_lifespan(
+    sweeper: object,
+    service: HostedMemoryService,
+) -> Callable[[FastAPI], Any]:
     """App lifespan that runs the dream sweeper loop (ADR 0030) beside the
     serving loop and stops it cleanly on shutdown. `sweeper` is any object
     with `async run(stop: asyncio.Event)` -- the `DreamSweeper` in production,
@@ -740,11 +743,38 @@ def _sweeper_lifespan(sweeper: object) -> Callable[[FastAPI], Any]:
                 await asyncio.wait_for(task, timeout=10)
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 task.cancel()
+            # Drain in-flight background jobs (dream chains, trigger sweeps,
+            # sweep-state recorders) instead of letting loop teardown cancel
+            # them mid-write: worker threads cannot be interrupted, and a
+            # cancelled orchestrator would otherwise release its scope lock
+            # while the thread is still mutating storage.
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 60
+            while service._background_tasks:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                # Re-snapshot each pass: a finishing job spawns its
+                # sweep-state recorder task, which must drain too.
+                await asyncio.wait(list(service._background_tasks), timeout=remaining)
+            for leftover in list(service._background_tasks):
+                leftover.cancel()
 
     return lifespan
 
 
 def _cap_result(result: _ResultT) -> _ResultT:
+    recap = getattr(result, "recap_text", None)
+    if recap is not None and len(recap) > MAX_EXPAND_HISTORY_CHARS:
+        # The recap rides outside the token budget (it summarizes spans the
+        # budget excluded), so it needs its own hard cap; the original blocks
+        # stay recoverable via expand_history.
+        result = result.model_copy(
+            update={
+                "recap_text": recap[:MAX_EXPAND_HISTORY_CHARS],
+                "truncated": True,
+            }
+        )
     if hasattr(result, "text") and len(result.text) > MAX_EXPAND_HISTORY_CHARS:
         update: dict[str, object] = {
             "text": result.text[:MAX_EXPAND_HISTORY_CHARS],

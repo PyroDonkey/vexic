@@ -56,10 +56,13 @@ already read the same content rendered as text.
   match; full-body `scope` remains available.
 - Rate limit: its own `load_active_context` bucket at the fresh-context tier
   (30/60s).
-- Response size is bounded by the token budget rather than the
+- `messages_json` size is bounded by the token budget rather than the
   `MAX_EXPAND_HISTORY_CHARS` text cap (which would gut a 24k-token history
   read); the tail walk keeps at least the most recent message even when it
   alone exceeds the budget, so the worst case is one maximal ingested message.
+  `recap_text` rides outside the token budget and gets its own
+  `MAX_EXPAND_HISTORY_CHARS` cap at the HTTP layer (truncation sets
+  `truncated`; the original blocks stay recoverable via expand_history).
 - Every `messages_json` entry and `recap_text` pass the fail-closed egress
   redaction guard before return.
 

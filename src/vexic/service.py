@@ -65,7 +65,10 @@ from vexic.contract import (
     require_capability,
 )
 from vexic.ports import ContentCodec, DreamPhasePorts, EmbedTexts, missing_host_port
-from vexic.redaction import assert_no_forbidden_secret_values
+from vexic.redaction import (
+    assert_no_forbidden_secret_values,
+    assert_no_forbidden_secret_values_in_payload,
+)
 from vexic.storage import (
     TranscriptRangeTooLarge,
     SourceTranscriptInput,
@@ -584,13 +587,16 @@ class LocalMemoryService(MemoryService):
             timezone_name=request.timezone_name,
             content_codec=self.content_codec,
         )
-        messages_json = [
-            single_message_adapter.dump_json(message).decode()
-            for message in messages
-        ]
         redaction_values = self._redaction_values(request.redaction)
-        for item in messages_json:
-            assert_no_forbidden_secret_values(redaction_values, item)
+        messages_json: list[str] = []
+        for message in messages:
+            # Guard the structured form, not the serialized string: JSON
+            # escaping (newline -> \n, non-ASCII -> \uXXXX) can hide a
+            # forbidden value from a substring check that the client would
+            # reconstruct on parse.
+            payload = single_message_adapter.dump_python(message, mode="json")
+            assert_no_forbidden_secret_values_in_payload(redaction_values, payload)
+            messages_json.append(json.dumps(payload, ensure_ascii=False))
         recap = render_session_recap(
             self.db_path,
             session_id=session_id,

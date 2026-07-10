@@ -2760,6 +2760,74 @@ class LoadActiveContextTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
+    async def test_rejects_multiline_secret_hidden_by_json_escaping(self) -> None:
+        # JSON-serializing a message turns a newline into the two characters
+        # backslash-n, so a substring guard over the serialized string misses
+        # a multiline forbidden value that the client reconstructs on parse.
+        # The guard must run over the structured form.
+        from vexic.service import LocalMemoryService
+
+        secret = "token:\nABC123"
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        self._save(f"my credential is {secret}")
+
+        with self.assertRaisesRegex(ValueError, "forbidden secret"):
+            await service.load_active_context(
+                LoadActiveContextRequest(
+                    scope=_scope().model_copy(
+                        update={"capabilities": {MemoryCapability.FRESH_CONTEXT}}
+                    ),
+                    redaction=RedactionContext(forbidden_values=(secret,)),
+                )
+            )
+
+    async def test_active_context_pages_across_fetch_chunks(self) -> None:
+        # The token-budget walk pages newest-first in bounded chunks instead
+        # of fetching the whole session; crossing a chunk boundary must not
+        # change ordering or completeness.
+        import vexic.storage.session_summaries as session_summaries
+        from unittest.mock import patch as mock_patch
+
+        from vexic.service import LocalMemoryService
+        from vexic.storage.transcript import single_message_adapter
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        for index in range(5):
+            self._save(f"message {index}")
+
+        with mock_patch.object(session_summaries, "_ACTIVE_CONTEXT_FETCH_CHUNK", 2):
+            result = await service.load_active_context(self._request())
+
+        bodies = [
+            single_message_adapter.validate_json(item).parts[0].content
+            for item in result.messages_json
+        ]
+        self.assertEqual(bodies, [f"message {index}" for index in range(5)])
+
+    async def test_recap_render_accepts_non_filesystem_storage_target(self) -> None:
+        # Hosted customer databases arrive as StorageTarget objects, not
+        # filesystem paths; the recap renderer must not feed them to
+        # os.path.exists (TypeError) on the way to the query.
+        from unittest.mock import patch as mock_patch
+
+        from vexic.storage.session_summaries import render_session_recap
+
+        class _TargetStandIn:
+            """Not a str: mimics a StorageTarget reaching the renderer."""
+
+        with mock_patch(
+            "vexic.storage.session_summaries.fetch_session_summary_frontier",
+            return_value=[],
+        ):
+            rendered = render_session_recap(
+                _TargetStandIn(),  # type: ignore[arg-type]
+                session_id="session-a",
+            )
+
+        self.assertEqual(rendered, "")
+
     async def test_scopes_to_session_and_agent(self) -> None:
         from vexic.service import LocalMemoryService
         from vexic.storage.transcript import single_message_adapter

@@ -31,7 +31,7 @@ from vexic.hosted_sweeper import (
     sweeper_config_from_env,
 )
 from vexic.ports import DreamPhasePorts
-from vexic.storage import max_message_id, save_messages
+from vexic.storage import agent_watermarks, save_messages
 
 NOW = datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc)
 
@@ -143,7 +143,14 @@ class DreamSweeperTickTests(unittest.IsolatedAsyncioTestCase):
 
     def _sweeper(self, service: HostedMemoryService, **overrides: object) -> DreamSweeper:
         config = DreamSweeperConfig(stagger_seconds=0.0, **overrides)
-        return DreamSweeper(service, config)
+        # Deterministic stamps: the sweeper's clock returns whatever the test
+        # last assigned to `self.clock_now`.
+        self.clock_now = NOW
+        return DreamSweeper(service, config, clock=lambda: self.clock_now)
+
+    @staticmethod
+    def _scope_watermark(db_path: object, agent_id: str | None = None) -> int:
+        return dict(agent_watermarks(db_path))[agent_id]
 
     async def _drain_background(self, service: HostedMemoryService) -> None:
         while service._background_tasks:
@@ -284,15 +291,15 @@ class DreamSweeperTickTests(unittest.IsolatedAsyncioTestCase):
         report = await sweeper.tick(now=NOW)
 
         self.assertEqual(report.summarize_scheduled, 1)
-        state = self.catalog.dream_sweep_state("tenant-a")
+        state = self.catalog.dream_sweep_state("tenant-a", None)
         self.assertEqual(state.last_summarize_watermark, 0)
 
         gate.set()
         await self._drain_background(service)
 
-        state = self.catalog.dream_sweep_state("tenant-a")
+        state = self.catalog.dream_sweep_state("tenant-a", None)
         self.assertEqual(
-            state.last_summarize_watermark, max_message_id(tenant.db_path)
+            state.last_summarize_watermark, self._scope_watermark(tenant.db_path)
         )
 
     async def test_failed_summarize_run_still_advances_watermark(self) -> None:
@@ -313,9 +320,9 @@ class DreamSweeperTickTests(unittest.IsolatedAsyncioTestCase):
         await self._drain_background(service)
 
         self.assertEqual(_summary_row_count(tenant.db_path), 0)
-        state = self.catalog.dream_sweep_state("tenant-a")
+        state = self.catalog.dream_sweep_state("tenant-a", None)
         self.assertEqual(
-            state.last_summarize_watermark, max_message_id(tenant.db_path)
+            state.last_summarize_watermark, self._scope_watermark(tenant.db_path)
         )
 
     async def test_failed_dream_chain_still_records_completion(self) -> None:
@@ -337,19 +344,20 @@ class DreamSweeperTickTests(unittest.IsolatedAsyncioTestCase):
         await self._drain_background(service)
 
         self.assertEqual(report.dreams_scheduled, 1)
-        state = self.catalog.dream_sweep_state("tenant-a")
+        state = self.catalog.dream_sweep_state("tenant-a", None)
         self.assertEqual(state.last_dream_completed_at, NOW.isoformat())
 
         report_two = await sweeper.tick(now=NOW + timedelta(hours=1))
         await self._drain_background(service)
         self.assertEqual(report_two.dreams_scheduled, 0)
 
-    async def test_locked_scope_blocks_watermark_advance(self) -> None:
+    async def test_locked_scope_keeps_its_own_watermark_unadvanced(self) -> None:
         """A scope skipped by the in-flight lock never ran this tick's job,
-        so the tenant-wide watermark must not advance over its rows: the
-        next tick has to see them as new and retry, keeping the module's
-        "a lost tick or restart loses nothing" posture. This differs from
-        the in-band failure posture, where the job did run."""
+        so ITS watermark must not advance: the next tick has to see its rows
+        as new and retry. Sweep state is per (tenant, agent) scope, so the
+        unlocked scope's watermark still advances independently -- a locked
+        scope must not strand its neighbors, and a neighbor's failure posture
+        must not be defeated by every-tick retries."""
         tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
         _seed_compactable_span(tenant.db_path, agent_id=None)
         _seed_compactable_span(tenant.db_path, agent_id="agent-b")
@@ -371,27 +379,34 @@ class DreamSweeperTickTests(unittest.IsolatedAsyncioTestCase):
 
         report = await sweeper.tick(now=NOW)
         self.assertEqual(report.summarize_scheduled, 1)
+        self.assertEqual(report.skipped_locked, 1)
 
         gate.set()
         await self._drain_background(service)
 
-        state = self.catalog.dream_sweep_state("tenant-a")
-        self.assertEqual(state.last_summarize_watermark, 0)
+        # The unlocked shared scope advanced; the locked scope did not.
+        state = self.catalog.dream_sweep_state("tenant-a", None)
+        self.assertEqual(
+            state.last_summarize_watermark,
+            self._scope_watermark(tenant.db_path, None),
+        )
+        state_b = self.catalog.dream_sweep_state("tenant-a", "agent-b")
+        self.assertEqual(state_b.last_summarize_watermark, 0)
 
-        # Lock released: the next tick retries both scopes and only then
-        # advances the watermark.
+        # Lock released: the next tick retries only the locked scope.
         report_two = await sweeper.tick(now=NOW + timedelta(minutes=30))
         await self._drain_background(service)
-        self.assertEqual(report_two.summarize_scheduled, 2)
-        state = self.catalog.dream_sweep_state("tenant-a")
+        self.assertEqual(report_two.summarize_scheduled, 1)
+        state_b = self.catalog.dream_sweep_state("tenant-a", "agent-b")
         self.assertEqual(
-            state.last_summarize_watermark, max_message_id(tenant.db_path)
+            state_b.last_summarize_watermark,
+            self._scope_watermark(tenant.db_path, "agent-b"),
         )
 
-    async def test_locked_scope_blocks_dream_completion_stamp(self) -> None:
-        """A due dream that skipped a locked scope is not stamped completed:
-        the skipped scope's Light -> REM -> Deep chain would otherwise wait
-        a full dream interval instead of the next tick."""
+    async def test_locked_scope_keeps_its_own_dream_stamp_unset(self) -> None:
+        """A due dream skipped on a locked scope is not stamped for THAT
+        scope -- it retries next tick instead of waiting a full interval --
+        while an unlocked scope's completed chain stamps independently."""
         tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
         _seed_compactable_span(tenant.db_path, agent_id=None)
         _seed_compactable_span(tenant.db_path, agent_id="agent-b")
@@ -412,21 +427,24 @@ class DreamSweeperTickTests(unittest.IsolatedAsyncioTestCase):
 
         report = await sweeper.tick(now=NOW)
         self.assertEqual(report.dreams_scheduled, 1)
+        self.assertEqual(report.skipped_locked, 1)
 
         gate.set()
         await self._drain_background(service)
 
-        state = self.catalog.dream_sweep_state("tenant-a")
-        self.assertIsNone(state.last_dream_completed_at)
+        state = self.catalog.dream_sweep_state("tenant-a", None)
+        self.assertEqual(state.last_dream_completed_at, NOW.isoformat())
+        state_b = self.catalog.dream_sweep_state("tenant-a", "agent-b")
+        self.assertIsNone(state_b.last_dream_completed_at)
 
-        # Lock released: the dream is still due next tick, runs every scope,
-        # and only then records completion.
+        # Lock released: only the skipped scope's dream is still due.
         later = NOW + timedelta(minutes=30)
+        self.clock_now = later
         report_two = await sweeper.tick(now=later)
         await self._drain_background(service)
         self.assertEqual(report_two.dreams_scheduled, 1)
-        state = self.catalog.dream_sweep_state("tenant-a")
-        self.assertEqual(state.last_dream_completed_at, later.isoformat())
+        state_b = self.catalog.dream_sweep_state("tenant-a", "agent-b")
+        self.assertEqual(state_b.last_dream_completed_at, later.isoformat())
 
     async def test_summarize_only_ports_never_schedule_full_dreams(self) -> None:
         tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
@@ -487,6 +505,18 @@ class SweeperConfigTests(unittest.TestCase):
                 self.assertIsNone(
                     sweeper_config_from_env({"VEXIC_DREAM_SWEEPER": value})
                 )
+
+    def test_non_positive_cadences_fail_loud(self) -> None:
+        # A zero/negative tick would tight-loop the tenant scan; a
+        # non-positive dream interval would make full dreams due every tick.
+        for env in (
+            {"VEXIC_DREAM_SWEEP_TICK_SECONDS": "0"},
+            {"VEXIC_DREAM_SWEEP_TICK_SECONDS": "-5"},
+            {"VEXIC_DREAM_INTERVAL_SECONDS": "0"},
+        ):
+            with self.subTest(env=env):
+                with self.assertRaises(ValueError):
+                    sweeper_config_from_env(env)
 
     def test_intervals_are_env_tunable(self) -> None:
         config = sweeper_config_from_env(

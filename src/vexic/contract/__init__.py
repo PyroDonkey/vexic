@@ -377,7 +377,9 @@ class LoadActiveContextResult(MemoryResult):
     `messages_json` entries are individually serialized transcript messages in
     transcript-storage form (one JSON document per message). `recap_text` is
     None when the session has no summary frontier. `truncated` is True when
-    earlier session messages exist that the returned window omits.
+    the response omits available context: earlier session messages beyond the
+    returned window, or recap text past the transport cap (the omitted spans
+    stay recoverable via `expand_history`).
     """
     messages_json: list[str]
     recap_text: str | None = None

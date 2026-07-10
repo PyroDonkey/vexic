@@ -56,9 +56,12 @@ scheduling entirely.
 ### State, knobs, and retirement
 
 - Sweeper bookkeeping lives in the control database's `dream_sweep_state`
-  table (last summarize watermark, last dream completion). Ripeness and
-  budgets are still computed downstream per run, so lost state merely causes
-  a cheap redundant sweep.
+  table, keyed per (tenant, agent) scope: the last summarize watermark whose
+  job ran to completion and when the scope's last dream chain finished.
+  Writes are monotonic and happen only after the scheduled job completes
+  (a cancelled job leaves state untouched); ripeness and budgets are still
+  computed downstream per run, so lost state merely causes a cheap redundant
+  sweep.
 - Per-tenant opt-out: `tenants.dream_scheduling` column,
   `HostedTenantCatalog.set_dream_scheduling`.
 - Kill switch: `VEXIC_DREAM_SWEEPER=off`. Tenants are staggered within a
@@ -72,9 +75,12 @@ scheduling entirely.
 - Every hosted tenant gets summarize recaps and nightly promotion with zero
   per-tenant setup; hosts need no dream scheduling of their own (the
   Coalescent cutover relies on this).
-- Dream model spend is now service-initiated; the existing daily span budget,
-  6/hour-equivalent lock behavior, and per-phase job events are the cost and
-  audit controls, and `dream_scheduling = 0` is the per-tenant brake.
+- Dream model spend is now service-initiated; the cost and audit controls are
+  the existing daily span budget, the per-(tenant, agent) in-flight lock (one
+  chain per scope at a time; the worker thread pool bounds global
+  concurrency), per-phase job events, and `dream_scheduling = 0` as the
+  per-tenant brake. There is no per-hour rate rule on the system path -- the
+  tick interval is the cadence control.
 - Single-replica assumptions stand (in-process lock, in-process sweeper);
   multi-replica coordination remains future work tracked with the other
   ADR 0006 launch gates.
