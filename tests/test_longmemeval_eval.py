@@ -11,6 +11,8 @@ from unittest.mock import AsyncMock, patch
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 
 from vexic.longmemeval import (
+    build_parser,
+    main as longmemeval_main,
     LongMemEvalRecallJudgeInput,
     LongMemEvalRecallJudgeVerdict,
     _render_recall_judge_input,
@@ -1433,6 +1435,144 @@ class LongMemEvalJudgedRecallTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(diagnostics["judged_recall_pass"])
         self.assertEqual(diagnostics["judge_model_id"], "fake/judge-model")
         self.assertEqual(summary.judged_recall_supported, 1)
+
+
+_FAKE_ADAPTER_SOURCE = '''
+"""Fake eval adapter for CLI wiring tests."""
+
+PROVIDER = "fake"
+
+
+class _Agent:
+    async def run(self, prompt, *args, **kwargs):
+        raise RuntimeError("fake adapter agent should not run in CLI tests")
+
+
+def build_extraction_agent(model_group, secrets=None):
+    return _Agent()
+
+
+def build_contradiction_agent(model_group, secrets=None):
+    return _Agent()
+
+
+def build_longmemeval_recall_judge_agent(model_group, secrets=None):
+    return _Agent()
+
+
+def embed_texts(texts):
+    return [[0.0] * 4 for _ in texts]
+'''
+
+
+class LongMemEvalCliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _base_argv(self, *extra: str) -> list[str]:
+        return [
+            "--dataset",
+            str(self.root / "longmemeval_oracle.json"),
+            "--split",
+            "oracle",
+            "--output-dir",
+            str(self.root / "runs"),
+            *extra,
+        ]
+
+    def test_cli_parses_dream_session_batch_size(self) -> None:
+        args = build_parser().parse_args(
+            self._base_argv("--dream-session-batch-size", "3")
+        )
+        self.assertEqual(args.dream_session_batch_size, 3)
+
+    def test_cli_rejects_non_positive_dream_session_batch_size(self) -> None:
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(
+                self._base_argv("--dream-session-batch-size", "0")
+            )
+
+    def test_cli_defaults_match_documented_smoke_run(self) -> None:
+        args = build_parser().parse_args(self._base_argv())
+        self.assertEqual(args.limit, 12)
+        self.assertEqual(args.selection, "stratified")
+        self.assertEqual(args.model_group, "glm")
+        self.assertEqual(args.answer_mode, "retrieval-debug")
+        self.assertEqual(args.judge_model_group, "claude")
+        self.assertEqual(args.deep_top_n, 15)
+        self.assertFalse(args.skip_dream)
+        self.assertFalse(args.allow_live)
+
+    def test_cli_skip_dream_runs_without_adapter_or_allow_live(self) -> None:
+        summary = unittest.mock.MagicMock()
+        summary.judged_recall_total = None
+        summary.judged_recall_supported = None
+        runner = AsyncMock(return_value=summary)
+
+        with patch("vexic.longmemeval.run_longmemeval_subset", new=runner):
+            exit_code = longmemeval_main(self._base_argv("--skip-dream"))
+
+        self.assertEqual(exit_code, 0)
+        runner.assert_awaited_once()
+        self.assertTrue(runner.await_args.kwargs["skip_dream"])
+        self.assertIsNone(runner.await_args.kwargs["extraction_agent_factory"])
+        self.assertIsNone(runner.await_args.kwargs["judge_agent_factory"])
+
+    def test_cli_dream_run_requires_allow_live(self) -> None:
+        runner = AsyncMock()
+
+        with patch("vexic.longmemeval.run_longmemeval_subset", new=runner):
+            exit_code = longmemeval_main(self._base_argv())
+
+        self.assertEqual(exit_code, 0)
+        runner.assert_not_awaited()
+
+    def test_cli_wires_adapter_factories_for_judged_recall(self) -> None:
+        adapter_path = self.root / "fake_adapter.py"
+        adapter_path.write_text(_FAKE_ADAPTER_SOURCE, encoding="utf-8")
+        summary = unittest.mock.MagicMock()
+        summary.judged_recall_total = 1
+        summary.judged_recall_supported = 1
+        summary.judged_recall_by_question_type = {
+            "single-session-user": {"supported": 1, "total": 1}
+        }
+        summary.questions_started = 1
+        summary.questions_completed = 1
+        summary.questions_failed = 0
+        runner = AsyncMock(return_value=summary)
+
+        with patch("vexic.longmemeval.run_longmemeval_subset", new=runner):
+            exit_code = longmemeval_main(
+                self._base_argv(
+                    "--allow-live",
+                    "--adapter",
+                    str(adapter_path),
+                    "--answer-mode",
+                    "judged-recall",
+                )
+            )
+
+        self.assertEqual(exit_code, 0)
+        runner.assert_awaited_once()
+        kwargs = runner.await_args.kwargs
+        self.assertEqual(kwargs["answer_mode"], "judged-recall")
+        self.assertTrue(callable(kwargs["extraction_agent_factory"]))
+        self.assertTrue(callable(kwargs["contradiction_agent_factory"]))
+        self.assertTrue(callable(kwargs["judge_agent_factory"]))
+        self.assertTrue(callable(kwargs["embed"]))
+
+    def test_cli_dream_run_requires_adapter_path(self) -> None:
+        runner = AsyncMock()
+
+        with patch("vexic.longmemeval.run_longmemeval_subset", new=runner):
+            exit_code = longmemeval_main(self._base_argv("--allow-live"))
+
+        self.assertNotEqual(exit_code, 0)
+        runner.assert_not_awaited()
 
 
 if __name__ == "__main__":

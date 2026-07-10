@@ -11,17 +11,23 @@ factories per the host-port boundary; this module contains no provider wiring.
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import hashlib
+import importlib.util
 import json
 import re
 import sqlite3
+import sys
 import time
+import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from math import ceil
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field
@@ -1555,3 +1561,187 @@ async def run_longmemeval_subset(
             judged_recall_by_question_type if answer_mode == "judged-recall" else None
         ),
     )
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run a native Vexic LongMemEval memory harness subset."
+    )
+    parser.add_argument(
+        "--allow-live",
+        action="store_true",
+        help=(
+            "Permit provider-backed dream and judge calls through the adapter. "
+            "Required unless --skip-dream limits the run to local transcript FTS."
+        ),
+    )
+    parser.add_argument(
+        "--adapter",
+        type=Path,
+        default=None,
+        help=(
+            "Path to a host adapter module exposing build_extraction_agent, "
+            "build_contradiction_agent, embed_texts, and (for judged-recall) "
+            "build_longmemeval_recall_judge_agent, e.g. "
+            "adapters/openrouter_live_adapter.py."
+        ),
+    )
+    parser.add_argument("--dataset", required=True, type=Path)
+    parser.add_argument("--split", required=True, choices=("oracle", "s"))
+    parser.add_argument("--limit", default=12, type=int)
+    parser.add_argument(
+        "--selection",
+        default="stratified",
+        choices=("first", "stratified"),
+        help=(
+            "Select the first N rows, or round-robin rows across question_type "
+            "for a stratified diagnostic subset."
+        ),
+    )
+    parser.add_argument(
+        "--question-id",
+        action="append",
+        default=[],
+        help=(
+            "Run only this question_id from the selected subset. Repeat the flag "
+            "to retry multiple questions."
+        ),
+    )
+    parser.add_argument(
+        "--resume-from-run",
+        type=Path,
+        default=None,
+        help=(
+            "Path to a prior LongMemEval run directory. Rows with status=ok in "
+            "that run's diagnostics.jsonl are skipped."
+        ),
+    )
+    parser.add_argument("--max-sessions", type=int, default=None)
+    parser.add_argument("--dream-session-batch-size", type=_positive_int, default=1)
+    parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--model-group", default="glm")
+    parser.add_argument(
+        "--answer-mode",
+        default="retrieval-debug",
+        choices=("retrieval-debug", "tier2-debug", "tier3-debug", "judged-recall"),
+    )
+    parser.add_argument("--judge-model-group", default="claude")
+    parser.add_argument("--max-light-cycles", type=int, default=None)
+    parser.add_argument("--deep-top-n", type=int, default=15)
+    parser.add_argument(
+        "--skip-dream",
+        action="store_true",
+        help=(
+            "Skip Light/REM/Deep preparation for retrieval-debug transcript-FTS runs. "
+            "Diagnostics will mark the run as dream_skipped."
+        ),
+    )
+    return parser
+
+
+def _load_eval_adapter(path: Path, *, require_judge: bool) -> ModuleType:
+    if not path.exists():
+        raise ValueError(f"adapter not found: {path}")
+    module_name = f"vexic_longmemeval_adapter_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"could not load adapter: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    required = [
+        "build_extraction_agent",
+        "build_contradiction_agent",
+        "embed_texts",
+    ]
+    if require_judge:
+        required.append("build_longmemeval_recall_judge_agent")
+    for name in required:
+        if not callable(getattr(module, name, None)):
+            raise ValueError(f"adapter must define callable {name}.")
+    return module
+
+
+async def _amain(args: argparse.Namespace) -> int:
+    extraction_agent_factory: AgentFactory | None = None
+    contradiction_agent_factory: AgentFactory | None = None
+    judge_agent_factory: AgentFactory | None = None
+    embed: EmbedTexts | None = None
+    if not args.skip_dream:
+        if not args.allow_live:
+            print(
+                "LongMemEval run skipped; pass --allow-live to run provider-backed "
+                "dream phases, or --skip-dream for a local retrieval-debug run."
+            )
+            return 0
+        if args.adapter is None:
+            print("--adapter is required with --allow-live.", file=sys.stderr)
+            return 2
+        adapter = _load_eval_adapter(
+            args.adapter,
+            require_judge=args.answer_mode == "judged-recall",
+        )
+        extraction_agent_factory = adapter.build_extraction_agent
+        contradiction_agent_factory = adapter.build_contradiction_agent
+        embed = adapter.embed_texts
+        if args.answer_mode == "judged-recall":
+            judge_agent_factory = adapter.build_longmemeval_recall_judge_agent
+    summary = await run_longmemeval_subset(
+        args.dataset,
+        split=args.split,
+        output_dir=args.output_dir,
+        limit=args.limit,
+        max_sessions=args.max_sessions,
+        dream_session_batch_size=args.dream_session_batch_size,
+        model_group=args.model_group,
+        answer_mode=args.answer_mode,
+        judge_model_group=args.judge_model_group,
+        max_light_cycles=args.max_light_cycles,
+        deep_top_n=args.deep_top_n,
+        skip_dream=args.skip_dream,
+        selection=args.selection,
+        question_ids=tuple(args.question_id),
+        resume_from_run=args.resume_from_run,
+        extraction_agent_factory=extraction_agent_factory,
+        contradiction_agent_factory=contradiction_agent_factory,
+        judge_agent_factory=judge_agent_factory,
+        embed=embed,
+    )
+    print(f"Predictions: {summary.paths.predictions_path}")
+    print(f"Diagnostics: {summary.paths.diagnostics_path}")
+    print(
+        "Questions: "
+        f"{summary.questions_completed}/{summary.questions_started} completed, "
+        f"{summary.questions_failed} failed"
+    )
+    judged_total = getattr(summary, "judged_recall_total", None)
+    judged_supported = getattr(summary, "judged_recall_supported", None)
+    if judged_total is not None and judged_supported is not None:
+        rate = 0.0 if judged_total == 0 else judged_supported / judged_total
+        print(f"Judged recall: {judged_supported}/{judged_total} ({rate:.1%})")
+        by_type = getattr(summary, "judged_recall_by_question_type", None) or {}
+        for question_type in sorted(by_type):
+            bucket = by_type[question_type]
+            supported = bucket["supported"]
+            total = bucket["total"]
+            bucket_rate = 0.0 if total == 0 else supported / total
+            print(
+                f"  {question_type}: {supported}/{total} ({bucket_rate:.1%})"
+            )
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    return asyncio.run(_amain(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
