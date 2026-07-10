@@ -15,6 +15,10 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
 
 from vexic.embeddings import EMBEDDING_DIM
+from vexic.longmemeval import (
+    LONGMEMEVAL_RECALL_JUDGE_PROMPT,
+    LongMemEvalRecallJudgeVerdict,
+)
 from vexic.models import ContradictionJudgment, FactCandidate
 
 
@@ -196,6 +200,26 @@ def build_summary_agent(
     # model group like the other agent builders in this module.
     _reject_passed_secrets(secrets)
     return _agent_with_model(_summary_model_name(), str, SUMMARY_INSTRUCTIONS)
+
+
+def build_longmemeval_recall_judge_agent(
+    model_group: str,
+    secrets: Mapping[str, str] | None = None,
+) -> Agent[None, LongMemEvalRecallJudgeVerdict]:
+    # Recall judging is deterministic grading, not generation: pin temperature 0
+    # on top of the shared env-driven settings. The shared 512-token output cap
+    # is dropped so a long structured verdict reason cannot truncate into a
+    # judge error.
+    _reject_passed_secrets(secrets)
+    settings = _model_settings()
+    settings["temperature"] = 0
+    settings.pop("max_tokens", None)
+    return Agent(
+        OpenAIChatModel(_model_name(model_group), provider=_provider()),
+        output_type=LongMemEvalRecallJudgeVerdict,
+        instructions=LONGMEMEVAL_RECALL_JUDGE_PROMPT,
+        model_settings=settings,
+    )
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
