@@ -97,6 +97,7 @@ behavioral contract and the current `LocalMemoryService` v0.1 surface.
 | Search transcript | `SearchTranscriptRequest` | `memory:search` | Implemented |
 | Expand history | `ExpandHistoryRequest` | `memory:expand` | Implemented |
 | Fresh context | `FreshContextRequest` | `memory:fresh-context` | Implemented |
+| Load active context | `LoadActiveContextRequest` | `memory:fresh-context` | Implemented |
 | Search long-term | `SearchLongTermRequest` | `memory:search` | Implemented |
 | Record retrieval event | `RecordRetrievalEventRequest` | `memory:write` | Implemented |
 | Retire fact | `RetireFactRequest` | `memory:write` | Implemented |
@@ -184,6 +185,24 @@ containing this header as Tier 1 transcript; `ingest_source_transcript`
 independently rejects any row containing it
 (`reason="prime context is not transcript text"`), so injected priming never
 re-enters Tier 1 and is never re-summarized or re-extracted.
+
+## Load Active Context
+
+`LoadActiveContextRequest` is the structured sibling of fresh context for
+hosts that replay conversation state from Vexic instead of keeping their own
+transcript (ADR 0029). It is session-scoped and redaction-required, carries a
+`token_budget` (default `24_000`, HTTP-capped to the fresh-context range) and
+a `timezone_name` (default `"UTC"`) used by the fresh-window boundary
+heuristic. It requires `memory:fresh-context` -- same trust tier and purpose
+as fresh context (turn-start priming over the caller's own session), returning
+replayable structure instead of rendered text.
+
+`LoadActiveContextResult` carries `messages_json` (individually serialized
+transcript messages in transcript-storage form, token-budget bounded, ordered
+oldest-first), `recap_text` (the rendered summary-frontier recap, `None` when
+no frontier exists), and `truncated` (`True` when earlier session messages
+exist that the returned window omits). Both `messages_json` entries and
+`recap_text` run through the fail-closed redaction guard before return.
 
 ## Redaction
 
@@ -306,6 +325,7 @@ dependencies.
 | `search_memory` transcript behavior | `SearchTranscriptRequest` / `search_transcript` over scoped clean Transcript |
 | `search_long_term` | `SearchLongTermRequest` / `search_long_term` with durable facts first and candidate fallback on zero Tier 3 hits |
 | `expand_history` | `ExpandHistoryRequest` / privileged, session-scoped verbatim egress |
+| `load_active_context_messages` + recap | `LoadActiveContextRequest` / token-budgeted structured history plus summary recap for host turn start |
 | Light, REM, Deep | `vexic.pipeline`, `vexic.rem`, and `vexic.deep` primitives; host-supplied agent ports cover Light extraction and Deep contradiction only (REM is a local heuristic), with optional local embeddings and deferrable Deep contradiction |
 | Per-tenant SQLite `memory.db` | local SQLite adapter opened through validated scope/context |
 

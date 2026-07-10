@@ -182,11 +182,13 @@ rebuildable derived projection, not source of truth -- they can be
 regenerated from Tier 1. A daily span budget bounds how many rows a
 tenant(+agent) can add per UTC day.
 
-Summarize now has automatic producers rather than only a manual CLI run: an
-hourly cron workflow and a detached, fire-and-forget subprocess spawned from
-the Claude Code SessionStart recorder prime both call `POST
-/v1/trigger_dream_phase` (capability `memory:dream:trigger`), which schedules
-an async summarize sweep and returns at once (see ADR 0025 and
+Summarize now has automatic producers rather than only a manual CLI run: the
+in-server dream sweeper walks active tenants every tick and schedules
+summarize sweeps for scopes with new transcript rows plus a nightly full
+Light -> REM -> Deep -> Summarize chain per tenant (ADR 0030), and a
+detached, fire-and-forget subprocess spawned from the Claude Code
+SessionStart recorder prime calls `POST /v1/trigger_dream_phase` (capability
+`memory:dream:trigger`) as a between-tick backstop (see ADR 0025 and
 `docs/hosted-mvp.md`).
 
 ## Retrieval
@@ -232,6 +234,22 @@ frontier summary as `[Recap of messages N-M -- verbatim via expand_history]`,
 and the egress redaction guard applies to the assembled text before it
 returns. `FreshContextResult` carries `summaries`, `recent`, the assembled
 `text`, and a `truncated` flag.
+
+### Load Active Context
+
+Load active context is the structured sibling of fresh context for hosts that
+replay conversation state from Vexic instead of keeping a local transcript
+(ADR 0029). `LoadActiveContextRequest` is session-scoped, redaction-required,
+carries a `token_budget` (default 24,000) and a `timezone_name` for the
+fresh-window boundary heuristic, and requires the same `memory:fresh-context`
+capability. `LocalMemoryService.load_active_context` reuses
+`load_active_context_messages` (token-budgeted raw tail, cut at the idle-gap /
+local-3am boundary when the summary frontier covers the prefix) and
+`render_session_recap`, returning `messages_json` (individually serialized
+transcript messages a host can validate back into model messages),
+`recap_text`, and a `truncated` flag set when earlier session messages were
+omitted. Every serialized message and the recap pass the egress redaction
+guard before return.
 
 ## Redaction
 

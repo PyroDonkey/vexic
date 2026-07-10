@@ -2742,6 +2742,217 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(response.status_code, 429)
         self.assertIn("Retry-After", response.headers)
 
+    def test_load_active_context_returns_replayable_messages_and_recap(self) -> None:
+        api_key = self._api_key(
+            capabilities={MemoryCapability.WRITE, MemoryCapability.FRESH_CONTEXT}
+        )
+        first_ids = self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key),
+            json=self._append_body("summarized alpha"),
+        ).json()["message_ids"]
+        self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key),
+            json=self._append_body("tail beta"),
+        )
+        tenant = self.catalog.get_tenant("tenant-a")
+        record_session_summary(
+            tenant.db_path,
+            session_id="session-a",
+            agent_id=None,
+            kind="leaf",
+            first_message_id=first_ids[0],
+            last_message_id=first_ids[0],
+            summary_text="alpha recap",
+        )
+
+        response = self.client.post(
+            "/v1/load_active_context",
+            headers=self._write_headers(api_key),
+            json={},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        replayed = [
+            single_message_adapter.validate_json(item)
+            for item in body["messages_json"]
+        ]
+        self.assertEqual(
+            [message.parts[0].content for message in replayed],
+            ["summarized alpha", "tail beta"],
+        )
+        self.assertIn("alpha recap", body["recap_text"])
+        self.assertFalse(body["truncated"])
+
+    def test_expand_history_header_bound_returns_range_text(self) -> None:
+        api_key = self._api_key(
+            capabilities={MemoryCapability.WRITE, MemoryCapability.EXPAND_HISTORY}
+        )
+        message_ids = self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key),
+            json=self._append_body("expandable cedar detail"),
+        ).json()["message_ids"]
+
+        response = self.client.post(
+            "/v1/expand_history",
+            headers=self._write_headers(api_key),
+            json={
+                "first_message_id": message_ids[0],
+                "last_message_id": message_ids[0],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("expandable cedar detail", response.json()["text"])
+
+    def test_expand_history_header_bound_requires_scope_headers(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.EXPAND_HISTORY})
+
+        response = self.client.post(
+            "/v1/expand_history",
+            headers=self._auth(api_key),
+            json={"first_message_id": 1, "last_message_id": 1},
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_expand_history_header_bound_rejects_key_without_capability(self) -> None:
+        api_key = self._api_key(
+            capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH}
+        )
+
+        response = self.client.post(
+            "/v1/expand_history",
+            headers=self._write_headers(api_key),
+            json={"first_message_id": 1, "last_message_id": 1},
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_load_active_context_requires_api_key(self) -> None:
+        response = self.client.post("/v1/load_active_context", json={})
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_load_active_context_rejects_key_without_capability(self) -> None:
+        api_key = self._api_key(
+            capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH}
+        )
+
+        response = self.client.post(
+            "/v1/load_active_context",
+            headers=self._write_headers(api_key),
+            json={},
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_load_active_context_requires_scope_headers(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.FRESH_CONTEXT})
+
+        response = self.client.post(
+            "/v1/load_active_context",
+            headers=self._auth(api_key),
+            json={},
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_load_active_context_validates_token_budget_range(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.FRESH_CONTEXT})
+
+        for token_budget in (0, 24_001):
+            with self.subTest(token_budget=token_budget):
+                response = self.client.post(
+                    "/v1/load_active_context",
+                    headers=self._write_headers(api_key),
+                    json={"token_budget": token_budget},
+                )
+
+                self.assertEqual(response.status_code, 400)
+
+    def test_load_active_context_isolates_tenants(self) -> None:
+        api_key_a = self._api_key(
+            capabilities={MemoryCapability.WRITE, MemoryCapability.FRESH_CONTEXT},
+            tenant_id="tenant-a",
+        )
+        api_key_b = self._api_key(
+            capabilities={MemoryCapability.WRITE, MemoryCapability.FRESH_CONTEXT},
+            tenant_id="tenant-b",
+            project_ids={"project-b"},
+        )
+        self.client.post(
+            "/v1/append_transcript",
+            headers=self._write_headers(api_key_a),
+            json=self._append_body("tenant a secret"),
+        )
+
+        response = self.client.post(
+            "/v1/load_active_context",
+            headers=self._write_headers(api_key_b, project_id="project-b"),
+            json={},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["messages_json"], [])
+        self.assertNotIn("tenant a secret", response.text)
+
+    def test_load_active_context_recap_is_capped(self) -> None:
+        # recap_text rides outside the token budget, so the HTTP layer gives
+        # it the same hard character cap as other rendered-text egress.
+        from vexic.contract import LoadActiveContextResult
+        from vexic.hosted_http import MAX_EXPAND_HISTORY_CHARS, _cap_result
+
+        result = _cap_result(
+            LoadActiveContextResult(
+                messages_json=[],
+                recap_text="x" * (MAX_EXPAND_HISTORY_CHARS + 1),
+            )
+        )
+
+        self.assertEqual(len(result.recap_text or ""), MAX_EXPAND_HISTORY_CHARS)
+        self.assertTrue(result.truncated)
+
+    def test_load_active_context_models_are_top_level_exports(self) -> None:
+        import vexic
+
+        self.assertTrue(hasattr(vexic, "LoadActiveContextRequest"))
+        self.assertTrue(hasattr(vexic, "LoadActiveContextResult"))
+        self.assertIn("LoadActiveContextRequest", vexic.__all__)
+
+    def test_load_active_context_has_rate_limit_rule(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.FRESH_CONTEXT})
+        service = HostedMemoryService(
+            self.catalog,
+            self.keys,
+            telemetry=self.catalog,
+            rate_limiter=HostedInMemoryRateLimiter(
+                operation_rules={
+                    "load_active_context": HostedRateLimitRule(
+                        limit=1, window_seconds=60
+                    ),
+                },
+            ),
+        )
+        client = TestClient(create_app(service))
+
+        client.post(
+            "/v1/load_active_context",
+            headers=self._write_headers(api_key),
+            json={},
+        )
+        response = client.post(
+            "/v1/load_active_context",
+            headers=self._write_headers(api_key),
+            json={},
+        )
+
+        self.assertEqual(response.status_code, 429)
+        self.assertIn("Retry-After", response.headers)
+
     def _prepare_dream_phase_run(self) -> tuple[str, Path]:
         """Provision a tenant with one appended message and a fake adapter file.
 

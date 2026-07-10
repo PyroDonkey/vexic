@@ -89,6 +89,7 @@ operations:
 - `search_transcript`
 - `expand_history`
 - `fresh_context`
+- `load_active_context`
 - `search_long_term`
 - `record_retrieval_event`
 - `retire_fact`

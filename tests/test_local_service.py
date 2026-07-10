@@ -24,6 +24,7 @@ from vexic.contract import (
     DreamPhase,
     ExportScopeRequest,
     FreshContextRequest,
+    LoadActiveContextRequest,
     IngestSourceTranscriptRequest,
     PRIME_CONTEXT_HEADER,
     RecordRetrievalEventRequest,
@@ -2643,6 +2644,214 @@ class FreshContextTests(unittest.IsolatedAsyncioTestCase):
             await service.fresh_context(
                 FreshContextRequest(scope=scope, redaction=redaction)
             )
+
+
+class LoadActiveContextTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.temp_dir.name) / "memory.db")
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _save(
+        self,
+        text: str,
+        *,
+        session_id: str = "default",
+        agent_id: str | None = None,
+    ) -> int:
+        return save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content=text)])],
+            session_id=session_id,
+            agent_id=agent_id,
+        )[0]
+
+    def _request(self, **kwargs: object) -> LoadActiveContextRequest:
+        return LoadActiveContextRequest(
+            scope=_scope().model_copy(
+                update={"capabilities": {MemoryCapability.FRESH_CONTEXT}}
+            ),
+            redaction=RedactionContext(forbidden_values=()),
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+    async def test_returns_saved_messages_as_replayable_message_json(self) -> None:
+        from vexic.service import LocalMemoryService
+        from vexic.storage.transcript import single_message_adapter
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        self._save("first turn")
+        self._save("second turn")
+
+        result = await service.load_active_context(self._request())
+
+        replayed = [
+            single_message_adapter.validate_json(item)
+            for item in result.messages_json
+        ]
+        self.assertEqual(len(replayed), 2)
+        self.assertEqual(replayed[0].parts[0].content, "first turn")
+        self.assertEqual(replayed[1].parts[0].content, "second turn")
+        self.assertIsNone(result.recap_text)
+        self.assertFalse(result.truncated)
+
+    async def test_recap_text_renders_summary_frontier(self) -> None:
+        from vexic.service import LocalMemoryService
+        from vexic.storage import record_session_summary
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        first_id = self._save("early message")
+        self._save("recent message")
+        record_session_summary(
+            self.db_path,
+            session_id="default",
+            agent_id=None,
+            kind="leaf",
+            first_message_id=first_id,
+            last_message_id=first_id,
+            summary_text="early recap",
+        )
+
+        result = await service.load_active_context(self._request())
+
+        self.assertIn(
+            f"[Recap of messages {first_id}-{first_id} -- verbatim via expand_history]",
+            result.recap_text or "",
+        )
+        self.assertIn("early recap", result.recap_text or "")
+
+    async def test_truncated_flags_omitted_earlier_messages(self) -> None:
+        from vexic.service import LocalMemoryService
+        from vexic.storage.transcript import single_message_adapter
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        self._save("x" * 4000)
+        self._save("kept tail")
+
+        result = await service.load_active_context(self._request(token_budget=1))
+
+        replayed = [
+            single_message_adapter.validate_json(item)
+            for item in result.messages_json
+        ]
+        self.assertEqual(len(replayed), 1)
+        self.assertEqual(replayed[0].parts[0].content, "kept tail")
+        self.assertTrue(result.truncated)
+
+    async def test_requires_fresh_context_capability(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        self._save("anything")
+
+        with self.assertRaises(PermissionError):
+            await service.load_active_context(
+                LoadActiveContextRequest(
+                    scope=_scope().model_copy(
+                        update={"capabilities": {MemoryCapability.SEARCH}}
+                    ),
+                    redaction=RedactionContext(forbidden_values=()),
+                )
+            )
+
+    async def test_rejects_multiline_secret_hidden_by_json_escaping(self) -> None:
+        # JSON-serializing a message turns a newline into the two characters
+        # backslash-n, so a substring guard over the serialized string misses
+        # a multiline forbidden value that the client reconstructs on parse.
+        # The guard must run over the structured form.
+        from vexic.service import LocalMemoryService
+
+        secret = "token:\nABC123"
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        self._save(f"my credential is {secret}")
+
+        with self.assertRaisesRegex(ValueError, "forbidden secret"):
+            await service.load_active_context(
+                LoadActiveContextRequest(
+                    scope=_scope().model_copy(
+                        update={"capabilities": {MemoryCapability.FRESH_CONTEXT}}
+                    ),
+                    redaction=RedactionContext(forbidden_values=(secret,)),
+                )
+            )
+
+    async def test_active_context_pages_across_fetch_chunks(self) -> None:
+        # The token-budget walk pages newest-first in bounded chunks instead
+        # of fetching the whole session; crossing a chunk boundary must not
+        # change ordering or completeness.
+        import vexic.storage.session_summaries as session_summaries
+        from unittest.mock import patch as mock_patch
+
+        from vexic.service import LocalMemoryService
+        from vexic.storage.transcript import single_message_adapter
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        for index in range(5):
+            self._save(f"message {index}")
+
+        with mock_patch.object(session_summaries, "_ACTIVE_CONTEXT_FETCH_CHUNK", 2):
+            result = await service.load_active_context(self._request())
+
+        bodies = [
+            single_message_adapter.validate_json(item).parts[0].content
+            for item in result.messages_json
+        ]
+        self.assertEqual(bodies, [f"message {index}" for index in range(5)])
+
+    async def test_recap_render_accepts_non_filesystem_storage_target(self) -> None:
+        # Hosted customer databases arrive as StorageTarget objects, not
+        # filesystem paths; the recap renderer must not feed them to
+        # os.path.exists (TypeError) on the way to the query.
+        from unittest.mock import patch as mock_patch
+
+        from vexic.storage.session_summaries import render_session_recap
+
+        class _TargetStandIn:
+            """Not a str: mimics a StorageTarget reaching the renderer."""
+
+        with mock_patch(
+            "vexic.storage.session_summaries.fetch_session_summary_frontier",
+            return_value=[],
+        ):
+            rendered = render_session_recap(
+                _TargetStandIn(),  # type: ignore[arg-type]
+                session_id="session-a",
+            )
+
+        self.assertEqual(rendered, "")
+
+    async def test_scopes_to_session_and_agent(self) -> None:
+        from vexic.service import LocalMemoryService
+        from vexic.storage.transcript import single_message_adapter
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        self._save("session a msg", session_id="session-a")
+        self._save("session b msg", session_id="session-b")
+        self._save("agent msg", session_id="session-a", agent_id="agent-1")
+
+        result = await service.load_active_context(
+            LoadActiveContextRequest(
+                scope=_scope(session_id="session-a").model_copy(
+                    update={"capabilities": {MemoryCapability.FRESH_CONTEXT}}
+                ),
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+
+        bodies = [
+            single_message_adapter.validate_json(item).parts[0].content
+            for item in result.messages_json
+        ]
+        self.assertEqual(bodies, ["session a msg"])
 
 
 class WithEventsSortedTests(unittest.TestCase):

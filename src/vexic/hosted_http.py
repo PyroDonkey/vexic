@@ -19,6 +19,7 @@ from vexic.contract import (
     ExpandHistoryResult,
     ExpandHistoryRequest,
     FreshContextRequest,
+    LoadActiveContextRequest,
     MemoryCapability,
     MemoryRequest,
     MemoryResult,
@@ -103,13 +104,35 @@ class _HeaderBoundFreshContextBody(BaseModel):
     redaction: RedactionContext = RedactionContext(forbidden_values=())
 
 
+class _HeaderBoundLoadActiveContextBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token_budget: int = 24_000
+    timezone_name: str = "UTC"
+    redaction: RedactionContext = RedactionContext(forbidden_values=())
+
+
+class _HeaderBoundExpandHistoryBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    first_message_id: int
+    last_message_id: int
+    redaction: RedactionContext = RedactionContext(forbidden_values=())
+
+
 def create_app(
     service: HostedMemoryService | None = None,
     *,
     mcp_forbidden_secret_values: tuple[str, ...] = (),
+    sweeper: object | None = None,
 ) -> FastAPI:
     service = service or create_service_from_env()
-    app = FastAPI(title="Vexic Hosted Memory", version=CONTRACT_VERSION)
+    lifespan = _sweeper_lifespan(sweeper, service) if sweeper is not None else None
+    app = FastAPI(
+        title="Vexic Hosted Memory",
+        version=CONTRACT_VERSION,
+        lifespan=lifespan,
+    )
     register_mcp_routes(
         app,
         service,
@@ -174,20 +197,18 @@ def create_app(
         )
 
     @app.post("/v1/expand_history")
-    async def expand_history(request: Request, payload: ExpandHistoryRequest) -> JSONResponse:
-        return await _handle(
-            request,
-            payload,
-            lambda api_key, body: service.expand_history(
-                api_key,
-                body,
-                max_rows=MAX_EXPAND_HISTORY_MESSAGES,
-            ),
-        )
+    async def expand_history(request: Request, payload: dict[str, Any]) -> JSONResponse:
+        return await _handle_expand_history(request, payload, service)
 
     @app.post("/v1/fresh_context")
     async def fresh_context(request: Request, payload: dict[str, Any]) -> JSONResponse:
         return await _handle_fresh_context(request, payload, service)
+
+    @app.post("/v1/load_active_context")
+    async def load_active_context(
+        request: Request, payload: dict[str, Any]
+    ) -> JSONResponse:
+        return await _handle_load_active_context(request, payload, service)
 
     @app.post("/v1/trigger_dream_phase")
     async def trigger_dream_phase(request: Request, payload: dict[str, Any]) -> JSONResponse:
@@ -389,7 +410,7 @@ async def _handle_fresh_context(
             auth = _authenticate_for_header_scope(service, api_key)
             fresh = _HeaderBoundFreshContextBody.model_validate(body)
             payload = FreshContextRequest(
-                scope=_fresh_context_scope_from_headers(request, auth),
+                scope=_session_scope_from_headers(request, auth),
                 token_budget=fresh.token_budget,
                 redaction=fresh.redaction,
             )
@@ -410,7 +431,98 @@ async def _handle_fresh_context(
     return await _handle_payload(api_key, payload, service.fresh_context)
 
 
-def _fresh_context_scope_from_headers(request: Request, auth: HostedAuthContext) -> MemoryScope:
+async def _handle_expand_history(
+    request: Request,
+    body: dict[str, Any],
+    service: HostedMemoryService,
+) -> JSONResponse:
+    api_key = _api_key(request)
+    if api_key is None:
+        return _error_response(401, "unauthorized", "Missing hosted API key.")
+    try:
+        if "scope" in body:
+            payload = ExpandHistoryRequest.model_validate(body)
+        else:
+            auth = _authenticate_for_header_scope(service, api_key)
+            parsed = _HeaderBoundExpandHistoryBody.model_validate(body)
+            payload = ExpandHistoryRequest(
+                scope=_session_scope_from_headers(
+                    request,
+                    auth,
+                    capability=MemoryCapability.EXPAND_HISTORY,
+                ),
+                first_message_id=parsed.first_message_id,
+                last_message_id=parsed.last_message_id,
+                redaction=parsed.redaction,
+            )
+    except ValidationError:
+        return _error_response(
+            422,
+            "invalid_request",
+            "Request body does not match the Vexic contract.",
+        )
+    except PermissionError as exc:
+        if str(exc) == "Invalid hosted API key.":
+            return _error_response(401, "unauthorized", "Invalid hosted API key.")
+        return _error_response(403, "permission_denied", str(exc))
+    except ValueError as exc:
+        return _error_response(400, "invalid_request", str(exc))
+    except Exception:
+        return _error_response(500, "internal_error", "Hosted memory request failed.")
+    return await _handle_payload(
+        api_key,
+        payload,
+        lambda key, body_payload: service.expand_history(
+            key,
+            body_payload,
+            max_rows=MAX_EXPAND_HISTORY_MESSAGES,
+        ),
+    )
+
+
+async def _handle_load_active_context(
+    request: Request,
+    body: dict[str, Any],
+    service: HostedMemoryService,
+) -> JSONResponse:
+    api_key = _api_key(request)
+    if api_key is None:
+        return _error_response(401, "unauthorized", "Missing hosted API key.")
+    try:
+        if "scope" in body:
+            payload = LoadActiveContextRequest.model_validate(body)
+        else:
+            auth = _authenticate_for_header_scope(service, api_key)
+            parsed = _HeaderBoundLoadActiveContextBody.model_validate(body)
+            payload = LoadActiveContextRequest(
+                scope=_session_scope_from_headers(request, auth),
+                token_budget=parsed.token_budget,
+                timezone_name=parsed.timezone_name,
+                redaction=parsed.redaction,
+            )
+    except ValidationError:
+        return _error_response(
+            422,
+            "invalid_request",
+            "Request body does not match the Vexic contract.",
+        )
+    except PermissionError as exc:
+        if str(exc) == "Invalid hosted API key.":
+            return _error_response(401, "unauthorized", "Invalid hosted API key.")
+        return _error_response(403, "permission_denied", str(exc))
+    except ValueError as exc:
+        return _error_response(400, "invalid_request", str(exc))
+    except Exception:
+        return _error_response(500, "internal_error", "Hosted memory request failed.")
+    return await _handle_payload(api_key, payload, service.load_active_context)
+
+
+def _session_scope_from_headers(
+    request: Request,
+    auth: HostedAuthContext,
+    *,
+    capability: MemoryCapability = MemoryCapability.FRESH_CONTEXT,
+) -> MemoryScope:
     project_id = request.headers.get("x-vexic-project-id")
     if project_id is None or not project_id.strip():
         raise ValueError("X-Vexic-Project-Id header is required.")
@@ -427,7 +539,7 @@ def _fresh_context_scope_from_headers(request: Request, auth: HostedAuthContext)
         agent_id=agent_id,
         principal=auth.principal,
         trust_boundary=TrustBoundary.NETWORKED,
-        capabilities={MemoryCapability.FRESH_CONTEXT},
+        capabilities={capability},
     )
 
 
@@ -592,7 +704,7 @@ def _cap_error(payload: MemoryRequest) -> JSONResponse | None:
                 "invalid_request",
                 "first_message_id must be less than or equal to last_message_id.",
             )
-    if isinstance(payload, FreshContextRequest):
+    if isinstance(payload, (FreshContextRequest, LoadActiveContextRequest)):
         if not (
             MIN_FRESH_CONTEXT_TOKEN_BUDGET
             <= payload.token_budget
@@ -607,7 +719,62 @@ def _cap_error(payload: MemoryRequest) -> JSONResponse | None:
     return None
 
 
+def _sweeper_lifespan(
+    sweeper: object,
+    service: HostedMemoryService,
+) -> Callable[[FastAPI], Any]:
+    """App lifespan that runs the dream sweeper loop (ADR 0030) beside the
+    serving loop and stops it cleanly on shutdown. `sweeper` is any object
+    with `async run(stop: asyncio.Event)` -- the `DreamSweeper` in production,
+    a double in tests."""
+    import asyncio
+    from contextlib import asynccontextmanager
+    from collections.abc import AsyncIterator
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        stop = asyncio.Event()
+        task = asyncio.create_task(sweeper.run(stop))  # type: ignore[attr-defined]
+        try:
+            yield
+        finally:
+            stop.set()
+            try:
+                await asyncio.wait_for(task, timeout=10)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                task.cancel()
+            # Drain in-flight background jobs (dream chains, trigger sweeps,
+            # sweep-state recorders) instead of letting loop teardown cancel
+            # them mid-write: worker threads cannot be interrupted, and a
+            # cancelled orchestrator would otherwise release its scope lock
+            # while the thread is still mutating storage.
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 60
+            while service._background_tasks:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                # Re-snapshot each pass: a finishing job spawns its
+                # sweep-state recorder task, which must drain too.
+                await asyncio.wait(list(service._background_tasks), timeout=remaining)
+            for leftover in list(service._background_tasks):
+                leftover.cancel()
+
+    return lifespan
+
+
 def _cap_result(result: _ResultT) -> _ResultT:
+    recap = getattr(result, "recap_text", None)
+    if recap is not None and len(recap) > MAX_EXPAND_HISTORY_CHARS:
+        # The recap rides outside the token budget (it summarizes spans the
+        # budget excluded), so it needs its own hard cap; the original blocks
+        # stay recoverable via expand_history.
+        result = result.model_copy(
+            update={
+                "recap_text": recap[:MAX_EXPAND_HISTORY_CHARS],
+                "truncated": True,
+            }
+        )
     if hasattr(result, "text") and len(result.text) > MAX_EXPAND_HISTORY_CHARS:
         update: dict[str, object] = {
             "text": result.text[:MAX_EXPAND_HISTORY_CHARS],

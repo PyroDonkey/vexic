@@ -156,6 +156,7 @@ The HTTP API accepts `Authorization: Bearer <raw-key>` or `X-Vexic-Api-Key` on
 - `POST /v1/search_long_term`
 - `POST /v1/expand_history`
 - `POST /v1/fresh_context`
+- `POST /v1/load_active_context`
 - `POST /mcp`
 - `/control/v1/*` when started through `vexic.hosted_control_plane_http`
 
@@ -588,32 +589,40 @@ Model used for summarization: `VEXIC_SUMMARY_MODEL`, read by
 `adapters/openrouter_live_adapter.py`'s `build_summary_agent`, defaulting to
 `deepseek/deepseek-v4-pro`.
 
-### Cron producer
+### In-server dream sweeper (ADR 0030)
 
-`.github/workflows/dream-cron.yml` fires the trigger endpoint hourly
-(`schedule: "0 * * * *"`, plus `workflow_dispatch` for hand-testing). It is
-deliberately dumb: no per-tenant matrix, no retry logic beyond `curl`'s own
-`--retry 2`; the endpoint owns dedup, rate limiting, and budget enforcement,
-so overlapping or redundant fires are cheap no-ops (`skipped`/`429`), never
-double work. A non-2xx response fails the workflow run red on purpose -- that
-is the intended v1 alerting signal, and it never blocks anything else in the
-repo.
+The deployed app runs its own periodic sweeper in the FastAPI lifespan
+(`vexic.hosted_sweeper.DreamSweeper`) -- this replaced the earlier
+single-tenant `dream-cron.yml` GitHub workflow and its three repo secrets.
+Every tick (`VEXIC_DREAM_SWEEP_TICK_SECONDS`, default 1800) it walks every
+active tenant in the catalog and, per recorded agent scope:
 
-Required GitHub secrets (operator-configured; not present until an operator
-sets them):
+- schedules a summarize sweep when the tenant has new transcript rows since
+  the last swept watermark (cheap `MAX(id)` check before opening anything
+  else), and
+- schedules a full Light -> REM -> Deep -> Summarize chain when the tenant's
+  dream interval (`VEXIC_DREAM_INTERVAL_SECONDS`, default 86400) has elapsed
+  since the last completed chain.
 
-- `VEXIC_DREAM_TRIGGER_URL` -- the full `https://.../v1/trigger_dream_phase`
-  URL for the deployed hosted service.
-- `VEXIC_DREAM_TRIGGER_KEY` -- a raw API key carrying `memory:dream:trigger`.
-- `VEXIC_DREAM_PROJECT_ID` -- the `X-Vexic-Project-Id` header value the
-  trigger key is bound to (the sweep itself is still tenant-wide per the
-  scoping note above; this only authenticates the call).
+Scheduling reuses the trigger endpoint's machinery through
+`HostedMemoryService.schedule_system_dream`: pre-bound, server-minted
+requests under a `system` principal (`dream-sweeper`), the per-(tenant,
+agent) in-flight dedup lock, worker-thread event-loop isolation, per-phase
+job events, and the daily span budget all apply unchanged. Tenants are
+staggered within a tick; a broken tenant or missing dream ports skips
+content-free without affecting the rest of the tick. Per-tenant opt-out:
+`dream_scheduling = 0` on the tenant catalog row
+(`HostedTenantCatalog.set_dream_scheduling`). Kill switch:
+`VEXIC_DREAM_SWEEPER=off`. Sweeper bookkeeping (last completed summarize
+watermark and last dream completion, per (tenant, agent) scope, advanced
+monotonically and only after the scheduled job finishes) lives in the control
+database's `dream_sweep_state` table.
 
 ### Recorder-side backstop trigger
 
 `recorder prime` (invoked from the Claude Code SessionStart hook) spawns a
 detached, fire-and-forget `vexic recorder trigger-dream` subprocess before
-doing its normal priming work, as a backstop between hourly cron ticks. This
+doing its normal priming work, as a backstop between in-server sweeper ticks (ADR 0030). This
 adds no serial latency to the hook: the subprocess is spawned with
 `stdin`/`stdout`/`stderr` all `DEVNULL` and `start_new_session=True` (an
 inherited stdout pipe would keep the hook's own stdout open until the child

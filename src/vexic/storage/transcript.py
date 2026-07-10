@@ -23,7 +23,7 @@ from vexic.ports import ContentCodec
 from vexic.storage.errors import is_operational_error, is_unique_violation
 from vexic.storage.schema import _assert_no_forbidden_secret_values, _fts_match_query
 from vexic.text_utils import estimate_tokens
-from vexic.storage.connection import connect
+from vexic.storage.connection import StorageTarget, connect
 
 # Tier 1 — the append-only transcript. Owns message (de)serialization, the
 # messages_fts shadow that init_db builds, and the read/write/search surface.
@@ -232,6 +232,37 @@ def load_messages(
             for msg in messages_adapter.validate_python(json_list)
         ]
         return _trim_unpaired_tool_messages(messages)
+
+
+def agent_watermarks(db_path: str | StorageTarget) -> list[tuple[str | None, int]]:
+    """Highest transcript row id per recorded agent scope (including the NULL
+    shared scope), one cheap aggregate query. The sweeper's per-scope
+    new-messages watermark check (ADR 0030); sweeps match ``agent_id``
+    exactly, so each scope is tracked individually."""
+    with closing(connect(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT agent_id, MAX(id) FROM messages GROUP BY agent_id"
+        ).fetchall()
+    return [(row[0], int(row[1])) for row in rows]
+
+
+def count_session_messages(
+    db_path: str,
+    *,
+    session_id: str = "default",
+    agent_id: str | None = None,
+) -> int:
+    with closing(connect(db_path)) as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM messages
+            WHERE session_id = ?
+                AND agent_id IS ?
+            """,
+            (session_id, agent_id),
+        ).fetchone()
+        return int(row[0])
 
 
 def _message_token_estimate(msg: ModelMessage) -> int:

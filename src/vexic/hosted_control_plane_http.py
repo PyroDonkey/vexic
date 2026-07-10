@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse, Response
 from vexic.hosted import HostedJobEvent, HostedMemoryService, HostedUsageEvent
 from vexic.hosted_http import create_app as create_hosted_memory_app
 from vexic.hosted_http import create_service_from_env
+from vexic.hosted_sweeper import DreamSweeper, sweeper_config_from_env
 from vexic.hosted_local import (
     HostedApiKeyRecord,
     HostedProjectRecord,
@@ -43,9 +44,17 @@ def create_app(
     service = service or create_service_from_env()
     if control_plane_tokens is None:
         control_plane_tokens = _control_plane_tokens_from_env()
+    # In-server dream sweeper (ADR 0030): the deployed app schedules per-tenant
+    # summarize + nightly dream sweeps itself. Requires dream ports; without
+    # them every job would fail closed, so the sweeper stays off.
+    sweeper = None
+    sweeper_config = sweeper_config_from_env(os.environ)
+    if sweeper_config is not None and service.dream_phase_ports is not None:
+        sweeper = DreamSweeper(service, sweeper_config)
     app = create_hosted_memory_app(
         service,
         mcp_forbidden_secret_values=mcp_forbidden_secret_values,
+        sweeper=sweeper,
     )
     register_control_plane_routes(
         app,

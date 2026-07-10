@@ -33,6 +33,8 @@ from vexic.contract import (
     FreshContextResult,
     IngestSourceTranscriptRequest,
     IngestSourceTranscriptResult,
+    LoadActiveContextRequest,
+    LoadActiveContextResult,
     RunDreamPhaseRequest,
     RunDreamPhaseResult,
     TriggerDreamPhaseRequest,
@@ -369,6 +371,7 @@ class _RateBucket:
 _EXPENSIVE_OPERATION_LIMITS = {
     "expand_history": HostedRateLimitRule(limit=30, window_seconds=60),
     "fresh_context": HostedRateLimitRule(limit=30, window_seconds=60),
+    "load_active_context": HostedRateLimitRule(limit=30, window_seconds=60),
     "run_dream_phase": HostedRateLimitRule(limit=6, window_seconds=3600),
     "export_scope": HostedRateLimitRule(limit=6, window_seconds=3600),
     "replay_scope": HostedRateLimitRule(limit=6, window_seconds=3600),
@@ -585,6 +588,19 @@ class HostedMemoryService:
             request,
             request.required_capability,
             lambda bound, tenant: self._local_service(tenant).fresh_context(bound),
+        )
+
+    async def load_active_context(
+        self,
+        api_key: str,
+        request: LoadActiveContextRequest,
+    ) -> LoadActiveContextResult:
+        return await self._call(
+            "load_active_context",
+            api_key,
+            request,
+            request.required_capability,
+            lambda bound, tenant: self._local_service(tenant).load_active_context(bound),
         )
 
     async def search_long_term(
@@ -835,6 +851,142 @@ class HostedMemoryService:
                 self.telemetry.record_job_event(event)
             except Exception:
                 pass
+
+    def schedule_system_dream(
+        self,
+        tenant_id: str,
+        *,
+        agent_id: str | None,
+        phases: tuple[DreamPhase, ...],
+    ) -> "asyncio.Task[None] | None":
+        """In-server sweeper seam (ADR 0030): schedule pre-bound dream phases
+        for one tenant+agent scope under a system principal — no API key.
+
+        Mirrors the trigger endpoint's containment exactly: the minted
+        `RunDreamPhaseRequest`s never re-enter `_call`/`_bind_request`, the
+        per-(tenant, agent) in-flight lock dedups against concurrent triggers,
+        and execution happens on a worker-thread event loop. Returns the
+        background task, or None when the scope is already running. Raises
+        `HostPortNotConfigured` when the requested phases' ports are absent so
+        the sweeper can skip fail-closed instead of scheduling doomed jobs.
+        """
+        ports = self.dream_phase_ports
+        if ports is None:
+            raise missing_host_port("Dream phase")
+        if DreamPhase.SUMMARIZE in phases and ports.summary_agent_factory is None:
+            raise missing_host_port("Dream phase")
+        if DreamPhase.LIGHT in phases and ports.extraction_agent_factory is None:
+            raise missing_host_port("Dream phase")
+        tenant = self.catalog.get_tenant(tenant_id)
+        lock_key = (tenant_id, agent_id)
+        if not self._acquire_dream_trigger_lock(lock_key):
+            return None
+        try:
+            principal = Principal(
+                principal_id="dream-sweeper",
+                principal_type=PrincipalType.SYSTEM,
+            )
+            auth = HostedAuthContext(
+                key_id="system:dream-sweeper",
+                tenant_id=tenant_id,
+                principal=principal,
+                capabilities=frozenset({MemoryCapability.ADMIN_REBUILD}),
+                project_ids=tenant.project_ids,
+            )
+            minted_scope = MemoryScope(
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                principal=principal,
+                trust_boundary=TrustBoundary.LOCAL_TRUSTED,
+                capabilities={MemoryCapability.ADMIN_REBUILD},
+            )
+            minted_requests = tuple(
+                RunDreamPhaseRequest(
+                    scope=minted_scope,
+                    phase=phase,
+                    redaction=RedactionContext(forbidden_values=()),
+                )
+                for phase in phases
+            )
+            task = asyncio.create_task(
+                self._run_system_dream_job(minted_requests, tenant, auth, lock_key)
+            )
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        except BaseException:
+            # Same wedge-prevention rule as `_schedule_dream_trigger`: any
+            # failure between lock acquisition and task handoff must release
+            # the lock or every later sweep of this scope silently skips.
+            self._release_dream_trigger_lock(lock_key)
+            raise
+        return task
+
+    async def _run_system_dream_job(
+        self,
+        requests: tuple[RunDreamPhaseRequest, ...],
+        tenant: HostedTenant,
+        auth: HostedAuthContext,
+        lock_key: tuple[str, str | None],
+    ) -> None:
+        """Run the sweeper's minted phases sequentially on a worker-thread
+        event loop (same isolation rationale as `_run_dream_trigger_job`).
+        A failing phase records its error and stops the chain — a Deep run
+        over a failed Light extraction would promote from stale candidates."""
+        try:
+            for request in requests:
+                job_id = secrets.token_hex(8)
+                self._record_dream_trigger_job(job_id, request, auth, status="running")
+
+                def _run_in_worker_thread(
+                    bound: RunDreamPhaseRequest = request,
+                ) -> tuple[RunDreamPhaseResult, UsageSummary]:
+                    return asyncio.run(self._run_dream_phase_with_usage(bound, tenant))
+
+                try:
+                    _result, usage = await asyncio.to_thread(_run_in_worker_thread)
+                except asyncio.CancelledError:
+                    # Shutdown cancellation: the worker thread cannot be
+                    # interrupted and may still be finishing its phase, so
+                    # record the orchestration as errored (callers must not
+                    # treat the chain as swept) and propagate.
+                    self._record_dream_trigger_job(
+                        job_id,
+                        request,
+                        auth,
+                        status="error",
+                        error_type="CancelledError",
+                    )
+                    raise
+                except Exception as exc:
+                    self._record_dream_trigger_job(
+                        job_id,
+                        request,
+                        auth,
+                        status="error",
+                        error_type=type(exc).__name__,
+                    )
+                    self.record_job_usage(
+                        operation="run_dream_phase",
+                        tenant_id=auth.tenant_id,
+                        principal_id=auth.principal.principal_id,
+                        status="error",
+                        error_type=type(exc).__name__,
+                        project_id=request.scope.project_id,
+                        key_id=auth.key_id,
+                    )
+                    return
+                self._record_dream_trigger_job(job_id, request, auth, status="ok")
+                self.record_job_usage(
+                    operation="run_dream_phase",
+                    tenant_id=auth.tenant_id,
+                    principal_id=auth.principal.principal_id,
+                    status="ok",
+                    usage=usage,
+                    project_id=request.scope.project_id,
+                    key_id=auth.key_id,
+                )
+        finally:
+            self._release_dream_trigger_lock(lock_key)
 
     async def export_scope(
         self,
