@@ -299,16 +299,17 @@ rows portable through export/replay, proving hosted adapter conformance against
 local SQLite behavior, and treating FTS/vector tables as rebuildable projections
 rather than source of truth.
 
-The deployed hosted alpha splits storage across two tiers (ADR 0019, with the
-as-shipped correction in its Addendum 4; full description in
-`docs/hosted-mvp.md`). Customer memory -- transcript, candidates, long-term
-facts, and dream-run records -- lives in a per-tenant managed Turso/libSQL
-database, addressed by the control-plane catalog's `tenants.customer_target`
-DSN. The control-plane catalog itself (tenant registry, API keys, operational
-telemetry, and the dream sweeper's `dream_sweep_state`) stays in a single local
-SQLite `control-plane.db` on the Railway volume under `VEXIC_HOSTED_ROOT`. A
-managed control-plane store (Neon Postgres) remains a deferred readiness
-target, not the current posture.
+The deployed hosted alpha splits storage across two tiers (ADR 0019, cutover
+executed in its Addendum 5; full description in `docs/hosted-mvp.md`). Customer
+memory -- transcript, candidates, long-term facts, and dream-run records --
+lives in a per-tenant managed Turso/libSQL database, addressed by the
+control-plane catalog's `tenants.customer_target` DSN. The control-plane
+catalog itself (tenant registry, API keys, operational telemetry, and the dream
+sweeper's `dream_sweep_state`) runs in a separate managed Turso control-plane
+database, selected by `VEXIC_CONTROL_PLANE_TARGET=turso`. Both tiers are on
+Turso; the local `control-plane.db` on the Railway volume under
+`VEXIC_HOSTED_ROOT` is retained only as a rollback handle. Turso, not Neon, is
+the committed managed control-plane store (Addendum 5).
 
 ## v0.1 Service Surface
 

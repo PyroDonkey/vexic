@@ -316,3 +316,52 @@ of this correction.
 The eventual managed control-plane store remains ADR 0008's readiness target
 and this ADR's deferred Neon Postgres promotion; that work, when taken, is the
 place to actually move `control-plane.db` off the Railway volume.
+
+## Addendum 5 -- 2026-07-10: control-plane cutover executed (COA-360)
+
+Addendum 4 recorded that the control-plane catalog had stayed local. That is no
+longer true: the catalog was moved to managed Turso/libSQL and the deployed
+Railway alpha now runs on it. This addendum supersedes Addendum 4's
+"stayed local" status and the Decision's original narrowing.
+
+What shipped and was executed:
+
+- **Wiring (COA-360).** A `VEXIC_CONTROL_PLANE_TARGET` selection flag
+  (`local` default, `turso`) routes the catalog and API-key store through
+  `control_plane_target(env)` in `create_service_from_env`, independent of the
+  customer-memory `VEXIC_STORAGE_BACKEND` flag. The `control_plane_target`
+  helper is no longer dead code -- it is the wired runtime path. Setting the
+  flag to `turso` is reversible: unset it and the service reads the local
+  `control-plane.db` again.
+- **Auth cache.** With the catalog remote, each API-key check is a network
+  round-trip, so `HostedApiKeyStore` gained a short-TTL in-process auth cache
+  (active only against a `StorageTarget`), evicted on revoke. Its bounded
+  multi-replica stale-revocation window is documented in code as an accepted
+  risk that is zero on the current single instance and must be revisited before
+  a second replica.
+- **Migration.** `vexic.migrate_control_plane` copies every control-plane table
+  from the local `control-plane.db` into an empty Turso target, parents-first
+  (foreign-key-safe), with plain `INSERT` and exact row-count verification, and
+  emits counts only (never key hashes). The dogfood catalog (3 tenants, their
+  API keys, and operational telemetry) was migrated this way and verified.
+
+Consequently the tenant registry, API keys, operational telemetry, and
+`dream_sweep_state` now live in the managed Turso control-plane database, not in
+the Railway-volume `control-plane.db`. That local file is retained, unwritten,
+as the instant rollback target. This realizes clean frontend / backend /
+database tier separation: the database tier (customer memory and control plane
+both on Turso) no longer lives inside the backend's compute volume.
+
+Direction change: the eventual managed control-plane store is now **Turso**, the
+same provider as customer memory, decided in favor of provider consolidation and
+the already-built libSQL seam over ADR 0008's deferred Neon Postgres target.
+Neon is no longer the planned control-plane home; the "libSQL catalog to Neon"
+second cutover named in the Consequences is retired.
+
+Backup posture (current tier reality): the deployment is on Turso's free tier,
+which has no point-in-time recovery, so the Turso PITR recovery mechanism named
+in "Backup, restore, and readiness" above is not available here. DR is instead
+scripted `turso db dump` exports of the control-plane and per-tenant databases
+(a scheduled GitHub Actions workflow), plus the retained local `control-plane.db`
+as a rollback handle. Turso PITR remains the intended mechanism if the
+deployment moves to a paid tier.

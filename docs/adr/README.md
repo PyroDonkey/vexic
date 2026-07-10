@@ -57,12 +57,13 @@ Notes:
   response) are tracked by COA-263. The 0005/0008 Turso/Neon production cutover
   (the hosted alpha currently runs SQLite on a Railway volume) is tracked by
   COA-264, and ADR 0019 records how that cutover starts: Turso-only as a
-  bootstrap posture. As shipped (ADR 0019 Addendum 4, COA-359), only customer
-  memory moved to per-tenant managed libSQL; the control-plane catalog and
-  API-key store stayed local on the Railway volume (`control-plane.db`), so the
-  Decision's "control-plane catalog on managed libSQL" was narrowed to
-  customer-memory-only. The Neon Postgres control plane is deferred to a later
-  promotion before external-customer memory. ADR 0019's 2026-07-01 addendum
+  bootstrap posture. Customer memory moved to per-tenant managed libSQL first
+  (Addendum 2); the control-plane catalog and API-key store followed later
+  (ADR 0019 Addendum 5, COA-360), so both now run on Turso, gated by
+  `VEXIC_CONTROL_PLANE_TARGET`. (Addendum 4 recorded the interim period when
+  only customer memory had moved.) The eventual managed control-plane store is
+  Turso, not Neon; ADR 0008's deferred Neon Postgres control plane is retired
+  (Addendum 5). ADR 0019's 2026-07-01 addendum
   records the implementation clarifications from a real-Turso verification spike
   and design audit (token is a separate `connect` arg via a secret-bearing
   `StorageTarget`, per-tenant tokens minted short-lived, init-once schema memo,

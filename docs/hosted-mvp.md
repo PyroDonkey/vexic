@@ -312,12 +312,16 @@ through the connection's separate `auth_token` argument). `src/vexic` never
 reads Turso credentials from the environment; the repo-root `adapters/`
 directory does that, per ADR 0008/0013 precedent.
 
-- **Non-secret backend flag.** `resolve_storage_backend` (in `vexic.hosted`)
-  reads `VEXIC_STORAGE_BACKEND` (`"local"` default, or `"turso"`) and is safe
-  to keep in `src/vexic` because it carries no credential. `local` is the
-  unchanged filesystem-SQLite path; `turso` keeps the control-plane catalog
-  and API-key store local/filesystem-rooted and routes only customer-memory
-  storage to per-tenant Turso databases.
+- **Non-secret backend flags.** `resolve_storage_backend` (in `vexic.hosted`)
+  reads `VEXIC_STORAGE_BACKEND` (`"local"` default, or `"turso"`) and routes
+  customer-memory storage: `local` is the filesystem-SQLite path, `turso`
+  routes it to per-tenant Turso databases. The control-plane catalog and
+  API-key store are routed *separately* by `resolve_control_plane_target`
+  reading `VEXIC_CONTROL_PLANE_TARGET` (`"local"` default, or `"turso"`, ADR
+  0019 Addendum 5 / COA-360); `turso` sends the catalog to a managed Turso
+  control-plane database via `control_plane_target(env)`. Both flags carry no
+  credential, so both stay in `src/vexic`. The deployed alpha runs both on
+  `turso`.
 - **Per-tenant provisioning, not a shared dogfood override.** `adapters/turso_adapter.py`
   provides `TursoProvisioningPort` (`create_database`/`mint_token`/`destroy_database`/
   `provision`, all against the Turso Platform API, mocked HTTP transport in
@@ -424,16 +428,20 @@ The image installs Python 3.13 dependencies with `uv` and includes
 
 Alpha storage split: the Turso/libSQL cutover (ADR 0019, see "Turso/libSQL
 Storage Backend" above) has landed on the deployed Railway alpha, which runs
-`VEXIC_STORAGE_BACKEND=turso`. Customer memory lives in per-tenant Turso
-databases addressed by the control-plane `tenants.customer_target` DSN, not on
-the volume. The control-plane catalog and API-key store stay
-filesystem-rooted, so the Railway persistent volume is still mounted at
-`/data/vexic` with `VEXIC_HOSTED_ROOT=/data/vexic`; `control-plane.db` is the
-only database that legitimately lives there.
+`VEXIC_STORAGE_BACKEND=turso` and `VEXIC_CONTROL_PLANE_TARGET=turso`. Customer
+memory lives in per-tenant Turso databases addressed by the control-plane
+`tenants.customer_target` DSN. The control-plane catalog and API-key store also
+run on Turso (ADR 0019 Addendum 5 / COA-360), migrated off the volume with
+`vexic.migrate_control_plane`. The Railway persistent volume stays mounted at
+`/data/vexic` (`VEXIC_HOSTED_ROOT=/data/vexic`), but the `control-plane.db` it
+holds is now a retained rollback handle -- unset `VEXIC_CONTROL_PLANE_TARGET`
+to fall back to it -- not the live catalog.
 
 Any `customer-*.db` files left on the volume are vestigial artifacts of the
-pre-cutover layout. Do not read them to inspect tenant memory: resolve
-`tenants.customer_target` and query the Turso database instead.
+pre-cutover layout, as is the now-unwritten `control-plane.db`. Do not read them
+to inspect live state: resolve `tenants.customer_target` (customer memory) or
+the Turso control-plane database (catalog, keys, `dream_sweep_state`) and query
+Turso instead.
 
 Required Railway config (variable names only; values are set in the Railway
 service, never committed):
@@ -761,10 +769,11 @@ ready.
 
 Not production/customer-data ready yet:
 
-- no production control-plane catalog, audit store, usage store, or job ledger
-  (the control-plane catalog and API-key store stay local/filesystem-rooted
-  even under `VEXIC_STORAGE_BACKEND=turso`; only customer memory moved to
-  per-tenant Turso databases -- see "Turso/libSQL Storage Backend" above);
+- the control-plane catalog, audit/usage/job stores, and API-key store now run
+  on managed Turso (`VEXIC_CONTROL_PLANE_TARGET=turso`, ADR 0019 Addendum 5 /
+  COA-360), but on Turso's free tier with no point-in-time recovery: backup is
+  scripted `turso db dump` exports (`.github/workflows/turso-backup.yml`), not
+  managed PITR, and the customer-readiness durability bar is not met;
 - no customer-readiness restore drill signed off end-to-end, incident
   tabletop/security-review signoff, network hardening, distributed rate
   limiting, or implemented support-access workflow; the Railway-volume alpha
