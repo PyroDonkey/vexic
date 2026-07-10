@@ -35,12 +35,26 @@ _ControlPlaneParams = ParamSpec("_ControlPlaneParams")
 _ControlPlaneResponseT = TypeVar("_ControlPlaneResponseT", bound=Response)
 
 
+def _configure_hosted_logging() -> None:
+    # The hosted entrypoint execs uvicorn, so any logging configured in the
+    # parent process is discarded, and uvicorn's own log config touches only
+    # its `uvicorn.*` loggers. Without this, the root logger sits at WARNING
+    # and the sweeper's INFO telemetry ("Dream sweep tick") never reaches the
+    # deployed process's stdout/stderr. Configure here, in the app factory the
+    # uvicorn worker actually calls. Only raise verbosity, never lower it.
+    logging.basicConfig(level=logging.INFO)
+    root_logger = logging.getLogger()
+    if root_logger.getEffectiveLevel() > logging.INFO:
+        root_logger.setLevel(logging.INFO)
+
+
 def create_app(
     service: HostedMemoryService | None = None,
     *,
     mcp_forbidden_secret_values: tuple[str, ...] = (),
     control_plane_tokens: tuple[str, ...] | None = None,
 ) -> FastAPI:
+    _configure_hosted_logging()
     service = service or create_service_from_env()
     if control_plane_tokens is None:
         control_plane_tokens = _control_plane_tokens_from_env()
