@@ -11,6 +11,9 @@ from unittest.mock import AsyncMock, patch
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 
 from vexic.longmemeval import (
+    LongMemEvalRecallJudgeInput,
+    LongMemEvalRecallJudgeVerdict,
+    _render_recall_judge_input,
     _select_instances,
     drain_light_then_consolidate,
     drain_light_then_rem,
@@ -20,7 +23,26 @@ from vexic.longmemeval import (
     question_db_path,
     run_longmemeval_subset,
 )
-from vexic.storage import init_db, save_messages, search_messages
+from vexic.storage import (
+    CandidateNote,
+    LongTermFact,
+    init_db,
+    save_messages,
+    search_messages,
+)
+
+
+class _FakeRecallJudge:
+    def __init__(self, verdict: LongMemEvalRecallJudgeVerdict) -> None:
+        self.verdict = verdict
+        self.calls: list[LongMemEvalRecallJudgeInput] = []
+
+    async def __call__(
+        self,
+        judge_input: LongMemEvalRecallJudgeInput,
+    ) -> LongMemEvalRecallJudgeVerdict:
+        self.calls.append(judge_input)
+        return self.verdict
 
 
 class TimestampedTranscriptIngestTests(unittest.TestCase):
@@ -596,6 +618,821 @@ class LongMemEvalArtifactTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"status": "ok"', diagnostics)
         self.assertIn('"deep_top_n": 15', diagnostics)
         self.assertIn('"candidate_fallback_used": false', diagnostics)
+
+    async def test_subset_tier3_debug_dreams_then_retrieves_long_term_facts(self) -> None:
+        dataset_path = self.root / "longmemeval_oracle.json"
+        dataset_path.write_text(
+            json.dumps([self._dataset_row("q-tier3", "single-session-user", "cedar")]),
+            encoding="utf-8",
+        )
+        drain = AsyncMock(return_value=_fake_dream_result())
+        facts = [
+            LongTermFact(
+                fact_id=7,
+                fact_text="The benchmark code was cedar.",
+                subject="benchmark",
+                category="fact",
+                importance=5,
+                confidence=0.9,
+                source_message_ids=[1],
+                retrieved_count=0,
+                used_count=0,
+            )
+        ]
+        retrieve = AsyncMock(return_value=facts)
+        secrets = {"OPENROUTER_API_KEY": "tenant-openrouter"}
+
+        with (
+            patch("vexic.longmemeval.drain_light_then_consolidate", new=drain),
+            patch("vexic.longmemeval.retrieve_long_term_facts", new=retrieve),
+        ):
+            summary = await run_longmemeval_subset(
+                dataset_path,
+                split="oracle",
+                output_dir=self.root / "runs",
+                limit=1,
+                model_group="claude",
+                answer_mode="tier3-debug",
+                secrets=secrets,
+                deep_top_n=3,
+            )
+
+        drain.assert_awaited_once()
+        retrieve.assert_awaited_once()
+        self.assertTrue(
+            retrieve.await_args.args[0].endswith("memory.db"),
+            retrieve.await_args.args[0],
+        )
+        self.assertEqual(retrieve.await_args.args[1], "What benchmark code was mentioned?")
+        self.assertEqual(retrieve.await_args.kwargs["model_group"], "claude")
+        self.assertEqual(retrieve.await_args.kwargs["secrets"], secrets)
+        self.assertEqual(retrieve.await_args.kwargs["session_id"], "longmemeval:q-tier3:answer")
+
+        prediction = json.loads(
+            summary.paths.predictions_path.read_text(encoding="utf-8")
+        )
+        diagnostics = json.loads(
+            summary.paths.diagnostics_path.read_text(encoding="utf-8")
+        )
+
+        self.assertIn("[fact 7]", prediction["hypothesis"])
+        self.assertIn("cedar", prediction["hypothesis"])
+        self.assertEqual(diagnostics["answer_mode"], "tier3-debug")
+        self.assertFalse(diagnostics["dream_skipped"])
+        self.assertEqual(diagnostics["deep_top_n"], 3)
+        self.assertEqual(diagnostics["retrieved_long_term_fact_count"], 1)
+        self.assertTrue(diagnostics["answer_found_in_tier1"])
+        self.assertTrue(diagnostics["answer_retrieved_from_tier3"])
+
+    async def test_subset_tier3_debug_returns_explicit_empty_when_no_facts_retrieved(
+        self,
+    ) -> None:
+        dataset_path = self.root / "longmemeval_oracle.json"
+        dataset_path.write_text(
+            json.dumps(
+                [self._dataset_row("q-tier3-empty", "single-session-user", "cedar")]
+            ),
+            encoding="utf-8",
+        )
+        drain = AsyncMock(return_value=_fake_dream_result())
+        retrieve = AsyncMock(return_value=[])
+        fallback = AsyncMock(return_value=[])
+
+        with (
+            patch("vexic.longmemeval.drain_light_then_consolidate", new=drain),
+            patch("vexic.longmemeval.retrieve_long_term_facts", new=retrieve),
+            patch("vexic.longmemeval.retrieve_candidate_fallback", new=fallback),
+        ):
+            summary = await run_longmemeval_subset(
+                dataset_path,
+                split="oracle",
+                output_dir=self.root / "runs",
+                limit=1,
+                model_group="claude",
+                answer_mode="tier3-debug",
+            )
+
+        prediction = json.loads(
+            summary.paths.predictions_path.read_text(encoding="utf-8")
+        )
+        diagnostics = json.loads(
+            summary.paths.diagnostics_path.read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(prediction["hypothesis"], "No long-term memories found.")
+        self.assertEqual(diagnostics["retrieved_long_term_fact_count"], 0)
+        self.assertEqual(diagnostics["retrieved_candidate_note_count"], 0)
+        self.assertFalse(diagnostics["candidate_fallback_used"])
+        fallback.assert_not_awaited()
+
+    async def test_judged_recall_uses_candidate_fallback_when_tier3_is_empty(
+        self,
+    ) -> None:
+        dataset_path = self.root / "longmemeval_oracle.json"
+        dataset_path.write_text(
+            json.dumps(
+                [self._dataset_row("q-judged-fallback", "single-session-user", "cedar")]
+            ),
+            encoding="utf-8",
+        )
+        drain = AsyncMock(return_value=_fake_dream_result())
+        retrieve = AsyncMock(return_value=[])
+        fallback = AsyncMock(
+            return_value=[
+                CandidateNote(
+                    candidate_id=1,
+                    fact_text="The benchmark code was cedar.",
+                    category="fact",
+                    source_message_ids=[1],
+                    created_at="2026-01-02T03:04:05+00:00",
+                )
+            ]
+        )
+        judge = _FakeRecallJudge(
+            LongMemEvalRecallJudgeVerdict(
+                verdict="supported",
+                reason="The retrieved note states the benchmark code.",
+                confidence=0.95,
+            )
+        )
+
+        with (
+            patch("vexic.longmemeval.drain_light_then_consolidate", new=drain),
+            patch("vexic.longmemeval.retrieve_long_term_facts", new=retrieve),
+            patch("vexic.longmemeval.retrieve_candidate_fallback", new=fallback),
+        ):
+            summary = await run_longmemeval_subset(
+                dataset_path,
+                split="oracle",
+                output_dir=self.root / "runs",
+                limit=1,
+                model_group="claude",
+                answer_mode="judged-recall",
+                judge_scorer=judge,
+            )
+
+        prediction = json.loads(
+            summary.paths.predictions_path.read_text(encoding="utf-8")
+        )
+        diagnostics = json.loads(
+            summary.paths.diagnostics_path.read_text(encoding="utf-8")
+        )
+
+        self.assertIn("[unverified note]", prediction["hypothesis"])
+        self.assertIn("The benchmark code was cedar.", prediction["hypothesis"])
+        self.assertTrue(diagnostics["candidate_fallback_used"])
+        self.assertEqual(diagnostics["retrieved_long_term_fact_count"], 0)
+        self.assertEqual(diagnostics["retrieved_candidate_note_count"], 1)
+        self.assertFalse(diagnostics["answer_retrieved_from_tier3"])
+        self.assertEqual(
+            judge.calls[0].retrieved_fact_texts,
+            (
+                "[unverified note] The benchmark code was cedar.\n"
+                "(category: fact, recently noted, not yet confirmed, source messages: 1)",
+            ),
+        )
+
+    async def test_subset_retrieval_debug_does_not_call_tier3_retrieval(self) -> None:
+        dataset_path = self.root / "longmemeval_oracle.json"
+        dataset_path.write_text(
+            json.dumps(
+                [self._dataset_row("q-tier1-only", "single-session-user", "cedar")]
+            ),
+            encoding="utf-8",
+        )
+        drain = AsyncMock(return_value=_fake_dream_result())
+        retrieve = AsyncMock()
+
+        with (
+            patch("vexic.longmemeval.drain_light_then_consolidate", new=drain),
+            patch("vexic.longmemeval.retrieve_long_term_facts", new=retrieve),
+        ):
+            summary = await run_longmemeval_subset(
+                dataset_path,
+                split="oracle",
+                output_dir=self.root / "runs",
+                limit=1,
+                model_group="claude",
+                answer_mode="retrieval-debug",
+            )
+
+        retrieve.assert_not_awaited()
+        prediction = json.loads(
+            summary.paths.predictions_path.read_text(encoding="utf-8")
+        )
+
+        self.assertIn("cedar", prediction["hypothesis"])
+
+    async def test_subset_refuses_artifacts_bearing_loaded_model_secrets(self) -> None:
+        dataset_path = self.root / "longmemeval_oracle.json"
+        dataset_path.write_text(
+            json.dumps(
+                [self._dataset_row("q-secret", "single-session-user", "secret-token")]
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "forbidden secret"):
+            await run_longmemeval_subset(
+                dataset_path,
+                split="oracle",
+                output_dir=self.root / "runs",
+                limit=1,
+                model_group="glm",
+                secrets={"OPENROUTER_API_KEY": "secret-token"},
+            )
+
+    async def test_subset_smoke_records_malformed_row_and_continues(self) -> None:
+        good_row = self._dataset_row("q-good", "single-session-user", "cedar")
+        bad_row = self._dataset_row("q-bad", "single-session-user", "bad")
+        del bad_row["question_id"]
+        dataset_path = self.root / "longmemeval_oracle.json"
+        dataset_path.write_text(json.dumps([bad_row, good_row]), encoding="utf-8")
+
+        with patch(
+            "vexic.longmemeval.drain_light_then_consolidate",
+            new=AsyncMock(return_value=_fake_dream_result()),
+        ):
+            summary = await run_longmemeval_subset(
+                dataset_path,
+                split="oracle",
+                output_dir=self.root / "runs",
+                limit=2,
+                model_group="glm",
+            )
+
+        predictions = [
+            json.loads(line)
+            for line in summary.paths.predictions_path.read_text(encoding="utf-8").splitlines()
+        ]
+        diagnostics = [
+            json.loads(line)
+            for line in summary.paths.diagnostics_path.read_text(encoding="utf-8").splitlines()
+        ]
+
+        self.assertEqual(summary.questions_started, 2)
+        self.assertEqual(summary.questions_completed, 1)
+        self.assertEqual(summary.questions_failed, 1)
+        self.assertEqual(len(predictions), 2)
+        self.assertEqual(len(diagnostics), 2)
+        self.assertEqual(predictions[0]["question_id"], "row-1:<unknown>")
+        self.assertEqual(diagnostics[0]["question_id"], "row-1:<unknown>")
+        self.assertEqual(diagnostics[0]["status"], "error")
+        self.assertIn("requires non-empty", diagnostics[0]["error"])
+        self.assertEqual(predictions[1]["question_id"], "q-good")
+        self.assertEqual(diagnostics[1]["question_id"], "q-good")
+        self.assertEqual(diagnostics[1]["status"], "ok")
+
+
+class LongMemEvalJudgedRecallTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_recall_judge_render_preserves_unverified_note_label(self) -> None:
+        rendered = _render_recall_judge_input(
+            LongMemEvalRecallJudgeInput(
+                question="What benchmark code was mentioned?",
+                gold_answer="cedar",
+                retrieved_fact_texts=(
+                    "[unverified note] The benchmark code was cedar.\n"
+                    "(category: fact, recently noted, not yet confirmed, source messages: 1)",
+                ),
+            )
+        )
+
+        self.assertIn("[unverified note] The benchmark code was cedar.", rendered)
+        self.assertNotIn("[fact 1] [unverified note]", rendered)
+
+    async def _run_case(
+        self,
+        *,
+        question_id: str,
+        question_type: str,
+        question: str,
+        answer: str,
+        transcript: str,
+        facts: list[LongTermFact],
+        judge_verdict: LongMemEvalRecallJudgeVerdict,
+        judge_model_group: str = "claude",
+    ) -> tuple[
+        dict[str, object],
+        dict[str, object],
+        _FakeRecallJudge,
+        object,
+    ]:
+        dataset_path = self.root / "longmemeval_oracle.json"
+        dataset_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "question_id": question_id,
+                        "question_type": question_type,
+                        "question": question,
+                        "answer": answer,
+                        "question_date": "2026-01-03",
+                        "answer_session_ids": ["session-1"],
+                        "haystack_session_ids": ["session-1"],
+                        "haystack_dates": ["2026-01-02T03:04:05Z"],
+                        "haystack_sessions": [
+                            [{"role": "user", "content": transcript}]
+                        ],
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        drain = AsyncMock(return_value=_fake_dream_result())
+        retrieve = AsyncMock(return_value=facts)
+        judge = _FakeRecallJudge(judge_verdict)
+
+        with (
+            patch("vexic.longmemeval.drain_light_then_consolidate", new=drain),
+            patch("vexic.longmemeval.retrieve_long_term_facts", new=retrieve),
+        ):
+            summary = await run_longmemeval_subset(
+                dataset_path,
+                split="oracle",
+                output_dir=self.root / "runs",
+                limit=1,
+                model_group="glm",
+                answer_mode="judged-recall",
+                judge_model_group=judge_model_group,
+                judge_scorer=judge,
+            )
+
+        prediction = json.loads(
+            summary.paths.predictions_path.read_text(encoding="utf-8")
+        )
+        diagnostics = json.loads(
+            summary.paths.diagnostics_path.read_text(encoding="utf-8")
+        )
+        return prediction, diagnostics, judge, summary
+
+    async def test_judged_recall_supports_reformatted_duration_answer(self) -> None:
+        fact = LongTermFact(
+            fact_id=1,
+            fact_text="Ryan's personal best 5K is 25:50.",
+            subject="Ryan",
+            category="fact",
+            importance=7,
+            confidence=0.9,
+            source_message_ids=[1],
+            retrieved_count=0,
+            used_count=0,
+        )
+
+        _, diagnostics, judge, summary = await self._run_case(
+            question_id="q-5k",
+            question_type="single-session-user",
+            question="What is my personal best 5K time?",
+            answer="25 minutes and 50 seconds",
+            transcript="My personal best 5K is 25:50.",
+            facts=[fact],
+            judge_verdict=LongMemEvalRecallJudgeVerdict(
+                verdict="supported",
+                reason="The retrieved fact states the same duration as 25:50.",
+                confidence=0.95,
+            ),
+        )
+
+        self.assertEqual(len(judge.calls), 1)
+        self.assertEqual(diagnostics["answer_mode"], "judged-recall")
+        self.assertFalse(diagnostics["answer_retrieved_from_tier3"])
+        self.assertEqual(diagnostics["judge_verdict"], "supported")
+        self.assertTrue(diagnostics["judged_recall_pass"])
+        self.assertEqual(diagnostics["judge_model_group"], "claude")
+        self.assertEqual(summary.judged_recall_supported, 1)
+        self.assertEqual(summary.judged_recall_total, 1)
+
+    async def test_judged_recall_partial_does_not_count_as_recall_pass(self) -> None:
+        fact = LongTermFact(
+            fact_id=1,
+            fact_text="Ryan mentioned running a 5K recently.",
+            subject="Ryan",
+            category="fact",
+            importance=5,
+            confidence=0.8,
+            source_message_ids=[1],
+            retrieved_count=0,
+            used_count=0,
+        )
+
+        _, diagnostics, _, summary = await self._run_case(
+            question_id="q-partial",
+            question_type="single-session-user",
+            question="What is my personal best 5K time?",
+            answer="25 minutes and 50 seconds",
+            transcript="My personal best 5K is 25:50.",
+            facts=[fact],
+            judge_verdict=LongMemEvalRecallJudgeVerdict(
+                verdict="partial",
+                reason="The fact mentions a 5K but not the time.",
+                confidence=0.6,
+            ),
+        )
+
+        self.assertEqual(diagnostics["judge_verdict"], "partial")
+        self.assertFalse(diagnostics["judged_recall_pass"])
+        self.assertEqual(summary.judged_recall_supported, 0)
+        self.assertEqual(summary.judged_recall_total, 1)
+
+    async def test_judged_recall_stops_when_dream_is_incomplete(self) -> None:
+        dataset_path = self.root / "longmemeval_oracle.json"
+        dataset_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "question_id": "q-judged-incomplete",
+                        "question_type": "single-session-user",
+                        "question": "What benchmark code was mentioned?",
+                        "answer": "cedar",
+                        "question_date": "2026-01-03",
+                        "answer_session_ids": ["session-1"],
+                        "haystack_session_ids": ["session-1"],
+                        "haystack_dates": ["2026-01-02T03:04:05Z"],
+                        "haystack_sessions": [
+                            [{"role": "user", "content": "The benchmark code was cedar."}]
+                        ],
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        drain = AsyncMock(
+            return_value=_fake_dream_result(
+                status="incomplete",
+                light_cycles=3,
+                rem_ran=False,
+                deep_ran=False,
+                error="Light phase did not reach a stable watermark.",
+            )
+        )
+        retrieve = AsyncMock(return_value=[])
+        judge = _FakeRecallJudge(
+            LongMemEvalRecallJudgeVerdict(
+                verdict="supported",
+                reason="Should not be used.",
+                confidence=0.99,
+            )
+        )
+
+        with (
+            patch("vexic.longmemeval.drain_light_then_consolidate", new=drain),
+            patch("vexic.longmemeval.retrieve_long_term_facts", new=retrieve),
+        ):
+            summary = await run_longmemeval_subset(
+                dataset_path,
+                split="oracle",
+                output_dir=self.root / "runs",
+                limit=1,
+                model_group="glm",
+                answer_mode="judged-recall",
+                judge_model_group="claude",
+                judge_scorer=judge,
+            )
+
+        retrieve.assert_not_awaited()
+        self.assertEqual(judge.calls, [])
+        prediction = json.loads(
+            summary.paths.predictions_path.read_text(encoding="utf-8")
+        )
+        diagnostics = json.loads(
+            summary.paths.diagnostics_path.read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(
+            prediction["hypothesis"],
+            (
+                "Tier 3 diagnostics incomplete: "
+                "Light phase did not reach a stable watermark."
+            ),
+        )
+        self.assertEqual(diagnostics["status"], "incomplete")
+        self.assertIsNone(diagnostics["judge_verdict"])
+        self.assertFalse(diagnostics["judged_recall_pass"])
+        self.assertEqual(diagnostics["retrieved_long_term_fact_count"], 0)
+
+    async def test_judged_recall_counts_pipeline_failures_as_recall_misses(
+        self,
+    ) -> None:
+        dataset_path = self.root / "longmemeval_oracle.json"
+        dataset_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "question_id": "q-supported",
+                        "question_type": "single-session-user",
+                        "question": "What benchmark code was mentioned?",
+                        "answer": "cedar",
+                        "question_date": "2026-01-03",
+                        "answer_session_ids": ["session-1"],
+                        "haystack_session_ids": ["session-1"],
+                        "haystack_dates": ["2026-01-02T03:04:05Z"],
+                        "haystack_sessions": [
+                            [
+                                {
+                                    "role": "user",
+                                    "content": "The benchmark code was cedar.",
+                                }
+                            ]
+                        ],
+                    },
+                    {
+                        "question_id": "q-retrieval-error",
+                        "question_type": "knowledge-update",
+                        "question": "What color did I switch to?",
+                        "answer": "green",
+                        "question_date": "2026-01-03",
+                        "answer_session_ids": ["session-1"],
+                        "haystack_session_ids": ["session-1"],
+                        "haystack_dates": ["2026-01-02T03:04:05Z"],
+                        "haystack_sessions": [
+                            [{"role": "user", "content": "I switched to green."}]
+                        ],
+                    },
+                ]
+            ),
+            encoding="utf-8",
+        )
+        fact = LongTermFact(
+            fact_id=1,
+            fact_text="The benchmark code was cedar.",
+            subject="benchmark",
+            category="fact",
+            importance=7,
+            confidence=0.9,
+            source_message_ids=[1],
+            retrieved_count=0,
+            used_count=0,
+        )
+        drain = AsyncMock(return_value=_fake_dream_result())
+        retrieve = AsyncMock(
+            side_effect=[[fact], RuntimeError("Tier 3 retrieval failed.")]
+        )
+        judge = _FakeRecallJudge(
+            LongMemEvalRecallJudgeVerdict(
+                verdict="supported",
+                reason="The retrieved fact states the benchmark code.",
+                confidence=0.95,
+            )
+        )
+
+        with (
+            patch("vexic.longmemeval.drain_light_then_consolidate", new=drain),
+            patch("vexic.longmemeval.retrieve_long_term_facts", new=retrieve),
+        ):
+            summary = await run_longmemeval_subset(
+                dataset_path,
+                split="oracle",
+                output_dir=self.root / "runs",
+                limit=2,
+                model_group="glm",
+                answer_mode="judged-recall",
+                judge_model_group="claude",
+                judge_scorer=judge,
+            )
+
+        diagnostics = [
+            json.loads(line)
+            for line in summary.paths.diagnostics_path.read_text(
+                encoding="utf-8"
+            ).splitlines()
+        ]
+
+        self.assertEqual(summary.questions_completed, 1)
+        self.assertEqual(summary.questions_failed, 1)
+        self.assertEqual(summary.judged_recall_supported, 1)
+        self.assertEqual(summary.judged_recall_total, 2)
+        self.assertEqual(
+            summary.judged_recall_by_question_type,
+            {
+                "knowledge-update": {"supported": 0, "total": 1},
+                "single-session-user": {"supported": 1, "total": 1},
+            },
+        )
+        self.assertTrue(diagnostics[0]["judged_recall_pass"])
+        self.assertFalse(diagnostics[1]["judged_recall_pass"])
+        self.assertEqual(diagnostics[1]["status"], "error")
+        self.assertEqual(diagnostics[1]["error"], "Tier 3 retrieval failed.")
+        self.assertIsNone(diagnostics[1]["judge_verdict"])
+        self.assertIsNone(diagnostics[1]["judge_error"])
+
+    async def test_judged_recall_records_judge_error_as_recall_miss(self) -> None:
+        dataset_path = self.root / "longmemeval_oracle.json"
+        dataset_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "question_id": "q-judge-error",
+                        "question_type": "single-session-user",
+                        "question": "What benchmark code was mentioned?",
+                        "answer": "cedar",
+                        "question_date": "2026-01-03",
+                        "answer_session_ids": ["session-1"],
+                        "haystack_session_ids": ["session-1"],
+                        "haystack_dates": ["2026-01-02T03:04:05Z"],
+                        "haystack_sessions": [
+                            [{"role": "user", "content": "The benchmark code was cedar."}]
+                        ],
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        fact = LongTermFact(
+            fact_id=1,
+            fact_text="The benchmark code was cedar.",
+            subject="benchmark",
+            category="fact",
+            importance=7,
+            confidence=0.9,
+            source_message_ids=[1],
+            retrieved_count=0,
+            used_count=0,
+        )
+        drain = AsyncMock(return_value=_fake_dream_result())
+        retrieve = AsyncMock(return_value=[fact])
+
+        async def judge_error(
+            _judge_input: LongMemEvalRecallJudgeInput,
+        ) -> LongMemEvalRecallJudgeVerdict:
+            raise RuntimeError("Judge timed out.")
+
+        with (
+            patch("vexic.longmemeval.drain_light_then_consolidate", new=drain),
+            patch("vexic.longmemeval.retrieve_long_term_facts", new=retrieve),
+        ):
+            summary = await run_longmemeval_subset(
+                dataset_path,
+                split="oracle",
+                output_dir=self.root / "runs",
+                limit=1,
+                model_group="glm",
+                answer_mode="judged-recall",
+                judge_model_group="claude",
+                judge_scorer=judge_error,
+            )
+
+        diagnostics = json.loads(
+            summary.paths.diagnostics_path.read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(summary.questions_completed, 0)
+        self.assertEqual(summary.questions_failed, 1)
+        self.assertEqual(summary.judged_recall_supported, 0)
+        self.assertEqual(summary.judged_recall_total, 1)
+        self.assertEqual(diagnostics["status"], "error")
+        self.assertEqual(diagnostics["error"], "Judge timed out.")
+        self.assertEqual(diagnostics["judge_error"], "Judge timed out.")
+        self.assertFalse(diagnostics["judged_recall_pass"])
+
+    async def test_judged_recall_fails_closed_without_judge_port(self) -> None:
+        dataset_path = self.root / "longmemeval_oracle.json"
+        dataset_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "question_id": "q-no-judge-port",
+                        "question_type": "single-session-user",
+                        "question": "What benchmark code was mentioned?",
+                        "answer": "cedar",
+                        "question_date": "2026-01-03",
+                        "answer_session_ids": ["session-1"],
+                        "haystack_session_ids": ["session-1"],
+                        "haystack_dates": ["2026-01-02T03:04:05Z"],
+                        "haystack_sessions": [
+                            [{"role": "user", "content": "The benchmark code was cedar."}]
+                        ],
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        fact = LongTermFact(
+            fact_id=1,
+            fact_text="The benchmark code was cedar.",
+            subject="benchmark",
+            category="fact",
+            importance=7,
+            confidence=0.9,
+            source_message_ids=[1],
+            retrieved_count=0,
+            used_count=0,
+        )
+        drain = AsyncMock(return_value=_fake_dream_result())
+        retrieve = AsyncMock(return_value=[fact])
+
+        with (
+            patch("vexic.longmemeval.drain_light_then_consolidate", new=drain),
+            patch("vexic.longmemeval.retrieve_long_term_facts", new=retrieve),
+        ):
+            summary = await run_longmemeval_subset(
+                dataset_path,
+                split="oracle",
+                output_dir=self.root / "runs",
+                limit=1,
+                model_group="glm",
+                answer_mode="judged-recall",
+                judge_model_group="claude",
+            )
+
+        diagnostics = json.loads(
+            summary.paths.diagnostics_path.read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(summary.questions_completed, 0)
+        self.assertEqual(summary.questions_failed, 1)
+        self.assertEqual(diagnostics["status"], "error")
+        self.assertIn("judge_agent_factory", diagnostics["error"])
+        self.assertFalse(diagnostics["judged_recall_pass"])
+
+    async def test_judged_recall_uses_host_supplied_judge_agent_factory(self) -> None:
+        dataset_path = self.root / "longmemeval_oracle.json"
+        dataset_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "question_id": "q-judge-factory",
+                        "question_type": "single-session-user",
+                        "question": "What benchmark code was mentioned?",
+                        "answer": "cedar",
+                        "question_date": "2026-01-03",
+                        "answer_session_ids": ["session-1"],
+                        "haystack_session_ids": ["session-1"],
+                        "haystack_dates": ["2026-01-02T03:04:05Z"],
+                        "haystack_sessions": [
+                            [{"role": "user", "content": "The benchmark code was cedar."}]
+                        ],
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        fact = LongTermFact(
+            fact_id=1,
+            fact_text="The benchmark code was cedar.",
+            subject="benchmark",
+            category="fact",
+            importance=7,
+            confidence=0.9,
+            source_message_ids=[1],
+            retrieved_count=0,
+            used_count=0,
+        )
+        drain = AsyncMock(return_value=_fake_dream_result())
+        retrieve = AsyncMock(return_value=[fact])
+        verdict = LongMemEvalRecallJudgeVerdict(
+            verdict="supported",
+            reason="The retrieved fact states the benchmark code.",
+            confidence=0.9,
+        )
+
+        class _FakeJudgeAgent:
+            def __init__(self) -> None:
+                self.model = type("Model", (), {"model_name": "fake/judge-model"})()
+                self.prompts: list[str] = []
+
+            async def run(self, prompt: str) -> object:
+                self.prompts.append(prompt)
+                return type("Result", (), {"output": verdict})()
+
+        agent = _FakeJudgeAgent()
+        factory_calls: list[tuple[str, object]] = []
+
+        def factory(model_group: str, secrets: object = None) -> _FakeJudgeAgent:
+            factory_calls.append((model_group, secrets))
+            return agent
+
+        with (
+            patch("vexic.longmemeval.drain_light_then_consolidate", new=drain),
+            patch("vexic.longmemeval.retrieve_long_term_facts", new=retrieve),
+        ):
+            summary = await run_longmemeval_subset(
+                dataset_path,
+                split="oracle",
+                output_dir=self.root / "runs",
+                limit=1,
+                model_group="glm",
+                answer_mode="judged-recall",
+                judge_model_group="claude",
+                judge_agent_factory=factory,
+            )
+
+        diagnostics = json.loads(
+            summary.paths.diagnostics_path.read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(factory_calls, [("claude", None)])
+        self.assertEqual(len(agent.prompts), 1)
+        self.assertIn("Retrieved facts:", agent.prompts[0])
+        self.assertEqual(diagnostics["judge_verdict"], "supported")
+        self.assertTrue(diagnostics["judged_recall_pass"])
+        self.assertEqual(diagnostics["judge_model_id"], "fake/judge-model")
+        self.assertEqual(summary.judged_recall_supported, 1)
 
 
 if __name__ == "__main__":
