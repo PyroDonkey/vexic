@@ -317,8 +317,12 @@ uv run python -m vexic.longmemeval \
   --dataset data/longmemeval_oracle.json --split oracle \
   --output-dir .eval-runs/longmemeval --skip-dream
 
-# Provider-backed judged-recall run (env-driven adapter secrets):
-OPENROUTER_API_KEY=... uv run python -m vexic.longmemeval \
+# Provider-backed judged-recall run (env-driven adapter secrets). The
+# recall judge refuses the adapter's implicit default model, so the judge
+# model group must be resolvable: set VEXIC_LIVE_CLAUDE_MODEL (for the
+# default --judge-model-group claude) or VEXIC_LIVE_MODEL explicitly.
+OPENROUTER_API_KEY=... VEXIC_LIVE_CLAUDE_MODEL=anthropic/claude-sonnet-5 \
+  uv run python -m vexic.longmemeval \
   --allow-live --adapter adapters/openrouter_live_adapter.py \
   --dataset data/longmemeval_s_cleaned.json --split s \
   --output-dir .eval-runs/longmemeval --answer-mode judged-recall --limit 12

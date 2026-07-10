@@ -282,7 +282,7 @@ def test_live_adapter_builds_longmemeval_recall_judge_agent(
     adapter = _load_adapter()
     monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
     monkeypatch.delenv("VEXIC_LIVE_MODEL", raising=False)
-    monkeypatch.delenv("VEXIC_LIVE_CLAUDE_MODEL", raising=False)
+    monkeypatch.setenv("VEXIC_LIVE_CLAUDE_MODEL", "anthropic/claude-sonnet-5")
 
     # Capture Agent construction kwargs instead of reaching into pydantic_ai
     # internals, so the assertions survive upstream attribute renames.
@@ -302,6 +302,18 @@ def test_live_adapter_builds_longmemeval_recall_judge_agent(
     settings = captured["model_settings"]
     assert settings["temperature"] == 0
     assert "max_tokens" not in settings
+
+
+def test_live_adapter_judge_agent_requires_explicit_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _load_adapter()
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
+    monkeypatch.delenv("VEXIC_LIVE_MODEL", raising=False)
+    monkeypatch.delenv("VEXIC_LIVE_CLAUDE_MODEL", raising=False)
+
+    with pytest.raises(RuntimeError, match="VEXIC_LIVE_CLAUDE_MODEL"):
+        adapter.build_longmemeval_recall_judge_agent("claude")
 
 
 def test_live_adapter_judge_agent_rejects_passed_secrets(
