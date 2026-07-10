@@ -28,6 +28,7 @@ from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 from vexic.hosted_sweeper import (
     DreamSweeper,
     DreamSweeperConfig,
+    SweepTickReport,
     sweeper_config_from_env,
 )
 from vexic.ports import DreamPhasePorts
@@ -398,6 +399,120 @@ class DreamSweeperTickTests(unittest.IsolatedAsyncioTestCase):
         report_two = await sweeper.tick(now=NOW + timedelta(hours=1))
         await self._drain_background(service)
         self.assertEqual(report_two.dreams_scheduled, 0)
+
+    async def test_stale_stream_record_failure_retries_on_fresh_connection(self) -> None:
+        """A reaped Hrana stream loses the state write (verified live);
+        the recorder must retry the whole record call so a fresh
+        connection re-executes and commits."""
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        service = self._service(_summary_ports())
+        sweeper = self._sweeper(service)
+
+        real_record = self.catalog.record_summarize_watermark
+        calls = {"count": 0}
+
+        def flaky_record(*args: object) -> None:
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise ValueError(
+                    "Hrana: `api error: `status=404 Not Found, "
+                    'body={"error":"stream not found: 68426218:1738176"}``'
+                )
+            real_record(*args)
+
+        self.catalog.record_summarize_watermark = flaky_record
+        try:
+            await sweeper.tick(now=NOW)
+            await self._drain_background(service)
+        finally:
+            del self.catalog.record_summarize_watermark
+
+        self.assertEqual(calls["count"], 2)
+        state = self.catalog.dream_sweep_state("tenant-a", None)
+        self.assertEqual(
+            state.last_summarize_watermark, self._scope_watermark(tenant.db_path)
+        )
+
+    async def test_watermark_record_failure_does_not_skip_dream_stamp(self) -> None:
+        """The two state writes are independent: a failed watermark write must
+        not skip the dream-completed stamp, or the dream re-fires every tick
+        and burns model spend indefinitely."""
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _FakeAgent("a fake summary"),
+            extraction_agent_factory=lambda *_a, **_k: _FakeAgent([]),
+        )
+        service = self._service(ports)
+        sweeper = self._sweeper(service)
+
+        def broken_record(*args: object) -> None:
+            raise RuntimeError("control-plane write failed")
+
+        self.catalog.record_summarize_watermark = broken_record
+        try:
+            with self.assertLogs("vexic.hosted_sweeper", level="ERROR") as logs:
+                await sweeper.tick(now=NOW)
+                await self._drain_background(service)
+        finally:
+            del self.catalog.record_summarize_watermark
+
+        state = self.catalog.dream_sweep_state("tenant-a", None)
+        self.assertEqual(state.last_dream_completed_at, NOW.isoformat())
+        self.assertEqual(state.last_summarize_watermark, 0)
+        self.assertTrue(
+            any("watermark" in line.lower() for line in logs.output)
+        )
+        self.assertEqual(sweeper._record_failures, 1)
+
+    async def test_record_failures_surface_in_the_run_log(self) -> None:
+        """The tick summary must not claim a clean sweep when recorder tasks
+        failed after the tick returned; the counter is reported and reset on
+        the next log line."""
+        service = self._service(_summary_ports())
+        sweeper = self._sweeper(service)
+        sweeper._record_failures = 3
+        stop = asyncio.Event()
+
+        async def one_tick(*, now: datetime | None = None) -> SweepTickReport:
+            stop.set()
+            return SweepTickReport()
+
+        sweeper.tick = one_tick
+        with self.assertLogs("vexic.hosted_sweeper", level="INFO") as logs:
+            await sweeper.run(stop)
+
+        self.assertTrue(any("3 record failures" in line for line in logs.output))
+        self.assertTrue(any("sweep errors" in line for line in logs.output))
+        self.assertEqual(sweeper._record_failures, 0)
+
+    async def test_shutdown_flushes_unlogged_record_failures(self) -> None:
+        """A recorder failure that lands after the last tick log line must
+        still surface before `run()` exits, not vanish into shutdown."""
+        service = self._service(_summary_ports())
+        sweeper = self._sweeper(service)
+        stop = asyncio.Event()
+
+        async def one_tick(*, now: datetime | None = None) -> SweepTickReport:
+            return SweepTickReport()
+
+        sweeper.tick = one_tick
+
+        async def fail_then_stop() -> None:
+            await asyncio.sleep(0)
+            sweeper._record_failures += 1
+            stop.set()
+
+        with self.assertLogs("vexic.hosted_sweeper", level="INFO") as logs:
+            await asyncio.gather(sweeper.run(stop), fail_then_stop())
+
+        self.assertTrue(
+            any("1 record failure" in line and "stopping" in line for line in logs.output)
+        )
+        self.assertEqual(sweeper._record_failures, 0)
 
     async def test_locked_scope_keeps_its_own_watermark_unadvanced(self) -> None:
         """A scope skipped by the in-flight lock never ran this tick's job,
