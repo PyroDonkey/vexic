@@ -422,21 +422,40 @@ Use the committed `Dockerfile`; do not rely on Railway Nixpacks for this slice.
 The image installs Python 3.13 dependencies with `uv` and includes
 `sqlite-vec`.
 
-Alpha storage choice: mount a Railway persistent volume at `/data/vexic` and
-keep `VEXIC_HOSTED_ROOT=/data/vexic`. This preserves the current
-SQLite-compatible Customer Memory Database boundary from ADR 0005. The Turso/libSQL
-cutover (ADR 0019, see "Turso/libSQL Storage Backend" above) is implemented and
-live-verified against a real Turso database, but the deployed Railway alpha has
-not yet been switched over to it; `VEXIC_STORAGE_BACKEND` stays unset/`local`
-on the live deployment until that cutover is scheduled.
+Alpha storage split: the Turso/libSQL cutover (ADR 0019, see "Turso/libSQL
+Storage Backend" above) has landed on the deployed Railway alpha, which runs
+`VEXIC_STORAGE_BACKEND=turso`. Customer memory lives in per-tenant Turso
+databases addressed by the control-plane `tenants.customer_target` DSN, not on
+the volume. The control-plane catalog and API-key store stay
+filesystem-rooted, so the Railway persistent volume is still mounted at
+`/data/vexic` with `VEXIC_HOSTED_ROOT=/data/vexic`; `control-plane.db` is the
+only database that legitimately lives there.
 
-Required Railway config:
+Any `customer-*.db` files left on the volume are vestigial artifacts of the
+pre-cutover layout. Do not read them to inspect tenant memory: resolve
+`tenants.customer_target` and query the Turso database instead.
+
+Required Railway config (variable names only; values are set in the Railway
+service, never committed):
 
 - `PORT`: provided by Railway.
 - `VEXIC_HOSTED_ROOT=/data/vexic`
 - `VEXIC_CONTROL_PLANE_TOKENS=<comma-separated Console service tokens>`
+- `VEXIC_STORAGE_BACKEND=turso`
+- `TURSO_ORG`, `TURSO_GROUP`, `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`,
+  `TURSO_PLATFORM_API_TOKEN` (see "Turso storage backend" in
+  `docs/configuration.md`)
+- `VEXIC_PROVISION_EXISTING_TURSO_TARGETS=1` to backfill Turso databases for
+  stores provisioned before the Turso backend
+- `VEXIC_DREAM_PHASE_ADAPTER=/app/adapters/openrouter_live_adapter.py` and the
+  provider credential it reads (`OPENROUTER_API_KEY`), without which the
+  in-server dream sweeper (ADR 0030) stays off
 - Persistent volume mounted at `/data/vexic`
 - Health check path: `/health`
+
+Omitting `VEXIC_STORAGE_BACKEND` silently selects the `local` backend against an
+empty volume while the control plane keeps routing tenants to their live Turso
+DSNs. Set it explicitly.
 
 Dream-phase / embedding model port config (optional; unset keeps every
 model-backed operation, including the `search_long_term` vector path, failing
