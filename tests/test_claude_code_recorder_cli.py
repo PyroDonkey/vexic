@@ -131,7 +131,41 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "hosted ingest failed: HTTP 403"):
                 post_source_messages(config, messages=[], forbidden_values=())
 
-    def test_post_source_messages_http_error_includes_server_error_detail(self) -> None:
+    def test_post_source_messages_4xx_error_includes_server_error_detail(self) -> None:
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+        body = io.BytesIO(
+            json.dumps(
+                {
+                    "error": {
+                        "code": "invalid_request",
+                        "message": "limit must be between 1 and 20.",
+                    }
+                }
+            ).encode("utf-8")
+        )
+        error = HTTPError(
+            url="https://api.example.test/v1/ingest_source_transcript",
+            code=400,
+            msg="Bad Request",
+            hdrs={},
+            fp=body,
+        )
+
+        with patch("vexic.recorders.hosted_ingest.urlopen", side_effect=error):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"hosted ingest failed: HTTP 400 \(invalid_request: "
+                r"limit must be between 1 and 20\.\)",
+            ):
+                post_source_messages(config, messages=[], forbidden_values=())
+
+    def test_post_source_messages_5xx_error_surfaces_code_only(self) -> None:
         config = HostedIngestConfig(
             base_url="https://api.example.test",
             api_key="vx_secret",
@@ -144,7 +178,7 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
                 {
                     "error": {
                         "code": "storage_unavailable",
-                        "message": "Hosted storage is temporarily unavailable.",
+                        "message": "SQLITE_BUSY: backend storage detail",
                     }
                 }
             ).encode("utf-8")
@@ -160,8 +194,7 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
         with patch("vexic.recorders.hosted_ingest.urlopen", side_effect=error):
             with self.assertRaisesRegex(
                 RuntimeError,
-                r"hosted ingest failed: HTTP 503 \(storage_unavailable: "
-                r"Hosted storage is temporarily unavailable\.\)",
+                r"hosted ingest failed: HTTP 503 \(storage_unavailable\)$",
             ):
                 post_source_messages(config, messages=[], forbidden_values=())
 
