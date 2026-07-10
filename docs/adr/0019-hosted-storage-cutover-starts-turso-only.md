@@ -273,3 +273,46 @@ reliance, not an oversight:
   detection. This branch is exercised only by a creds-gated live test and is
   therefore unverified in the default creds-free CI run. Both edges bite only
   under multi-worker Light, which v0.1 does not run.
+
+## Addendum 4 -- 2026-07-10: the control-plane catalog stayed local (COA-359)
+
+Correction of record. The Decision above (and Addendum 2's "All items in the
+Decision ... are implemented" summary) is inaccurate about *one* store: the
+control-plane catalog did **not** move to managed Turso/libSQL. What actually
+shipped, and what the deployed Railway alpha runs today, is a split:
+
+- **Customer memory** -- one isolated Turso/libSQL database per tenant,
+  addressed by the catalog's `tenants.customer_target` DSN. This half of the
+  Decision landed as written (Addendum 2).
+- **The control-plane catalog and API-key store** -- a single local SQLite
+  `control-plane.db` on the Railway volume, rooted at `VEXIC_HOSTED_ROOT`
+  (`/data/vexic`). `create_service_from_env` (`src/vexic/hosted_http.py`)
+  builds `HostedTenantCatalog(root)` / `HostedApiKeyStore(root)` from that
+  filesystem path under `VEXIC_STORAGE_BACKEND=turso`, exactly as under the
+  `local` backend; the docstring there is explicit that the turso backend
+  "keeps the control-plane ... LOCAL/filesystem-rooted." The tenant registry,
+  API keys, operational telemetry, and the dream sweeper's `dream_sweep_state`
+  scheduling table therefore all live in that local file, not on Turso.
+
+So the Decision's "move to a managed Turso/libSQL database" for the control
+plane, and the Consequences line naming "customer memory and the control-plane
+catalog both on managed libSQL," describe an intended posture that was
+deliberately narrowed to customer-memory-only during implementation. The
+narrowing is not itself a reversal of ADR 0019's direction -- a managed
+control-plane store remains a readiness target -- but it was never recorded
+until now. `docs/hosted-mvp.md` (corrected under COA-353) is the accurate
+as-shipped description; this addendum brings the ADR and the ADR index
+(`docs/adr/README.md`) into line with it.
+
+The `connect(target)`/`StorageTarget` seam still applies to the control plane
+in principle -- the catalog and API-key store open through it, and a
+`control_plane_target(env)` helper that builds a Turso `StorageTarget` from
+`TURSO_DATABASE_URL` exists in `adapters/turso_adapter.py`. But that helper is
+referenced only by tests; no runtime path wires it into the service factory.
+It is dead code embodying the never-shipped catalog-on-Turso leg, and whether
+to delete it or wire it is a separate decision (tracked on COA-359), not part
+of this correction.
+
+The eventual managed control-plane store remains ADR 0008's readiness target
+and this ADR's deferred Neon Postgres promotion; that work, when taken, is the
+place to actually move `control-plane.db` off the Railway volume.

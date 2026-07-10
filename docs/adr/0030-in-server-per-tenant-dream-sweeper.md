@@ -55,8 +55,10 @@ scheduling entirely.
 
 ### State, knobs, and retirement
 
-- Sweeper bookkeeping lives in the control database's `dream_sweep_state`
-  table, keyed per (tenant, agent) scope: the last summarize watermark whose
+- Sweeper bookkeeping lives in the control-plane catalog's `dream_sweep_state`
+  table -- the local `control-plane.db` on the Railway volume, not a per-tenant
+  Turso database (ADR 0019 Addendum 4) --
+  keyed per (tenant, agent) scope: the last summarize watermark whose
   job ran to completion and when the scope's last dream chain finished.
   Writes are monotonic and happen only after the scheduled job completes
   (a cancelled job leaves state untouched); ripeness and budgets are still
