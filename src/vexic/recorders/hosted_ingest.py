@@ -64,6 +64,7 @@ def post_source_messages(
 
 
 _ERROR_DETAIL_MAX_CHARS = 300
+_ERROR_BODY_MAX_BYTES = 64 * 1024
 
 
 def _error_body_detail(exc: HTTPError) -> str | None:
@@ -71,10 +72,15 @@ def _error_body_detail(exc: HTTPError) -> str | None:
 
     Only the server's structured error envelope is surfaced -- an HTML or
     unparseable body is dropped so the raised message never echoes arbitrary
-    proxy output.
+    proxy output. The read is bounded so a huge body from a misbehaving proxy
+    is never buffered whole; anything over the cap cannot be the hosted
+    envelope and is dropped.
     """
     try:
-        body = json.loads(exc.read().decode("utf-8"))
+        raw = exc.read(_ERROR_BODY_MAX_BYTES + 1)
+        if len(raw) > _ERROR_BODY_MAX_BYTES:
+            return None
+        body = json.loads(raw.decode("utf-8"))
     except Exception:
         return None
     error = body.get("error") if isinstance(body, dict) else None
