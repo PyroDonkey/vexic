@@ -453,9 +453,9 @@ service, never committed):
 - Persistent volume mounted at `/data/vexic`
 - Health check path: `/health`
 
-Omitting `VEXIC_STORAGE_BACKEND` silently selects the `local` backend against an
-empty volume while the control plane keeps routing tenants to their live Turso
-DSNs. Set it explicitly.
+Omitting `VEXIC_STORAGE_BACKEND` silently selects the `local` backend, so the
+service ignores `tenants.customer_target` and serves tenant memory from local
+`customer-*.db` files on the volume instead of Turso. Set it explicitly.
 
 Dream-phase / embedding model port config (optional; unset keeps every
 model-backed operation, including the `search_long_term` vector path, failing
