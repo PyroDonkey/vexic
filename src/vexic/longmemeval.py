@@ -428,7 +428,11 @@ async def drain_light_then_consolidate(
 ) -> LongMemEvalDreamResult:
     """Drain Light to a watermark fixpoint, then run REM and Deep once."""
 
-    cycle_cap = max_light_cycles or ceil(message_count / LIGHT_PHASE_BATCH_SIZE) + 1
+    cycle_cap = (
+        max_light_cycles
+        if max_light_cycles is not None
+        else ceil(message_count / LIGHT_PHASE_BATCH_SIZE) + 1
+    )
     previous_watermark = get_watermark(db_path, agent_id=None)
     current_watermark = previous_watermark
     cycles = 0
@@ -566,7 +570,11 @@ async def drain_light_then_rem(
 ) -> LongMemEvalDreamResult:
     """Drain Light to a watermark fixpoint, then run REM without Deep promotion."""
 
-    cycle_cap = max_light_cycles or ceil(message_count / LIGHT_PHASE_BATCH_SIZE) + 1
+    cycle_cap = (
+        max_light_cycles
+        if max_light_cycles is not None
+        else ceil(message_count / LIGHT_PHASE_BATCH_SIZE) + 1
+    )
     previous_watermark = get_watermark(db_path, agent_id=None)
     current_watermark = previous_watermark
     cycles = 0
@@ -849,10 +857,19 @@ class _DiagnosticCandidate:
 
 
 def _answer_variants(answer: Any) -> tuple[str, ...]:
+    # Gold answers can be JSON numbers (counting/temporal questions), so
+    # numeric scalars and items are stringified rather than dropped.
     if isinstance(answer, str):
         return (answer,)
+    if isinstance(answer, (int, float)) and not isinstance(answer, bool):
+        return (str(answer),)
     if isinstance(answer, Sequence) and not isinstance(answer, (bytes, bytearray)):
-        return tuple(item for item in answer if isinstance(item, str))
+        return tuple(
+            item if isinstance(item, str) else str(item)
+            for item in answer
+            if isinstance(item, str)
+            or (isinstance(item, (int, float)) and not isinstance(item, bool))
+        )
     return ()
 
 
@@ -1436,7 +1453,9 @@ async def run_longmemeval_subset(
             failed += 1
             status = "error"
             error = str(exc)
-            hypothesis = ""
+            # `hypothesis` is deliberately left alone: a judge failure after a
+            # successful Tier 3 retrieval keeps the retrieved hypothesis in
+            # predictions.jsonl instead of discarding it.
         else:
             if status == "ok":
                 completed += 1
@@ -1654,7 +1673,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("retrieval-debug", "tier2-debug", "tier3-debug", "judged-recall"),
     )
     parser.add_argument("--judge-model-group", default="claude")
-    parser.add_argument("--max-light-cycles", type=int, default=None)
+    parser.add_argument("--max-light-cycles", type=_positive_int, default=None)
     parser.add_argument("--deep-top-n", type=int, default=15)
     parser.add_argument(
         "--skip-dream",
@@ -1756,7 +1775,7 @@ async def _amain(args: argparse.Namespace) -> int:
             print(
                 f"  {question_type}: {supported}/{total} ({bucket_rate:.1%})"
             )
-    return 0
+    return 0 if summary.questions_failed == 0 else 1
 
 
 def main(argv: Sequence[str] | None = None) -> int:

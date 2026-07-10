@@ -128,6 +128,21 @@ def _model_name(model_group: str) -> str:
     return "deepseek/deepseek-v4-pro"
 
 
+def _judge_model_name(model_group: str) -> str:
+    # Recall verdicts must never be graded by the implicit deepseek default:
+    # diagnostics label the run with the judge model group, so a silent
+    # fallback would attribute scores to the wrong judge. Require an explicit
+    # model instead of falling through like `_model_name`.
+    group_env = f"VEXIC_LIVE_{_env_key(model_group)}_MODEL"
+    if group_model := os.environ.get(group_env):
+        return _require_openrouter_model(group_model, group_env)
+    if default_model := os.environ.get("VEXIC_LIVE_MODEL"):
+        return _require_openrouter_model(default_model, "VEXIC_LIVE_MODEL")
+    raise RuntimeError(
+        f"Recall judging requires an explicit model: set {group_env} or VEXIC_LIVE_MODEL."
+    )
+
+
 def _summary_model_name() -> str:
     model = os.environ.get("VEXIC_SUMMARY_MODEL")
     if model:
@@ -215,7 +230,7 @@ def build_longmemeval_recall_judge_agent(
     settings["temperature"] = 0
     settings.pop("max_tokens", None)
     return Agent(
-        OpenAIChatModel(_model_name(model_group), provider=_provider()),
+        OpenAIChatModel(_judge_model_name(model_group), provider=_provider()),
         output_type=LongMemEvalRecallJudgeVerdict,
         instructions=LONGMEMEVAL_RECALL_JUDGE_PROMPT,
         model_settings=settings,

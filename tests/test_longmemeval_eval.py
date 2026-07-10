@@ -15,6 +15,7 @@ from vexic.longmemeval import (
     main as longmemeval_main,
     LongMemEvalRecallJudgeInput,
     LongMemEvalRecallJudgeVerdict,
+    _answer_variants,
     _render_recall_judge_input,
     _select_instances,
     drain_light_then_consolidate,
@@ -399,6 +400,38 @@ class LongMemEvalDreamDrainTests(unittest.IsolatedAsyncioTestCase):
             deep.await_args.kwargs["contradiction_agent_factory"],
             contradiction_factory,
         )
+
+    async def test_zero_max_light_cycles_runs_no_light_phase(self) -> None:
+        light = AsyncMock()
+        rem = AsyncMock()
+        deep = AsyncMock()
+
+        with (
+            patch("vexic.longmemeval.get_watermark", return_value=0),
+            patch("vexic.longmemeval.run_light_phase", light),
+            patch("vexic.longmemeval.run_rem_phase", rem),
+            patch("vexic.longmemeval.run_deep_phase", deep),
+        ):
+            consolidate_result = await drain_light_then_consolidate(
+                "memory.db",
+                "glm",
+                message_count=100,
+                max_light_cycles=0,
+            )
+            rem_result = await drain_light_then_rem(
+                "memory.db",
+                "glm",
+                message_count=100,
+                max_light_cycles=0,
+            )
+
+        light.assert_not_awaited()
+        rem.assert_not_awaited()
+        deep.assert_not_awaited()
+        self.assertEqual(consolidate_result.status, "incomplete")
+        self.assertEqual(consolidate_result.light_cycles, 0)
+        self.assertEqual(rem_result.status, "incomplete")
+        self.assertEqual(rem_result.light_cycles, 0)
 
 
 def _fake_dream_result(**overrides: object) -> object:
@@ -1350,6 +1383,71 @@ class LongMemEvalJudgedRecallTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(diagnostics["judge_error"], "Judge timed out.")
         self.assertFalse(diagnostics["judged_recall_pass"])
 
+    async def test_judged_recall_judge_failure_preserves_retrieved_hypothesis(
+        self,
+    ) -> None:
+        dataset_path = self.root / "longmemeval_oracle.json"
+        dataset_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "question_id": "q-judge-error-hypothesis",
+                        "question_type": "single-session-user",
+                        "question": "What benchmark code was mentioned?",
+                        "answer": "cedar",
+                        "question_date": "2026-01-03",
+                        "answer_session_ids": ["session-1"],
+                        "haystack_session_ids": ["session-1"],
+                        "haystack_dates": ["2026-01-02T03:04:05Z"],
+                        "haystack_sessions": [
+                            [{"role": "user", "content": "The benchmark code was cedar."}]
+                        ],
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        fact = LongTermFact(
+            fact_id=1,
+            fact_text="The benchmark code was cedar.",
+            subject="benchmark",
+            category="fact",
+            importance=7,
+            confidence=0.9,
+            source_message_ids=[1],
+            retrieved_count=0,
+            used_count=0,
+        )
+        drain = AsyncMock(return_value=_fake_dream_result())
+        retrieve = AsyncMock(return_value=[fact])
+
+        async def judge_error(
+            _judge_input: LongMemEvalRecallJudgeInput,
+        ) -> LongMemEvalRecallJudgeVerdict:
+            raise RuntimeError("Judge timed out.")
+
+        with (
+            patch("vexic.longmemeval.drain_light_then_consolidate", new=drain),
+            patch("vexic.longmemeval.retrieve_long_term_facts", new=retrieve),
+        ):
+            summary = await run_longmemeval_subset(
+                dataset_path,
+                split="oracle",
+                output_dir=self.root / "runs",
+                limit=1,
+                model_group="glm",
+                answer_mode="judged-recall",
+                judge_model_group="claude",
+                judge_scorer=judge_error,
+            )
+
+        prediction = json.loads(
+            summary.paths.predictions_path.read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(summary.questions_failed, 1)
+        self.assertIn("cedar", prediction["hypothesis"])
+
     async def test_judged_recall_does_not_blend_candidates_when_tier3_hits(
         self,
     ) -> None:
@@ -1771,6 +1869,19 @@ def embed_texts(texts):
 '''
 
 
+class LongMemEvalAnswerVariantTests(unittest.TestCase):
+    def test_numeric_scalar_gold_answers_are_matchable(self) -> None:
+        self.assertEqual(_answer_variants(2015), ("2015",))
+        self.assertEqual(_answer_variants(3.5), ("3.5",))
+
+    def test_sequence_gold_answers_include_numeric_items(self) -> None:
+        self.assertEqual(_answer_variants(["cedar", 2015]), ("cedar", "2015"))
+
+    def test_unmatchable_gold_answers_stay_empty(self) -> None:
+        self.assertEqual(_answer_variants(None), ())
+        self.assertEqual(_answer_variants({"answer": "cedar"}), ())
+
+
 class LongMemEvalCliTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -1818,6 +1929,7 @@ class LongMemEvalCliTests(unittest.TestCase):
         summary = unittest.mock.MagicMock()
         summary.judged_recall_total = None
         summary.judged_recall_supported = None
+        summary.questions_failed = 0
         runner = AsyncMock(return_value=summary)
 
         with patch("vexic.longmemeval.run_longmemeval_subset", new=runner):
@@ -1871,6 +1983,27 @@ class LongMemEvalCliTests(unittest.TestCase):
         self.assertTrue(callable(kwargs["contradiction_agent_factory"]))
         self.assertTrue(callable(kwargs["judge_agent_factory"]))
         self.assertTrue(callable(kwargs["embed"]))
+
+    def test_cli_returns_nonzero_when_any_question_failed(self) -> None:
+        summary = unittest.mock.MagicMock()
+        summary.judged_recall_total = None
+        summary.judged_recall_supported = None
+        summary.questions_started = 2
+        summary.questions_completed = 1
+        summary.questions_failed = 1
+        runner = AsyncMock(return_value=summary)
+
+        with patch("vexic.longmemeval.run_longmemeval_subset", new=runner):
+            exit_code = longmemeval_main(self._base_argv("--skip-dream"))
+
+        self.assertEqual(exit_code, 1)
+
+    def test_cli_rejects_non_positive_max_light_cycles(self) -> None:
+        for value in ("0", "-1"):
+            with self.assertRaises(SystemExit):
+                build_parser().parse_args(
+                    self._base_argv("--max-light-cycles", value)
+                )
 
     def test_cli_dream_run_requires_adapter_path(self) -> None:
         runner = AsyncMock()
