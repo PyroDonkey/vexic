@@ -1419,8 +1419,17 @@ class HostedApiKeyStore:
         # In-process auth cache, active only against a remote (StorageTarget)
         # control plane where each `_load_key` is a network round-trip. Local
         # file / in-memory paths read straight from disk/dict and are not
-        # cached. Evicted on revoke; entries expire after a short TTL so a
-        # revocation on another replica cannot linger past that window.
+        # cached.
+        #
+        # Revocation is evicted in-process (`_invalidate_auth_cache`), so on the
+        # single serving instance the current hosted deployment runs the
+        # stale-revocation window is ZERO. ACCEPTED, BOUNDED RISK: with two or
+        # more replicas a revoke on one replica is not seen by the others until
+        # their cached entry expires, so a revoked key can still authenticate on
+        # a peer for up to `_AUTH_CACHE_TTL_SECONDS`. This is safe only while the
+        # service is single-instance. REVISIT BEFORE ENABLING A SECOND REPLICA:
+        # add cross-replica invalidation (shared cache / pub-sub) or a
+        # per-request revocation check, or drop the TTL to the tolerable window.
         self._auth_cache: dict[str, _CachedAuthKey] = {}
         self.root_path = Path(root_path) if root_path is not None else None
         self._control_target: str | Path | StorageTarget | None = None
