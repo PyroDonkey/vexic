@@ -4,9 +4,10 @@ This module intentionally ingests benchmark conversations through the normal
 Tier 1 transcript surface so the benchmark measures Vexic memory behavior,
 not a parallel fixture format.
 
-Rehomed from the Coalescent source host (COA-342). Model-backed stages
-(extraction, contradiction, recall judging) flow through host-supplied agent
-factories per the host-port boundary; this module contains no provider wiring.
+Rehomed from the private source host; see docs/provenance.md. Model-backed
+stages (extraction, contradiction, recall judging) flow through host-supplied
+agent factories per the host-port boundary; this module contains no provider
+wiring.
 """
 
 from __future__ import annotations
@@ -46,6 +47,8 @@ from vexic.ports import AgentFactory, EmbedTexts, missing_host_port
 from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.rem import run_rem_phase
 from vexic.storage import TranscriptHit, init_db, save_messages, search_messages
+from vexic.storage.connection import connect as storage_connect
+from vexic.storage.errors import is_operational_error
 from vexic.storage.transcript import get_watermark
 from vexic.subagents.retrieval import (
     retrieve_candidate_fallback,
@@ -878,10 +881,12 @@ def _contains_answer_tokens(text: str, answer_tokens: Sequence[tuple[str, ...]])
 def _messages_fts_bodies(db_path: Path) -> list[str]:
     if not db_path.exists():
         return []
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(storage_connect(db_path)) as conn:
         try:
             rows = conn.execute("SELECT body FROM messages_fts").fetchall()
-        except sqlite3.OperationalError:
+        except (sqlite3.OperationalError, ValueError) as exc:
+            if not is_operational_error(exc):
+                raise
             return []
     return [str(row[0]) for row in rows]
 
@@ -889,7 +894,7 @@ def _messages_fts_bodies(db_path: Path) -> list[str]:
 def _load_diagnostic_candidates(db_path: Path) -> list[_DiagnosticCandidate]:
     if not db_path.exists():
         return []
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(storage_connect(db_path)) as conn:
         try:
             rows = conn.execute(
                 """
@@ -903,7 +908,9 @@ def _load_diagnostic_candidates(db_path: Path) -> list[_DiagnosticCandidate]:
                 ORDER BY id ASC
                 """
             ).fetchall()
-        except sqlite3.OperationalError:
+        except (sqlite3.OperationalError, ValueError) as exc:
+            if not is_operational_error(exc):
+                raise
             return []
     return [
         _DiagnosticCandidate(
@@ -983,7 +990,7 @@ def _promoted_answer_fact_exists(
 ) -> bool:
     if not db_path.exists():
         return False
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(storage_connect(db_path)) as conn:
         try:
             rows = conn.execute(
                 """
@@ -992,7 +999,9 @@ def _promoted_answer_fact_exists(
                 WHERE retired = 0
                 """
             ).fetchall()
-        except sqlite3.OperationalError:
+        except (sqlite3.OperationalError, ValueError) as exc:
+            if not is_operational_error(exc):
+                raise
             return False
     for fact_text, promoted_from_candidate_id in rows:
         if candidate_id is not None and int(promoted_from_candidate_id) == candidate_id:
@@ -1149,10 +1158,12 @@ def _count_rows_if_present(db_path: Path | None, table_name: str) -> int:
         return 0
     if table_name not in {"dream_runs", "memory_candidates", "long_term_memory"}:
         raise ValueError(f"Unsupported diagnostic table: {table_name}")
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(storage_connect(db_path)) as conn:
         try:
             row = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
-        except sqlite3.OperationalError:
+        except (sqlite3.OperationalError, ValueError) as exc:
+            if not is_operational_error(exc):
+                raise
             return 0
     return int(row[0]) if row is not None else 0
 

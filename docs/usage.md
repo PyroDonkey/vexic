@@ -302,6 +302,41 @@ promotion miss, retrieval miss, candidate fallback, or provider/runtime failure;
 answer synthesis is recorded separately as `not_run` with the reserved
 `judge_synthesis_issue` taxonomy slot for this retrieval-only smoke.
 
+## LongMemEval Memory Harness
+
+`vexic.longmemeval` is the full LongMemEval benchmark harness (rehomed from the
+private source host; see `docs/provenance.md`). Unlike `vexic.run_evals`
+(Tier 1 FTS only) and the live retrieval baseline (single-row provider smoke),
+it ingests each benchmark question into an isolated per-question SQLite
+database, runs the Light -> REM -> Deep dream chain through host-supplied agent
+factories, and measures Tier 3 retrieval quality with per-stage diagnostics.
+
+```bash
+# Local, provider-free transcript-FTS run:
+uv run python -m vexic.longmemeval \
+  --dataset data/longmemeval_oracle.json --split oracle \
+  --output-dir .eval-runs/longmemeval --skip-dream
+
+# Provider-backed judged-recall run (env-driven adapter secrets):
+OPENROUTER_API_KEY=... uv run python -m vexic.longmemeval \
+  --allow-live --adapter adapters/openrouter_live_adapter.py \
+  --dataset data/longmemeval_s_cleaned.json --split s \
+  --output-dir .eval-runs/longmemeval --answer-mode judged-recall --limit 12
+```
+
+Answer modes: `retrieval-debug` (Tier 1 FTS), `tier2-debug` (Light+REM, no
+Deep), `tier3-debug` (full dream then `retrieve_long_term_facts`), and
+`judged-recall` (Tier 3 with candidate fallback, graded by an LLM recall judge
+built from the adapter's `build_longmemeval_recall_judge_agent`). Each run
+writes `predictions.jsonl` and `diagnostics.jsonl` (stage decomposition:
+`answer_extracted_to_tier2`, `answer_promoted_to_tier3`,
+`answer_retrieved_from_tier3`, `answer_candidate_rank`), plus per-question-type
+judged-recall rates. `--selection stratified` round-robins across question
+types; `--resume-from-run` skips rows already `ok` in a prior run's
+diagnostics. Dream-phase runs require `--allow-live` and an `--adapter`; the
+judge fails closed with `HostPortNotConfigured` when no judge port is supplied.
+Do not vendor the LongMemEval benchmark corpus into this repo.
+
 ## Hosted MVP Shell
 
 The dependency-free hosted shell in `vexic.hosted` binds authenticated tenant

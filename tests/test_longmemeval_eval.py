@@ -1,4 +1,4 @@
-"""Conformance tests for the LongMemEval harness (rehomed from Coalescent, COA-342)."""
+"""Conformance tests for the LongMemEval harness in vexic.longmemeval."""
 
 import json
 import sqlite3
