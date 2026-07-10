@@ -146,6 +146,15 @@ class DreamSweeper:
                 )
             except asyncio.TimeoutError:
                 continue
+        # Recorder tasks can fail between the last tick log line and shutdown;
+        # flush that count so final-tick failures do not vanish. (Recorders
+        # that finish after this point were already logged individually.)
+        record_failures, self._record_failures = self._record_failures, 0
+        if record_failures:
+            logger.info(
+                "Dream sweeper stopping: %d record failures since the last tick log.",
+                record_failures,
+            )
 
     async def tick(self, *, now: datetime | None = None) -> SweepTickReport:
         now = now or self._clock()

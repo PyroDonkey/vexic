@@ -489,6 +489,31 @@ class DreamSweeperTickTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("sweep errors" in line for line in logs.output))
         self.assertEqual(sweeper._record_failures, 0)
 
+    async def test_shutdown_flushes_unlogged_record_failures(self) -> None:
+        """A recorder failure that lands after the last tick log line must
+        still surface before `run()` exits, not vanish into shutdown."""
+        service = self._service(_summary_ports())
+        sweeper = self._sweeper(service)
+        stop = asyncio.Event()
+
+        async def one_tick(*, now: datetime | None = None) -> SweepTickReport:
+            return SweepTickReport()
+
+        sweeper.tick = one_tick
+
+        async def fail_then_stop() -> None:
+            await asyncio.sleep(0)
+            sweeper._record_failures += 1
+            stop.set()
+
+        with self.assertLogs("vexic.hosted_sweeper", level="INFO") as logs:
+            await asyncio.gather(sweeper.run(stop), fail_then_stop())
+
+        self.assertTrue(
+            any("1 record failure" in line and "stopping" in line for line in logs.output)
+        )
+        self.assertEqual(sweeper._record_failures, 0)
+
     async def test_locked_scope_keeps_its_own_watermark_unadvanced(self) -> None:
         """A scope skipped by the in-flight lock never ran this tick's job,
         so ITS watermark must not advance: the next tick has to see its rows

@@ -180,6 +180,14 @@ def test_retryable_libsql_stream_not_found() -> None:
     assert is_retryable_operational_error(_hrana_stream_not_found()) is True
 
 
+def test_retryable_ignores_domain_stream_not_found_value_error() -> None:
+    # A domain ValueError that happens to contain the phrase without the
+    # Hrana payload context must not classify as a storage fault.
+    exc = ValueError("stream not found in registry")
+    assert is_operational_error(exc) is False
+    assert is_retryable_operational_error(exc) is False
+
+
 def test_retryable_ignores_unrelated_api_404_value_error() -> None:
     # A 404 api error without the stream-not-found marker (e.g. a deleted
     # database) must not classify as retryable.
