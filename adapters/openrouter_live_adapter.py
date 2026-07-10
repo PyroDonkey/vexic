@@ -64,6 +64,15 @@ meta-commentary -- return only the summary body.\
 
 DEFAULT_SUMMARY_MODEL = "deepseek/deepseek-v4-pro"
 
+# Per-agent output-token caps. The default model is a reasoning
+# model whose thinking tokens count against max_tokens, so a shared 512 cap
+# starved extraction into finish_reason=length before any structured output
+# was emitted. Each agent gets a budget sized to its job; the
+# VEXIC_LIVE_MAX_OUTPUT_TOKENS env var still overrides all of them.
+EXTRACTION_MAX_OUTPUT_TOKENS = 8192  # reasoning + structured candidate list
+SUMMARY_MAX_OUTPUT_TOKENS = 4096  # reasoning + prose summary
+CONTRADICTION_MAX_OUTPUT_TOKENS = 512  # single boolean judgment
+
 
 def _env_key(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_").upper()
@@ -157,9 +166,11 @@ def _embedding_model_name() -> str:
     return "openai/text-embedding-3-small"
 
 
-def _model_settings() -> ModelSettings:
+def _model_settings(
+    default_max_tokens: int = CONTRADICTION_MAX_OUTPUT_TOKENS,
+) -> ModelSettings:
     return {
-        "max_tokens": _int_env("VEXIC_LIVE_MAX_OUTPUT_TOKENS", 512),
+        "max_tokens": _int_env("VEXIC_LIVE_MAX_OUTPUT_TOKENS", default_max_tokens),
         "timeout": _float_env("VEXIC_LIVE_REQUEST_TIMEOUT_SECONDS", 60.0),
         "extra_body": OPENROUTER_PROVIDER_PREFERENCES,
     }
@@ -172,21 +183,33 @@ def _provider() -> OpenAIProvider:
     )
 
 
-def _agent(model_group: str, output_type: Any, instructions: str) -> Agent[None, Any]:
+def _agent(
+    model_group: str,
+    output_type: Any,
+    instructions: str,
+    *,
+    default_max_tokens: int,
+) -> Agent[None, Any]:
     return Agent(
         OpenAIChatModel(_model_name(model_group), provider=_provider()),
         output_type=output_type,
         instructions=instructions,
-        model_settings=_model_settings(),
+        model_settings=_model_settings(default_max_tokens),
     )
 
 
-def _agent_with_model(model_name: str, output_type: Any, instructions: str) -> Agent[None, Any]:
+def _agent_with_model(
+    model_name: str,
+    output_type: Any,
+    instructions: str,
+    *,
+    default_max_tokens: int,
+) -> Agent[None, Any]:
     return Agent(
         OpenAIChatModel(model_name, provider=_provider()),
         output_type=output_type,
         instructions=instructions,
-        model_settings=_model_settings(),
+        model_settings=_model_settings(default_max_tokens),
     )
 
 
@@ -195,7 +218,12 @@ def build_extraction_agent(
     secrets: Mapping[str, str] | None = None,
 ) -> Agent[None, list[FactCandidate]]:
     _reject_passed_secrets(secrets)
-    return _agent(model_group, list[FactCandidate], EXTRACTION_INSTRUCTIONS)
+    return _agent(
+        model_group,
+        list[FactCandidate],
+        EXTRACTION_INSTRUCTIONS,
+        default_max_tokens=EXTRACTION_MAX_OUTPUT_TOKENS,
+    )
 
 
 def build_contradiction_agent(
@@ -203,7 +231,12 @@ def build_contradiction_agent(
     secrets: Mapping[str, str] | None = None,
 ) -> Agent[None, ContradictionJudgment]:
     _reject_passed_secrets(secrets)
-    return _agent(model_group, ContradictionJudgment, CONTRADICTION_INSTRUCTIONS)
+    return _agent(
+        model_group,
+        ContradictionJudgment,
+        CONTRADICTION_INSTRUCTIONS,
+        default_max_tokens=CONTRADICTION_MAX_OUTPUT_TOKENS,
+    )
 
 
 def build_summary_agent(
@@ -214,7 +247,12 @@ def build_summary_agent(
     # via `VEXIC_SUMMARY_MODEL` (see `_summary_model_name`), not routed by
     # model group like the other agent builders in this module.
     _reject_passed_secrets(secrets)
-    return _agent_with_model(_summary_model_name(), str, SUMMARY_INSTRUCTIONS)
+    return _agent_with_model(
+        _summary_model_name(),
+        str,
+        SUMMARY_INSTRUCTIONS,
+        default_max_tokens=SUMMARY_MAX_OUTPUT_TOKENS,
+    )
 
 
 def build_longmemeval_recall_judge_agent(
