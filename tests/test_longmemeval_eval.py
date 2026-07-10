@@ -25,13 +25,22 @@ from vexic.longmemeval import (
     question_db_path,
     run_longmemeval_subset,
 )
+from vexic.embeddings import EMBEDDING_DIM
+from vexic.models import FactCandidate
 from vexic.storage import (
     CandidateNote,
     LongTermFact,
+    commit_dream_cycle,
     init_db,
     save_messages,
     search_messages,
 )
+
+
+def _basis_vector(axis: int) -> list[float]:
+    vector = [0.0] * EMBEDDING_DIM
+    vector[axis] = 1.0
+    return vector
 
 
 class _FakeRecallJudge:
@@ -844,6 +853,32 @@ class LongMemEvalArtifactTests(unittest.IsolatedAsyncioTestCase):
                 secrets={"OPENROUTER_API_KEY": "secret-token"},
             )
 
+    async def test_subset_skip_dream_refuses_secret_bearing_artifacts(self) -> None:
+        dataset_path = self.root / "longmemeval_oracle.json"
+        dataset_path.write_text(
+            json.dumps(
+                [self._dataset_row("q-secret", "single-session-user", "secret-token")]
+            ),
+            encoding="utf-8",
+        )
+        drain = AsyncMock()
+
+        with (
+            patch("vexic.longmemeval.drain_light_then_consolidate", new=drain),
+            self.assertRaisesRegex(ValueError, "forbidden secret"),
+        ):
+            await run_longmemeval_subset(
+                dataset_path,
+                split="oracle",
+                output_dir=self.root / "runs",
+                limit=1,
+                model_group="glm",
+                forbidden_secret_values=["secret-token"],
+                skip_dream=True,
+            )
+
+        drain.assert_not_awaited()
+
     async def test_subset_smoke_records_malformed_row_and_continues(self) -> None:
         good_row = self._dataset_row("q-good", "single-session-user", "cedar")
         bad_row = self._dataset_row("q-bad", "single-session-user", "bad")
@@ -1041,6 +1076,10 @@ class LongMemEvalJudgedRecallTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(diagnostics["judged_recall_pass"])
         self.assertEqual(summary.judged_recall_supported, 0)
         self.assertEqual(summary.judged_recall_total, 1)
+        self.assertEqual(
+            summary.judged_recall_by_question_type,
+            {"single-session-user": {"supported": 0, "total": 1}},
+        )
 
     async def test_judged_recall_stops_when_dream_is_incomplete(self) -> None:
         dataset_path = self.root / "longmemeval_oracle.json"
@@ -1292,6 +1331,186 @@ class LongMemEvalJudgedRecallTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(diagnostics["judge_error"], "Judge timed out.")
         self.assertFalse(diagnostics["judged_recall_pass"])
 
+    async def test_judged_recall_does_not_blend_candidates_when_tier3_hits(
+        self,
+    ) -> None:
+        dataset_path = self.root / "longmemeval_oracle.json"
+        dataset_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "question_id": "q-judged-tier3-hit",
+                        "question_type": "single-session-user",
+                        "question": "What benchmark code was mentioned?",
+                        "answer": "cedar",
+                        "question_date": "2026-01-03",
+                        "answer_session_ids": ["session-1"],
+                        "haystack_session_ids": ["session-1"],
+                        "haystack_dates": ["2026-01-02T03:04:05Z"],
+                        "haystack_sessions": [
+                            [{"role": "user", "content": "The benchmark code was cedar."}]
+                        ],
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        fact = LongTermFact(
+            fact_id=1,
+            fact_text="The benchmark code was cedar.",
+            subject="benchmark",
+            category="fact",
+            importance=7,
+            confidence=0.9,
+            source_message_ids=[1],
+            retrieved_count=0,
+            used_count=0,
+        )
+        drain = AsyncMock(return_value=_fake_dream_result())
+        retrieve = AsyncMock(return_value=[fact])
+        fallback = AsyncMock(
+            return_value=[
+                CandidateNote(
+                    candidate_id=2,
+                    fact_text="A candidate note should not be mixed in.",
+                    category="fact",
+                    source_message_ids=[2],
+                    created_at="2026-01-02T03:04:05+00:00",
+                )
+            ]
+        )
+        judge = _FakeRecallJudge(
+            LongMemEvalRecallJudgeVerdict(
+                verdict="supported",
+                reason="The durable fact states the benchmark code.",
+                confidence=0.95,
+            )
+        )
+
+        with (
+            patch("vexic.longmemeval.drain_light_then_consolidate", new=drain),
+            patch("vexic.longmemeval.retrieve_long_term_facts", new=retrieve),
+            patch("vexic.longmemeval.retrieve_candidate_fallback", new=fallback),
+        ):
+            summary = await run_longmemeval_subset(
+                dataset_path,
+                split="oracle",
+                output_dir=self.root / "runs",
+                limit=1,
+                model_group="claude",
+                answer_mode="judged-recall",
+                judge_scorer=judge,
+            )
+
+        diagnostics = json.loads(
+            summary.paths.diagnostics_path.read_text(encoding="utf-8")
+        )
+
+        fallback.assert_not_awaited()
+        self.assertFalse(diagnostics["candidate_fallback_used"])
+        self.assertEqual(diagnostics["retrieved_long_term_fact_count"], 1)
+        self.assertEqual(diagnostics["retrieved_candidate_note_count"], 0)
+        self.assertEqual(
+            judge.calls[0].retrieved_fact_texts,
+            ("The benchmark code was cedar.",),
+        )
+
+    async def test_judged_recall_candidate_fallback_logs_retrieval_event(
+        self,
+    ) -> None:
+        dataset_path = self.root / "longmemeval_oracle.json"
+        dataset_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "question_id": "q-judged-event",
+                        "question_type": "single-session-user",
+                        "question": "What benchmark code was mentioned?",
+                        "answer": "cedar",
+                        "question_date": "2026-01-03",
+                        "answer_session_ids": ["session-1"],
+                        "haystack_session_ids": ["session-1"],
+                        "haystack_dates": ["2026-01-02T03:04:05Z"],
+                        "haystack_sessions": [
+                            [{"role": "user", "content": "The benchmark code was cedar."}]
+                        ],
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        async def seed_candidate(
+            db_path: str,
+            _model_group: str,
+            **_: object,
+        ) -> object:
+            commit_dream_cycle(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="The benchmark code was cedar.",
+                        subject="benchmark",
+                        category="fact",
+                        importance=7,
+                        confidence=1.0,
+                        source_message_ids=[1],
+                    )
+                ],
+                agent_id=None,
+                candidate_embeddings=[_basis_vector(0)],
+                status="ok",
+                started_at="2026-01-03T00:00:00+00:00",
+                finished_at="2026-01-03T00:00:01+00:00",
+                messages_processed=1,
+                last_processed_message_id=1,
+            )
+            return _fake_dream_result()
+
+        retrieve = AsyncMock(return_value=[])
+        judge = _FakeRecallJudge(
+            LongMemEvalRecallJudgeVerdict(
+                verdict="supported",
+                reason="The retrieved note states the benchmark code.",
+                confidence=0.95,
+            )
+        )
+
+        with (
+            patch("vexic.longmemeval.drain_light_then_consolidate", new=seed_candidate),
+            patch("vexic.longmemeval.retrieve_long_term_facts", new=retrieve),
+            patch(
+                "vexic.subagents.retrieval.embed_texts",
+                return_value=[_basis_vector(0)],
+            ),
+        ):
+            summary = await run_longmemeval_subset(
+                dataset_path,
+                split="oracle",
+                output_dir=self.root / "runs",
+                limit=1,
+                model_group="claude",
+                answer_mode="judged-recall",
+                judge_scorer=judge,
+            )
+
+        db_path = next(summary.paths.run_dir.glob("q-judged-event-*/memory.db"))
+        with closing(sqlite3.connect(db_path)) as conn:
+            event_row = conn.execute(
+                """
+                SELECT candidate_id, session_id, query
+                FROM candidate_retrieval_events
+                """
+            ).fetchone()
+            retrieved_count = conn.execute(
+                "SELECT retrieved_count FROM memory_candidates WHERE id = 1"
+            ).fetchone()[0]
+
+        self.assertEqual(event_row[0], 1)
+        self.assertEqual(event_row[1], "longmemeval:q-judged-event:answer")
+        self.assertEqual(event_row[2], "What benchmark code was mentioned?")
+        self.assertEqual(retrieved_count, 1)
+
     async def test_judged_recall_fails_closed_without_judge_port(self) -> None:
         dataset_path = self.root / "longmemeval_oracle.json"
         dataset_path.write_text(
@@ -1491,10 +1710,11 @@ class LongMemEvalCliTests(unittest.TestCase):
         self.assertEqual(args.dream_session_batch_size, 3)
 
     def test_cli_rejects_non_positive_dream_session_batch_size(self) -> None:
-        with self.assertRaises(SystemExit):
-            build_parser().parse_args(
-                self._base_argv("--dream-session-batch-size", "0")
-            )
+        for value in ("0", "-1"):
+            with self.assertRaises(SystemExit):
+                build_parser().parse_args(
+                    self._base_argv("--dream-session-batch-size", value)
+                )
 
     def test_cli_defaults_match_documented_smoke_run(self) -> None:
         args = build_parser().parse_args(self._base_argv())

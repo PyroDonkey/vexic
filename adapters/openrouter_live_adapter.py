@@ -207,10 +207,13 @@ def build_longmemeval_recall_judge_agent(
     secrets: Mapping[str, str] | None = None,
 ) -> Agent[None, LongMemEvalRecallJudgeVerdict]:
     # Recall judging is deterministic grading, not generation: pin temperature 0
-    # on top of the shared env-driven settings.
+    # on top of the shared env-driven settings. The shared 512-token output cap
+    # is dropped so a long structured verdict reason cannot truncate into a
+    # judge error.
     _reject_passed_secrets(secrets)
     settings = _model_settings()
     settings["temperature"] = 0
+    settings.pop("max_tokens", None)
     return Agent(
         OpenAIChatModel(_model_name(model_group), provider=_provider()),
         output_type=LongMemEvalRecallJudgeVerdict,
