@@ -39,6 +39,7 @@ from vexic.hosted import (
     add_run_dream_phase_subcommand,
     dream_phase_ports_from_env,
     register_hosted_write_routes,
+    resolve_control_plane_target,
     resolve_storage_backend,
     run_dream_phase_command,
 )
@@ -80,6 +81,11 @@ class _TursoProvisioning:
         from adapters.turso_adapter import TenantTokenCache
 
         return TenantTokenCache(port)
+
+    def build_control_plane_target(self, env: dict[str, str]) -> object:
+        from adapters.turso_adapter import control_plane_target
+
+        return control_plane_target(env)
 
 
 MAX_BODY_BYTES = 1_000_000
@@ -280,26 +286,34 @@ def create_service_from_env(
     """
     backend = resolve_storage_backend(os.environ)
     root = Path(os.environ.get("VEXIC_HOSTED_ROOT", ".hosted-memory"))
+    provisioning = turso_provisioning or _TursoProvisioning()
+    # Control-plane target is independent of the customer-memory backend
+    # (ADR 0019 Addendum 4): `turso` routes the catalog + API-key
+    # store to the managed libSQL control-plane database; `local` (default)
+    # keeps the filesystem `control-plane.db`. `None` here means local.
+    control_target = None
+    if resolve_control_plane_target(os.environ) == "turso":
+        control_target = provisioning.build_control_plane_target(dict(os.environ))
     customer_target_resolver = None
     if backend == "turso":
-        provisioning = turso_provisioning or _TursoProvisioning()
         org = os.environ["TURSO_ORG"].strip()
         port = provisioning.build_port(dict(os.environ))
         catalog = HostedTenantCatalog(
             root,
+            control_target=control_target,
             customer_target_factory=lambda tenant_id: port.create_database(
                 _customer_database_name(tenant_id)
             ),
         )
-        keys = HostedApiKeyStore(root)
+        keys = HostedApiKeyStore(root, control_target=control_target)
         cache = provisioning.build_token_cache(port)
         if os.environ.get("VEXIC_PROVISION_EXISTING_TURSO_TARGETS", "").strip() == "1":
             catalog.provision_missing_customer_targets()
         _ensure_dogfood_tenant_target(catalog)
         customer_target_resolver = provisioning.build_resolver(cache, org=org)
     else:
-        catalog = HostedTenantCatalog(root)
-        keys = HostedApiKeyStore(root)
+        catalog = HostedTenantCatalog(root, control_target=control_target)
+        keys = HostedApiKeyStore(root, control_target=control_target)
     return HostedMemoryService(
         catalog,
         keys,

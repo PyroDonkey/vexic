@@ -1142,3 +1142,88 @@ def test_replacement_scope_unrelated_valueerror_still_propagates(monkeypatch, tm
         catalog.activate_replacement_database(
             "tenant-a", "libsql://replacement-customer-db"
         )
+
+
+# ---------------------------------------------------------------------------
+# In-process auth cache in front of a remote (StorageTarget) control
+# plane. Each authenticate() otherwise costs a network round-trip per
+# _load_key; the cache serves within a short TTL and is evicted on revoke.
+
+
+def _patch_connect_counting(monkeypatch, fake_conn: FakeLibsqlConn) -> dict:
+    import vexic.hosted_local as hosted_local
+
+    counter = {"n": 0}
+
+    def _fake_connect(target, *, auth_token=None, **kwargs):
+        counter["n"] += 1
+        return _NonClosingFakeConnHandle(fake_conn)
+
+    monkeypatch.setattr(hosted_local, "connect", _fake_connect)
+    return counter
+
+
+def _remote_key_store(monkeypatch, tmp_path):
+    fake_conn = FakeLibsqlConn()
+    counter = _patch_connect_counting(monkeypatch, fake_conn)
+    _forbid_local_permission_ops(monkeypatch)
+    target = StorageTarget("libsql://fake-control-plane", auth_token="s3cr3t-token")
+    keys = HostedApiKeyStore(tmp_path, control_target=target)
+    provisioned = keys.create_key(
+        tenant_id="tenant-a",
+        principal_id="agent-a",
+        capabilities={MemoryCapability.SEARCH},
+        project_ids={"project-a"},
+    )
+    return keys, provisioned, counter
+
+
+def test_auth_cache_hit_skips_control_plane_reads(monkeypatch, tmp_path):
+    keys, provisioned, counter = _remote_key_store(monkeypatch, tmp_path)
+
+    before = counter["n"]
+    auth = keys.authenticate(provisioned.raw_key)
+    assert auth.key_id == provisioned.key_id
+    after_first = counter["n"]
+    assert after_first > before  # first auth reached the control plane
+
+    # Repeated auth within the TTL is served from cache: no new connections.
+    keys.authenticate(provisioned.raw_key)
+    keys.authenticate(provisioned.raw_key)
+    assert counter["n"] == after_first
+    assert provisioned.key_id in keys._auth_cache
+
+
+def test_auth_cache_expiry_refetches(monkeypatch, tmp_path):
+    keys, provisioned, counter = _remote_key_store(monkeypatch, tmp_path)
+    keys._AUTH_CACHE_TTL_SECONDS = -1.0  # every entry is immediately stale
+
+    keys.authenticate(provisioned.raw_key)
+    after_first = counter["n"]
+    keys.authenticate(provisioned.raw_key)
+    assert counter["n"] > after_first  # stale entry forces a re-read
+
+
+def test_revoke_evicts_auth_cache(monkeypatch, tmp_path):
+    keys, provisioned, _counter = _remote_key_store(monkeypatch, tmp_path)
+
+    keys.authenticate(provisioned.raw_key)
+    assert provisioned.key_id in keys._auth_cache
+
+    keys.revoke_key(provisioned.key_id)
+    assert provisioned.key_id not in keys._auth_cache
+    with pytest.raises(PermissionError):
+        keys.authenticate(provisioned.raw_key)
+
+
+def test_local_control_plane_is_not_auth_cached(tmp_path):
+    # Local file control plane: auth reads a local sqlite file, no cache.
+    keys = HostedApiKeyStore(tmp_path)
+    provisioned = keys.create_key(
+        tenant_id="tenant-a",
+        principal_id="agent-a",
+        capabilities={MemoryCapability.SEARCH},
+        project_ids={"project-a"},
+    )
+    keys.authenticate(provisioned.raw_key)
+    assert keys._auth_cache == {}

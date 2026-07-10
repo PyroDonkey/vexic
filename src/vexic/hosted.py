@@ -1433,6 +1433,23 @@ def resolve_storage_backend(env: Mapping[str, str]) -> str:
     return value
 
 
+def resolve_control_plane_target(env: Mapping[str, str]) -> str:
+    """Resolve the non-secret ``VEXIC_CONTROL_PLANE_TARGET`` selection flag.
+
+    Selects where the control-plane catalog and API-key store live, separate
+    from ``VEXIC_STORAGE_BACKEND`` (which routes only customer memory). Defaults
+    to ``"local"`` (the filesystem ``control-plane.db`` on the hosted root,
+    unchanged behavior). ``"turso"`` routes the catalog to the managed libSQL
+    control-plane database resolved by ``adapters.turso_adapter`` (ADR 0019
+    Addendum 4); any other value is rejected. Never reads secrets --
+    only the flag -- so it is safe to keep in ``src/vexic``.
+    """
+    value = env.get("VEXIC_CONTROL_PLANE_TARGET", "local").strip().lower()
+    if value not in {"local", "turso"}:
+        raise ValueError(f"invalid VEXIC_CONTROL_PLANE_TARGET: {value!r}")
+    return value
+
+
 def _hosted_root_arg(value: str | None) -> Path:
     return Path(value or os.environ.get("VEXIC_HOSTED_ROOT", ".hosted-memory"))
 
