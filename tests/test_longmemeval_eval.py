@@ -1947,7 +1947,7 @@ class LongMemEvalCliTests(unittest.TestCase):
         with patch("vexic.longmemeval.run_longmemeval_subset", new=runner):
             exit_code = longmemeval_main(self._base_argv())
 
-        self.assertEqual(exit_code, 0)
+        self.assertEqual(exit_code, 2)
         runner.assert_not_awaited()
 
     def test_cli_wires_adapter_factories_for_judged_recall(self) -> None:

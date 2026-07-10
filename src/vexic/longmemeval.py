@@ -1717,10 +1717,11 @@ async def _amain(args: argparse.Namespace) -> int:
     if not args.skip_dream:
         if not args.allow_live:
             print(
-                "LongMemEval run skipped; pass --allow-live to run provider-backed "
-                "dream phases, or --skip-dream for a local retrieval-debug run."
+                "LongMemEval dream-phase runs require --allow-live (provider-backed) "
+                "or --skip-dream for a local retrieval-debug run.",
+                file=sys.stderr,
             )
-            return 0
+            return 2
         if args.adapter is None:
             print("--adapter is required with --allow-live.", file=sys.stderr)
             return 2
