@@ -656,12 +656,22 @@ def _filter_instances_by_question_id(
     if not question_ids:
         return list(raw_instances)
     allowed_ids = set(question_ids)
-    return [
+    selected = [
         raw
         for raw in raw_instances
         if isinstance(raw.get("question_id"), str)
         and raw["question_id"] in allowed_ids
     ]
+    found_ids = {raw["question_id"] for raw in selected}
+    missing_ids = sorted(allowed_ids - found_ids)
+    if missing_ids:
+        raise ValueError(
+            "LongMemEval question ids "
+            f"{', '.join(missing_ids)} are not in the selected subset; "
+            "raise --limit or adjust --selection so the requested rows are "
+            "selected before filtering."
+        )
+    return selected
 
 
 def _completed_question_ids_from_run(run_dir: Path) -> set[str]:

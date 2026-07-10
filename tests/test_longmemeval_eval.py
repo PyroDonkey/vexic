@@ -556,6 +556,25 @@ class LongMemEvalArtifactTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary.questions_started, 2)
         self.assertEqual([row["question_id"] for row in diagnostics], ["q-1", "q-2"])
 
+    async def test_subset_rejects_question_ids_missing_from_selected_subset(self) -> None:
+        rows = [
+            self._dataset_row(f"q-{index}", "single-session-user", f"code-{index}")
+            for index in range(3)
+        ]
+        dataset_path = self.root / "longmemeval_s_cleaned.json"
+        dataset_path.write_text(json.dumps(rows), encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "q-2.*not in the selected subset"):
+            await run_longmemeval_subset(
+                dataset_path,
+                split="s",
+                output_dir=self.root / "runs",
+                limit=1,
+                model_group="glm",
+                selection="first",
+                question_ids=("q-0", "q-2"),
+            )
+
     async def test_subset_can_resume_after_completed_rows_from_prior_run(self) -> None:
         rows = [
             self._dataset_row(f"q-{index}", "single-session-user", f"code-{index}")
@@ -1510,6 +1529,74 @@ class LongMemEvalJudgedRecallTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event_row[1], "longmemeval:q-judged-event:answer")
         self.assertEqual(event_row[2], "What benchmark code was mentioned?")
         self.assertEqual(retrieved_count, 1)
+
+    async def test_judged_recall_records_factory_judge_error_in_diagnostics(self) -> None:
+        dataset_path = self.root / "longmemeval_oracle.json"
+        dataset_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "question_id": "q-factory-judge-error",
+                        "question_type": "single-session-user",
+                        "question": "What benchmark code was mentioned?",
+                        "answer": "cedar",
+                        "question_date": "2026-01-03",
+                        "answer_session_ids": ["session-1"],
+                        "haystack_session_ids": ["session-1"],
+                        "haystack_dates": ["2026-01-02T03:04:05Z"],
+                        "haystack_sessions": [
+                            [{"role": "user", "content": "The benchmark code was cedar."}]
+                        ],
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        fact = LongTermFact(
+            fact_id=1,
+            fact_text="The benchmark code was cedar.",
+            subject="benchmark",
+            category="fact",
+            importance=7,
+            confidence=0.9,
+            source_message_ids=[1],
+            retrieved_count=0,
+            used_count=0,
+        )
+        drain = AsyncMock(return_value=_fake_dream_result())
+        retrieve = AsyncMock(return_value=[fact])
+
+        class _FailingJudgeAgent:
+            model = type("Model", (), {"model_name": "fake/judge-model"})()
+
+            async def run(self, prompt: str) -> object:
+                raise RuntimeError("Provider judge exploded.")
+
+        with (
+            patch("vexic.longmemeval.drain_light_then_consolidate", new=drain),
+            patch("vexic.longmemeval.retrieve_long_term_facts", new=retrieve),
+        ):
+            summary = await run_longmemeval_subset(
+                dataset_path,
+                split="oracle",
+                output_dir=self.root / "runs",
+                limit=1,
+                model_group="glm",
+                answer_mode="judged-recall",
+                judge_model_group="claude",
+                judge_agent_factory=lambda group, secrets=None: _FailingJudgeAgent(),
+            )
+
+        diagnostics = json.loads(
+            summary.paths.diagnostics_path.read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(summary.questions_failed, 1)
+        self.assertEqual(diagnostics["status"], "error")
+        self.assertEqual(diagnostics["judge_error"], "Provider judge exploded.")
+        self.assertEqual(diagnostics["error"], "Provider judge exploded.")
+        self.assertEqual(diagnostics["judge_model_id"], "fake/judge-model")
+        self.assertFalse(diagnostics["judged_recall_pass"])
 
     async def test_judged_recall_fails_closed_without_judge_port(self) -> None:
         dataset_path = self.root / "longmemeval_oracle.json"
