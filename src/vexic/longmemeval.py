@@ -1776,7 +1776,15 @@ async def _amain(args: argparse.Namespace) -> int:
             print(
                 f"  {question_type}: {supported}/{total} ({bucket_rate:.1%})"
             )
-    return 0 if summary.questions_failed == 0 else 1
+    # Incomplete rows (e.g. a drain that exhausted max_light_cycles) increment
+    # neither counter, so a clean exit also requires every started question to
+    # have completed.
+    return (
+        0
+        if summary.questions_failed == 0
+        and summary.questions_completed == summary.questions_started
+        else 1
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
