@@ -448,8 +448,11 @@ service, never committed):
 - `VEXIC_PROVISION_EXISTING_TURSO_TARGETS=1` to backfill Turso databases for
   stores provisioned before the Turso backend
 - `VEXIC_DREAM_PHASE_ADAPTER=/app/adapters/openrouter_live_adapter.py` and the
-  provider credential it reads (`OPENROUTER_API_KEY`), without which the
-  in-server dream sweeper (ADR 0030) stays off
+  provider credential it reads (`OPENROUTER_API_KEY`): set in production so the
+  in-server dream sweeper (ADR 0030) runs. These are optional for the process
+  to boot -- leaving them unset keeps model-backed operations failing closed,
+  as detailed under "Dream-phase / embedding model port config" below -- but
+  the deployed alpha sets them, so they are part of its required config.
 - Persistent volume mounted at `/data/vexic`
 - Health check path: `/health`
 
