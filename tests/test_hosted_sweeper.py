@@ -31,7 +31,8 @@ from vexic.hosted_sweeper import (
     sweeper_config_from_env,
 )
 from vexic.ports import DreamPhasePorts
-from vexic.storage import agent_watermarks, save_messages
+from vexic.storage import agent_watermarks, init_db, save_messages
+from vexic.storage.connection import StorageTarget
 
 NOW = datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc)
 
@@ -168,6 +169,31 @@ class DreamSweeperTickTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report.summarize_scheduled, 1)
         self.assertGreater(_summary_row_count(tenant.db_path), 0)
 
+    async def test_sweep_resolves_storage_through_customer_target_resolver(self) -> None:
+        """Regression: with a customer-target resolver configured (Turso
+        backend), the sweeper reads watermarks from the resolved target,
+        never from the vestigial local ``tenant.db_path``."""
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        resolved_path = self.root / "customer-memory.db"
+        init_db(str(resolved_path))
+        _seed_compactable_span(str(resolved_path))
+        target = StorageTarget(str(resolved_path))
+        service = HostedMemoryService(
+            self.catalog,
+            self.keys,
+            telemetry=self.catalog,
+            dream_phase_ports=_summary_ports(),
+            customer_target_resolver=lambda _tenant: target,
+        )
+        sweeper = self._sweeper(service)
+
+        report = await sweeper.tick(now=NOW)
+        await self._drain_background(service)
+
+        self.assertEqual(report.summarize_scheduled, 1)
+        self.assertGreater(_summary_row_count(str(resolved_path)), 0)
+        self.assertEqual(_summary_row_count(tenant.db_path), 0)
+
     async def test_second_tick_skips_when_no_new_messages(self) -> None:
         tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
         _seed_compactable_span(tenant.db_path)
@@ -228,6 +254,28 @@ class DreamSweeperTickTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report.errors, 1)
         self.assertEqual(report.summarize_scheduled, 1)
         self.assertGreater(_summary_row_count(tenant_b.db_path), 0)
+
+    async def test_every_tenant_failing_logs_a_distinct_error(self) -> None:
+        """A sweep that fails for every tenant on every tick must surface
+        loudly, not blend into per-tenant noise."""
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        self.catalog.provision_tenant("tenant-b", project_ids={"project-b"})
+        service = self._service(_summary_ports())
+
+        def broken_get_tenant(tenant_id: str):
+            raise RuntimeError("catalog corruption")
+
+        self.catalog.get_tenant = broken_get_tenant  # type: ignore[method-assign]
+        sweeper = self._sweeper(service)
+
+        with self.assertLogs("vexic.hosted_sweeper", level="ERROR") as logs:
+            report = await sweeper.tick(now=NOW)
+
+        self.assertEqual(report.errors, 2)
+        self.assertTrue(
+            any("every tenant" in message for message in logs.output),
+            logs.output,
+        )
 
     async def test_missing_summary_port_skips_without_crashing(self) -> None:
         tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
