@@ -18,6 +18,7 @@ as the hosted service factory does.
 from __future__ import annotations
 
 import argparse
+import sqlite3
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,17 +39,14 @@ class TableMigration:
 
     @property
     def complete(self) -> bool:
-        """True when the target holds at least every source row. Target may
-        exceed source when it already carried rows the source did not (a
-        re-run, or writes that landed after the snapshot)."""
-        return self.target_rows_after >= self.source_rows
+        """True when the target holds exactly the source rows. The target is
+        required to start empty (see ``migrate_control_plane``), so an exact
+        match is the real verification: fewer means rows were dropped, more
+        would mean the empty-target precondition was bypassed."""
+        return self.target_rows_after == self.source_rows
 
 
-def _open(target: ControlPlaneTarget):
-    # Plain connect(), deliberately WITHOUT `PRAGMA foreign_keys = ON`: the copy
-    # walks tables in schema-declaration order, not FK-dependency order, so
-    # enforcement would reject a child row inserted before its parent. INSERT
-    # OR IGNORE already preserves uniqueness/PK constraints.
+def _open(target: ControlPlaneTarget) -> sqlite3.Connection:
     if isinstance(target, StorageTarget):
         return connect(target)
     return connect(target, timeout=30)
@@ -74,20 +72,55 @@ def _ensure_target_schema(target: ControlPlaneTarget) -> None:
         HostedApiKeyStore(control_target=target)
 
 
-def _source_tables(conn) -> list[str]:
-    rows = conn.execute(
-        "SELECT name FROM sqlite_master "
-        "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
-        "ORDER BY name"
-    ).fetchall()
-    return [row[0] for row in rows]
+def _ordered_tables(conn: sqlite3.Connection) -> list[str]:
+    """Every non-internal source table, in foreign-key dependency order:
+    a referenced (parent) table always precedes the tables that reference it.
+
+    Alphabetical order would copy children such as ``tenant_projects`` before
+    ``tenants``; on a target that enforces foreign keys (Turso may) those
+    inserts fail and leave a partially populated catalog. Ordering by
+    ``PRAGMA foreign_key_list`` avoids that regardless of the target's FK
+    enforcement. Table names come from the source's own ``sqlite_master``.
+    """
+    tables = [
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
+            "ORDER BY name"
+        ).fetchall()
+    ]
+    table_set = set(tables)
+    parents: dict[str, set[str]] = {}
+    for table in tables:
+        refs = {
+            row[2]
+            for row in conn.execute(f"PRAGMA foreign_key_list({table})").fetchall()
+        }
+        parents[table] = (refs & table_set) - {table}
+
+    ordered: list[str] = []
+    placed: set[str] = set()
+
+    def _visit(table: str, on_stack: frozenset[str]) -> None:
+        if table in placed:
+            return
+        for parent in sorted(parents[table]):
+            if parent not in on_stack:  # ignore any cycle edge (schema is a DAG)
+                _visit(parent, on_stack | {table})
+        placed.add(table)
+        ordered.append(table)
+
+    for table in tables:
+        _visit(table, frozenset())
+    return ordered
 
 
-def _count(conn, table: str) -> int:
+def _count(conn: sqlite3.Connection, table: str) -> int:
     return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
 
 
-def _copy_table(src, dst, table: str) -> None:
+def _copy_table(src: sqlite3.Connection, dst: sqlite3.Connection, table: str) -> None:
     columns = [row[1] for row in src.execute(f"PRAGMA table_info({table})").fetchall()]
     if not columns:
         return
@@ -96,10 +129,22 @@ def _copy_table(src, dst, table: str) -> None:
     rows = src.execute(f"SELECT {col_list} FROM {table}").fetchall()
     if not rows:
         return
+    # Plain INSERT into a verified-empty target: any constraint conflict is a
+    # real anomaly that must surface, not be silently swallowed by OR IGNORE.
     dst.executemany(
-        f"INSERT OR IGNORE INTO {table} ({col_list}) VALUES ({placeholders})",
+        f"INSERT INTO {table} ({col_list}) VALUES ({placeholders})",
         rows,
     )
+
+
+class TargetNotEmptyError(RuntimeError):
+    """Raised when the target already holds control-plane rows.
+
+    The cutover copies into a freshly provisioned (empty) database. Refusing a
+    non-empty target is what makes the plain-``INSERT`` copy and the exact
+    row-count verification trustworthy: it rules out silently dropping a source
+    row that collides with a pre-existing, different target row. Recover by
+    recreating a fresh target database and re-running."""
 
 
 def migrate_control_plane(
@@ -108,12 +153,14 @@ def migrate_control_plane(
     *,
     ensure_target_schema: bool = True,
 ) -> list[TableMigration]:
-    """Copy every control-plane table from ``source`` to ``target``.
+    """Copy every control-plane table from ``source`` into an EMPTY ``target``.
 
-    Returns one ``TableMigration`` per source table with before/after row
-    counts. Idempotent; safe to re-run. Table identifiers come from the
-    source's own ``sqlite_master`` (never external input), so the f-string SQL
-    below interpolates trusted names only.
+    Returns one ``TableMigration`` per source table with source/after row
+    counts. The target must contain no control-plane rows (raises
+    ``TargetNotEmptyError`` otherwise); copy into a fresh database. Tables are
+    copied parents-first so foreign-key enforcement on the target cannot reject
+    a child row. Table identifiers come from the source's own ``sqlite_master``
+    (never external input), so the f-string SQL interpolates trusted names.
     """
     if ensure_target_schema:
         _ensure_target_schema(target)
@@ -123,7 +170,14 @@ def migrate_control_plane(
     try:
         dst = _open(target)
         try:
-            for table in _source_tables(src):
+            tables = _ordered_tables(src)
+            nonempty = [t for t in tables if _count(dst, t) > 0]
+            if nonempty:
+                raise TargetNotEmptyError(
+                    "target control plane is not empty; migrate into a fresh "
+                    f"database (populated tables: {', '.join(sorted(nonempty))})"
+                )
+            for table in tables:
                 source_rows = _count(src, table)
                 _copy_table(src, dst, table)
                 dst.commit()

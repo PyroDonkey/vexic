@@ -2,9 +2,14 @@
 local file -> local file (the real cutover swaps the target for a Turso
 StorageTarget, exercised live)."""
 
+import pytest
+
 from vexic.contract import MemoryCapability
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
-from vexic.migrate_control_plane import migrate_control_plane
+from vexic.migrate_control_plane import (
+    TargetNotEmptyError,
+    migrate_control_plane,
+)
 
 
 def _seed_source(root):
@@ -63,17 +68,36 @@ def test_migrate_preserves_key_authentication(tmp_path):
     assert auth.key_id == provisioned.key_id
 
 
-def test_migrate_is_idempotent(tmp_path):
+def test_migrate_refuses_nonempty_target(tmp_path):
+    """A second run into the now-populated target is refused, so a colliding
+    pre-existing row can never silently shadow a source row."""
     source_db = _seed_source(tmp_path / "src")
     target_db = tmp_path / "dst" / "control-plane.db"
 
-    first = migrate_control_plane(source_db, target_db)
-    second = migrate_control_plane(source_db, target_db)
+    migrate_control_plane(source_db, target_db)  # populates the target
+    with pytest.raises(TargetNotEmptyError):
+        migrate_control_plane(source_db, target_db)
 
-    first_tenants = next(r for r in first if r.table == "tenants")
-    second_tenants = next(r for r in second if r.table == "tenants")
-    assert first_tenants.target_rows_after == second_tenants.target_rows_after == 2
-    assert all(r.complete for r in second)
+
+def test_ordered_tables_places_parents_before_children(tmp_path):
+    """FK parents precede the tables that reference them, so a target that
+    enforces foreign keys never sees a child row before its parent."""
+    import sqlite3
+
+    from vexic.migrate_control_plane import _ordered_tables
+
+    source_db = _seed_source(tmp_path / "src")
+    conn = sqlite3.connect(source_db)
+    try:
+        order = _ordered_tables(conn)
+    finally:
+        conn.close()
+
+    def _before(parent: str, child: str) -> bool:
+        return parent in order and child in order and order.index(parent) < order.index(child)
+
+    assert _before("tenants", "tenant_projects")
+    assert _before("hosted_api_keys", "hosted_api_key_metadata")
 
 
 def test_migrate_reports_every_source_table(tmp_path):
