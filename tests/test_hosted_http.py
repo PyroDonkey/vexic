@@ -2085,6 +2085,83 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(ingest_response.json()["items"][0]["status"], "rejected")
         self.assertEqual(search_response.json()["hits"], [])
 
+    def _ingest_body(self, text: str = "hello") -> dict[str, object]:
+        message_json = single_message_adapter.dump_json(
+            ModelRequest(parts=[UserPromptPart(content=text)])
+        ).decode()
+        return {
+            "messages": [
+                {
+                    "source_host": "claude-code",
+                    "source_session_id": "source-session-a",
+                    "source_message_id": "msg-1",
+                    "message_json": message_json,
+                }
+            ],
+            "redaction": {"forbidden_values": []},
+        }
+
+    def test_hosted_ingest_maps_retryable_storage_valueerror_to_503(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE})
+
+        with patch.object(
+            type(self.service),
+            "ingest_source_transcript",
+            side_effect=ValueError(
+                'Hrana: `stream error: `Error { message: "SQLite error: '
+                'database is locked", code: "SQLITE_BUSY" }``'
+            ),
+        ):
+            response = self.client.post(
+                "/v1/ingest_source_transcript",
+                headers=self._write_headers(api_key),
+                json=self._ingest_body(),
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "storage_unavailable")
+        self.assertNotIn("SQLITE_BUSY", response.text)
+
+    def test_hosted_ingest_maps_nonretryable_storage_valueerror_to_500(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE})
+
+        with patch.object(
+            type(self.service),
+            "ingest_source_transcript",
+            side_effect=ValueError(
+                'Hrana: `stream error: `Error { message: "SQLite error: '
+                'no such table: messages_fts", code: "SQLITE_ERROR" }``'
+            ),
+        ):
+            response = self.client.post(
+                "/v1/ingest_source_transcript",
+                headers=self._write_headers(api_key),
+                json=self._ingest_body(),
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["error"]["code"], "internal_error")
+        self.assertNotIn("SQLITE_ERROR", response.text)
+
+    def test_hosted_ingest_contract_valueerror_still_returns_400(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE})
+
+        with patch.object(
+            type(self.service),
+            "ingest_source_transcript",
+            side_effect=ValueError(
+                "Refusing to persist message containing a forbidden secret value."
+            ),
+        ):
+            response = self.client.post(
+                "/v1/ingest_source_transcript",
+                headers=self._write_headers(api_key),
+                json=self._ingest_body(),
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], "invalid_request")
+
     def test_control_plane_routes_and_keys_are_tenant_isolated(self) -> None:
         client = TestClient(
             create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
