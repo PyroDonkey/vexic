@@ -318,7 +318,7 @@ directory does that, per ADR 0008/0013 precedent.
   routes it to per-tenant Turso databases. The control-plane catalog and
   API-key store are routed *separately* by `resolve_control_plane_target`
   reading `VEXIC_CONTROL_PLANE_TARGET` (`"local"` default, or `"turso"`, ADR
-  0019 Addendum 5 / COA-360); `turso` sends the catalog to a managed Turso
+  0019 Addendum 5); `turso` sends the catalog to a managed Turso
   control-plane database via `control_plane_target(env)`. Both flags carry no
   credential, so both stay in `src/vexic`. The deployed alpha runs both on
   `turso`.
@@ -431,7 +431,7 @@ Storage Backend" above) has landed on the deployed Railway alpha, which runs
 `VEXIC_STORAGE_BACKEND=turso` and `VEXIC_CONTROL_PLANE_TARGET=turso`. Customer
 memory lives in per-tenant Turso databases addressed by the control-plane
 `tenants.customer_target` DSN. The control-plane catalog and API-key store also
-run on Turso (ADR 0019 Addendum 5 / COA-360), migrated off the volume with
+run on Turso (ADR 0019 Addendum 5), migrated off the volume with
 `vexic.migrate_control_plane`. The Railway persistent volume stays mounted at
 `/data/vexic` (`VEXIC_HOSTED_ROOT=/data/vexic`), but the `control-plane.db` it
 holds is now a retained rollback handle -- unset `VEXIC_CONTROL_PLANE_TARGET`
@@ -770,8 +770,8 @@ ready.
 Not production/customer-data ready yet:
 
 - the control-plane catalog, audit/usage/job stores, and API-key store now run
-  on managed Turso (`VEXIC_CONTROL_PLANE_TARGET=turso`, ADR 0019 Addendum 5 /
-  COA-360), but on Turso's free tier with no point-in-time recovery: backup is
+  on managed Turso (`VEXIC_CONTROL_PLANE_TARGET=turso`, ADR 0019 Addendum 5),
+  but on Turso's free tier with no point-in-time recovery: backup is
   scripted `turso db dump` exports (`.github/workflows/turso-backup.yml`), not
   managed PITR, and the customer-readiness durability bar is not met;
 - no customer-readiness restore drill signed off end-to-end, incident
