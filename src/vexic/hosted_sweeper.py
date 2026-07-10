@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -25,8 +26,23 @@ from vexic.contract import DreamPhase
 from vexic.hosted import HostedMemoryService
 from vexic.ports import HostPortNotConfigured
 from vexic.storage import agent_watermarks
+from vexic.storage.errors import is_retryable_operational_error
 
 logger = logging.getLogger(__name__)
+
+
+def _record_with_retry(record: Callable[..., None], /, *args: object) -> None:
+    """Invoke a catalog state write, retrying once on a retryable storage
+    fault. Re-invoking the whole call opens a fresh control connection, which
+    is the actual fix for a reaped Turso Hrana stream: the failed commit lost
+    the write, and both sweep-state upserts are idempotent and
+    monotonic, so re-executing is safe."""
+    try:
+        record(*args)
+    except (sqlite3.Error, ValueError) as exc:
+        if not is_retryable_operational_error(exc):
+            raise
+        record(*args)
 
 _OFF_VALUES = frozenset({"off", "0", "false", "no"})
 FULL_DREAM_PHASES = (DreamPhase.LIGHT, DreamPhase.REM, DreamPhase.DEEP)
@@ -96,6 +112,11 @@ class DreamSweeper:
         # Injectable so tests can pin dream-completion stamps; production
         # always stamps real wall-clock time.
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        # Recorder tasks finish after their tick returns, so their failures
+        # cannot appear in that tick's report; they accumulate here and are
+        # reported (then reset) on the next run-loop log line. Incremented on
+        # the event loop only, so no lock is needed.
+        self._record_failures = 0
 
     async def run(self, stop: asyncio.Event) -> None:
         """Tick until `stop` is set. Each tick is fully self-contained; a
@@ -103,9 +124,11 @@ class DreamSweeper:
         while not stop.is_set():
             try:
                 report = await self.tick()
+                record_failures, self._record_failures = self._record_failures, 0
                 logger.info(
                     "Dream sweep tick: %d tenants, %d summarize, %d dreams, "
-                    "%d disabled, %d idle, %d locked, %d errors.",
+                    "%d disabled, %d idle, %d locked, %d sweep errors, "
+                    "%d record failures.",
                     report.tenants_seen,
                     report.summarize_scheduled,
                     report.dreams_scheduled,
@@ -113,6 +136,7 @@ class DreamSweeper:
                     report.skipped_no_new_messages,
                     report.skipped_locked,
                     report.errors,
+                    record_failures,
                 )
             except Exception:
                 logger.exception("Dream sweep tick failed.")
@@ -122,6 +146,15 @@ class DreamSweeper:
                 )
             except asyncio.TimeoutError:
                 continue
+        # Recorder tasks can fail between the last tick log line and shutdown;
+        # flush that count so final-tick failures do not vanish. (Recorders
+        # that finish after this point were already logged individually.)
+        record_failures, self._record_failures = self._record_failures, 0
+        if record_failures:
+            logger.info(
+                "Dream sweeper stopping: %d record failures since the last tick log.",
+                record_failures,
+            )
 
     async def tick(self, *, now: datetime | None = None) -> SweepTickReport:
         now = now or self._clock()
@@ -275,6 +308,9 @@ class DreamSweeper:
         completion time, not tick-start time, so the next dream is due a
         full interval after the chain finished. Catalog writes are monotonic,
         so a stale recorder can never rewind a newer watermark or stamp.
+        The watermark write and the dream stamp are recorded independently
+        and retried once on retryable storage faults (reaped Turso Hrana
+        stream), so one failed write cannot strand the other.
         """
         catalog = self._service.catalog
 
@@ -282,23 +318,33 @@ class DreamSweeper:
             results = await asyncio.gather(task, return_exceptions=True)
             if any(isinstance(result, asyncio.CancelledError) for result in results):
                 return
-            try:
-                if watermark is not None:
+            # The two writes are independent and retried: a failed watermark
+            # write must not skip the dream stamp, or the dream re-fires
+            # every tick.
+            if watermark is not None:
+                try:
                     await asyncio.to_thread(
+                        _record_with_retry,
                         catalog.record_summarize_watermark,
                         tenant_id,
                         agent_id,
                         watermark,
                     )
-                if dream_completed:
+                except Exception:
+                    self._record_failures += 1
+                    logger.exception("Recording summarize watermark failed.")
+            if dream_completed:
+                try:
                     await asyncio.to_thread(
+                        _record_with_retry,
                         catalog.record_dream_completed,
                         tenant_id,
                         agent_id,
                         self._clock().isoformat(),
                     )
-            except Exception:
-                logger.exception("Recording sweep state failed.")
+                except Exception:
+                    self._record_failures += 1
+                    logger.exception("Recording dream completion failed.")
 
         recorder = asyncio.create_task(_await_and_record())
         self._service._background_tasks.add(recorder)

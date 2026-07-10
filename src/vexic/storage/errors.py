@@ -67,6 +67,17 @@ _RETRYABLE_MARKERS = (
 )
 
 
+def _is_reaped_stream_error(message: str) -> bool:
+    """True for the Hrana ``api error`` 404 raised when Turso reaps an idle
+    stream (~10s) before the next round-trip -- typically ``commit()``. The
+    write on that stream is LOST (verified live 2026-07-10), so a retry must
+    re-execute on a fresh connection, not just re-commit. Requires the Hrana
+    payload context so a domain ``ValueError`` that merely contains the phrase
+    is not reclassified as a storage fault. ``message`` is lowercased.
+    """
+    return "hrana" in message and "stream not found" in message
+
+
 def _message(exc: BaseException) -> str:
     """Best-effort message text for both ``sqlite3.*`` and the libSQL ``ValueError``.
 
@@ -108,7 +119,9 @@ def is_operational_error(exc: BaseException) -> bool:
         return True
     if isinstance(exc, ValueError):
         message = _message(exc).lower()
-        return any(marker.lower() in message for marker in _OPERATIONAL_MARKERS)
+        return any(
+            marker.lower() in message for marker in _OPERATIONAL_MARKERS
+        ) or _is_reaped_stream_error(message)
     return False
 
 
@@ -125,5 +138,7 @@ def is_retryable_operational_error(exc: BaseException) -> bool:
         isinstance(exc, ValueError) and is_operational_error(exc)
     ):
         message = _message(exc).lower()
-        return any(marker in message for marker in _RETRYABLE_MARKERS)
+        return any(
+            marker in message for marker in _RETRYABLE_MARKERS
+        ) or _is_reaped_stream_error(message)
     return False
