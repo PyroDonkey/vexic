@@ -284,12 +284,24 @@ def test_live_adapter_builds_longmemeval_recall_judge_agent(
     monkeypatch.delenv("VEXIC_LIVE_MODEL", raising=False)
     monkeypatch.delenv("VEXIC_LIVE_CLAUDE_MODEL", raising=False)
 
-    agent = adapter.build_longmemeval_recall_judge_agent("claude")
+    # Capture Agent construction kwargs instead of reaching into pydantic_ai
+    # internals, so the assertions survive upstream attribute renames.
+    captured: dict[str, object] = {}
 
-    assert agent.output_type is LongMemEvalRecallJudgeVerdict
-    assert agent.model_settings["temperature"] == 0
-    instructions = agent._instructions  # pydantic_ai keeps instructions private
-    assert LONGMEMEVAL_RECALL_JUDGE_PROMPT in instructions
+    class _RecordingAgent:
+        def __init__(self, model: object, **kwargs: object) -> None:
+            captured["model"] = model
+            captured.update(kwargs)
+
+    monkeypatch.setattr(adapter, "Agent", _RecordingAgent)
+
+    adapter.build_longmemeval_recall_judge_agent("claude")
+
+    assert captured["output_type"] is LongMemEvalRecallJudgeVerdict
+    assert captured["instructions"] == LONGMEMEVAL_RECALL_JUDGE_PROMPT
+    settings = captured["model_settings"]
+    assert settings["temperature"] == 0
+    assert "max_tokens" not in settings
 
 
 def test_live_adapter_judge_agent_rejects_passed_secrets(
