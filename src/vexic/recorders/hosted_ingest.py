@@ -68,13 +68,16 @@ _ERROR_BODY_MAX_BYTES = 64 * 1024
 
 
 def _error_body_detail(exc: HTTPError) -> str | None:
-    """Extract `code: message` from a Vexic hosted error body, else None.
+    """Extract detail from a Vexic hosted error body, else None.
 
     Only the server's structured error envelope is surfaced -- an HTML or
     unparseable body is dropped so the raised message never echoes arbitrary
     proxy output. The read is bounded so a huge body from a misbehaving proxy
     is never buffered whole; anything over the cap cannot be the hosted
-    envelope and is dropped.
+    envelope and is dropped. Client-fault 4xx responses surface
+    `code: message` because the message carries the actionable detail;
+    5xx responses surface only the stable error code so server-side text
+    never reaches the recorder's status output.
     """
     try:
         raw = exc.read(_ERROR_BODY_MAX_BYTES + 1)
@@ -90,5 +93,8 @@ def _error_body_detail(exc: HTTPError) -> str | None:
     message = error.get("message")
     if not isinstance(code, str) or not code:
         return None
-    detail = code if not isinstance(message, str) or not message else f"{code}: {message}"
+    if exc.code >= 500 or not isinstance(message, str) or not message:
+        detail = code
+    else:
+        detail = f"{code}: {message}"
     return detail[:_ERROR_DETAIL_MAX_CHARS]
