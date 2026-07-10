@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -45,7 +46,13 @@ from vexic.mcp_http import register_mcp_routes
 from vexic.mcp_http import _scope_from_headers as _read_scope_from_headers
 from vexic.ports import HostPortNotConfigured
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
-from vexic.storage.errors import is_operational_error, is_retryable_operational_error
+from vexic.storage.errors import (
+    is_operational_error,
+    is_retryable_operational_error,
+    is_unique_violation,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class _TursoProvisioning:
@@ -390,7 +397,7 @@ async def _handle_search(
             return _error_response(401, "unauthorized", "Invalid hosted API key.")
         return _error_response(403, "permission_denied", str(exc))
     except ValueError as exc:
-        return _error_response(400, "invalid_request", str(exc))
+        return _value_error_response(exc)
     except Exception:
         return _error_response(500, "internal_error", "Hosted memory request failed.")
     return await _handle_payload(api_key, payload, call)
@@ -426,7 +433,7 @@ async def _handle_fresh_context(
             return _error_response(401, "unauthorized", "Invalid hosted API key.")
         return _error_response(403, "permission_denied", str(exc))
     except ValueError as exc:
-        return _error_response(400, "invalid_request", str(exc))
+        return _value_error_response(exc)
     except Exception:
         return _error_response(500, "internal_error", "Hosted memory request failed.")
     return await _handle_payload(api_key, payload, service.fresh_context)
@@ -467,7 +474,7 @@ async def _handle_expand_history(
             return _error_response(401, "unauthorized", "Invalid hosted API key.")
         return _error_response(403, "permission_denied", str(exc))
     except ValueError as exc:
-        return _error_response(400, "invalid_request", str(exc))
+        return _value_error_response(exc)
     except Exception:
         return _error_response(500, "internal_error", "Hosted memory request failed.")
     return await _handle_payload(
@@ -512,7 +519,7 @@ async def _handle_load_active_context(
             return _error_response(401, "unauthorized", "Invalid hosted API key.")
         return _error_response(403, "permission_denied", str(exc))
     except ValueError as exc:
-        return _error_response(400, "invalid_request", str(exc))
+        return _value_error_response(exc)
     except Exception:
         return _error_response(500, "internal_error", "Hosted memory request failed.")
     return await _handle_payload(api_key, payload, service.load_active_context)
@@ -598,7 +605,7 @@ async def _handle_trigger_dream_phase(
     except ValidationError as exc:
         return _error_response(400, "invalid_request", str(exc))
     except ValueError as exc:
-        return _error_response(400, "invalid_request", str(exc))
+        return _value_error_response(exc)
 
     try:
         result = await service.trigger_dream_phase(api_key, payload)
@@ -616,7 +623,7 @@ async def _handle_trigger_dream_phase(
             return _error_response(401, "unauthorized", "Invalid hosted API key.")
         return _error_response(403, "permission_denied", str(exc))
     except ValueError as exc:
-        return _error_response(400, "invalid_request", str(exc))
+        return _value_error_response(exc)
     except Exception:
         return _error_response(500, "internal_error", "Hosted memory request failed.")
     return JSONResponse(result.model_dump(mode="json"), status_code=202)
@@ -647,6 +654,40 @@ def _authenticate_for_header_scope(
     return authenticate(api_key)
 
 
+def _value_error_response(exc: ValueError) -> JSONResponse:
+    """Map a ``ValueError`` from a hosted operation to an HTTP response.
+
+    The hosted libSQL/Turso driver raises bare ``ValueError`` for SQL errors
+    (ADR 0019), so a storage fault mid-operation must not surface as a
+    client-fault 400 or echo the Hrana payload. ``pydantic.ValidationError``
+    subclasses ``ValueError`` and can embed marker-like client input in its
+    message, so it is classified as a client fault before the storage
+    classifiers run. Storage detail is never logged, mirroring the sanitized
+    control-plane logging convention.
+    """
+    if isinstance(exc, ValidationError):
+        return _error_response(400, "invalid_request", str(exc))
+    if is_retryable_operational_error(exc):
+        _log_storage_value_error("retryable_operational", exc)
+        return _error_response(
+            503,
+            "storage_unavailable",
+            "Hosted storage is temporarily unavailable.",
+        )
+    if is_operational_error(exc) or is_unique_violation(exc) or "hrana" in str(exc).lower():
+        _log_storage_value_error("operational", exc)
+        return _error_response(500, "internal_error", "Hosted memory request failed.")
+    return _error_response(400, "invalid_request", str(exc))
+
+
+def _log_storage_value_error(category: str, exc: ValueError) -> None:
+    logger.warning(
+        "hosted storage error category=%s exception_type=%s",
+        category,
+        type(exc).__name__,
+    )
+
+
 async def _handle_payload(
     api_key: str,
     payload: _RequestT,
@@ -674,19 +715,7 @@ async def _handle_payload(
             return _error_response(401, "unauthorized", "Invalid hosted API key.")
         return _error_response(403, "permission_denied", str(exc))
     except ValueError as exc:
-        # The hosted libSQL/Turso driver raises bare ValueError for SQL errors
-        # (ADR 0019), so a storage fault mid-operation must not surface as a
-        # client-fault 400. Classify it as a server-side condition and never
-        # echo the Hrana payload.
-        if is_retryable_operational_error(exc):
-            return _error_response(
-                503,
-                "storage_unavailable",
-                "Hosted storage is temporarily unavailable.",
-            )
-        if is_operational_error(exc):
-            return _error_response(500, "internal_error", "Hosted memory request failed.")
-        return _error_response(400, "invalid_request", str(exc))
+        return _value_error_response(exc)
     except Exception:
         return _error_response(500, "internal_error", "Hosted memory request failed.")
     return JSONResponse(result.model_dump(mode="json"))
