@@ -11,12 +11,14 @@ from unittest.mock import AsyncMock, patch
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 
 from vexic.longmemeval import (
+    _select_instances,
     drain_light_then_consolidate,
     drain_light_then_rem,
     ingest_instance,
     create_run_paths,
     parse_longmemeval_instance,
     question_db_path,
+    run_longmemeval_subset,
 )
 from vexic.storage import init_db, save_messages, search_messages
 
@@ -364,6 +366,236 @@ class LongMemEvalDreamDrainTests(unittest.IsolatedAsyncioTestCase):
             deep.await_args.kwargs["contradiction_agent_factory"],
             contradiction_factory,
         )
+
+
+def _fake_dream_result(**overrides: object) -> object:
+    fields: dict[str, object] = {
+        "status": "ok",
+        "light_cycles": 1,
+        "rem_ran": True,
+        "deep_ran": True,
+        "final_watermark": 1,
+        "error": None,
+    }
+    fields.update(overrides)
+    return type("DreamResult", (), fields)()
+
+
+class LongMemEvalArtifactTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _dataset_row(self, question_id: str, question_type: str, detail: str) -> dict:
+        return {
+            "question_id": question_id,
+            "question_type": question_type,
+            "question": "What benchmark code was mentioned?",
+            "answer": detail,
+            "question_date": "2026-01-03",
+            "answer_session_ids": ["session-1"],
+            "haystack_session_ids": ["session-1"],
+            "haystack_dates": ["2026-01-02T03:04:05Z"],
+            "haystack_sessions": [
+                [
+                    {
+                        "role": "user",
+                        "content": f"The benchmark code was {detail}.",
+                    }
+                ]
+            ],
+        }
+
+    async def test_subset_can_select_a_stratified_sample_by_question_type(self) -> None:
+        rows = []
+        for question_type in ("single-session-user", "multi-session", "knowledge-update"):
+            for index in range(3):
+                rows.append(
+                    self._dataset_row(
+                        f"{question_type}-{index}",
+                        question_type,
+                        f"code-{question_type}-{index}",
+                    )
+                )
+        dataset_path = self.root / "longmemeval_s_cleaned.json"
+        dataset_path.write_text(json.dumps(rows), encoding="utf-8")
+
+        with patch(
+            "vexic.longmemeval.drain_light_then_consolidate",
+            new=AsyncMock(return_value=_fake_dream_result()),
+        ):
+            summary = await run_longmemeval_subset(
+                dataset_path,
+                split="s",
+                output_dir=self.root / "runs",
+                limit=6,
+                model_group="glm",
+                selection="stratified",
+            )
+
+        diagnostics = [
+            json.loads(line)
+            for line in summary.paths.diagnostics_path.read_text(
+                encoding="utf-8"
+            ).splitlines()
+        ]
+
+        self.assertEqual(summary.questions_started, 6)
+        self.assertEqual(
+            [row["question_id"] for row in diagnostics],
+            [
+                "single-session-user-0",
+                "multi-session-0",
+                "knowledge-update-0",
+                "single-session-user-1",
+                "multi-session-1",
+                "knowledge-update-1",
+            ],
+        )
+        self.assertEqual(
+            [row["question_type"] for row in diagnostics],
+            [
+                "single-session-user",
+                "multi-session",
+                "knowledge-update",
+                "single-session-user",
+                "multi-session",
+                "knowledge-update",
+            ],
+        )
+
+    async def test_subset_rejects_non_positive_dream_session_batch_size(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "dream_session_batch_size must be at least 1",
+        ):
+            await run_longmemeval_subset(
+                self.root / "missing.json",
+                split="s",
+                output_dir=self.root / "runs",
+                limit=1,
+                model_group="glm",
+                dream_session_batch_size=0,
+            )
+
+    def test_subset_rejects_unsupported_selection(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "Unsupported LongMemEval selection: random",
+        ):
+            _select_instances(
+                [{"question_id": "q-1"}],
+                limit=1,
+                selection="random",
+            )
+
+    async def test_subset_can_retry_specific_question_ids(self) -> None:
+        rows = [
+            self._dataset_row(f"q-{index}", "single-session-user", f"code-{index}")
+            for index in range(3)
+        ]
+        dataset_path = self.root / "longmemeval_s_cleaned.json"
+        dataset_path.write_text(json.dumps(rows), encoding="utf-8")
+
+        with patch(
+            "vexic.longmemeval.drain_light_then_consolidate",
+            new=AsyncMock(return_value=_fake_dream_result()),
+        ):
+            summary = await run_longmemeval_subset(
+                dataset_path,
+                split="s",
+                output_dir=self.root / "runs",
+                limit=3,
+                model_group="glm",
+                question_ids=("q-1", "q-2"),
+            )
+
+        diagnostics = [
+            json.loads(line)
+            for line in summary.paths.diagnostics_path.read_text(
+                encoding="utf-8"
+            ).splitlines()
+        ]
+
+        self.assertEqual(summary.questions_started, 2)
+        self.assertEqual([row["question_id"] for row in diagnostics], ["q-1", "q-2"])
+
+    async def test_subset_can_resume_after_completed_rows_from_prior_run(self) -> None:
+        rows = [
+            self._dataset_row(f"q-{index}", "single-session-user", f"code-{index}")
+            for index in range(3)
+        ]
+        dataset_path = self.root / "longmemeval_s_cleaned.json"
+        dataset_path.write_text(json.dumps(rows), encoding="utf-8")
+        prior_run = self.root / "runs" / "prior"
+        prior_run.mkdir(parents=True)
+        prior_diagnostics = prior_run / "diagnostics.jsonl"
+        prior_diagnostics.write_text(
+            "\n".join(
+                [
+                    json.dumps({"question_id": "q-0", "status": "ok"}),
+                    json.dumps({"question_id": "q-1", "status": "error"}),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with patch(
+            "vexic.longmemeval.drain_light_then_consolidate",
+            new=AsyncMock(return_value=_fake_dream_result()),
+        ):
+            summary = await run_longmemeval_subset(
+                dataset_path,
+                split="s",
+                output_dir=self.root / "runs",
+                limit=3,
+                model_group="glm",
+                resume_from_run=prior_run,
+            )
+
+        diagnostics = [
+            json.loads(line)
+            for line in summary.paths.diagnostics_path.read_text(
+                encoding="utf-8"
+            ).splitlines()
+        ]
+
+        self.assertEqual(summary.questions_started, 2)
+        self.assertEqual([row["question_id"] for row in diagnostics], ["q-1", "q-2"])
+
+    async def test_subset_smoke_writes_prediction_and_diagnostics_jsonl(self) -> None:
+        dataset_path = self.root / "longmemeval_oracle.json"
+        dataset_path.write_text(
+            json.dumps([self._dataset_row("q-artifact", "single-session-user", "cedar")]),
+            encoding="utf-8",
+        )
+
+        with patch(
+            "vexic.longmemeval.drain_light_then_consolidate",
+            new=AsyncMock(return_value=_fake_dream_result()),
+        ):
+            summary = await run_longmemeval_subset(
+                dataset_path,
+                split="oracle",
+                output_dir=self.root / "runs",
+                limit=1,
+                model_group="glm",
+            )
+
+        predictions = summary.paths.predictions_path.read_text(encoding="utf-8")
+        diagnostics = summary.paths.diagnostics_path.read_text(encoding="utf-8")
+
+        self.assertIn('"question_id": "q-artifact"', predictions)
+        self.assertIn('"hypothesis":', predictions)
+        self.assertIn("cedar", predictions)
+        self.assertIn('"split": "oracle"', diagnostics)
+        self.assertIn('"status": "ok"', diagnostics)
+        self.assertIn('"deep_top_n": 15', diagnostics)
+        self.assertIn('"candidate_fallback_used": false', diagnostics)
 
 
 if __name__ == "__main__":
