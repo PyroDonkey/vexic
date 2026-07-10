@@ -48,6 +48,7 @@ _OPERATIONAL_MARKERS = (
     "syntax error",
     "malformed match",
     "fts5:",
+    "stream not found",
 )
 
 # Lock/busy/IO conditions that a retry might clear. Mirrors the intent of the
@@ -64,6 +65,11 @@ _RETRYABLE_MARKERS = (
     "sqlite_locked",
     "sqlite_ioerr",
     "sqlite_cantopen",
+    # Turso reaps an idle Hrana stream (~10s) and the next round-trip --
+    # typically ``commit()`` -- fails with an ``api error`` 404. The write on
+    # that stream is LOST (verified live 2026-07-10), so a retry must
+    # re-execute on a fresh connection, not just re-commit.
+    "stream not found",
 )
 
 
