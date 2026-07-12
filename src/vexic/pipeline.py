@@ -88,27 +88,31 @@ def _render_message_lines(message_id: int, msg: ModelMessage) -> list[str]:
     return lines
 
 
-def validate_candidate_source_ids(
+def keep_candidates_with_valid_source_ids(
     candidates: list[FactCandidate],
     allowed_message_ids: list[int],
-) -> None:
-    """Reject candidates citing message ids outside the rendered window."""
+) -> tuple[list[FactCandidate], int]:
+    """Keep only candidates whose source_message_ids sit inside the rendered
+    window, returning them with the count of those dropped.
+
+    Invariant 5 is enforced per candidate, not per batch. A miscited candidate
+    still never reaches Tier 2 -- provenance stays airtight -- but one model
+    slip no longer fails the whole Light run, which would halt the chain and
+    starve REM, Deep, and Tier 3.
+    """
     allowed = set(allowed_message_ids)
-    for index, candidate in enumerate(candidates):
+    kept: list[FactCandidate] = []
+    dropped = 0
+    for candidate in candidates:
         candidate_ids = set(candidate.source_message_ids)
-        if not candidate_ids:
-            # Identify candidates by position, never by fact_text: these
-            # messages end up in tracebacks and persisted error diagnostics.
-            raise ValueError(
-                f"Candidate #{index} source_message_ids must be non-empty."
-            )
-        invalid_ids = sorted(candidate_ids - allowed)
-        if invalid_ids:
-            raise ValueError(
-                "Candidate source_message_ids must refer to messages in the current window. "
-                f"Invalid IDs for candidate #{index}: {invalid_ids}"
-            )
+        if not candidate_ids or candidate_ids - allowed:
+            # Counted, never echoed: fact_text and the offending ids would
+            # carry tenant content into shared logs and error diagnostics.
+            dropped += 1
+            continue
         candidate.source_message_ids = sorted(candidate_ids)
+        kept.append(candidate)
+    return kept, dropped
 
 
 def _forbidden_secret_values(
@@ -194,8 +198,9 @@ async def run_light_phase(
         agent = agent_factory(model_group, secrets=secrets)
         result = await agent.run(transcript)
         usage = summarize_agent_usage(result)
-        candidates = result.output
-        validate_candidate_source_ids(candidates, evidence_ids)
+        candidates, dropped = keep_candidates_with_valid_source_ids(
+            result.output, evidence_ids
+        )
 
         missing_embeddings = load_candidates_missing_embeddings(
             db_path,
@@ -236,7 +241,15 @@ async def run_light_phase(
             estimated_cost_micros=usage.estimated_cost_micros,
             forbidden_secret_values=forbidden,
         )
-        print(f"Light phase: {len(rows)} messages -> {len(candidates)} extracted candidates.")
+        dropped_note = (
+            f" ({dropped} dropped: source_message_ids missing or outside the window)"
+            if dropped
+            else ""
+        )
+        print(
+            f"Light phase: {len(rows)} messages -> "
+            f"{len(candidates)} extracted candidates{dropped_note}."
+        )
         return usage
 
     except Exception as exc:

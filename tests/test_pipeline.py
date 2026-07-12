@@ -49,6 +49,188 @@ def _rem_candidate(candidate_id: int, embedding: list[float] | None) -> RemCandi
     return RemCandidate(candidate_id=candidate_id, embedding=embedding)
 
 
+class LightPhaseProvenanceTests(unittest.IsolatedAsyncioTestCase):
+    """Invariant 5 (every fact carries real provenance) is enforced per
+    candidate, not per batch: a candidate citing message ids outside the
+    rendered window is dropped, and the rest of the extraction still lands.
+    A model that miscites one fact must not cost the whole Light run -- that
+    halts the chain, so REM and Deep never run and Tier 3 stops advancing."""
+
+    async def test_light_phase_drops_candidate_citing_message_outside_window(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            message_id = save_messages(
+                db_path,
+                [ModelRequest(parts=[UserPromptPart(content="I prefer compact reports.")])],
+            )[0]
+            outside_window_id = message_id + 999
+
+            class ExtractionAgent:
+                async def run(self, transcript: str) -> object:
+                    return SimpleNamespace(
+                        output=[
+                            FactCandidate(
+                                fact_text="Ryan prefers compact reports.",
+                                subject="Ryan",
+                                category="preference",
+                                importance=7,
+                                confidence=0.9,
+                                source_message_ids=[message_id],
+                            ),
+                            FactCandidate(
+                                fact_text="Ryan lives on Mars.",
+                                subject="Ryan",
+                                category="fact",
+                                importance=5,
+                                confidence=0.8,
+                                source_message_ids=[outside_window_id],
+                            ),
+                        ]
+                    )
+
+            def agent_factory(model_group: str, secrets: object = None) -> object:
+                return ExtractionAgent()
+
+            def embed(texts: list[str]) -> list[list[float]]:
+                return [_unit_vector(1.0) for _ in texts]
+
+            await run_light_phase(
+                db_path,
+                "glm",
+                extraction_agent_factory=agent_factory,
+                embed=embed,
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                persisted = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT fact_text FROM memory_candidates ORDER BY id"
+                    ).fetchall()
+                ]
+                run_status = conn.execute(
+                    "SELECT status, last_processed_message_id FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+
+        self.assertEqual(persisted, ["Ryan prefers compact reports."])
+        self.assertEqual(run_status, ("ok", message_id))
+
+    async def test_light_phase_drops_candidate_with_no_source_message_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            message_id = save_messages(
+                db_path,
+                [ModelRequest(parts=[UserPromptPart(content="I prefer compact reports.")])],
+            )[0]
+
+            class ExtractionAgent:
+                async def run(self, transcript: str) -> object:
+                    return SimpleNamespace(
+                        output=[
+                            FactCandidate(
+                                fact_text="Ryan prefers compact reports.",
+                                subject="Ryan",
+                                category="preference",
+                                importance=7,
+                                confidence=0.9,
+                                source_message_ids=[message_id],
+                            ),
+                            FactCandidate(
+                                fact_text="Ryan dislikes long meetings.",
+                                subject="Ryan",
+                                category="preference",
+                                importance=5,
+                                confidence=0.8,
+                                source_message_ids=[],
+                            ),
+                        ]
+                    )
+
+            def agent_factory(model_group: str, secrets: object = None) -> object:
+                return ExtractionAgent()
+
+            def embed(texts: list[str]) -> list[list[float]]:
+                return [_unit_vector(1.0) for _ in texts]
+
+            await run_light_phase(
+                db_path,
+                "glm",
+                extraction_agent_factory=agent_factory,
+                embed=embed,
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                persisted = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT fact_text FROM memory_candidates ORDER BY id"
+                    ).fetchall()
+                ]
+
+        self.assertEqual(persisted, ["Ryan prefers compact reports."])
+
+    async def test_light_phase_advances_watermark_when_every_candidate_is_dropped(
+        self,
+    ) -> None:
+        # A run where the model miscites everything must still complete and
+        # advance the watermark. Holding it would re-extract the same window
+        # every tick -- paying the model over and over for a batch that can
+        # never land -- and halt the chain behind it.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            message_id = save_messages(
+                db_path,
+                [ModelRequest(parts=[UserPromptPart(content="I prefer compact reports.")])],
+            )[0]
+
+            class ExtractionAgent:
+                async def run(self, transcript: str) -> object:
+                    return SimpleNamespace(
+                        output=[
+                            FactCandidate(
+                                fact_text="Ryan lives on Mars.",
+                                subject="Ryan",
+                                category="fact",
+                                importance=5,
+                                confidence=0.8,
+                                source_message_ids=[message_id + 999],
+                            )
+                        ]
+                    )
+
+            def agent_factory(model_group: str, secrets: object = None) -> object:
+                return ExtractionAgent()
+
+            def embed(texts: list[str]) -> list[list[float]]:
+                return [_unit_vector(1.0) for _ in texts]
+
+            output = StringIO()
+            with redirect_stdout(output):
+                await run_light_phase(
+                    db_path,
+                    "glm",
+                    extraction_agent_factory=agent_factory,
+                    embed=embed,
+                )
+
+            self.assertEqual(get_watermark(db_path, agent_id=None), message_id)
+            with closing(sqlite3.connect(db_path)) as conn:
+                candidate_count = conn.execute(
+                    "SELECT COUNT(*) FROM memory_candidates"
+                ).fetchone()[0]
+
+        self.assertEqual(candidate_count, 0)
+        # Content-free: the operator learns that provenance dropped candidates
+        # and how many, never which facts or which message ids.
+        self.assertIn("1 dropped", output.getvalue())
+        self.assertNotIn("Mars", output.getvalue())
+
+
 class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
     async def test_light_phase_keeps_agent_scoped_windows_and_watermarks(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1379,9 +1561,11 @@ class PipelineCliTests(unittest.TestCase):
 
 
 class LightPhaseErrorDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
-    async def test_error_diagnostics_never_record_candidate_content(self) -> None:
+    async def test_dropped_candidate_content_never_reaches_diagnostics(self) -> None:
         # dream_runs.error_detail and the operator print are diagnostics; a
-        # failing extraction must not copy user memory text into either.
+        # candidate dropped for bad provenance must not copy user memory text
+        # into either. The drop replaces the old fail-the-batch ValueError, so
+        # the run now lands 'ok' with the miscited candidate simply absent.
         sentinel = "secret-medical-fact-sentinel"
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = str(Path(temp_dir) / "memory.db")
@@ -1414,25 +1598,28 @@ class LightPhaseErrorDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
 
             stdout = StringIO()
             with redirect_stdout(stdout):
-                with self.assertRaises(ValueError):
-                    await run_light_phase(
-                        db_path,
-                        "glm",
-                        extraction_agent_factory=lambda group, secrets=None: ExtractionAgent(),
-                        embed=lambda texts: [
-                            [1.0] + [0.0] * (EMBEDDING_DIM - 1) for _ in texts
-                        ],
-                    )
+                await run_light_phase(
+                    db_path,
+                    "glm",
+                    extraction_agent_factory=lambda group, secrets=None: ExtractionAgent(),
+                    embed=lambda texts: [
+                        [1.0] + [0.0] * (EMBEDDING_DIM - 1) for _ in texts
+                    ],
+                )
 
             with closing(sqlite3.connect(db_path)) as conn:
                 status, error_detail = conn.execute(
                     "SELECT status, error_detail FROM dream_runs ORDER BY id DESC LIMIT 1"
                 ).fetchone()
+                persisted = conn.execute(
+                    "SELECT COUNT(*) FROM memory_candidates"
+                ).fetchone()[0]
 
-        self.assertEqual(status, "error")
-        self.assertIn("ValueError", error_detail)
-        self.assertNotIn(sentinel, error_detail)
+        self.assertEqual(status, "ok")
+        self.assertIsNone(error_detail)
+        self.assertEqual(persisted, 0)
         self.assertNotIn(sentinel, stdout.getvalue())
+        self.assertIn("1 dropped", stdout.getvalue())
 
 
 def _cosine_vector(cos: float) -> list[float]:
