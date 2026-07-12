@@ -11,6 +11,8 @@ endpoint's own tests.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import shutil
 import sqlite3
 import tempfile
 import threading
@@ -19,10 +21,12 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 from vexic.contract import DreamPhase
+from vexic import hosted
 from vexic.hosted import HostedMemoryService
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 from vexic.hosted_sweeper import (
@@ -123,6 +127,357 @@ def _seed_compactable_span(db_path: object, *, agent_id: str | None = None) -> N
 def _summary_row_count(db_path: object) -> int:
     with closing(sqlite3.connect(db_path)) as conn:
         return conn.execute("SELECT COUNT(*) FROM session_summaries").fetchone()[0]
+
+
+class CrossProcessDreamLeaseTests(unittest.IsolatedAsyncioTestCase):
+    """The in-flight dedup lock must survive a container boundary.
+
+    Railway does rolling deploys, so an outgoing and an incoming container
+    overlap, and `DreamSweeper.run` sweeps immediately on boot. Both processes
+    then sweep the same (tenant, agent) scope against the same tenant database.
+    A process-local lock is invisible across that boundary, the writes collide,
+    and libSQL surfaces the commit conflict as a bare ValueError that halts the
+    chain (observed on all six production Light failures, each inside a deploy
+    window). Two `HostedMemoryService` instances over one control plane are
+    exactly that condition: shared catalog, separate in-process locks.
+    """
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.catalog = HostedTenantCatalog(self.root)
+        self.keys = HostedApiKeyStore(self.root)
+
+    def tearDown(self) -> None:
+        # A cancelled dream job's phase keeps running: it executes on a
+        # worker-thread event loop that cannot be interrupted (see
+        # `_run_system_dream_job`). That thread can still be writing SQLite
+        # sidecar files as the temp dir is removed, which raced `cleanup()` into
+        # a spurious "Directory not empty". The uninterruptible worker is the
+        # product's documented behaviour, so tolerate the debris here rather
+        # than pretend the thread stopped.
+        shutil.rmtree(self.root, ignore_errors=True)
+        self.temp_dir.cleanup()
+
+    def _service(self, ports: DreamPhasePorts) -> HostedMemoryService:
+        return HostedMemoryService(
+            self.catalog,
+            self.keys,
+            telemetry=self.catalog,
+            dream_phase_ports=ports,
+        )
+
+    async def test_failed_lease_acquire_does_not_wedge_the_scope_in_process(
+        self,
+    ) -> None:
+        # The in-process key is taken before the durable lease. If the
+        # control-plane write throws (transient libSQL fault), the key must not
+        # be left behind -- that scope would then be skipped as
+        # "already running" by every later sweep until the process restarts.
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        service = self._service(_summary_ports())
+
+        def _boom(*args: object, **kwargs: object) -> bool:
+            raise RuntimeError("control plane unavailable")
+
+        with patch.object(self.catalog, "acquire_dream_lease", _boom):
+            with self.assertRaises(RuntimeError):
+                service.schedule_system_dream(
+                    "tenant-a", agent_id=None, phases=(DreamPhase.SUMMARIZE,)
+                )
+
+        # The control plane recovers; the scope must be claimable again.
+        task = service.schedule_system_dream(
+            "tenant-a", agent_id=None, phases=(DreamPhase.SUMMARIZE,)
+        )
+        self.assertIsNotNone(task)
+        await asyncio.gather(*list(service._background_tasks))
+
+    async def test_failed_lease_release_does_not_escape_the_job(self) -> None:
+        # Release runs in the job's `finally`. A throwing control plane there
+        # would escape and mask the job's own outcome. Swallow it: the lease row
+        # just lapses on its TTL, so the scope is skipped for at most one lease
+        # period instead of the failure taking the job down with it.
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        service = self._service(_summary_ports())
+
+        def _boom(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("control plane unavailable")
+
+        with patch.object(self.catalog, "release_dream_lease", _boom):
+            job = service.schedule_system_dream(
+                "tenant-a", agent_id=None, phases=(DreamPhase.SUMMARIZE,)
+            )
+            self.assertIsNotNone(job)
+            await job  # must not raise
+
+        self.assertTrue(job.done())
+        self.assertIsNone(job.exception())
+
+    async def test_cancelled_job_keeps_its_lease_until_the_ttl(self) -> None:
+        # Cancelling does not stop the phase already in flight: it runs on a
+        # worker-thread event loop that cannot be interrupted, so it keeps
+        # writing. Releasing the lease on that path would hand the scope to the
+        # next container while the old worker is still writing it -- the very
+        # collision this lease exists to prevent. Let the lease lapse instead:
+        # the TTL covers the draining worker.
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        gate = threading.Event()
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _GatedAgent(gate, "a fake summary"),
+        )
+        holder = self._service(ports)
+        rival = self._service(ports)
+
+        try:
+            job = holder.schedule_system_dream(
+                "tenant-a", agent_id=None, phases=(DreamPhase.SUMMARIZE,)
+            )
+            self.assertIsNotNone(job)
+
+            # Let the job actually reach its worker thread. Cancelling a task
+            # that has not started yet never runs its `finally`, so it would
+            # pass this test without exercising the release path at all.
+            for _ in range(100):
+                await asyncio.sleep(0.02)
+                if any(
+                    event.status == "running"
+                    for event in holder.dream_trigger_job_events
+                ):
+                    break
+            else:
+                self.fail("job never reached the worker thread")
+
+            job.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await job
+
+            # The worker may still be draining, so the scope must stay claimed.
+            contended = rival.schedule_system_dream(
+                "tenant-a", agent_id=None, phases=(DreamPhase.SUMMARIZE,)
+            )
+            self.assertIsNone(contended, "a cancelled job released its lease early")
+        finally:
+            gate.set()
+
+    async def test_cancelling_does_not_let_the_same_process_reacquire(self) -> None:
+        # The cancel path keeps the durable lease but clears the in-process key,
+        # so the *same* process could try the scope again on its next tick. It
+        # must still lose: the lease it is holding has not lapsed, and its own
+        # uninterruptible worker is still draining. Acquire steals only an
+        # expired row, and does not special-case its own holder id.
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        gate = threading.Event()
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _GatedAgent(gate, "a fake summary"),
+        )
+        service = self._service(ports)
+
+        try:
+            job = service.schedule_system_dream(
+                "tenant-a", agent_id=None, phases=(DreamPhase.SUMMARIZE,)
+            )
+            for _ in range(100):
+                await asyncio.sleep(0.02)
+                if any(
+                    event.status == "running"
+                    for event in service.dream_trigger_job_events
+                ):
+                    break
+            else:
+                self.fail("job never reached the worker thread")
+
+            job.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await job
+
+            again = service.schedule_system_dream(
+                "tenant-a", agent_id=None, phases=(DreamPhase.SUMMARIZE,)
+            )
+            self.assertIsNone(
+                again, "the cancelling process reacquired its own draining scope"
+            )
+        finally:
+            gate.set()
+
+    async def test_lease_is_renewed_while_the_chain_is_still_running(self) -> None:
+        # The lease TTL bounds a *dead* holder, but it must never lapse under a
+        # *live* one. Deep alone has run 8 minutes in production and scales with
+        # candidate count, so a long chain could outlive a fixed TTL -- and the
+        # steal would hand the scope to a second container mid-write, which is
+        # the exact collision the lease exists to prevent. A live holder
+        # heartbeats.
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        gate = threading.Event()
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _GatedAgent(gate, "a fake summary"),
+        )
+        holder = self._service(ports)
+        rival = self._service(ports)
+
+        with (
+            patch.object(hosted, "DREAM_LEASE_TTL", timedelta(seconds=1)),
+            patch.object(hosted, "DREAM_LEASE_RENEW_INTERVAL", timedelta(seconds=0.1)),
+        ):
+            held = holder.schedule_system_dream(
+                "tenant-a", agent_id=None, phases=(DreamPhase.SUMMARIZE,)
+            )
+            self.assertIsNotNone(held)
+
+            # Outlive the TTL while the chain is still gated open.
+            await asyncio.sleep(1.5)
+
+            # The holder is alive, so its lease must still be good.
+            contended = rival.schedule_system_dream(
+                "tenant-a", agent_id=None, phases=(DreamPhase.SUMMARIZE,)
+            )
+            self.assertIsNone(contended)
+
+            gate.set()
+            await asyncio.gather(*list(holder._background_tasks))
+
+    async def test_losing_the_lease_mid_chain_stops_the_job(self) -> None:
+        # Renewal returns False when this holder no longer owns the row (a
+        # sustained control-plane outage let it lapse and another container
+        # stole it). Carrying on would keep writing to the tenant database
+        # while the new holder dreams the same scope -- the collision the lease
+        # exists to prevent, now silent. Fail closed: stop the chain and let the
+        # next tick re-evaluate.
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        gate = threading.Event()
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _GatedAgent(gate, "a fake summary"),
+        )
+        service = self._service(ports)
+
+        try:
+            with (
+                patch.object(hosted, "DREAM_LEASE_TTL", timedelta(seconds=1)),
+                patch.object(
+                    hosted, "DREAM_LEASE_RENEW_INTERVAL", timedelta(seconds=0.1)
+                ),
+                patch.object(self.catalog, "renew_dream_lease", lambda *a, **k: False),
+            ):
+                job = service.schedule_system_dream(
+                    "tenant-a", agent_id=None, phases=(DreamPhase.SUMMARIZE,)
+                )
+                self.assertIsNotNone(job)
+
+                # The heartbeat discovers the lease is gone and stops the chain.
+                # Budget generously (5s against a 0.1s renew interval): this
+                # asserts that cancellation *happens*, not how fast, and a tight
+                # budget only buys flakes on a loaded CI box.
+                for _ in range(100):
+                    await asyncio.sleep(0.05)
+                    if job.done():
+                        break
+
+                self.assertTrue(
+                    job.done(), "job kept running without holding the lease"
+                )
+        finally:
+            # Release the gated agent and let the cancelled job unwind before
+            # the temp dir goes away: a failing assertion would otherwise strand
+            # the worker thread, and its in-flight writes would race teardown.
+            gate.set()
+            with contextlib.suppress(asyncio.CancelledError):
+                await job
+            await asyncio.sleep(0)
+
+    def test_lapsed_lease_is_stealable_so_a_dead_holder_cannot_wedge_a_scope(
+        self,
+    ) -> None:
+        # A container killed mid-chain never releases its lease. The scope must
+        # become claimable once the lease lapses, or one crash silently stops
+        # that scope dreaming forever.
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        held = self.catalog.acquire_dream_lease(
+            "tenant-a",
+            None,
+            holder="container-1",
+            now="2026-07-12T00:00:00+00:00",
+            expires_at="2026-07-12T00:20:00+00:00",
+        )
+        self.assertTrue(held)
+
+        # Still live: a second container must lose.
+        contended = self.catalog.acquire_dream_lease(
+            "tenant-a",
+            None,
+            holder="container-2",
+            now="2026-07-12T00:05:00+00:00",
+            expires_at="2026-07-12T00:25:00+00:00",
+        )
+        self.assertFalse(contended)
+
+        # Lapsed: the scope is reclaimable.
+        stolen = self.catalog.acquire_dream_lease(
+            "tenant-a",
+            None,
+            holder="container-2",
+            now="2026-07-12T00:30:00+00:00",
+            expires_at="2026-07-12T00:50:00+00:00",
+        )
+        self.assertTrue(stolen)
+
+        # The dead holder's late release must not free the new holder's scope.
+        self.catalog.release_dream_lease("tenant-a", None, holder="container-1")
+        still_held = self.catalog.acquire_dream_lease(
+            "tenant-a",
+            None,
+            holder="container-3",
+            now="2026-07-12T00:35:00+00:00",
+            expires_at="2026-07-12T00:55:00+00:00",
+        )
+        self.assertFalse(still_held)
+
+    async def test_second_container_cannot_dream_a_scope_another_holds(self) -> None:
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        gate = threading.Event()
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _GatedAgent(gate, "a fake summary"),
+        )
+        outgoing = self._service(ports)
+        incoming = self._service(ports)
+
+        held = outgoing.schedule_system_dream(
+            "tenant-a", agent_id=None, phases=(DreamPhase.SUMMARIZE,)
+        )
+        self.assertIsNotNone(held)
+
+        # The incoming container boots mid-rollout and sweeps the same scope.
+        # It must lose: the outgoing container still holds the lease.
+        contended = incoming.schedule_system_dream(
+            "tenant-a", agent_id=None, phases=(DreamPhase.SUMMARIZE,)
+        )
+        self.assertIsNone(contended)
+
+        gate.set()
+        await asyncio.gather(*list(outgoing._background_tasks))
+
+        # Once the holder finishes, the scope is claimable again.
+        after = incoming.schedule_system_dream(
+            "tenant-a", agent_id=None, phases=(DreamPhase.SUMMARIZE,)
+        )
+        self.assertIsNotNone(after)
+        await asyncio.gather(*list(incoming._background_tasks))
 
 
 class DreamSweeperTickTests(unittest.IsolatedAsyncioTestCase):

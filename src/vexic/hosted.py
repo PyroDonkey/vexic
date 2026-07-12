@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import importlib.util
 import json
+import logging
 import os
 import secrets
 import sys
@@ -13,7 +14,7 @@ import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType
 from typing import Awaitable, Callable, Protocol, TypeVar
@@ -70,11 +71,26 @@ from vexic.storage.connection import StorageTarget
 from vexic.usage import UsageSummary
 
 
+logger = logging.getLogger(__name__)
+
 _RequestT = TypeVar("_RequestT", bound=MemoryRequest)
 _ResultT = TypeVar("_ResultT", bound=MemoryResult)
 
 HOSTED_WRITE_MAX_MESSAGES = 100
 HOSTED_WRITE_MAX_CHARS = 250_000
+
+# How long a dream lease survives without a heartbeat before another container
+# may steal it. This bounds a holder that DIED: short enough that a crash costs
+# at most one skipped sweep rather than a wedged scope, and comfortably under
+# the default 30-minute tick.
+DREAM_LEASE_TTL = timedelta(minutes=20)
+
+# A live holder heartbeats, so the TTL never lapses under a running chain --
+# Deep scales with candidate count and has run 8 minutes in production, so no
+# fixed TTL is safely "long enough" on its own. The 4x margin over the interval
+# tolerates a few missed renewals (a transient control-plane blip) before the
+# lease is at risk.
+DREAM_LEASE_RENEW_INTERVAL = timedelta(minutes=5)
 
 
 class HostedAppendTranscriptBody(BaseModel):
@@ -500,13 +516,19 @@ class HostedMemoryService:
         # shared-DB / second-tenant hazard. Secrets (the minted jwt) live only
         # inside the resolver, which is built in `adapters/`.
         self._customer_target_resolver = customer_target_resolver
-        # trigger_dream_phase (ADR 0025): per-(tenant_id,
-        # agent_id) in-process in-flight guard so a concurrent trigger is a
-        # cheap no-op (`skipped/already_running`) instead of a second
-        # summarize sweep. Process-local by design (see plan D3's accepted
-        # single-process risk); a multi-replica deploy needs a shared lock.
+        # Per-(tenant_id, agent_id) in-flight guard so a concurrent trigger or
+        # sweep is a cheap no-op instead of a second dream over one scope. Two
+        # layers: this in-process set is the fast path, and a durable
+        # control-plane lease (ADR 0032) makes the guard hold across container
+        # boundaries -- a rolling deploy overlaps two containers, each sweeping
+        # on boot, and a process-local lock cannot see the other one.
         self._dream_trigger_lock = threading.Lock()
         self._dream_trigger_inflight: set[tuple[str, str | None]] = set()
+        # Identifies this process as a lease holder. A lease is only released
+        # by the holder that took it, so a late release cannot free a scope
+        # another container has since claimed.
+        self._dream_lease_holder = f"dream-{uuid.uuid4()}"
+        self._dream_lease_heartbeats: set[asyncio.Task[None]] = set()
         # Background dream-trigger job events, mirroring
         # `HostedBackgroundJobRunner.job_events` for the trigger path. The
         # list append itself is safe on the asyncio event loop (single
@@ -752,6 +774,7 @@ class HostedMemoryService:
             )
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
+            self._start_dream_lease_heartbeat(lock_key, task)
         except BaseException:
             # Anything raised between acquiring the lock and successfully
             # handing the job off to `asyncio.create_task` must release the
@@ -767,11 +790,122 @@ class HostedMemoryService:
             if key in self._dream_trigger_inflight:
                 return False
             self._dream_trigger_inflight.add(key)
+        try:
+            claimed = self._acquire_dream_lease(key)
+        except BaseException:
+            # A throwing control plane must not strand the in-process claim:
+            # the scope would then be skipped as "already running" by every
+            # later sweep in this process until it restarts.
+            with self._dream_trigger_lock:
+                self._dream_trigger_inflight.discard(key)
+            raise
+        if claimed:
             return True
-
-    def _release_dream_trigger_lock(self, key: tuple[str, str | None]) -> None:
+        # Another container holds the scope. Drop the in-process claim too, or
+        # this process would refuse the scope forever once the other releases.
         with self._dream_trigger_lock:
             self._dream_trigger_inflight.discard(key)
+        return False
+
+    def _release_dream_trigger_lock(
+        self,
+        key: tuple[str, str | None],
+        *,
+        release_lease: bool = True,
+    ) -> None:
+        with self._dream_trigger_lock:
+            self._dream_trigger_inflight.discard(key)
+        if not release_lease:
+            # A cancelled job's phase keeps running: the worker-thread event
+            # loop cannot be interrupted. Releasing now would hand the scope to
+            # the next container while this one is still writing it -- exactly
+            # the collision the lease exists to prevent. Let the lease lapse
+            # instead; the TTL covers the draining worker.
+            return
+        try:
+            self._release_dream_lease(key)
+        except Exception:
+            # A throwing control plane must not escape the job's `finally` and
+            # mask the job's own outcome. The lease row simply lapses on its
+            # TTL, so the scope is skipped for at most one lease period instead
+            # of being stranded forever.
+            logger.exception("Dream lease release failed; leaving it to lapse.")
+
+    def _acquire_dream_lease(self, key: tuple[str, str | None]) -> bool:
+        tenant_id, agent_id = key
+        now = datetime.now(UTC)
+        return self.catalog.acquire_dream_lease(
+            tenant_id,
+            agent_id,
+            holder=self._dream_lease_holder,
+            now=now.isoformat(),
+            expires_at=(now + DREAM_LEASE_TTL).isoformat(),
+        )
+
+    def _release_dream_lease(self, key: tuple[str, str | None]) -> None:
+        tenant_id, agent_id = key
+        self.catalog.release_dream_lease(
+            tenant_id, agent_id, holder=self._dream_lease_holder
+        )
+
+    def _start_dream_lease_heartbeat(
+        self,
+        key: tuple[str, str | None],
+        job: "asyncio.Task[None]",
+    ) -> None:
+        """Keep this holder's lease fresh for as long as `job` runs.
+
+        Without this, a chain that outlives DREAM_LEASE_TTL lapses under itself
+        and a second container steals the scope mid-write -- the very collision
+        the lease exists to prevent.
+        """
+        tenant_id, agent_id = key
+
+        async def _heartbeat() -> None:
+            while True:
+                await asyncio.sleep(DREAM_LEASE_RENEW_INTERVAL.total_seconds())
+                try:
+                    still_ours = await asyncio.to_thread(
+                        self.catalog.renew_dream_lease,
+                        tenant_id,
+                        agent_id,
+                        holder=self._dream_lease_holder,
+                        expires_at=(
+                            datetime.now(UTC) + DREAM_LEASE_TTL
+                        ).isoformat(),
+                    )
+                except Exception:
+                    # A blip must not kill the chain: the TTL's margin over the
+                    # renew interval tolerates missed renewals, and the job's
+                    # own completion still releases the lease.
+                    logger.exception("Dream lease renewal failed.")
+                    continue
+                if not still_ours:
+                    # The lease lapsed and another container took the scope.
+                    # Running the rest of the chain would write to the tenant
+                    # database while the new holder dreams the same scope -- the
+                    # collision this lease exists to prevent, only silent.
+                    #
+                    # Cancelling stops the REMAINING phases. It cannot abort the
+                    # phase already in flight: that runs on a worker-thread event
+                    # loop which cannot be interrupted (see
+                    # `_run_system_dream_job`), so its writes still land. This
+                    # bounds the overlap to one phase rather than eliminating it.
+                    # A cancelled job leaves sweep state untouched, so the next
+                    # tick re-evaluates the scope cleanly.
+                    logger.warning(
+                        "Dream lease lost mid-chain; stopping the job for one scope."
+                    )
+                    job.cancel()
+                    return
+
+        # Deliberately NOT in `_background_tasks`: those are awaited on drain
+        # and shutdown, and a heartbeat is cancelled rather than completed. The
+        # separate set just keeps a strong reference so it is not GC'd mid-flight.
+        heartbeat = asyncio.create_task(_heartbeat())
+        self._dream_lease_heartbeats.add(heartbeat)
+        heartbeat.add_done_callback(self._dream_lease_heartbeats.discard)
+        job.add_done_callback(lambda _job: heartbeat.cancel())
 
     async def _run_dream_trigger_job(
         self,
@@ -795,8 +929,15 @@ class HostedMemoryService:
         def _run_in_worker_thread() -> tuple[RunDreamPhaseResult, UsageSummary]:
             return asyncio.run(self._run_dream_phase_with_usage(request, tenant))
 
+        cancelled = False
         try:
             result, usage = await asyncio.to_thread(_run_in_worker_thread)
+        except asyncio.CancelledError:
+            # The worker thread cannot be interrupted, so the phase may still be
+            # writing this scope. Hold the lease and let it lapse on its TTL
+            # rather than handing a live scope to the next container.
+            cancelled = True
+            raise
         except Exception as exc:
             self._record_dream_trigger_job(
                 job_id, request, auth, status="error", error_type=type(exc).__name__
@@ -822,7 +963,9 @@ class HostedMemoryService:
                 key_id=auth.key_id,
             )
         finally:
-            self._release_dream_trigger_lock(lock_key)
+            self._release_dream_trigger_lock(
+                lock_key, release_lease=not cancelled
+            )
 
     def _record_dream_trigger_job(
         self,
@@ -913,6 +1056,7 @@ class HostedMemoryService:
             )
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
+            self._start_dream_lease_heartbeat(lock_key, task)
         except BaseException:
             # Same wedge-prevention rule as `_schedule_dream_trigger`: any
             # failure between lock acquisition and task handoff must release
@@ -932,6 +1076,7 @@ class HostedMemoryService:
         event loop (same isolation rationale as `_run_dream_trigger_job`).
         A failing phase records its error and stops the chain — a Deep run
         over a failed Light extraction would promote from stale candidates."""
+        cancelled = False
         try:
             for request in requests:
                 job_id = secrets.token_hex(8)
@@ -985,8 +1130,16 @@ class HostedMemoryService:
                     project_id=request.scope.project_id,
                     key_id=auth.key_id,
                 )
+        except asyncio.CancelledError:
+            # The worker thread cannot be interrupted, so a phase may still be
+            # writing this scope. Hold the lease and let it lapse on its TTL
+            # rather than handing a live scope to the next container.
+            cancelled = True
+            raise
         finally:
-            self._release_dream_trigger_lock(lock_key)
+            self._release_dream_trigger_lock(
+                lock_key, release_lease=not cancelled
+            )
 
     async def export_scope(
         self,

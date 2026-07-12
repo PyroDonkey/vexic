@@ -296,6 +296,15 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
         )
     ).result()
     embeddings = [list(embedding) for embedding in result.embeddings]
+    # Count before dimensions: callers zip embeddings against their inputs with
+    # `strict=True`, so a short provider response would otherwise surface far
+    # downstream as a bare ValueError -- the same exception class libSQL raises
+    # for storage faults, which makes the two indistinguishable in an incident.
+    if len(embeddings) != len(texts):
+        raise RuntimeError(
+            f"{model} returned {len(embeddings)} embeddings for {len(texts)} "
+            "inputs; expected exactly one embedding per input text."
+        )
     bad_dimensions = [
         len(embedding)
         for embedding in embeddings
