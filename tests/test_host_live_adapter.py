@@ -340,6 +340,35 @@ def test_live_adapter_per_agent_output_caps(
     )
 
 
+def test_live_adapter_embedder_rejects_a_short_provider_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The adapter validated embedding *dimensions* but never *count*. A provider
+    # that returns fewer embeddings than inputs then flowed into
+    # `zip(..., strict=True)` in the Light path and surfaced as a bare
+    # ValueError -- indistinguishable from the libSQL storage faults that make
+    # ValueError so ambiguous here. Fail at the boundary, naming the model.
+    adapter = _load_adapter()
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
+    monkeypatch.delenv("VEXIC_LIVE_EMBEDDING_MODEL", raising=False)
+
+    class _ShortEmbedder:
+        def __init__(self, model: object) -> None:
+            pass
+
+        def embed_documents_sync(self, texts: list[str], *, settings: dict) -> object:
+            class _Result:
+                # Two inputs, one embedding back.
+                embeddings = [[0.0] * adapter.EMBEDDING_DIM]
+
+            return _Result()
+
+    monkeypatch.setattr(adapter, "Embedder", _ShortEmbedder)
+
+    with pytest.raises(RuntimeError, match="one embedding per input"):
+        adapter.embed_texts(["first text", "second text"])
+
+
 def test_live_adapter_no_agent_caps_below_reasoning_headroom(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

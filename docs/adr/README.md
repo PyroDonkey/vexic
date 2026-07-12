@@ -46,7 +46,8 @@ index (and the reverse).
 | 0028 | Control-plane destructive ops are audited, confirmed, and soft-deleted | accepted |
 | 0029 | Hosted load_active_context returns structured session history under the fresh-context capability | accepted |
 | 0030 | The hosted service schedules per-tenant dreaming itself with an in-server sweeper | accepted |
-| 0031 | Light drops miscited candidates instead of failing the batch | accepted |
+| 0031 | Light drops miscited candidates instead of failing the batch | accepted (Context corrected: it did not cause the 2026-07 hosted Light failures; see ADR 0032) |
+| 0032 | The dream in-flight lock is a durable control-plane lease | accepted |
 
 Notes:
 
