@@ -1,6 +1,9 @@
 # Automatic summarize triggering ships as an async trigger endpoint, hourly cron, and a detached SessionStart backstop
 
-Status: accepted
+Status: accepted (D5 cron producer only is superseded by ADR 0030; the
+in-server per-tenant sweeper replaced the hourly `dream-cron.yml` workflow
+as the primary producer. The trigger endpoint, dedup lock, budgets, and
+SessionStart backstop carry forward.)
 
 ## Context
 

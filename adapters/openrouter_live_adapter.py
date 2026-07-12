@@ -64,14 +64,16 @@ meta-commentary -- return only the summary body.\
 
 DEFAULT_SUMMARY_MODEL = "deepseek/deepseek-v4-pro"
 
-# Per-agent output-token caps. The default model is a reasoning
-# model whose thinking tokens count against max_tokens, so a shared 512 cap
-# starved extraction into finish_reason=length before any structured output
-# was emitted. Each agent gets a budget sized to its job; the
-# VEXIC_LIVE_MAX_OUTPUT_TOKENS env var still overrides all of them.
+# Per-agent output-token caps. The default model is a reasoning model whose
+# thinking tokens count against max_tokens, so a cap sized to the visible
+# output starves the agent into finish_reason=length before it emits anything:
+# 512 killed extraction, and the same 512 later killed Deep's contradiction
+# judgment even though that judgment is one boolean. Size every cap for the
+# reasoning ahead of the output, not the output. max_tokens is a ceiling, not
+# a spend, so headroom is free. VEXIC_LIVE_MAX_OUTPUT_TOKENS overrides all.
 EXTRACTION_MAX_OUTPUT_TOKENS = 8192  # reasoning + structured candidate list
-SUMMARY_MAX_OUTPUT_TOKENS = 4096  # reasoning + prose summary
-CONTRADICTION_MAX_OUTPUT_TOKENS = 512  # single boolean judgment
+SUMMARY_MAX_OUTPUT_TOKENS = 8192  # reasoning + prose summary
+CONTRADICTION_MAX_OUTPUT_TOKENS = 8192  # reasoning + single boolean judgment
 
 
 def _env_key(value: str) -> str:
@@ -166,14 +168,18 @@ def _embedding_model_name() -> str:
     return "openai/text-embedding-3-small"
 
 
-def _model_settings(
-    default_max_tokens: int = CONTRADICTION_MAX_OUTPUT_TOKENS,
-) -> ModelSettings:
-    return {
-        "max_tokens": _int_env("VEXIC_LIVE_MAX_OUTPUT_TOKENS", default_max_tokens),
+def _model_settings(default_max_tokens: int | None) -> ModelSettings:
+    # `None` omits the cap entirely; every capped caller states its own budget,
+    # so no agent can silently inherit another agent's ceiling.
+    settings: ModelSettings = {
         "timeout": _float_env("VEXIC_LIVE_REQUEST_TIMEOUT_SECONDS", 60.0),
         "extra_body": OPENROUTER_PROVIDER_PREFERENCES,
     }
+    if default_max_tokens is not None:
+        settings["max_tokens"] = _int_env(
+            "VEXIC_LIVE_MAX_OUTPUT_TOKENS", default_max_tokens
+        )
+    return settings
 
 
 def _provider() -> OpenAIProvider:
@@ -260,13 +266,12 @@ def build_longmemeval_recall_judge_agent(
     secrets: Mapping[str, str] | None = None,
 ) -> Agent[None, LongMemEvalRecallJudgeVerdict]:
     # Recall judging is deterministic grading, not generation: pin temperature 0
-    # on top of the shared env-driven settings. The shared 512-token output cap
-    # is dropped so a long structured verdict reason cannot truncate into a
+    # on top of the shared env-driven settings. The output cap is dropped
+    # entirely so a long structured verdict reason cannot truncate into a
     # judge error.
     _reject_passed_secrets(secrets)
-    settings = _model_settings()
+    settings = _model_settings(None)
     settings["temperature"] = 0
-    settings.pop("max_tokens", None)
     return Agent(
         OpenAIChatModel(_judge_model_name(model_group), provider=_provider()),
         output_type=LongMemEvalRecallJudgeVerdict,
