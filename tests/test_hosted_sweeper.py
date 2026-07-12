@@ -11,6 +11,8 @@ endpoint's own tests.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import shutil
 import sqlite3
 import tempfile
 import threading
@@ -147,6 +149,14 @@ class CrossProcessDreamLeaseTests(unittest.IsolatedAsyncioTestCase):
         self.keys = HostedApiKeyStore(self.root)
 
     def tearDown(self) -> None:
+        # A cancelled dream job's phase keeps running: it executes on a
+        # worker-thread event loop that cannot be interrupted (see
+        # `_run_system_dream_job`). That thread can still be writing SQLite
+        # sidecar files as the temp dir is removed, which raced `cleanup()` into
+        # a spurious "Directory not empty". The uninterruptible worker is the
+        # product's documented behaviour, so tolerate the debris here rather
+        # than pretend the thread stopped.
+        shutil.rmtree(self.root, ignore_errors=True)
         self.temp_dir.cleanup()
 
     def _service(self, ports: DreamPhasePorts) -> HostedMemoryService:
@@ -222,6 +232,57 @@ class CrossProcessDreamLeaseTests(unittest.IsolatedAsyncioTestCase):
 
             gate.set()
             await asyncio.gather(*list(holder._background_tasks))
+
+    async def test_losing_the_lease_mid_chain_stops_the_job(self) -> None:
+        # Renewal returns False when this holder no longer owns the row (a
+        # sustained control-plane outage let it lapse and another container
+        # stole it). Carrying on would keep writing to the tenant database
+        # while the new holder dreams the same scope -- the collision the lease
+        # exists to prevent, now silent. Fail closed: stop the chain and let the
+        # next tick re-evaluate.
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        gate = threading.Event()
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _GatedAgent(gate, "a fake summary"),
+        )
+        service = self._service(ports)
+
+        try:
+            with (
+                patch.object(hosted, "DREAM_LEASE_TTL", timedelta(seconds=1)),
+                patch.object(
+                    hosted, "DREAM_LEASE_RENEW_INTERVAL", timedelta(seconds=0.1)
+                ),
+                patch.object(self.catalog, "renew_dream_lease", lambda *a, **k: False),
+            ):
+                job = service.schedule_system_dream(
+                    "tenant-a", agent_id=None, phases=(DreamPhase.SUMMARIZE,)
+                )
+                self.assertIsNotNone(job)
+
+                # The heartbeat discovers the lease is gone and stops the chain.
+                # Budget generously (5s against a 0.1s renew interval): this
+                # asserts that cancellation *happens*, not how fast, and a tight
+                # budget only buys flakes on a loaded CI box.
+                for _ in range(100):
+                    await asyncio.sleep(0.05)
+                    if job.done():
+                        break
+
+                self.assertTrue(
+                    job.done(), "job kept running without holding the lease"
+                )
+        finally:
+            # Release the gated agent and let the cancelled job unwind before
+            # the temp dir goes away: a failing assertion would otherwise strand
+            # the worker thread, and its in-flight writes would race teardown.
+            gate.set()
+            with contextlib.suppress(asyncio.CancelledError):
+                await job
+            await asyncio.sleep(0)
 
     def test_lapsed_lease_is_stealable_so_a_dead_holder_cannot_wedge_a_scope(
         self,

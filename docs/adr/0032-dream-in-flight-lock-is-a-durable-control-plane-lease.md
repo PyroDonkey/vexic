@@ -65,6 +65,12 @@ Back the in-flight lock with a durable lease in the control-plane catalog.
   The in-process key is taken first, so it is released on that path too;
   otherwise the scope would be skipped as "already running" by every later sweep
   in the process until restart.
+- A renewal that returns "not yours" means the lease lapsed and another
+  container took the scope. The holder stops rather than keep dreaming a scope
+  it no longer owns. This bounds the overlap; it does not eliminate it. A phase
+  already in flight runs on a worker-thread event loop that cannot be
+  interrupted, so its writes still land. Cancelling stops the *remaining*
+  phases, which is the most the current execution model allows.
 
 ## Consequences
 

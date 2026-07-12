@@ -846,7 +846,7 @@ class HostedMemoryService:
             while True:
                 await asyncio.sleep(DREAM_LEASE_RENEW_INTERVAL.total_seconds())
                 try:
-                    await asyncio.to_thread(
+                    still_ours = await asyncio.to_thread(
                         self.catalog.renew_dream_lease,
                         tenant_id,
                         agent_id,
@@ -860,6 +860,25 @@ class HostedMemoryService:
                     # renew interval tolerates missed renewals, and the job's
                     # own completion still releases the lease.
                     logger.exception("Dream lease renewal failed.")
+                    continue
+                if not still_ours:
+                    # The lease lapsed and another container took the scope.
+                    # Running the rest of the chain would write to the tenant
+                    # database while the new holder dreams the same scope -- the
+                    # collision this lease exists to prevent, only silent.
+                    #
+                    # Cancelling stops the REMAINING phases. It cannot abort the
+                    # phase already in flight: that runs on a worker-thread event
+                    # loop which cannot be interrupted (see
+                    # `_run_system_dream_job`), so its writes still land. This
+                    # bounds the overlap to one phase rather than eliminating it.
+                    # A cancelled job leaves sweep state untouched, so the next
+                    # tick re-evaluates the scope cleanly.
+                    logger.warning(
+                        "Dream lease lost mid-chain; stopping the job for one scope."
+                    )
+                    job.cancel()
+                    return
 
         # Deliberately NOT in `_background_tasks`: those are awaited on drain
         # and shutdown, and a heartbeat is cancelled rather than completed. The
