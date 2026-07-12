@@ -265,6 +265,49 @@ class CrossProcessDreamLeaseTests(unittest.IsolatedAsyncioTestCase):
         finally:
             gate.set()
 
+    async def test_cancelling_does_not_let_the_same_process_reacquire(self) -> None:
+        # The cancel path keeps the durable lease but clears the in-process key,
+        # so the *same* process could try the scope again on its next tick. It
+        # must still lose: the lease it is holding has not lapsed, and its own
+        # uninterruptible worker is still draining. Acquire steals only an
+        # expired row, and does not special-case its own holder id.
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        gate = threading.Event()
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _GatedAgent(gate, "a fake summary"),
+        )
+        service = self._service(ports)
+
+        try:
+            job = service.schedule_system_dream(
+                "tenant-a", agent_id=None, phases=(DreamPhase.SUMMARIZE,)
+            )
+            for _ in range(100):
+                await asyncio.sleep(0.02)
+                if any(
+                    event.status == "running"
+                    for event in service.dream_trigger_job_events
+                ):
+                    break
+            else:
+                self.fail("job never reached the worker thread")
+
+            job.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await job
+
+            again = service.schedule_system_dream(
+                "tenant-a", agent_id=None, phases=(DreamPhase.SUMMARIZE,)
+            )
+            self.assertIsNone(
+                again, "the cancelling process reacquired its own draining scope"
+            )
+        finally:
+            gate.set()
+
     async def test_lease_is_renewed_while_the_chain_is_still_running(self) -> None:
         # The lease TTL bounds a *dead* holder, but it must never lapse under a
         # *live* one. Deep alone has run 8 minutes in production and scales with
