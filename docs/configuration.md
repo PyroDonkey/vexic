@@ -55,7 +55,7 @@ dream-phase adapter.
 | `VEXIC_LIVE_<GROUP>_MODEL` | live adapter | -- | Per-group override, e.g. `VEXIC_LIVE_HOSTED_DREAM_MODEL` for the `hosted-dream` group. Wins over `VEXIC_LIVE_MODEL`. |
 | `VEXIC_SUMMARY_MODEL` | live adapter | `deepseek/deepseek-v4-pro` | Model for the summarize phase (not routed by model group). |
 | `VEXIC_LIVE_EMBEDDING_MODEL` | live adapter | `openai/text-embedding-3-small` | Embedding model. |
-| `VEXIC_LIVE_MAX_OUTPUT_TOKENS` | live adapter | `8192` per dream agent (extraction, contradiction, summary); the recall judge is uncapped | Per-request output token cap. Set it to override every agent's default with one value. The default model reasons before it emits and thinking tokens count against this cap, so size it for the reasoning, not the visible output -- a cap sized to the output truncates the agent into `finish_reason=length`. |
+| `VEXIC_LIVE_MAX_OUTPUT_TOKENS` | live adapter | `8192` per dream agent (extraction, contradiction, summary); the recall judge is uncapped | Per-request output token cap. Set it to override the extraction, contradiction, and summary defaults with one value; the recall judge stays uncapped even when this is set, so a long structured verdict reason cannot truncate into a judge error. The default model reasons before it emits and thinking tokens count against this cap, so size it for the reasoning, not the visible output -- a cap sized to the output truncates the agent into `finish_reason=length`. |
 | `VEXIC_LIVE_REQUEST_TIMEOUT_SECONDS` | live adapter | `60.0` | Per-request timeout. |
 
 ## External cron caller (documented convention, not read by this repo)
