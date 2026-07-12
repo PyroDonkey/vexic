@@ -55,7 +55,7 @@ dream-phase adapter.
 | `VEXIC_LIVE_<GROUP>_MODEL` | live adapter | -- | Per-group override, e.g. `VEXIC_LIVE_HOSTED_DREAM_MODEL` for the `hosted-dream` group. Wins over `VEXIC_LIVE_MODEL`. |
 | `VEXIC_SUMMARY_MODEL` | live adapter | `deepseek/deepseek-v4-pro` | Model for the summarize phase (not routed by model group). |
 | `VEXIC_LIVE_EMBEDDING_MODEL` | live adapter | `openai/text-embedding-3-small` | Embedding model. |
-| `VEXIC_LIVE_MAX_OUTPUT_TOKENS` | live adapter | `512` | Per-request output token cap. |
+| `VEXIC_LIVE_MAX_OUTPUT_TOKENS` | live adapter | per-agent (extraction 8192, contradiction 8192, summary 4096) | Per-request output token cap. Set it to override every agent's default with one value. |
 | `VEXIC_LIVE_REQUEST_TIMEOUT_SECONDS` | live adapter | `60.0` | Per-request timeout. |
 
 ## External cron caller (documented convention, not read by this repo)

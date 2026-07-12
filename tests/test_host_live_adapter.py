@@ -9,6 +9,11 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# Below this, a reasoning model can burn the whole budget thinking and emit
+# nothing. Kept independent of the adapter's own constants so a bad edit there
+# cannot move the goalposts.
+REASONING_HEADROOM_FLOOR = 4096
+
 
 def _load_adapter() -> object:
     spec = importlib.util.spec_from_file_location(
@@ -309,9 +314,10 @@ def test_live_adapter_extraction_request_carries_raised_max_tokens(
 def test_live_adapter_per_agent_output_caps(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Each dream agent gets an output budget sized to its job: extraction
-    # emits a structured candidate list after reasoning, summary emits prose,
-    # contradiction emits a single boolean judgment.
+    # Each dream agent gets an output budget that leaves a reasoning model room
+    # to think before it emits: extraction a structured candidate list, summary
+    # prose, contradiction a single boolean judgment. The judgment is small but
+    # the reasoning ahead of it is not, so it needs extraction-sized headroom.
     adapter = _load_adapter()
     monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
     monkeypatch.delenv("VEXIC_LIVE_MAX_OUTPUT_TOKENS", raising=False)
@@ -324,14 +330,44 @@ def test_live_adapter_per_agent_output_caps(
         == 8192
     )
     assert (
-        adapter.build_summary_agent("summarize").model_settings["max_tokens"] == 4096
+        adapter.build_summary_agent("summarize").model_settings["max_tokens"] == 8192
     )
     assert (
         adapter.build_contradiction_agent("retrieval-smoke").model_settings[
             "max_tokens"
         ]
-        == 512
+        == 8192
     )
+
+
+def test_live_adapter_no_agent_caps_below_reasoning_headroom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The rule, not the numbers: the default model reasons before it emits, so
+    # any cap sized to an agent's visible output starves it into
+    # finish_reason=length. 512 killed extraction, then the same 512 killed
+    # Deep's one-boolean contradiction judgment. A new agent that sizes its cap
+    # by output length should fail here rather than in the hosted nightly dream.
+    adapter = _load_adapter()
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
+    monkeypatch.setenv("VEXIC_LIVE_MODEL", "deepseek/deepseek-v4-pro")
+    monkeypatch.delenv("VEXIC_LIVE_MAX_OUTPUT_TOKENS", raising=False)
+    monkeypatch.delenv("VEXIC_LIVE_RETRIEVAL_SMOKE_MODEL", raising=False)
+    monkeypatch.delenv("VEXIC_SUMMARY_MODEL", raising=False)
+
+    builders = (
+        adapter.build_extraction_agent,
+        adapter.build_contradiction_agent,
+        adapter.build_summary_agent,
+    )
+    for build in builders:
+        settings = build("retrieval-smoke").model_settings
+        assert settings["max_tokens"] >= REASONING_HEADROOM_FLOOR, build.__name__
+
+    # The recall judge is uncapped on purpose: a long structured verdict reason
+    # must never truncate into a judge error.
+    judge = adapter.build_longmemeval_recall_judge_agent("retrieval-smoke")
+    assert "max_tokens" not in judge.model_settings
 
 
 def test_live_adapter_max_output_tokens_env_overrides_all_agents(
