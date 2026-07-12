@@ -52,11 +52,19 @@ Back the in-flight lock with a durable lease in the control-plane catalog.
 - The in-process set stays as the fast path. Both layers are taken and released
   through the existing `_acquire_dream_trigger_lock` seam, so the sweeper and
   the trigger endpoint are both covered without a second authority model.
-- `expires_at` bounds a holder that dies mid-chain: `DREAM_LEASE_TTL` is 20
-  minutes, comfortably above a full Light -> REM -> Deep -> Summarize chain
-  (Deep alone has run 8 minutes in production) so a live holder is never stolen
-  from, and below the 30-minute sweep tick so a crashed holder costs at most one
-  skipped sweep rather than a permanently wedged scope.
+- `expires_at` bounds a holder that *died*: `DREAM_LEASE_TTL` is 20 minutes, so
+  a crash costs at most one skipped sweep rather than a permanently wedged
+  scope. A *live* holder heartbeats (`DREAM_LEASE_RENEW_INTERVAL`, 5 minutes),
+  because no fixed TTL is safely long enough on its own -- Deep scales with
+  candidate count and has already run 8 minutes in production, so a long chain
+  would otherwise lapse under itself and hand the scope to another container
+  mid-write. The 4x margin over the renew interval tolerates a few missed
+  renewals before the lease is at risk, and renewal is holder-scoped, so a lease
+  already stolen is never resurrected.
+- Acquiring the durable lease can itself throw (transient control-plane fault).
+  The in-process key is taken first, so it is released on that path too;
+  otherwise the scope would be skipped as "already running" by every later sweep
+  in the process until restart.
 
 ## Consequences
 

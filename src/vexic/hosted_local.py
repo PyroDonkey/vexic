@@ -1069,6 +1069,33 @@ class HostedTenantCatalog:
             conn.commit()
             return cursor.rowcount == 1
 
+    def renew_dream_lease(
+        self,
+        tenant_id: str,
+        agent_id: str | None,
+        *,
+        holder: str,
+        expires_at: str,
+    ) -> bool:
+        """Extend this holder's lease. True when the lease was still ours.
+
+        The TTL bounds a holder that died; a holder that is still working must
+        keep its claim, or a long chain (Deep scales with candidate count)
+        would lapse under itself and hand the scope to another container
+        mid-write. Holder-scoped: a lease already stolen is not resurrected.
+        """
+        with closing(self._connect_control()) as conn:
+            cursor = conn.execute(
+                """
+                UPDATE dream_sweep_lease
+                SET expires_at = ?
+                WHERE tenant_id = ? AND agent_id = ? AND holder = ?
+                """,
+                (expires_at, tenant_id, agent_id or _SHARED_AGENT_SENTINEL, holder),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+
     def release_dream_lease(
         self,
         tenant_id: str,

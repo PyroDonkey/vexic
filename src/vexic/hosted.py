@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import importlib.util
 import json
+import logging
 import os
 import secrets
 import sys
@@ -70,18 +71,26 @@ from vexic.storage.connection import StorageTarget
 from vexic.usage import UsageSummary
 
 
+logger = logging.getLogger(__name__)
+
 _RequestT = TypeVar("_RequestT", bound=MemoryRequest)
 _ResultT = TypeVar("_ResultT", bound=MemoryResult)
 
 HOSTED_WRITE_MAX_MESSAGES = 100
 HOSTED_WRITE_MAX_CHARS = 250_000
 
-# How long a dream lease is held before another container may steal it. Sized
-# well above a full Light -> REM -> Deep -> Summarize chain (Deep alone has run
-# 8 minutes in production) so a live holder is never stolen from mid-chain, and
-# well under the default 30-minute sweep tick so a holder that dies costs at
-# most one skipped sweep rather than a wedged scope.
+# How long a dream lease survives without a heartbeat before another container
+# may steal it. This bounds a holder that DIED: short enough that a crash costs
+# at most one skipped sweep rather than a wedged scope, and comfortably under
+# the default 30-minute tick.
 DREAM_LEASE_TTL = timedelta(minutes=20)
+
+# A live holder heartbeats, so the TTL never lapses under a running chain --
+# Deep scales with candidate count and has run 8 minutes in production, so no
+# fixed TTL is safely "long enough" on its own. The 4x margin over the interval
+# tolerates a few missed renewals (a transient control-plane blip) before the
+# lease is at risk.
+DREAM_LEASE_RENEW_INTERVAL = timedelta(minutes=5)
 
 
 class HostedAppendTranscriptBody(BaseModel):
@@ -519,6 +528,7 @@ class HostedMemoryService:
         # by the holder that took it, so a late release cannot free a scope
         # another container has since claimed.
         self._dream_lease_holder = f"dream-{uuid.uuid4()}"
+        self._dream_lease_heartbeats: set[asyncio.Task[None]] = set()
         # Background dream-trigger job events, mirroring
         # `HostedBackgroundJobRunner.job_events` for the trigger path. The
         # list append itself is safe on the asyncio event loop (single
@@ -764,6 +774,7 @@ class HostedMemoryService:
             )
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
+            self._start_dream_lease_heartbeat(lock_key, task)
         except BaseException:
             # Anything raised between acquiring the lock and successfully
             # handing the job off to `asyncio.create_task` must release the
@@ -779,7 +790,16 @@ class HostedMemoryService:
             if key in self._dream_trigger_inflight:
                 return False
             self._dream_trigger_inflight.add(key)
-        if self._acquire_dream_lease(key):
+        try:
+            claimed = self._acquire_dream_lease(key)
+        except BaseException:
+            # A throwing control plane must not strand the in-process claim:
+            # the scope would then be skipped as "already running" by every
+            # later sweep in this process until it restarts.
+            with self._dream_trigger_lock:
+                self._dream_trigger_inflight.discard(key)
+            raise
+        if claimed:
             return True
         # Another container holds the scope. Drop the in-process claim too, or
         # this process would refuse the scope forever once the other releases.
@@ -808,6 +828,46 @@ class HostedMemoryService:
         self.catalog.release_dream_lease(
             tenant_id, agent_id, holder=self._dream_lease_holder
         )
+
+    def _start_dream_lease_heartbeat(
+        self,
+        key: tuple[str, str | None],
+        job: "asyncio.Task[None]",
+    ) -> None:
+        """Keep this holder's lease fresh for as long as `job` runs.
+
+        Without this, a chain that outlives DREAM_LEASE_TTL lapses under itself
+        and a second container steals the scope mid-write -- the very collision
+        the lease exists to prevent.
+        """
+        tenant_id, agent_id = key
+
+        async def _heartbeat() -> None:
+            while True:
+                await asyncio.sleep(DREAM_LEASE_RENEW_INTERVAL.total_seconds())
+                try:
+                    await asyncio.to_thread(
+                        self.catalog.renew_dream_lease,
+                        tenant_id,
+                        agent_id,
+                        holder=self._dream_lease_holder,
+                        expires_at=(
+                            datetime.now(UTC) + DREAM_LEASE_TTL
+                        ).isoformat(),
+                    )
+                except Exception:
+                    # A blip must not kill the chain: the TTL's margin over the
+                    # renew interval tolerates missed renewals, and the job's
+                    # own completion still releases the lease.
+                    logger.exception("Dream lease renewal failed.")
+
+        # Deliberately NOT in `_background_tasks`: those are awaited on drain
+        # and shutdown, and a heartbeat is cancelled rather than completed. The
+        # separate set just keeps a strong reference so it is not GC'd mid-flight.
+        heartbeat = asyncio.create_task(_heartbeat())
+        self._dream_lease_heartbeats.add(heartbeat)
+        heartbeat.add_done_callback(self._dream_lease_heartbeats.discard)
+        job.add_done_callback(lambda _job: heartbeat.cancel())
 
     async def _run_dream_trigger_job(
         self,
@@ -949,6 +1009,7 @@ class HostedMemoryService:
             )
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
+            self._start_dream_lease_heartbeat(lock_key, task)
         except BaseException:
             # Same wedge-prevention rule as `_schedule_dream_trigger`: any
             # failure between lock acquisition and task handoff must release

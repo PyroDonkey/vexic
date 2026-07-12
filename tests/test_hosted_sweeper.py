@@ -19,10 +19,12 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 from vexic.contract import DreamPhase
+from vexic import hosted
 from vexic.hosted import HostedMemoryService
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 from vexic.hosted_sweeper import (
@@ -154,6 +156,72 @@ class CrossProcessDreamLeaseTests(unittest.IsolatedAsyncioTestCase):
             telemetry=self.catalog,
             dream_phase_ports=ports,
         )
+
+    async def test_failed_lease_acquire_does_not_wedge_the_scope_in_process(
+        self,
+    ) -> None:
+        # The in-process key is taken before the durable lease. If the
+        # control-plane write throws (transient libSQL fault), the key must not
+        # be left behind -- that scope would then be skipped as
+        # "already running" by every later sweep until the process restarts.
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        service = self._service(_summary_ports())
+
+        def _boom(*args: object, **kwargs: object) -> bool:
+            raise RuntimeError("control plane unavailable")
+
+        with patch.object(self.catalog, "acquire_dream_lease", _boom):
+            with self.assertRaises(RuntimeError):
+                service.schedule_system_dream(
+                    "tenant-a", agent_id=None, phases=(DreamPhase.SUMMARIZE,)
+                )
+
+        # The control plane recovers; the scope must be claimable again.
+        task = service.schedule_system_dream(
+            "tenant-a", agent_id=None, phases=(DreamPhase.SUMMARIZE,)
+        )
+        self.assertIsNotNone(task)
+        await asyncio.gather(*list(service._background_tasks))
+
+    async def test_lease_is_renewed_while_the_chain_is_still_running(self) -> None:
+        # The lease TTL bounds a *dead* holder, but it must never lapse under a
+        # *live* one. Deep alone has run 8 minutes in production and scales with
+        # candidate count, so a long chain could outlive a fixed TTL -- and the
+        # steal would hand the scope to a second container mid-write, which is
+        # the exact collision the lease exists to prevent. A live holder
+        # heartbeats.
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        gate = threading.Event()
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _GatedAgent(gate, "a fake summary"),
+        )
+        holder = self._service(ports)
+        rival = self._service(ports)
+
+        with (
+            patch.object(hosted, "DREAM_LEASE_TTL", timedelta(seconds=1)),
+            patch.object(hosted, "DREAM_LEASE_RENEW_INTERVAL", timedelta(seconds=0.1)),
+        ):
+            held = holder.schedule_system_dream(
+                "tenant-a", agent_id=None, phases=(DreamPhase.SUMMARIZE,)
+            )
+            self.assertIsNotNone(held)
+
+            # Outlive the TTL while the chain is still gated open.
+            await asyncio.sleep(1.5)
+
+            # The holder is alive, so its lease must still be good.
+            contended = rival.schedule_system_dream(
+                "tenant-a", agent_id=None, phases=(DreamPhase.SUMMARIZE,)
+            )
+            self.assertIsNone(contended)
+
+            gate.set()
+            await asyncio.gather(*list(holder._background_tasks))
 
     def test_lapsed_lease_is_stealable_so_a_dead_holder_cannot_wedge_a_scope(
         self,
