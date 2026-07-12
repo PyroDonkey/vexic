@@ -39,7 +39,7 @@ chain.
   chain behind it.
 - The dropped count is reported content-free
   (`Light phase: 50 messages -> 6 extracted candidates (1 dropped:
-  source_message_ids outside the window).`). Neither `fact_text` nor the
+  source_message_ids missing or outside the window).`). Neither `fact_text` nor the
   offending message ids reach shared logs or `dream_runs.error_detail`; a
   miscited id is itself tenant-derived.
 

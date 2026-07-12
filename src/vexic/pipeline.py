@@ -242,7 +242,7 @@ async def run_light_phase(
             forbidden_secret_values=forbidden,
         )
         dropped_note = (
-            f" ({dropped} dropped: source_message_ids outside the window)"
+            f" ({dropped} dropped: source_message_ids missing or outside the window)"
             if dropped
             else ""
         )
