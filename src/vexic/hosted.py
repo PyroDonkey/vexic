@@ -807,10 +807,29 @@ class HostedMemoryService:
             self._dream_trigger_inflight.discard(key)
         return False
 
-    def _release_dream_trigger_lock(self, key: tuple[str, str | None]) -> None:
+    def _release_dream_trigger_lock(
+        self,
+        key: tuple[str, str | None],
+        *,
+        release_lease: bool = True,
+    ) -> None:
         with self._dream_trigger_lock:
             self._dream_trigger_inflight.discard(key)
-        self._release_dream_lease(key)
+        if not release_lease:
+            # A cancelled job's phase keeps running: the worker-thread event
+            # loop cannot be interrupted. Releasing now would hand the scope to
+            # the next container while this one is still writing it -- exactly
+            # the collision the lease exists to prevent. Let the lease lapse
+            # instead; the TTL covers the draining worker.
+            return
+        try:
+            self._release_dream_lease(key)
+        except Exception:
+            # A throwing control plane must not escape the job's `finally` and
+            # mask the job's own outcome. The lease row simply lapses on its
+            # TTL, so the scope is skipped for at most one lease period instead
+            # of being stranded forever.
+            logger.exception("Dream lease release failed; leaving it to lapse.")
 
     def _acquire_dream_lease(self, key: tuple[str, str | None]) -> bool:
         tenant_id, agent_id = key
@@ -910,8 +929,15 @@ class HostedMemoryService:
         def _run_in_worker_thread() -> tuple[RunDreamPhaseResult, UsageSummary]:
             return asyncio.run(self._run_dream_phase_with_usage(request, tenant))
 
+        cancelled = False
         try:
             result, usage = await asyncio.to_thread(_run_in_worker_thread)
+        except asyncio.CancelledError:
+            # The worker thread cannot be interrupted, so the phase may still be
+            # writing this scope. Hold the lease and let it lapse on its TTL
+            # rather than handing a live scope to the next container.
+            cancelled = True
+            raise
         except Exception as exc:
             self._record_dream_trigger_job(
                 job_id, request, auth, status="error", error_type=type(exc).__name__
@@ -937,7 +963,9 @@ class HostedMemoryService:
                 key_id=auth.key_id,
             )
         finally:
-            self._release_dream_trigger_lock(lock_key)
+            self._release_dream_trigger_lock(
+                lock_key, release_lease=not cancelled
+            )
 
     def _record_dream_trigger_job(
         self,
@@ -1048,6 +1076,7 @@ class HostedMemoryService:
         event loop (same isolation rationale as `_run_dream_trigger_job`).
         A failing phase records its error and stops the chain — a Deep run
         over a failed Light extraction would promote from stale candidates."""
+        cancelled = False
         try:
             for request in requests:
                 job_id = secrets.token_hex(8)
@@ -1101,8 +1130,16 @@ class HostedMemoryService:
                     project_id=request.scope.project_id,
                     key_id=auth.key_id,
                 )
+        except asyncio.CancelledError:
+            # The worker thread cannot be interrupted, so a phase may still be
+            # writing this scope. Hold the lease and let it lapse on its TTL
+            # rather than handing a live scope to the next container.
+            cancelled = True
+            raise
         finally:
-            self._release_dream_trigger_lock(lock_key)
+            self._release_dream_trigger_lock(
+                lock_key, release_lease=not cancelled
+            )
 
     async def export_scope(
         self,

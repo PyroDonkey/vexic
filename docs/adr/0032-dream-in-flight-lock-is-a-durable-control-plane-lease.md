@@ -67,10 +67,19 @@ Back the in-flight lock with a durable lease in the control-plane catalog.
   in the process until restart.
 - A renewal that returns "not yours" means the lease lapsed and another
   container took the scope. The holder stops rather than keep dreaming a scope
-  it no longer owns. This bounds the overlap; it does not eliminate it. A phase
-  already in flight runs on a worker-thread event loop that cannot be
-  interrupted, so its writes still land. Cancelling stops the *remaining*
-  phases, which is the most the current execution model allows.
+  it no longer owns.
+- **A cancelled job keeps its lease and lets it lapse on the TTL.** Cancelling
+  does not stop the phase already in flight: it runs on a worker-thread event
+  loop that cannot be interrupted, so it keeps writing. Releasing the lease at
+  that moment would hand a *live* scope to the next container -- reintroducing
+  the exact collision this ADR exists to prevent, on the shutdown path that a
+  rolling deploy takes every time. Holding the lease means the scope is skipped
+  for at most one lease period while the worker drains, which is the cheaper
+  failure. Cancelling therefore stops the *remaining* phases and lets the
+  current one finish under the protection of a lease nobody else can take.
+- A release that throws (control-plane fault) is swallowed rather than escaping
+  the job's `finally` and masking the job's own outcome. The lease row lapses on
+  its TTL, so the worst case is one skipped sweep, not a stranded scope.
 
 ## Consequences
 

@@ -194,6 +194,77 @@ class CrossProcessDreamLeaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(task)
         await asyncio.gather(*list(service._background_tasks))
 
+    async def test_failed_lease_release_does_not_escape_the_job(self) -> None:
+        # Release runs in the job's `finally`. A throwing control plane there
+        # would escape and mask the job's own outcome. Swallow it: the lease row
+        # just lapses on its TTL, so the scope is skipped for at most one lease
+        # period instead of the failure taking the job down with it.
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        service = self._service(_summary_ports())
+
+        def _boom(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("control plane unavailable")
+
+        with patch.object(self.catalog, "release_dream_lease", _boom):
+            job = service.schedule_system_dream(
+                "tenant-a", agent_id=None, phases=(DreamPhase.SUMMARIZE,)
+            )
+            self.assertIsNotNone(job)
+            await job  # must not raise
+
+        self.assertTrue(job.done())
+        self.assertIsNone(job.exception())
+
+    async def test_cancelled_job_keeps_its_lease_until_the_ttl(self) -> None:
+        # Cancelling does not stop the phase already in flight: it runs on a
+        # worker-thread event loop that cannot be interrupted, so it keeps
+        # writing. Releasing the lease on that path would hand the scope to the
+        # next container while the old worker is still writing it -- the very
+        # collision this lease exists to prevent. Let the lease lapse instead:
+        # the TTL covers the draining worker.
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        gate = threading.Event()
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _GatedAgent(gate, "a fake summary"),
+        )
+        holder = self._service(ports)
+        rival = self._service(ports)
+
+        try:
+            job = holder.schedule_system_dream(
+                "tenant-a", agent_id=None, phases=(DreamPhase.SUMMARIZE,)
+            )
+            self.assertIsNotNone(job)
+
+            # Let the job actually reach its worker thread. Cancelling a task
+            # that has not started yet never runs its `finally`, so it would
+            # pass this test without exercising the release path at all.
+            for _ in range(100):
+                await asyncio.sleep(0.02)
+                if any(
+                    event.status == "running"
+                    for event in holder.dream_trigger_job_events
+                ):
+                    break
+            else:
+                self.fail("job never reached the worker thread")
+
+            job.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await job
+
+            # The worker may still be draining, so the scope must stay claimed.
+            contended = rival.schedule_system_dream(
+                "tenant-a", agent_id=None, phases=(DreamPhase.SUMMARIZE,)
+            )
+            self.assertIsNone(contended, "a cancelled job released its lease early")
+        finally:
+            gate.set()
+
     async def test_lease_is_renewed_while_the_chain_is_still_running(self) -> None:
         # The lease TTL bounds a *dead* holder, but it must never lapse under a
         # *live* one. Deep alone has run 8 minutes in production and scales with
