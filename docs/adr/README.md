@@ -40,7 +40,7 @@ index (and the reverse).
 | 0022 | Physical purge erases tombstoned scopes from the primary database | accepted |
 | 0023 | Hosted content encryption flows through a core ContentCodec port | accepted |
 | 0024 | Hosted fresh-conversation context ships as a Summarize dream phase plus a dedicated fresh_context capability | accepted |
-| 0025 | Automatic summarize triggering ships as an async trigger endpoint, hourly cron, and a detached SessionStart backstop | accepted |
+| 0025 | Automatic summarize triggering ships as an async trigger endpoint, hourly cron, and a detached SessionStart backstop | accepted (cron producer superseded by ADR 0030) |
 | 0026 | Agent setup uses a short-lived setup token exchange             | accepted |
 | 0027 | Agent MCP connect uses each client's own `mcp add` command, opt-in | accepted |
 | 0028 | Control-plane destructive ops are audited, confirmed, and soft-deleted | accepted |
@@ -120,9 +120,11 @@ Notes:
 - 0025 settles the COA-254 follow-on that makes Summarize triggering
   automatic: `POST /v1/trigger_dream_phase` (capability
   `memory:dream:trigger`, summarize-only in v1) schedules an async sweep run
-  on its own worker-thread event loop, an hourly `dream-cron.yml` workflow is
-  the primary producer, and a detached subprocess spawned from `recorder
-  prime` is a SessionStart backstop. It documents the tenant(+agent)-wide
+  on its own worker-thread event loop, and a detached subprocess spawned from
+  `recorder prime` is a SessionStart backstop. Its hourly `dream-cron.yml`
+  workflow was the primary producer until ADR 0030's in-server per-tenant
+  sweeper replaced it (the workflow is retired). It documents the
+  tenant(+agent)-wide
   sweep/budget scope honestly (project header authenticates, does not scope
   the sweep) and the accepted single-process risks (in-process dedup lock
   and rate limiter, task loss on restart). It affirms ADR 0018 and extends
