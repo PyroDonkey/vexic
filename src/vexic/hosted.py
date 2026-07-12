@@ -13,7 +13,7 @@ import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType
 from typing import Awaitable, Callable, Protocol, TypeVar
@@ -75,6 +75,13 @@ _ResultT = TypeVar("_ResultT", bound=MemoryResult)
 
 HOSTED_WRITE_MAX_MESSAGES = 100
 HOSTED_WRITE_MAX_CHARS = 250_000
+
+# How long a dream lease is held before another container may steal it. Sized
+# well above a full Light -> REM -> Deep -> Summarize chain (Deep alone has run
+# 8 minutes in production) so a live holder is never stolen from mid-chain, and
+# well under the default 30-minute sweep tick so a holder that dies costs at
+# most one skipped sweep rather than a wedged scope.
+DREAM_LEASE_TTL = timedelta(minutes=20)
 
 
 class HostedAppendTranscriptBody(BaseModel):
@@ -500,13 +507,18 @@ class HostedMemoryService:
         # shared-DB / second-tenant hazard. Secrets (the minted jwt) live only
         # inside the resolver, which is built in `adapters/`.
         self._customer_target_resolver = customer_target_resolver
-        # trigger_dream_phase (ADR 0025): per-(tenant_id,
-        # agent_id) in-process in-flight guard so a concurrent trigger is a
-        # cheap no-op (`skipped/already_running`) instead of a second
-        # summarize sweep. Process-local by design (see plan D3's accepted
-        # single-process risk); a multi-replica deploy needs a shared lock.
+        # Per-(tenant_id, agent_id) in-flight guard so a concurrent trigger or
+        # sweep is a cheap no-op instead of a second dream over one scope. Two
+        # layers: this in-process set is the fast path, and a durable
+        # control-plane lease (ADR 0032) makes the guard hold across container
+        # boundaries -- a rolling deploy overlaps two containers, each sweeping
+        # on boot, and a process-local lock cannot see the other one.
         self._dream_trigger_lock = threading.Lock()
         self._dream_trigger_inflight: set[tuple[str, str | None]] = set()
+        # Identifies this process as a lease holder. A lease is only released
+        # by the holder that took it, so a late release cannot free a scope
+        # another container has since claimed.
+        self._dream_lease_holder = f"dream-{uuid.uuid4()}"
         # Background dream-trigger job events, mirroring
         # `HostedBackgroundJobRunner.job_events` for the trigger path. The
         # list append itself is safe on the asyncio event loop (single
@@ -767,11 +779,35 @@ class HostedMemoryService:
             if key in self._dream_trigger_inflight:
                 return False
             self._dream_trigger_inflight.add(key)
+        if self._acquire_dream_lease(key):
             return True
+        # Another container holds the scope. Drop the in-process claim too, or
+        # this process would refuse the scope forever once the other releases.
+        with self._dream_trigger_lock:
+            self._dream_trigger_inflight.discard(key)
+        return False
 
     def _release_dream_trigger_lock(self, key: tuple[str, str | None]) -> None:
         with self._dream_trigger_lock:
             self._dream_trigger_inflight.discard(key)
+        self._release_dream_lease(key)
+
+    def _acquire_dream_lease(self, key: tuple[str, str | None]) -> bool:
+        tenant_id, agent_id = key
+        now = datetime.now(UTC)
+        return self.catalog.acquire_dream_lease(
+            tenant_id,
+            agent_id,
+            holder=self._dream_lease_holder,
+            now=now.isoformat(),
+            expires_at=(now + DREAM_LEASE_TTL).isoformat(),
+        )
+
+    def _release_dream_lease(self, key: tuple[str, str | None]) -> None:
+        tenant_id, agent_id = key
+        self.catalog.release_dream_lease(
+            tenant_id, agent_id, holder=self._dream_lease_holder
+        )
 
     async def _run_dream_trigger_job(
         self,

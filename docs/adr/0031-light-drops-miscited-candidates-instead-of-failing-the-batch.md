@@ -11,15 +11,28 @@ Light enforced this with `validate_candidate_source_ids`, which raised
 none). The raise aborted the whole Light run.
 
 That policy made a single model slip catastrophic. A failing phase stops its
-chain (ADR 0030), so one miscited candidate discarded every good candidate in
-the batch, held the watermark, and prevented REM and Deep from running at all.
+chain (ADR 0030), so one miscited candidate would discard every good candidate
+in the batch, hold the watermark, and prevent REM and Deep from running at all.
 
-It fired in production five times in three days (2026-07-10 and 2026-07-12).
-The hosted dogfood tenant's shared scope accumulated 15 staged candidates and
-promoted **zero** facts: `long_term_memory` sat empty while Light aborted on
-each attempt and the chain never reached Deep. The failure was invisible in
-operator logs beyond a content-free `ValueError` type name, because the guard
-deliberately refuses to echo candidate text.
+### Correction: the production failures were not this
+
+This ADR originally attributed six hosted Light `ValueError` failures
+(2026-07-10, 2026-07-12) to the guard. **That attribution was wrong**, and it is
+recorded here rather than quietly deleted because the reasoning error is the
+instructive part.
+
+The guard raises `ValueError`; the failures were `ValueError`; the type matched
+and the cause was assumed. But `ValueError` is ambiguous in this codebase: the
+managed libSQL backend raises a *bare* `ValueError` for every server-side SQL
+error (ADR 0019). The real cause was concurrent dreaming across overlapping
+containers during a rolling deploy, addressed in ADR 0032. Two pieces of
+evidence were available the whole time and went unread: not one of the failures
+wrote a `dream_runs` error row (the error-recording write was colliding too,
+which a validation raise would never do), and every failure landed inside a
+deploy window.
+
+The decision below stands on the policy's blast radius, which is real and
+independent. It does not stand on that incident.
 
 ## Decision
 

@@ -87,5 +87,12 @@ scheduling entirely.
 - Single-replica assumptions stand (in-process lock, in-process sweeper);
   multi-replica coordination remains future work tracked with the other
   ADR 0006 launch gates.
+
+  > Amended by ADR 0032. The in-process lock was not sufficient even for a
+  > single-replica service: a rolling deploy overlaps two containers, each
+  > sweeping on boot, and a process-local lock cannot see across that boundary.
+  > The in-flight lock is now backed by a durable control-plane lease. The
+  > sweeper *loop* is still single-replica by assumption; the dream *work* is
+  > now coordinated per scope.
 - Exact per-session +2h timers stay approximated by the tick interval, as
   COA-294 accepted.

@@ -157,6 +157,21 @@ _CONTROL_PLANE_SCHEMA_STATEMENTS: tuple[str, ...] = (
         FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
     )
     """,
+    # The in-flight dream lock, durable so it survives a container boundary.
+    # A rolling deploy overlaps two containers and each sweeps on boot, so a
+    # process-local lock lets both dream the same scope against one tenant
+    # database; the writes collide and libSQL reports the commit conflict as a
+    # bare ValueError that halts the chain. `expires_at` bounds a holder that
+    # dies mid-chain: the scope is reclaimable after it lapses, never wedged.
+    """
+    CREATE TABLE IF NOT EXISTS dream_sweep_lease (
+        tenant_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL DEFAULT '',
+        holder TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        PRIMARY KEY (tenant_id, agent_id)
+    )
+    """,
 )
 
 # The NULL/shared agent scope stored in `dream_sweep_state.agent_id` -- SQLite
@@ -1013,6 +1028,64 @@ class HostedTenantCatalog:
                     END
                 """,
                 (tenant_id, agent_id or _SHARED_AGENT_SENTINEL, completed_at),
+            )
+            conn.commit()
+
+    def acquire_dream_lease(
+        self,
+        tenant_id: str,
+        agent_id: str | None,
+        *,
+        holder: str,
+        now: str,
+        expires_at: str,
+    ) -> bool:
+        """Claim one (tenant, agent) scope for dreaming. True when claimed.
+
+        The claim is a single conditional upsert, so two containers racing the
+        same scope during a rolling deploy resolve at the database: exactly one
+        row write wins. A lapsed lease (holder died mid-chain) is stealable, so
+        a crash costs at most one lease period, never a wedged scope.
+        """
+        with closing(self._connect_control()) as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO dream_sweep_lease
+                    (tenant_id, agent_id, holder, expires_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(tenant_id, agent_id) DO UPDATE
+                    SET holder = excluded.holder,
+                        expires_at = excluded.expires_at
+                    WHERE dream_sweep_lease.expires_at <= ?
+                """,
+                (
+                    tenant_id,
+                    agent_id or _SHARED_AGENT_SENTINEL,
+                    holder,
+                    expires_at,
+                    now,
+                ),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+
+    def release_dream_lease(
+        self,
+        tenant_id: str,
+        agent_id: str | None,
+        *,
+        holder: str,
+    ) -> None:
+        """Release a scope this holder claimed. Releasing a lease another
+        holder has since stolen is a no-op -- the `holder` predicate makes a
+        late release harmless instead of freeing someone else's scope."""
+        with closing(self._connect_control()) as conn:
+            conn.execute(
+                """
+                DELETE FROM dream_sweep_lease
+                WHERE tenant_id = ? AND agent_id = ? AND holder = ?
+                """,
+                (tenant_id, agent_id or _SHARED_AGENT_SENTINEL, holder),
             )
             conn.commit()
 

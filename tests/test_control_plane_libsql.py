@@ -112,6 +112,46 @@ def _forbid_local_permission_ops(monkeypatch) -> None:
     monkeypatch.setattr("os.chmod", _boom_chmod)
 
 
+def test_dream_lease_contends_correctly_against_fake_libsql(monkeypatch, tmp_path):
+    # The lease decides a race by reading `cursor.rowcount` off a conditional
+    # upsert. The control plane runs on libSQL in production, so pin the
+    # contended path against the libSQL driver shape, not just sqlite3: if
+    # rowcount did not survive the backend swap, every container would think it
+    # won the scope and the collision this lease exists to stop would return.
+    fake_conn = FakeLibsqlConn()
+    _patch_connect_to_fake(monkeypatch, fake_conn)
+    _forbid_local_permission_ops(monkeypatch)
+    target = StorageTarget("libsql://fake-control-plane", auth_token="s3cr3t-token")
+
+    catalog = HostedTenantCatalog(tmp_path, control_target=target)
+    catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+
+    assert catalog.acquire_dream_lease(
+        "tenant-a",
+        None,
+        holder="container-1",
+        now="2026-07-12T00:00:00+00:00",
+        expires_at="2026-07-12T00:20:00+00:00",
+    )
+    assert not catalog.acquire_dream_lease(
+        "tenant-a",
+        None,
+        holder="container-2",
+        now="2026-07-12T00:05:00+00:00",
+        expires_at="2026-07-12T00:25:00+00:00",
+    )
+
+    catalog.release_dream_lease("tenant-a", None, holder="container-1")
+
+    assert catalog.acquire_dream_lease(
+        "tenant-a",
+        None,
+        holder="container-2",
+        now="2026-07-12T00:06:00+00:00",
+        expires_at="2026-07-12T00:26:00+00:00",
+    )
+
+
 def test_catalog_provisions_tenant_against_fake_libsql_control_plane(monkeypatch, tmp_path):
     fake_conn = FakeLibsqlConn()
     _patch_connect_to_fake(monkeypatch, fake_conn)
