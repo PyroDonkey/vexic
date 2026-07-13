@@ -1528,17 +1528,36 @@ def add_run_dream_phase_subcommand(
     run_phase.add_argument("--secret-env", action="append", default=[])
 
 
-def run_dream_phase_command(args: argparse.Namespace) -> int:
+def run_dream_phase_command(
+    args: argparse.Namespace,
+    *,
+    catalog: Any | None = None,
+    keys: Any | None = None,
+    customer_target_resolver: Callable[[HostedTenant], StorageTarget | None]
+    | None = None,
+) -> int:
+    """Run one dream phase from the operator CLI.
+
+    The CLI entry point (`vexic.hosted_http.main`) builds `catalog`/`keys`/
+    `customer_target_resolver` through the shared `_build_hosted_stores` seam
+    so this command honors `VEXIC_CONTROL_PLANE_TARGET` and
+    `VEXIC_STORAGE_BACKEND` exactly like `create_service_from_env`.
+    The local-filesystem fallback below serves only direct callers in tests.
+    """
     from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 
     root = _hosted_root_arg(args.root)
-    catalog = HostedTenantCatalog(root)
+    if catalog is None:
+        catalog = HostedTenantCatalog(root)
+    if keys is None:
+        keys = HostedApiKeyStore(root)
     service = HostedMemoryService(
         catalog,
-        HostedApiKeyStore(root),
+        keys,
         telemetry=catalog,
         rate_limiter=HostedInMemoryRateLimiter(),
         dream_phase_ports=_dream_phase_ports(args),
+        customer_target_resolver=customer_target_resolver,
     )
     # NOTE(alpha): staging CLI assumes no concurrent tenant writers; add event ids if shared.
     usage_event_offset = len(catalog.usage_events(args.tenant_id))

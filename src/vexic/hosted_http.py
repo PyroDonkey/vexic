@@ -5,7 +5,7 @@ import hashlib
 import json
 import logging
 import os
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -284,20 +284,50 @@ def create_service_from_env(
     including the ``search_long_term`` vector path, fail closed with
     ``HostPortNotConfigured``).
     """
-    backend = resolve_storage_backend(os.environ)
     root = Path(os.environ.get("VEXIC_HOSTED_ROOT", ".hosted-memory"))
     provisioning = turso_provisioning or _TursoProvisioning()
+    catalog, keys, customer_target_resolver = _build_hosted_stores(
+        root, provisioning=provisioning, env=os.environ
+    )
+    if resolve_storage_backend(os.environ) == "turso":
+        if os.environ.get("VEXIC_PROVISION_EXISTING_TURSO_TARGETS", "").strip() == "1":
+            catalog.provision_missing_customer_targets()
+        _ensure_dogfood_tenant_target(catalog)
+    return HostedMemoryService(
+        catalog,
+        keys,
+        telemetry=catalog,
+        rate_limiter=HostedInMemoryRateLimiter(),
+        dream_phase_ports=dream_phase_ports_from_env(os.environ),
+        customer_target_resolver=customer_target_resolver,
+    )
+
+
+def _build_hosted_stores(
+    root: Path,
+    *,
+    provisioning: _TursoProvisioning,
+    env: Mapping[str, str],
+) -> tuple[HostedTenantCatalog, HostedApiKeyStore, object | None]:
+    """Build the catalog, API-key store, and customer-target resolver from the
+    `VEXIC_CONTROL_PLANE_TARGET` / `VEXIC_STORAGE_BACKEND` flags.
+
+    This is the single seam both `create_service_from_env` and the operator
+    CLI (`main`) go through, so runbook commands and the serving app always
+    resolve the same control plane from the same environment.
+    """
+    backend = resolve_storage_backend(env)
     # Control-plane target is independent of the customer-memory backend
     # (ADR 0019 Addendum 4): `turso` routes the catalog + API-key
     # store to the managed libSQL control-plane database; `local` (default)
     # keeps the filesystem `control-plane.db`. `None` here means local.
     control_target = None
-    if resolve_control_plane_target(os.environ) == "turso":
-        control_target = provisioning.build_control_plane_target(dict(os.environ))
+    if resolve_control_plane_target(env) == "turso":
+        control_target = provisioning.build_control_plane_target(dict(env))
     customer_target_resolver = None
     if backend == "turso":
-        org = os.environ["TURSO_ORG"].strip()
-        port = provisioning.build_port(dict(os.environ))
+        org = env["TURSO_ORG"].strip()
+        port = provisioning.build_port(dict(env))
         catalog = HostedTenantCatalog(
             root,
             control_target=control_target,
@@ -307,21 +337,11 @@ def create_service_from_env(
         )
         keys = HostedApiKeyStore(root, control_target=control_target)
         cache = provisioning.build_token_cache(port)
-        if os.environ.get("VEXIC_PROVISION_EXISTING_TURSO_TARGETS", "").strip() == "1":
-            catalog.provision_missing_customer_targets()
-        _ensure_dogfood_tenant_target(catalog)
         customer_target_resolver = provisioning.build_resolver(cache, org=org)
     else:
         catalog = HostedTenantCatalog(root, control_target=control_target)
         keys = HostedApiKeyStore(root, control_target=control_target)
-    return HostedMemoryService(
-        catalog,
-        keys,
-        telemetry=catalog,
-        rate_limiter=HostedInMemoryRateLimiter(),
-        dream_phase_ports=dream_phase_ports_from_env(os.environ),
-        customer_target_resolver=customer_target_resolver,
-    )
+    return catalog, keys, customer_target_resolver
 
 
 def _ensure_dogfood_tenant_target(catalog: HostedTenantCatalog) -> None:
@@ -877,7 +897,11 @@ def _capabilities(values: list[str]) -> set[MemoryCapability]:
     return {MemoryCapability(value) for value in values}
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    turso_provisioning: _TursoProvisioning | None = None,
+) -> int:
     parser = argparse.ArgumentParser(description="Manage the Vexic hosted alpha adapter.")
     subcommands = parser.add_subparsers(dest="command", required=True)
 
@@ -899,14 +923,21 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        if args.command == "run-dream-phase":
-            return run_dream_phase_command(args)
-
         root = _root_arg(args.root)
-        keys = HostedApiKeyStore(root)
+        provisioning = turso_provisioning or _TursoProvisioning()
+        catalog, keys, customer_target_resolver = _build_hosted_stores(
+            root, provisioning=provisioning, env=os.environ
+        )
+
+        if args.command == "run-dream-phase":
+            return run_dream_phase_command(
+                args,
+                catalog=catalog,
+                keys=keys,
+                customer_target_resolver=customer_target_resolver,
+            )
 
         if args.command == "issue-key":
-            catalog = HostedTenantCatalog(root)
             catalog.provision_tenant(args.tenant_id, project_ids=set(args.project_id))
             api_key = keys.create_key(
                 tenant_id=args.tenant_id,

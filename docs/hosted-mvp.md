@@ -459,15 +459,16 @@ what a correctly-working Turso deployment looks like. Resolve
 `tenants.customer_target` for customer memory, or query the Turso control-plane
 database for the catalog, keys, and `dream_sweep_state`.
 
-> **The operator CLI does not yet honor `VEXIC_CONTROL_PLANE_TARGET`.**
-> `python -m vexic.hosted_http issue-key|revoke-key` and `run-dream-phase`
-> construct their catalog and key store straight from `--root`, so against
-> `--root /data/vexic` they read and write the volume's stale `control-plane.db`
-> rather than the Turso control plane the service authenticates against. A key
-> issued that way will not authenticate, and a key revoked that way **stays
-> live**. Until the CLI is fixed, do not use it to manage keys on a
-> Turso-backed deployment -- issue and revoke through the Console control plane
-> instead. The CLI examples below are written for a local root.
+> **The operator CLI resolves the control plane from the environment, not from
+> `--root`.** `python -m vexic.hosted_http issue-key|revoke-key` and
+> `run-dream-phase` go through the same store-building seam as
+> `create_service_from_env`, so they honor `VEXIC_CONTROL_PLANE_TARGET` (and
+> `run-dream-phase` also honors `VEXIC_STORAGE_BACKEND` for customer memory).
+> To manage keys on a Turso-backed deployment, run the CLI with the service's
+> environment loaded (e.g. `railway run ...`, or export the flag plus the Turso
+> connection variables). Run without those variables and the CLI operates on
+> the local `control-plane.db` under `--root`, which a Turso-backed service
+> never reads. The CLI examples below are written for a local root.
 
 Required Railway config (variable names only; values are set in the Railway
 service, never committed):
@@ -738,11 +739,12 @@ Revoke a throwaway key by key id, not by raw key:
 uv run --no-sync python -m vexic.hosted_http revoke-key --root .hosted-memory --key-id <key-id> --revoked-by <operator>
 ```
 
-This revokes against the control plane selected by `--root`. It does **not**
-revoke a key on a Turso-backed deployment: the CLI never consults
-`VEXIC_CONTROL_PLANE_TARGET`, so a `--root /data/vexic` revocation is written to
-the volume's stale `control-plane.db` while the service keeps authenticating the
-key against Turso. Revoke those keys through the Console control plane.
+This revokes against the control plane selected by `VEXIC_CONTROL_PLANE_TARGET`
+in the CLI's environment (unset or `local` falls back to the local
+`control-plane.db` under `--root`). To revoke a key on a Turso-backed
+deployment, run the command with the service's environment loaded (e.g.
+`railway run ...`) so the revocation lands on the same control plane the
+service authenticates against.
 
 This is internal-alpha infrastructure for throwaway data. It is not a
 production customer-data launch, public MCP endpoint, billing portal, dashboard,
