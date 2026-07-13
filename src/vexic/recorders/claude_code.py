@@ -184,8 +184,12 @@ def _resume_offset(
     """Byte offset to resume from, or 0 when the cursor cannot be trusted."""
     if cursor is None or cursor.byte_offset <= 0:
         return 0
-    if source_session_id is not None and cursor.source_session_id != source_session_id:
-        # Same path, different Claude Code session: the file was replaced.
+    if source_session_id is None or cursor.source_session_id != source_session_id:
+        # Either the caller cannot say which Claude Code session this transcript
+        # belongs to, or it names a different one than the cursor recorded. A
+        # session that cannot be matched cannot be trusted: the file at this path
+        # may have been replaced, and resuming would seek past the new session's
+        # rows. Reread all of it and let the hosted ledger dedupe.
         return 0
     length = cursor.byte_offset - cursor.last_line_offset
     if length <= 0:

@@ -55,7 +55,7 @@ def _write_transcript(path: Path, rows: list[str], *, trailing_newline: bool = T
 class _RecorderHarness:
     """Drives `vexic recorder ingest` against a temp home and records posts."""
 
-    def __init__(self, root: Path, *, source_session_id: str = "claude-session") -> None:
+    def __init__(self, root: Path, *, source_session_id: str | None = "claude-session") -> None:
         self.root = root
         self.transcript = root / "claude-session.jsonl"
         self.config_path = root / "vexic" / "claude-code-recorder.json"
@@ -74,16 +74,13 @@ class _RecorderHarness:
             encoding="utf-8",
         )
         self.hook_path = root / "hook.json"
-        self.hook_path.write_text(
-            json.dumps(
-                {
-                    "hook_event_name": "Stop",
-                    "session_id": source_session_id,
-                    "transcript_path": str(self.transcript),
-                }
-            ),
-            encoding="utf-8",
-        )
+        hook: dict[str, str] = {
+            "hook_event_name": "Stop",
+            "transcript_path": str(self.transcript),
+        }
+        if source_session_id is not None:
+            hook["session_id"] = source_session_id
+        self.hook_path.write_text(json.dumps(hook), encoding="utf-8")
         self.posted: list[list[str]] = []
 
     @property
@@ -263,6 +260,30 @@ class RecorderTranscriptCursorTests(unittest.TestCase):
 
             self.assertEqual(replacement.run(), 0)
             self.assertEqual(replacement.posted_ids(), ["uuid-1", "uuid-2"])
+
+    def test_hook_without_a_source_session_triggers_a_full_reread(self) -> None:
+        # A hook payload that omits `session_id` leaves the run unable to check
+        # the cursor's session against the session on disk. An unchecked cursor
+        # cannot be trusted -- the transcript at this path may belong to a new
+        # session whose rows the cursor would seek straight past -- so the run
+        # rereads the whole file and lets the hosted ledger dedupe.
+        with tempfile.TemporaryDirectory() as temp:
+            harness = _RecorderHarness(Path(temp))
+            _write_transcript(
+                harness.transcript,
+                [_user_row("uuid-1", "remember cedar"), _user_row("uuid-2", "and orchid")],
+            )
+            self.assertEqual(harness.run(), 0)
+            self.assertEqual(len(harness.cursor_files()), 1)
+
+            # Same path, transcript untouched: the cursor still fingerprints
+            # clean, so only the unknown session forces the reread.
+            sessionless = _RecorderHarness(Path(temp), source_session_id=None)
+            self.assertEqual(sessionless.transcript, harness.transcript)
+            self.assertEqual(sessionless.cursor_dir, harness.cursor_dir)
+
+            self.assertEqual(sessionless.run(), 0)
+            self.assertEqual(sessionless.posted_ids(), ["uuid-1", "uuid-2"])
 
     def test_failed_post_does_not_advance_the_cursor(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
