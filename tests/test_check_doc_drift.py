@@ -419,8 +419,7 @@ def test_name_mentioned_only_inside_a_larger_literal_is_not_dead(
             code="import os\n"
             'os.environ.get("PORT", "8000")\n'
             'raise RuntimeError("OPENROUTER_API_KEY is required")\n',
-            rows="| `PORT` | x | `8000` | y |\n"
-            "| `OPENROUTER_API_KEY` | x | -- | y |\n",
+            rows="| `PORT` | x | `8000` | y |\n| `OPENROUTER_API_KEY` | x | -- | y |\n",
         )
         == []
     )
