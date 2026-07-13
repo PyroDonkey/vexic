@@ -11,7 +11,7 @@ from typing import Iterator
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from vexic.contract import SourceTranscriptMessage
 from vexic.hosted import HOSTED_WRITE_MAX_CHARS, HOSTED_WRITE_MAX_MESSAGES
-from vexic.recorders.claude_code import iter_claude_code_source_messages
+from vexic.recorders.claude_code import scan_claude_code_transcript
 from vexic.recorders.claude_setup import (
     default_recorder_hook_command,
     install_claude_code_setup,
@@ -27,6 +27,7 @@ from vexic.recorders.hosted_ingest import HostedIngestConfig, post_source_messag
 from vexic.recorders.mcp_connect import install_codex_connect, install_generic_connect
 from vexic.recorders.setup_exchange import SetupExchangeConfig, exchange_setup_token
 from vexic.recorders.status import RecorderStatus, write_status
+from vexic.recorders.transcript_cursor import TranscriptCursor, read_cursor, write_cursor
 
 # Client names become the `~/.vexic/<name>-mcp.json` creds filename, so keep
 # them to a safe single filename component (no path separators or traversal).
@@ -281,6 +282,36 @@ def _read_session_start_payload(path: Path | None) -> _ClaudeSessionStartHookPay
         raise ValueError(f"invalid hook input: {exc}") from exc
 
 
+def _cursor_dir(args: argparse.Namespace) -> Path | None:
+    """Recorder-local cursor directory, next to the recorder config.
+
+    Without `--config` there is no recorder-local state directory to own, so the
+    run stays on the full-reread path. The cursor is only ever an optimization.
+    """
+    config = getattr(args, "config", None)
+    if config is None:
+        return None
+    return Path(config).parent / "cursors"
+
+
+def _try_write_cursor(
+    cursor_dir: Path | None,
+    transcript: Path,
+    cursor: TranscriptCursor | None,
+) -> None:
+    """Persist the cursor after a successful ingest; never fail the run for it.
+
+    A cursor that cannot be written just means the next run rereads the whole
+    transcript and the ledger dedupes it, which is exactly the fallback path.
+    """
+    if cursor_dir is None or cursor is None:
+        return
+    try:
+        write_cursor(cursor_dir, transcript, cursor)
+    except Exception as exc:
+        print(f"warning: recorder cursor write failed: {type(exc).__name__}", file=sys.stderr)
+
+
 def _ingest(args: argparse.Namespace) -> int:
     payload = _read_hook_payload(args.hook_input)
     transcript_path = payload.transcript_path
@@ -288,13 +319,15 @@ def _ingest(args: argparse.Namespace) -> int:
     args.transcript_path = transcript_path
     args.source_session_id = source_session_id
 
-    messages = []
-    ignored = 0
-    for message in iter_claude_code_source_messages([Path(transcript_path)]):
-        if message is None:
-            ignored += 1
-        else:
-            messages.append(message)
+    transcript = Path(transcript_path)
+    cursor_dir = _cursor_dir(args)
+    scan = scan_claude_code_transcript(
+        transcript,
+        cursor=read_cursor(cursor_dir, transcript) if cursor_dir is not None else None,
+        source_session_id=source_session_id,
+    )
+    messages = scan.messages
+    ignored = scan.ignored
 
     config = HostedIngestConfig(
         base_url=args.base_url,
@@ -318,6 +351,10 @@ def _ingest(args: argparse.Namespace) -> int:
     inserted = sum(1 for item in items if isinstance(item, dict) and item.get("status") == "inserted")
     skipped = sum(1 for item in items if isinstance(item, dict) and item.get("status") == "skipped")
     rejected = sum(1 for item in items if isinstance(item, dict) and item.get("status") == "rejected")
+
+    # Only after every batch posted: a cursor written ahead of a failed POST
+    # would skip those rows forever, and the cursor must never decide ingest.
+    _try_write_cursor(cursor_dir, transcript, scan.cursor)
 
     status = RecorderStatus(
         ok=True,
