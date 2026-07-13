@@ -4,7 +4,7 @@
 Also runs in CI with `--ci`: same checks, but findings go to stderr and drift
 exits 1 so a drifting PR cannot merge.
 
-Read-only. It checks two in-repo invariants and reports drift; it never edits
+Read-only. It checks three in-repo invariants and reports drift; it never edits
 files. A hook cannot read an external tracking system, so this only enforces the
 in-repo half of the "Docs Are Downstream Of Code" loop in AGENTS.md:
 
@@ -13,6 +13,12 @@ in-repo half of the "Docs Are Downstream Of Code" loop in AGENTS.md:
 2. The MemoryService contract Protocol and LocalMemoryService expose the same
    operation surface, and AGENTS.md mentions each operation, so an
    operation added in code without a doc update is surfaced.
+3. docs/configuration.md catalogues every environment variable the code reads,
+   and names no variable the code does not read. Both directions have drifted at
+   once before: `VEXIC_CONTROL_PLANE_TARGET` was read but undocumented (an
+   operator rebuilding from the docs would silently get the local control
+   plane), while three `VEXIC_DREAM_TRIGGER_*` names outlived the cron workflow
+   that read them.
 
 Closing the loop against the downstream tracking roadmap/todo stays a manual
 step under the reconciliation triggers in AGENTS.md.
@@ -32,9 +38,24 @@ ADR_INDEX = ADR_DIR / "README.md"
 CONTRACT = REPO_ROOT / "src" / "vexic" / "contract" / "__init__.py"
 SERVICE = REPO_ROOT / "src" / "vexic" / "service.py"
 AGENTS = REPO_ROOT / "AGENTS.md"
+CONFIG_DOC = REPO_ROOT / "docs" / "configuration.md"
+CODE_DIRS = (REPO_ROOT / "src", REPO_ROOT / "adapters")
 
 ADR_FILE_RE = re.compile(r"^(\d{4})-.+\.md$")
 ADR_INDEX_RE = re.compile(r"^\|\s*(\d{4})\s*\|")
+
+# An environment variable name as it appears as a string literal in code and as
+# a backticked token in the docs. Deliberately excludes the `VEXIC_LIVE_<GROUP>
+# _MODEL` doc row: that angle-bracketed name is a *pattern* (the model group is
+# interpolated at runtime), not a literal, so it never matches here and needs no
+# allowlist entry.
+ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,}$")
+DOC_ENV_RE = re.compile(r"`([A-Z][A-Z0-9_]{2,})`")
+
+# Mapping parameters that carry the process environment. `resolve_storage_backend
+# (env)` and friends take `env: Mapping[str, str]` rather than reading
+# `os.environ` directly, so a literal read through one of these names counts.
+ENV_MAPPING_NAMES = frozenset({"env", "environ"})
 
 
 def _emit(additional_context: str | None, system_message: str | None) -> None:
@@ -147,6 +168,106 @@ def _check_service_surface(warnings: list[str]) -> None:
         )
 
 
+def _is_env_source(node: ast.expr) -> bool:
+    """True if `node` evaluates to the process environment.
+
+    Recognizes `os.environ` and a bare `env`/`environ` mapping parameter.
+    """
+    if isinstance(node, ast.Attribute) and node.attr == "environ":
+        return True
+    return isinstance(node, ast.Name) and node.id in ENV_MAPPING_NAMES
+
+
+def _is_getenv(node: ast.expr) -> bool:
+    return isinstance(node, ast.Attribute) and node.attr == "getenv"
+
+
+def _env_names_read(tree: ast.AST) -> set[str]:
+    """Env var names read through a literal key.
+
+    Strict on purpose: only `os.environ["X"]`, `os.environ.get("X")`,
+    `os.getenv("X")`, and `env.get("X")` count. A dynamic read
+    (`os.environ.get(name)`) yields no name here, which is why the reverse
+    direction below searches for bare literals instead of demanding an env-read
+    context.
+    """
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        key: ast.expr | None = None
+        if isinstance(node, ast.Subscript) and _is_env_source(node.value):
+            key = node.slice
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if _is_getenv(func) and node.args:
+                key = node.args[0]
+            elif (
+                isinstance(func, ast.Attribute)
+                and func.attr == "get"
+                and _is_env_source(func.value)
+                and node.args
+            ):
+                key = node.args[0]
+        if (
+            isinstance(key, ast.Constant)
+            and isinstance(key.value, str)
+            and ENV_NAME_RE.match(key.value)
+        ):
+            names.add(key.value)
+    return names
+
+
+def _string_literals(tree: ast.AST) -> set[str]:
+    return {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+
+
+def _check_env_vars(warnings: list[str]) -> None:
+    read: set[str] = set()
+    literals: set[str] = set()
+    for code_dir in CODE_DIRS:
+        for path in code_dir.rglob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            read |= _env_names_read(tree)
+            literals |= _string_literals(tree)
+
+    documented = {
+        name
+        for line in CONFIG_DOC.read_text(encoding="utf-8").splitlines()
+        if line.lstrip().startswith("|")
+        for name in DOC_ENV_RE.findall(line.split("|")[1] if "|" in line else "")
+    }
+
+    undocumented = sorted(read - documented)
+    if undocumented:
+        warnings.append(
+            "docs/configuration.md does not document environment variable(s) "
+            "read by src/ or adapters/: "
+            + ", ".join(undocumented)
+            + ". That file claims to catalogue every variable the code reads, "
+            "and an operator rebuilding the deployment from it would silently "
+            "get the default. Add a row (name only, never a value)."
+        )
+
+    # Reverse direction, deliberately looser: a documented name only has to
+    # appear as a string literal somewhere in the code, not in an env-read
+    # context. `VEXIC_API_KEY` is read through a variable key
+    # (`--api-key-env` names it at runtime), so demanding an env-read context
+    # here would flag a live variable as dead. A genuinely dead name -- the
+    # retired `VEXIC_DREAM_TRIGGER_*` trio -- appears nowhere at all.
+    dead = sorted(documented - literals)
+    if dead:
+        warnings.append(
+            "docs/configuration.md documents environment variable(s) that "
+            "appear nowhere in src/ or adapters/: "
+            + ", ".join(dead)
+            + ". Remove the row, or the docs will outlive the code that read "
+            "them."
+        )
+
+
 def main(ci: bool = False) -> int:
     if not REPO_ROOT.joinpath(".git").exists() and not ADR_DIR.exists():
         return 0
@@ -155,6 +276,7 @@ def main(ci: bool = False) -> int:
     checks = (
         ("ADR index", _check_adr_index),
         ("service surface", _check_service_surface),
+        ("environment variables", _check_env_vars),
     )
     notes: list[str] = []
     for label, check in checks:
@@ -171,15 +293,15 @@ def main(ci: bool = False) -> int:
         if warnings or notes:
             return 1
         print(
-            "Doc drift check: ADR index and LocalMemoryService surface match "
-            "the in-repo source of truth."
+            "Doc drift check: ADR index, LocalMemoryService surface, and the "
+            "documented environment variables match the in-repo source of truth."
         )
         return 0
 
     if not warnings and not notes:
         _emit(
-            "Doc drift check: ADR index and LocalMemoryService surface match "
-            "the in-repo source of truth.",
+            "Doc drift check: ADR index, LocalMemoryService surface, and the "
+            "documented environment variables match the in-repo source of truth.",
             None,
         )
         return 0

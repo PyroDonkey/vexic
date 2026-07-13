@@ -11,6 +11,21 @@ searchable-memory encryption" is superseded by ADR 0023, which introduces an
 app-level ContentCodec seam for hosted content encryption; the encrypting
 adapter ships in a later phase per that ADR's rollout plan.
 
+> Amended (2026-07-13): the whole Neon thread in this record is now retired, not
+> merely deferred. This ADR says below that "Neon remains the selected
+> control-plane database unless a later decision reopens that stack choice." A
+> later decision reopened it: ADR 0019's Addendum 5 cut the control plane over to
+> managed Turso/libSQL and recorded that Neon is no longer the planned
+> control-plane home. Read every Neon mention below -- including the "Control
+> plane | Neon Postgres" row in the surfaces table -- as historical. The
+> control plane runs on Turso today (`src/vexic/hosted_http.py`,
+> `control_plane_target` in `adapters/turso_adapter.py`); Neon appears nowhere
+> in `src/`, `adapters/`, or `pyproject.toml`. The data-protection *posture*
+> this ADR decides -- provider encryption, PITR, drilled independent exports as
+> readiness targets -- is unchanged; only the named provider is. On PITR
+> specifically, see ADR 0019's Addendum 5: the current free-tier deployment has
+> no point-in-time recovery, so the readiness target is not yet met.
+
 ## Context
 
 Hosted Vexic memory will store sensitive long-running agent memory. Before real

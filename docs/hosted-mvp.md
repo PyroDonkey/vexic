@@ -157,6 +157,8 @@ The HTTP API accepts `Authorization: Bearer <raw-key>` or `X-Vexic-Api-Key` on
 - `POST /v1/expand_history`
 - `POST /v1/fresh_context`
 - `POST /v1/load_active_context`
+- `POST /v1/trigger_dream_phase`
+- `POST /v1/setup/exchange`
 - `POST /mcp`
 - `/control/v1/*` when started through `vexic.hosted_control_plane_http`
 
@@ -247,11 +249,13 @@ the local setup guidance in
 treat Vexic as authoritative only for memory that reaches Vexic through the
 hosted HTTP append route, recorder, or importer path. Claude Code hosted
 auto-recording uses `vexic setup claude-code`; the command installs user-local
-Claude Code hook config and Vexic recorder config, then scaffolds the project
-MCP entry that Claude Code asks the user to approve. The recorder sends cleaned
-transcript rows to `/v1/ingest_source_transcript`; the SessionStart primer
-injects capped hosted memory context on `startup` and `clear`; approved MCP
-reads go through the read-only hosted `/mcp` route for targeted on-demand
+Claude Code hook config and Vexic recorder config, then prints a vendor
+`claude mcp add` command for the user to run
+([ADR 0027](adr/0027-agent-mcp-connect-uses-vendor-add-commands.md)). Vexic
+writes no `.mcp.json`. The recorder sends cleaned transcript rows to
+`/v1/ingest_source_transcript`; the SessionStart primer injects capped hosted
+memory context on `startup` and `clear`; once the user runs the connect command,
+MCP reads go through the read-only hosted `/mcp` route for targeted on-demand
 search. The Claude Code host transcript
 recorder flow is documented in
 [usage.md](usage.md#claude-code-transcript-import) and
@@ -285,19 +289,20 @@ MCP tools.
 
 For hosted auto-recording, run `vexic setup claude-code` with the hosted base
 URL, raw key, project ID, and session ID. It installs user-local Claude Code
-hook config plus Vexic recorder config, then scaffolds a project `.mcp.json`
-entry for Vexic. The Stop hook posts cleaned Claude Code transcript rows to
-`/v1/ingest_source_transcript`; the SessionStart hook primes new/cleared
-sessions through hosted read endpoints using the same recorder config; after
-the user approves the project MCP server in Claude Code, targeted reads go
-through the scaffolded stdio proxy to hosted `/mcp`. The raw API key stays in
-the user-local recorder config, not `.mcp.json` or Claude settings.
+hook config plus Vexic recorder config, then prints a `claude mcp add` command
+for the user to run (ADR 0027). The Stop hook posts cleaned Claude Code
+transcript rows to `/v1/ingest_source_transcript`; the SessionStart hook primes
+new/cleared sessions through hosted read endpoints using the same recorder
+config; once the user runs the connect command, targeted reads go through the
+stdio proxy to hosted `/mcp`. The raw API key stays in the user-local recorder
+config, never in Claude settings; the connect command is derived from the
+recorder config path, so no raw key appears in it.
 
-Passing the raw key on the setup command line is the current interim path.
-The accepted target flow is a console-minted, single-use setup token that the
-CLI exchanges for the scoped key
-([ADR 0026](adr/0026-agent-setup-token-exchange.md)); follow-up issues own
-that implementation.
+Passing the raw key on the setup command line is the interim path. The target
+flow is a console-minted, single-use setup token that the CLI exchanges for the
+scoped key ([ADR 0026](adr/0026-agent-setup-token-exchange.md)). That exchange
+has landed: the Console mints a single-use token through the control-plane
+setup-token route, and the CLI redeems it against `POST /v1/setup/exchange`.
 
 ## Turso/libSQL Storage Backend
 
@@ -438,10 +443,20 @@ holds is now a retained rollback handle -- unset `VEXIC_CONTROL_PLANE_TARGET`
 to fall back to it -- not the live catalog.
 
 Any `customer-*.db` files left on the volume are vestigial artifacts of the
-pre-cutover layout, as is the now-unwritten `control-plane.db`. Do not read them
-to inspect live state: resolve `tenants.customer_target` (customer memory) or
-the Turso control-plane database (catalog, keys, `dream_sweep_state`) and query
-Turso instead.
+pre-cutover layout, and the volume's `control-plane.db` is no longer read or
+written by the serving app. Do not read either to inspect live state: resolve
+`tenants.customer_target` (customer memory) or the Turso control-plane database
+(catalog, keys, `dream_sweep_state`) and query Turso instead.
+
+> **The operator CLI does not yet honor `VEXIC_CONTROL_PLANE_TARGET`.**
+> `python -m vexic.hosted_http issue-key|revoke-key` and `run-dream-phase`
+> construct their catalog and key store straight from `--root`, so against
+> `--root /data/vexic` they read and write the volume's stale `control-plane.db`
+> rather than the Turso control plane the service authenticates against. A key
+> issued that way will not authenticate, and a key revoked that way **stays
+> live**. Until the CLI is fixed, do not use it to manage live alpha keys --
+> issue and revoke through the Console control plane instead. The CLI examples
+> below are written for a local root.
 
 Required Railway config (variable names only; values are set in the Railway
 service, never committed):
@@ -450,6 +465,7 @@ service, never committed):
 - `VEXIC_HOSTED_ROOT=/data/vexic`
 - `VEXIC_CONTROL_PLANE_TOKENS=<comma-separated Console service tokens>`
 - `VEXIC_STORAGE_BACKEND=turso`
+- `VEXIC_CONTROL_PLANE_TARGET=turso`
 - `TURSO_ORG`, `TURSO_GROUP`, `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`,
   `TURSO_PLATFORM_API_TOKEN` (see "Turso storage backend" in
   `docs/configuration.md`)
@@ -464,9 +480,19 @@ service, never committed):
 - Persistent volume mounted at `/data/vexic`
 - Health check path: `/health`
 
-Omitting `VEXIC_STORAGE_BACKEND` silently selects the `local` backend, so the
-service ignores `tenants.customer_target` and serves tenant memory from local
-`customer-*.db` files on the volume instead of Turso. Set it explicitly.
+`VEXIC_DOGFOOD_TENANT_ID` is optional and unset on the deployed alpha; when set,
+`create_service_from_env` provisions a per-tenant Turso database for that tenant
+if it has no `customer_target` yet.
+
+Both backend flags default to `local` and neither raises when omitted, so each
+has the same silent-downgrade failure mode. Set both explicitly:
+
+- Omitting `VEXIC_STORAGE_BACKEND` serves tenant memory from local
+  `customer-*.db` files on the volume, ignoring `tenants.customer_target`.
+- Omitting `VEXIC_CONTROL_PLANE_TARGET` routes the tenant catalog and API-key
+  store to the volume's stale `control-plane.db`, so the service authenticates
+  against a control plane the Console does not write. A deployment provisioned
+  from a config list that omits it will look healthy and reject every live key.
 
 Dream-phase / embedding model port config (optional; unset keeps every
 model-backed operation, including the `search_long_term` vector path, failing
@@ -495,7 +521,11 @@ GitHub Actions deploy trigger:
 - The workflow keeps one hosted deploy active per ref, lets an in-progress
   deploy finish before the next pending run, runs `uv run pytest`, builds the
   hosted Docker image, deploys with Railway CLI `5.23.1`, then checks
-  `https://api.vexic.dev/health` with bounded curl timeouts and retries.
+  `https://api.vexic.dev/health` with bounded curl timeouts and retries, and
+  finally asserts that an unauthenticated `/control/v1/*` request returns `401`
+  so a deploy cannot silently expose the control plane.
+- The deploy job runs in the `railway-alpha` GitHub environment; environment
+  protection rules therefore gate every hosted deploy.
 - Required GitHub secret: `RAILWAY_TOKEN`, a Railway project token scoped to
   the `production` environment.
 - Required GitHub variable: `RAILWAY_PROJECT_ID=<railway-project-id>`.
@@ -516,20 +546,30 @@ repository, not here):
 - A full Light/REM/Deep promotion/search path passed with tenant isolation
   intact and hosted job usage counters recorded. (REM is a local heuristic per
   ADR 0020, so a fresh smoke records zero REM model usage.)
-- Tester keys are alpha-only and should be revoked after each check.
+- Tester keys are alpha-only and should be revoked after each check. Revoke them
+  through the Console control plane, not the CLI -- see the warning above.
 
-One-off key issuance can run against the same volume:
+One-off key issuance against a local hosted root:
 
 ```powershell
-uv run --no-sync python -m vexic.hosted_http issue-key --root /data/vexic --tenant-id tenant-a --project-id project-a --principal-id claude-code --capability memory:write --capability memory:search --capability memory:admin:rebuild
+uv run --no-sync python -m vexic.hosted_http issue-key --root .hosted-memory --tenant-id tenant-a --project-id project-a --principal-id claude-code --capability memory:write --capability memory:search --capability memory:admin:rebuild
 ```
+
+Issuing no `--capability` at all yields a key with `memory:write` and
+`memory:search`.
 
 Run one hosted dream phase through a host-owned adapter:
 
 ```powershell
 $env:VEXIC_API_KEY = "<raw-key>"
-uv run --no-sync python -m vexic.hosted_http run-dream-phase --root /data/vexic --api-key-env VEXIC_API_KEY --adapter /app/adapters/openrouter_live_adapter.py --model-group hosted-dream --tenant-id tenant-a --project-id project-a --session-id session-a --agent-id agent-a --phase light
+uv run --no-sync python -m vexic.hosted_http run-dream-phase --root .hosted-memory --api-key-env VEXIC_API_KEY --adapter ./adapters/openrouter_live_adapter.py --model-group hosted-dream --tenant-id tenant-a --project-id project-a --session-id session-a --agent-id agent-a --phase light
 ```
+
+These examples use a local root deliberately. The CLI currently resolves its
+control plane and customer memory from `--root` alone, so pointing it at
+`/data/vexic` on the deployed container reaches the stale volume databases, not
+Turso. On the deployed alpha the in-server sweeper (ADR 0030) runs the dream
+phases; the CLI is not the production path.
 
 `--adapter` defaults to `VEXIC_DREAM_PHASE_ADAPTER` and `--model-group` to
 `VEXIC_DREAM_PHASE_MODEL_GROUP` (then `hosted-dream`), so in a deployed
@@ -562,13 +602,12 @@ other phase value with `400` (light/rem/deep triggering has a different
 cost/abuse profile and is a separate decision). A header-bound scope
 authenticates the same way as the other `/v1/*` routes.
 
-- Requires capability `memory:dream:trigger`, a new capability distinct from
-  `memory:admin:rebuild`: trigger-only keys (the recorder and the cron
-  workflow below) never need admin-rebuild just to kick off a sweep. Issue a
-  trigger key with, for example:
+- Requires capability `memory:dream:trigger`, a capability distinct from
+  `memory:admin:rebuild`: trigger-only keys (such as the recorder's) never need
+  admin-rebuild just to kick off a sweep. Issue a trigger key with, for example:
 
   ```powershell
-  uv run --no-sync python -m vexic.hosted_http issue-key --root /data/vexic --tenant-id tenant-a --project-id project-a --principal-id cron --capability memory:dream:trigger
+  uv run --no-sync python -m vexic.hosted_http issue-key --root .hosted-memory --tenant-id tenant-a --project-id project-a --principal-id recorder --capability memory:dream:trigger
   ```
 
   A priming key that should also self-trigger from `recorder prime` needs
@@ -576,7 +615,9 @@ authenticates the same way as the other `/v1/*` routes.
   memory:dream:trigger`.
 - Returns `202` with `{"status": "scheduled"}`, or `{"status": "skipped",
   "reason": "already_running"}` when a sweep for the same (tenant, agent) is
-  already in flight (an in-process lock -- see "Known limitations" below).
+  already in flight. The guard is a durable control-plane lease with a
+  heartbeat (ADR 0032), so it holds across processes and across the overlapping
+  containers of a rolling deploy, not just within one process.
 - Missing/invalid key: `401`. Key without `memory:dream:trigger`: `403`.
   `phase` other than `"summarize"`: `400`. No `build_summary_agent` port
   configured: `503 host_port_not_configured`, checked synchronously before
@@ -665,11 +706,12 @@ exits `0` and never affects prime's own output or exit code.
 
 **Known limitations, accepted for v1** (see ADR 0025):
 
-- The in-flight dedup lock and the 6/hour rate limiter are in-process. The
-  current deploy is verified single-process/single-instance; if the hosted
-  service ever scales to multiple replicas, dedup stops deduping across
-  replicas and the rate cap becomes per-replica rather than global. Revisit
-  with a durable queue or a shared limiter before scaling out.
+- The 6/hour rate limiter is in-process, so under multiple replicas the rate
+  cap becomes per-replica rather than global. Revisit with a shared limiter
+  before scaling out. The in-flight dedup guard is no longer in this bucket:
+  ADR 0032 made it a durable control-plane lease after the single-replica
+  assumption broke on ordinary rolling deploys, where the old and new
+  containers overlap and both swept the same tenant.
 - A scheduled trigger task is in-memory: it does not survive a process
   restart or redeploy mid-sweep. The next trigger (cron or prime) re-runs
   idempotently, so no data is lost, but an in-flight sweep at deploy time is
@@ -682,8 +724,14 @@ exits `0` and never affects prime's own output or exit code.
 Revoke a throwaway key by key id, not by raw key:
 
 ```powershell
-uv run --no-sync python -m vexic.hosted_http revoke-key --root /data/vexic --key-id <key-id> --revoked-by <operator>
+uv run --no-sync python -m vexic.hosted_http revoke-key --root .hosted-memory --key-id <key-id> --revoked-by <operator>
 ```
+
+This revokes against the control plane selected by `--root`. It does **not**
+revoke a key on the deployed alpha: the CLI never consults
+`VEXIC_CONTROL_PLANE_TARGET`, so a `--root /data/vexic` revocation is written to
+the volume's stale `control-plane.db` while the service keeps authenticating the
+key against Turso. Revoke live alpha keys through the Console control plane.
 
 This is internal-alpha infrastructure for throwaway data. It is not a
 production customer-data launch, public MCP endpoint, billing portal, dashboard,
@@ -698,9 +746,13 @@ explicit security/engineering owner risk acceptance is recorded.
 Internal-only today:
 
 - in-process Python API boundary and internal-alpha HTTP adapter;
-- local SQLite-compatible tenant databases;
-- repo-local SQLite control-plane tenant catalog and API-key/revocation adapter;
-- sanitized local SQLite control-plane audit, usage, and job lifecycle ledgers;
+- per-tenant Turso databases for customer memory, and a managed Turso
+  control-plane database holding the tenant catalog, API-key/revocation records,
+  and the sanitized audit, usage, and job lifecycle ledgers (ADR 0019 and its
+  Addendum 5). The local SQLite path remains supported and is the default when
+  the backend flags are unset, but it is not what the deployed alpha runs;
+- control-plane DR is a scripted `turso db dump`
+  (`.github/workflows/turso-backup.yml`), not PITR: the free tier has none;
 - single-process in-memory authenticated request limiter;
 - one `LocalMemoryService` instance is created per hosted request;
 - hosted Light/REM/Deep/Summarize jobs run only with injected host model

@@ -99,8 +99,9 @@ Notes:
   carry forward.
 - 0018 settles COA-262: the default Claude Code read path is SessionStart
   priming from the existing recorder config plus an opt-in MCP on-demand pull
-  leg. UserPromptSubmit relevance injection and a dedicated no-query priming
-  endpoint stay deferred.
+  leg. UserPromptSubmit relevance injection stays deferred; the no-query
+  priming endpoint it also deferred shipped later as ADR 0024's
+  `fresh_context`.
 - 0020 settles COA-275 and extends 0016's LLM-floor reduction: REM becomes a
   local deterministic embedding-centrality heuristic, the REM agent port and
   adapter symbol are deleted, and the remaining dream-phase LLM legs are Light
