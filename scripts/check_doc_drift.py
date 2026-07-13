@@ -97,10 +97,41 @@ HISTORICAL_DOCS = ("docs/adr/", "docs/provenance.md", "CHANGELOG.md")
 COMMAND_STARTS = ("vexic", "uv", "python", "$", ">")
 SUBCOMMAND_RE = re.compile(r"[a-z][a-z0-9-]*$")
 
+# How many leading tokens are subcommand *names* rather than argument *values*.
+#
+# The Vexic CLI nests exactly two subcommand levels (`vexic setup mcp-client`,
+# `vexic recorder uninstall-mcp-client`); the token after them is a positional
+# argument value. Nothing in a token's shape distinguishes the two -- in
+# `vexic setup mcp-client myagent`, the client name `myagent` satisfies
+# SUBCOMMAND_RE exactly as `mcp-client` does, and the collecting loop below
+# stops at flags and paths but has no way to stop at a bare value.
+#
+# So validating every collected token would demand that the module define
+# `myagent` as a subcommand and fire the gate on a doc that is correct. This
+# bound is what keeps the check honest, not a shortcut around it: a stale
+# third-level subcommand and a third-position argument value are the same string
+# to a flat literal scan, and the only options are to bound the depth or to cry
+# wolf. Raise this if and only if the CLI grows a third subcommand level.
+CLI_SUBCOMMAND_DEPTH = 2
+
 # Suite-total test-count claims. A bare "3 tests" in prose is usually a delta
 # ("adds 3 tests"), not a suite total, so a cue word must appear on the line.
+#
+# Cues match on a word boundary, and `passed` is spelled out rather than left as
+# a `pass` stem. A substring cue finds `pass` inside `passes`, so "Adds 3 tests;
+# the gate passes." -- correct prose about a delta -- was read as a claim that
+# the suite totals 3, and the gate fired on a doc that was right. A check that
+# cries wolf is a check people learn to ignore.
+#
+# `passed` earns its place separately: "742 passed" is how pytest reports a
+# total, and it is the one cited form that carries no other cue word on the
+# line. `passes`/`passing` are deliberately not cues -- they describe a run's
+# outcome, not its size.
 TEST_COUNT_RE = re.compile(r"\b(\d[\d,_]*)\s+(?:tests?|passed)\b", re.IGNORECASE)
-TEST_COUNT_CUES = ("suite", "collected", "pass", "total", "green", "pytest")
+TEST_COUNT_CUES = ("suite", "collected", "passed", "total", "green", "pytest")
+TEST_COUNT_CUE_RE = re.compile(
+    r"\b(?:" + "|".join(TEST_COUNT_CUES) + r")\b", re.IGNORECASE
+)
 
 # An environment variable name as it appears as a string literal in code and as
 # a backticked token in the docs. Deliberately excludes the `VEXIC_LIVE_<GROUP>
@@ -432,8 +463,7 @@ def _cited_test_counts(text: str) -> set[int]:
     """Suite-total test counts asserted by `text`."""
     counts: set[int] = set()
     for line in text.splitlines():
-        lowered = line.lower()
-        if not any(cue in lowered for cue in TEST_COUNT_CUES):
+        if not TEST_COUNT_CUE_RE.search(line):
             continue
         for match in TEST_COUNT_RE.finditer(line):
             counts.add(int(match.group(1).replace(",", "").replace("_", "")))
@@ -597,7 +627,9 @@ def _documented_commands(text: str) -> set[tuple[str, tuple[str, ...]]]:
             if not SUBCOMMAND_RE.match(token):
                 break
             subcommands.append(token)
-        commands.add((module, tuple(subcommands[:2])))
+        # Bounded to the CLI's real subcommand depth: past it, a bare token is an
+        # argument value, not a subcommand name. See CLI_SUBCOMMAND_DEPTH.
+        commands.add((module, tuple(subcommands[:CLI_SUBCOMMAND_DEPTH])))
     return commands
 
 

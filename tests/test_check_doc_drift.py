@@ -181,6 +181,114 @@ def test_flags_documented_subcommand_the_cli_no_longer_knows(tmp_path: Path) -> 
     assert "mcp-stdio" not in joined
 
 
+def test_flags_a_second_level_subcommand_the_cli_no_longer_knows(
+    tmp_path: Path,
+) -> None:
+    """The depth bound must reach every subcommand level the CLI actually has.
+
+    `vexic recorder uninstall-mcp-client` nests two deep, so a bound that
+    stopped at one would leave the second level unvalidated and a renamed
+    subcommand there would never be flagged.
+    """
+    hook = _load_hook()
+    root = _repo(tmp_path)
+    (root / "src" / "vexic" / "cli.py").write_text(
+        'SUBCOMMANDS = ("recorder", "ingest")\n', encoding="utf-8"
+    )
+    (root / "docs" / "usage.md").write_text(
+        "```\n"
+        "vexic recorder ingest --db-path ./memory.db\n"
+        "vexic recorder retired-step\n"
+        "```\n",
+        encoding="utf-8",
+    )
+
+    warnings, notes = hook.collect_warnings(root)
+
+    assert notes == []
+    joined = "\n".join(warnings)
+    assert "retired-step" in joined
+    assert "ingest" not in joined
+
+
+def test_does_not_read_a_positional_argument_value_as_a_subcommand(
+    tmp_path: Path,
+) -> None:
+    """`vexic setup mcp-client myagent` names a client; `myagent` is the value of
+    the `name` positional, not a subcommand.
+
+    Nothing in the token shape separates the two -- a bare argument value and a
+    subcommand name are both lowercase words, and SUBCOMMAND_RE matches both --
+    so validating every token past the CLI's real subcommand depth would demand
+    that the module define `myagent`, and the gate would fire on a doc that is
+    correct. This is why the check bounds the depth it validates rather than
+    walking the whole token list.
+    """
+    hook = _load_hook()
+    root = _repo(tmp_path)
+    (root / "src" / "vexic" / "cli.py").write_text(
+        'SUBCOMMANDS = ("setup", "mcp-client")\n', encoding="utf-8"
+    )
+    (root / "docs" / "usage.md").write_text(
+        "```\nvexic setup mcp-client myagent --base-url https://api.vexic.dev\n```\n",
+        encoding="utf-8",
+    )
+
+    warnings, notes = hook.collect_warnings(root)
+
+    assert notes == []
+    assert warnings == []
+
+
+def test_resolves_a_subcommand_through_a_module_the_cli_imports(
+    tmp_path: Path,
+) -> None:
+    """`vexic recorder ingest` resolves through `vexic.cli` into
+    `vexic.recorders.cli`, where the `ingest` literal actually lives.
+
+    Every other CLI fixture keeps the literal in `cli.py` itself, so the one-hop
+    import walk in `_string_literals` never executes and a regression in it
+    would ship green. `ingest` is deliberately absent from `cli.py` here: the
+    only way it can resolve is through the import, and the stale `retired-step`
+    on the next line proves the check is live rather than vacuously silent.
+    """
+    hook = _load_hook()
+    root = _repo(tmp_path)
+    recorders = root / "src" / "vexic" / "recorders"
+    recorders.mkdir(parents=True)
+    (recorders / "__init__.py").write_text("", encoding="utf-8")
+    (recorders / "cli.py").write_text(
+        "def build_parser(subparsers):\n"
+        '    subparsers.add_parser("ingest")\n'
+        "    return subparsers\n",
+        encoding="utf-8",
+    )
+    (root / "src" / "vexic" / "cli.py").write_text(
+        "from vexic.recorders.cli import build_parser\n"
+        "\n"
+        "\n"
+        "def main(argv):\n"
+        '    if argv[0] == "recorder":\n'
+        "        return build_parser(argv)\n"
+        "    return 0\n",
+        encoding="utf-8",
+    )
+    (root / "docs" / "usage.md").write_text(
+        "```\n"
+        "vexic recorder ingest --db-path ./memory.db\n"
+        "vexic recorder retired-step\n"
+        "```\n",
+        encoding="utf-8",
+    )
+
+    warnings, notes = hook.collect_warnings(root)
+
+    assert notes == []
+    joined = "\n".join(warnings)
+    assert "retired-step" in joined
+    assert "ingest" not in joined
+
+
 def test_does_not_read_a_python_import_example_as_a_cli_call(tmp_path: Path) -> None:
     hook = _load_hook()
     root = _repo(tmp_path)
@@ -257,6 +365,54 @@ def test_does_not_read_a_test_delta_as_a_suite_total(
 
     assert notes == []
     assert warnings == []
+
+
+def test_does_not_read_a_passing_gate_as_a_suite_total(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """ "the gate passes" is prose about a run, not a suite-total cue.
+
+    A substring cue match finds `pass` inside `passes`, then reads the delta
+    ("3 tests") as the suite total -- the gate firing on correct docs. A check
+    that cries wolf is a check people learn to ignore, so the cue has to match
+    on a word boundary.
+    """
+    hook = _load_hook()
+    root = _repo(tmp_path)
+    (root / "CONTRIBUTING.md").write_text(
+        "Adds 3 tests; the gate passes.\n", encoding="utf-8"
+    )
+
+    def _never(_root: Path) -> int:
+        raise AssertionError("pytest must not be collected when no count is cited")
+
+    monkeypatch.setattr(hook, "_collect_test_count", _never)
+
+    warnings, notes = hook.collect_warnings(root)
+
+    assert notes == []
+    assert warnings == []
+
+
+def test_still_reads_a_bare_pytest_passed_line_as_a_suite_total(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The word-boundary fix must not cost the check its reach.
+
+    "742 passed" is how pytest reports a suite total, and it is the one form
+    that carries no other cue word. Narrowing the cue to a bare `pass` would
+    silently stop catching it.
+    """
+    hook = _load_hook()
+    root = _repo(tmp_path)
+    (root / "README.md").write_text("The last run: 500 passed.\n", encoding="utf-8")
+    monkeypatch.setattr(hook, "_collect_test_count", lambda _root: 742)
+
+    warnings, _ = hook.collect_warnings(root)
+
+    joined = "\n".join(warnings)
+    assert "500" in joined
+    assert "742" in joined
 
 
 def test_flags_reference_to_an_adr_that_does_not_exist(tmp_path: Path) -> None:
