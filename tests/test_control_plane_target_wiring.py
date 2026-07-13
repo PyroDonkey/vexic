@@ -229,6 +229,41 @@ def test_cli_revoke_key_honors_turso_control_plane_target(
         verifier.authenticate(api_key.raw_key)
 
 
+def test_cli_revoke_key_needs_no_customer_provisioning_vars(
+    turso_control_plane, tmp_path, monkeypatch, capsys
+):
+    """Revocation must never be blocked by customer-memory provisioning
+    config: with `VEXIC_STORAGE_BACKEND=turso` but no `TURSO_ORG` /
+    platform-API variables, `revoke-key` still revokes against the
+    flag-selected control plane."""
+    from vexic.hosted_http import main
+
+    seed_catalog = HostedTenantCatalog(tmp_path, control_target=turso_control_plane)
+    seed_catalog.provision_tenant("t1", project_ids=set())
+    seed_keys = HostedApiKeyStore(control_target=turso_control_plane)
+    api_key = seed_keys.create_key(
+        tenant_id="t1",
+        principal_id="p1",
+        capabilities={MemoryCapability.WRITE},
+        project_ids=set(),
+        agent_ids=set(),
+    )
+
+    monkeypatch.setenv("VEXIC_STORAGE_BACKEND", "turso")
+    monkeypatch.delenv("TURSO_ORG", raising=False)
+    provisioning = _ControlTargetProvisioning(turso_control_plane)
+    rc = main(
+        ["revoke-key", "--root", str(tmp_path), "--key-id", api_key.key_id],
+        turso_provisioning=provisioning,
+    )
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["revoked"] is True
+
+    verifier = HostedApiKeyStore(control_target=turso_control_plane)
+    with pytest.raises(PermissionError):
+        verifier.authenticate(api_key.raw_key)
+
+
 def test_cli_and_factory_resolve_same_control_plane_target(
     turso_control_plane, tmp_path, monkeypatch, capsys
 ):

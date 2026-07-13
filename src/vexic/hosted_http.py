@@ -308,6 +308,7 @@ def _build_hosted_stores(
     *,
     provisioning: _TursoProvisioning,
     env: Mapping[str, str],
+    customer_memory: bool = True,
 ) -> tuple[HostedTenantCatalog, HostedApiKeyStore, object | None]:
     """Build the catalog, API-key store, and customer-target resolver from the
     `VEXIC_CONTROL_PLANE_TARGET` / `VEXIC_STORAGE_BACKEND` flags.
@@ -315,8 +316,13 @@ def _build_hosted_stores(
     This is the single seam both `create_service_from_env` and the operator
     CLI (`main`) go through, so runbook commands and the serving app always
     resolve the same control plane from the same environment.
+
+    ``customer_memory=False`` skips the `VEXIC_STORAGE_BACKEND` branch
+    entirely: control-plane-only commands (`revoke-key`) must never be blocked
+    by missing customer-provisioning configuration (`TURSO_ORG`, platform API
+    token), or a production revocation could fail before the key is revoked.
     """
-    backend = resolve_storage_backend(env)
+    backend = resolve_storage_backend(env) if customer_memory else "local"
     # Control-plane target is independent of the customer-memory backend
     # (ADR 0019 Addendum 4): `turso` routes the catalog + API-key
     # store to the managed libSQL control-plane database; `local` (default)
@@ -926,7 +932,10 @@ def main(
         root = _root_arg(args.root)
         provisioning = turso_provisioning or _TursoProvisioning()
         catalog, keys, customer_target_resolver = _build_hosted_stores(
-            root, provisioning=provisioning, env=os.environ
+            root,
+            provisioning=provisioning,
+            env=os.environ,
+            customer_memory=args.command != "revoke-key",
         )
 
         if args.command == "run-dream-phase":
