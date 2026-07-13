@@ -34,11 +34,34 @@ OPENROUTER_PROVIDER_PREFERENCES: dict[str, Any] = {
 # NOTE(alpha): single embedding worker; add a pool only if live runs need parallel embeddings.
 _EMBED_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 
+# An earlier "only durable user facts stated in the transcript" wording read
+# as personal-bio facts, so assistant-heavy working sessions -- the common
+# shape of agent transcripts -- extracted zero candidates even though the
+# user's own requests and corrections established durable facts about their
+# projects, stack, and working preferences. The instructions name that shape
+# explicitly and narrow the empty-list escape to transcripts that establish
+# nothing durable at all.
 EXTRACTION_INSTRUCTIONS = """\
-Extract only durable user facts stated in the transcript.
+Extract durable facts about the user from the transcript.
+Durable user facts are stated directly ("I use uv for all my projects") or
+clearly established by the user's own requests and corrections: the projects
+they are building, the tools, languages, and environments they work in, how
+they prefer to work, and preferences their corrections reveal.
+Most transcripts are working sessions, not conversations about the user. A
+transcript where the user only directs coding work still establishes durable
+facts about their projects and working preferences; extract those rather
+than returning an empty list.
+Do not extract one-off task mechanics -- a specific bug fixed, a command that
+was run, code the assistant wrote -- unless they establish something durable
+about the user or their projects. Ground every fact in what the user said or
+asked for, not in what the assistant did on its own.
 Use the closed category vocabulary exactly: preference, fact, goal, event,
 relationship, skill, constraint, context.
 Every candidate must include source_message_ids from the [message_id=N] markers.
+Because every fact is grounded in the user, source_message_ids must include
+at least one User message -- the request or correction that establishes the
+fact. Cite the Assistant message that carries the detail alongside it, never
+alone.
 When the transcript states or clearly implies a temporal reference for when
 the fact occurred (a date, month, year, or relative time you can resolve
 against context), populate occurred_at with an ISO 8601 string at whatever
@@ -47,7 +70,8 @@ precision is actually known: a full date ("2025-03-14"), a year-month
 told. Leave occurred_at null when no temporal reference exists. Look
 especially hard for a date on category="event" facts, since event facts
 should carry an occurred_at whenever the transcript gives any basis for one.
-Return an empty list when there are no durable user facts.\
+Return an empty list only when the transcript establishes no durable user
+facts at all, not merely because the session is task-focused.\
 """
 
 CONTRADICTION_INSTRUCTIONS = """\
