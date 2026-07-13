@@ -9,6 +9,7 @@ from vexic.contract import PRIME_CONTEXT_HEADER
 from vexic.recorders.claude_code import (
     SOURCE_HOST,
     iter_claude_code_source_messages,
+    scan_claude_code_transcript,
     source_message_from_claude_code_row,
 )
 from vexic.storage import single_message_adapter
@@ -84,6 +85,149 @@ class ClaudeCodeRecorderSharedTests(unittest.TestCase):
         )
 
         self.assertIsNone(message)
+
+    def test_source_message_from_row_drops_slash_command_envelope(self) -> None:
+        envelope_rows = [
+            {
+                "type": "user",
+                "sessionId": "session-1",
+                "uuid": "slash-command",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "<command-name>/clear</command-name>\n"
+                        "<command-message>clear</command-message>\n"
+                        "<command-args></command-args>"
+                    ),
+                },
+            },
+            {
+                "type": "user",
+                "sessionId": "session-1",
+                "uuid": "command-stdout",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "<local-command-stdout>Set model to sonnet"
+                        "</local-command-stdout>"
+                    ),
+                },
+            },
+        ]
+
+        for row in envelope_rows:
+            with self.subTest(uuid=row["uuid"]):
+                self.assertIsNone(source_message_from_claude_code_row(row))
+
+    def test_source_message_from_row_strips_system_reminder_keeps_user_text(
+        self,
+    ) -> None:
+        message = source_message_from_claude_code_row(
+            {
+                "type": "user",
+                "sessionId": "session-1",
+                "uuid": "mixed-reminder",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "remember cedar\n"
+                        "<system-reminder>\nInjected harness context.\n"
+                        "</system-reminder>"
+                    ),
+                },
+            }
+        )
+
+        self.assertIsNotNone(message)
+        assert message is not None
+        model_message = single_message_adapter.validate_json(message.message_json)
+        assert isinstance(model_message, ModelRequest)
+        self.assertEqual(model_message.parts[0].content, "remember cedar")
+
+    def test_source_message_from_row_drops_pure_system_reminder(self) -> None:
+        message = source_message_from_claude_code_row(
+            {
+                "type": "user",
+                "sessionId": "session-1",
+                "uuid": "pure-reminder",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "<system-reminder>\nInjected harness context only.\n"
+                        "</system-reminder>"
+                    ),
+                },
+            }
+        )
+
+        self.assertIsNone(message)
+
+    def test_source_message_from_row_drops_unpaired_system_reminder_tag(
+        self,
+    ) -> None:
+        unpaired_contents = [
+            "<system-reminder>\ndangling open tag, no close",
+            "dangling close tag only\n</system-reminder>",
+            "remember cedar\n<system-reminder>\nunterminated block",
+        ]
+
+        for content in unpaired_contents:
+            with self.subTest(content=content):
+                message = source_message_from_claude_code_row(
+                    {
+                        "type": "user",
+                        "sessionId": "session-1",
+                        "uuid": "unpaired-reminder",
+                        "message": {"role": "user", "content": content},
+                    }
+                )
+                self.assertIsNone(message)
+
+    def test_scan_drops_envelopes_and_strips_reminders(self) -> None:
+        rows = [
+            {
+                "type": "user",
+                "sessionId": "session-1",
+                "uuid": "slash-command",
+                "message": {
+                    "role": "user",
+                    "content": "<command-name>/clear</command-name>",
+                },
+            },
+            {
+                "type": "user",
+                "sessionId": "session-1",
+                "uuid": "mixed-reminder",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "remember cedar\n"
+                        "<system-reminder>injected</system-reminder>"
+                    ),
+                },
+            },
+            {
+                "type": "user",
+                "sessionId": "session-1",
+                "uuid": "clean",
+                "message": {"role": "user", "content": "clean maple"},
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "session.jsonl"
+            path.write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+            scan = scan_claude_code_transcript(path)
+
+        self.assertEqual(scan.ignored, 1)
+        texts = [
+            single_message_adapter.validate_json(message.message_json).parts[0].content
+            for message in scan.messages
+        ]
+        self.assertEqual(texts, ["remember cedar", "clean maple"])
 
     def test_iter_claude_code_source_messages_yields_none_for_bad_lines(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

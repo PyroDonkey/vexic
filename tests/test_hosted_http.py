@@ -2086,6 +2086,51 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(ingest_response.json()["items"][0]["status"], "rejected")
         self.assertEqual(search_response.json()["hits"], [])
 
+    def test_hosted_ingest_rejects_harness_envelope_rows(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
+        envelope = single_message_adapter.dump_json(
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content="<command-name>/clear</command-name>\n"
+                        "<command-message>clear</command-message>"
+                    )
+                ]
+            )
+        ).decode()
+
+        ingest_response = self.client.post(
+            "/v1/ingest_source_transcript",
+            headers=self._write_headers(api_key),
+            json={
+                "messages": [
+                    {
+                        "source_host": "claude-code",
+                        "source_session_id": "source-session-a",
+                        "source_message_id": "slash-command",
+                        "message_json": envelope,
+                    }
+                ],
+                "redaction": {"forbidden_values": []},
+            },
+        )
+        search_response = self.client.post(
+            "/v1/search_transcript",
+            headers=self._auth(api_key),
+            json=SearchTranscriptRequest(
+                scope=_scope(capabilities={MemoryCapability.SEARCH}),
+                query="clear",
+            ).model_dump(mode="json"),
+        )
+
+        self.assertEqual(ingest_response.status_code, 200)
+        item = ingest_response.json()["items"][0]
+        self.assertEqual(item["status"], "rejected")
+        self.assertEqual(
+            item["reason"], "claude-code command envelope is not transcript text"
+        )
+        self.assertEqual(search_response.json()["hits"], [])
+
     def _ingest_body(self, text: str = "hello") -> dict[str, object]:
         message_json = single_message_adapter.dump_json(
             ModelRequest(parts=[UserPromptPart(content=text)])

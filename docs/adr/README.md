@@ -49,6 +49,7 @@ index (and the reverse).
 | 0031 | Light drops miscited candidates instead of failing the batch | accepted (Context corrected: it did not cause the 2026-07 hosted Light failures; see ADR 0032) |
 | 0032 | The dream in-flight lock is a durable control-plane lease | accepted |
 | 0033 | Versioned docs do not record deployed state | accepted |
+| 0034 | Claude Code harness envelopes are filtered, not ingested | accepted |
 
 Notes:
 

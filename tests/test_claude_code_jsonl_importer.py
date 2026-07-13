@@ -152,6 +152,15 @@ class ClaudeCodeJsonlImporterTests(unittest.IsolatedAsyncioTestCase):
             {
                 "type": "user",
                 "sessionId": "session-1",
+                "uuid": "slash-command",
+                "message": {
+                    "role": "user",
+                    "content": "<local-command-stdout>stdout cedar</local-command-stdout>",
+                },
+            },
+            {
+                "type": "user",
+                "sessionId": "session-1",
                 "uuid": "clean",
                 "message": {"role": "user", "content": "clean cedar"},
             },
@@ -180,7 +189,7 @@ class ClaudeCodeJsonlImporterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         summary = json.loads(completed.stdout)
         self.assertEqual(summary["inserted"], 1)
-        self.assertEqual(summary["ignored"], 4)
+        self.assertEqual(summary["ignored"], 5)
 
         service = LocalMemoryService(db_path=str(self.db_path), tenant_id="tenant-a")
         clean = await service.search_transcript(
