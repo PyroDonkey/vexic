@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 import sqlite3
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
-
-from vexic.storage.errors import is_retryable_operational_error
 
 @dataclass(frozen=True)
 class StorageTarget:
@@ -28,24 +25,6 @@ class StorageTarget:
 # ":memory:" is the local SQLite backend. ``str.startswith`` accepts the tuple.
 _LIBSQL_SCHEMES = ("libsql://", "https://", "http://", "wss://", "ws://")
 _PLAINTEXT_LIBSQL_SCHEMES = ("http://", "ws://")
-
-# Hot-path bounds for the REMOTE libSQL path only (ADR 0019 Addendum 2
-# follow-up). The local SQLite path keeps sqlite3's own semantics untouched:
-# retrying a local file open is meaningless, and adding latency there would
-# hit the local reference service and every test.
-#
-# The driver's own default is 5.0s; naming it here makes the bound explicit
-# and reviewable rather than inherited. Attempts are TOTAL (1 initial try + 2
-# retries), so worst-case added latency is bounded by
-# 2*timeout + 0.5 + 1.0 backoff -- it can never grow without limit.
-LIBSQL_CONNECT_TIMEOUT_SECONDS = 5.0
-LIBSQL_CONNECT_ATTEMPTS = 3
-LIBSQL_CONNECT_BACKOFF_SECONDS = 0.5
-LIBSQL_CONNECT_BACKOFF_MAX_SECONDS = 2.0
-
-# Injection seam for the backoff sleep so retry tests run instantly and assert
-# the schedule. Not a config surface -- callers never pass this.
-_sleep = time.sleep
 
 
 class StorageConnection(Protocol):
@@ -105,13 +84,6 @@ def connect(
     in by the repo-root ``adapters/`` layer, and ``src/vexic`` never reads it
     from the environment (ADR 0019). The ``libsql`` client is an optional
     ``hosted`` extra, imported lazily so the local path needs no extra dependency.
-
-    The REMOTE path additionally gets an explicit connect timeout and a bounded
-    retry/backoff (ADR 0019): without them a network degradation could hang the
-    hot path indefinitely. Both apply to the libSQL branch ONLY -- the local
-    SQLite branch keeps sqlite3's own semantics exactly, since retrying a local
-    file open is meaningless and an injected timeout would surprise every local
-    call site. A caller-supplied ``timeout`` kwarg still wins on either branch.
     """
     if isinstance(target, StorageTarget):
         if auth_token is not None:
@@ -132,54 +104,10 @@ def connect(
                 "it with `uv sync --extra hosted` (or `pip install vexic[hosted]`)."
             ) from exc
 
-        timeout = kwargs.pop("timeout", LIBSQL_CONNECT_TIMEOUT_SECONDS)
-        if auth_token is not None:
-            kwargs["auth_token"] = auth_token
-        return _connect_libsql_with_retry(libsql, target, timeout=timeout, **kwargs)
+        if auth_token is None:
+            return libsql.connect(target)
+        return libsql.connect(target, auth_token=auth_token)
     return sqlite3.connect(target, **kwargs)
-
-
-def _is_retryable_connect_error(exc: BaseException) -> bool:
-    """True for a remote-connect fault a bounded retry might clear.
-
-    Two families qualify. Network/transport faults reach us as :class:`OSError`
-    subclasses (:class:`ConnectionError`, :class:`TimeoutError` -- including the
-    driver timeout above). Server-side busy/locked/IO conditions reach us as the
-    libSQL bare :class:`ValueError` carrying a Hrana payload, which the shared
-    classifier in :mod:`vexic.storage.errors` already recognizes; reusing it
-    keeps one definition of "retryable" across the codebase.
-
-    Everything else -- notably an auth failure -- is NOT retried: it cannot
-    succeed on a second attempt and would only add latency to the hot path.
-    """
-    if isinstance(exc, OSError):
-        return True
-    return is_retryable_operational_error(exc)
-
-
-def _connect_libsql_with_retry(libsql: Any, target: str, **kwargs: Any) -> StorageConnection:
-    """Open a remote libSQL connection with a BOUNDED retry and backoff.
-
-    Bounded means bounded (ADR 0019): at most ``LIBSQL_CONNECT_ATTEMPTS`` total
-    attempts and a backoff capped at ``LIBSQL_CONNECT_BACKOFF_MAX_SECONDS``, so
-    worst-case latency here is finite and small. On exhaustion the LAST
-    exception is re-raised unchanged -- deliberately not wrapped in a new type,
-    because the hosted adapter classifies the raw libSQL ``ValueError`` to map a
-    storage fault to a 503 ``storage_unavailable``, and a wrapper type would
-    silently downgrade that to a generic 500.
-    """
-    for attempt in range(1, LIBSQL_CONNECT_ATTEMPTS + 1):
-        try:
-            return libsql.connect(target, **kwargs)
-        except Exception as exc:
-            if attempt == LIBSQL_CONNECT_ATTEMPTS or not _is_retryable_connect_error(exc):
-                raise
-            backoff = min(
-                LIBSQL_CONNECT_BACKOFF_SECONDS * (2 ** (attempt - 1)),
-                LIBSQL_CONNECT_BACKOFF_MAX_SECONDS,
-            )
-            _sleep(backoff)
-    raise AssertionError("unreachable: the retry loop is bounded and always returns or raises")
 
 
 def rows_as_dicts(cursor: Any) -> list[dict[str, Any]]:
