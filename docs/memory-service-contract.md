@@ -142,9 +142,17 @@ re-entering would strip the minted capability during capability
 intersection and double-count the shared rate bucket. `TriggerDreamPhaseResult`
 carries `status` (`"scheduled"` or `"skipped"`) and an optional `reason`
 (e.g. `"already_running"` when a sweep for the same tenant+agent is already
-in flight -- an in-process, per-(tenant_id, agent_id) lock). The scheduled
-sweep runs asynchronously; the caller gets `202` back immediately and does
-not await phase completion.
+in flight). In-flight is decided by a durable, per-(tenant_id, agent_id)
+lease in the control plane -- a `dream_sweep_lease` row claimed by a
+conditional upsert, held for a TTL, and heartbeat-renewed for as long as the
+chain runs (ADR 0032). The lease, not process memory, is the source of truth,
+so a scope stays claimed across a container restart and two overlapping
+replicas during a rolling deploy resolve at the database: exactly one claims
+the scope, the other is skipped. A holder that dies mid-chain costs at most
+one lease period, because a lapsed lease is stealable. The process-local lock
+is only a fast path in front of that lease. The scheduled sweep runs
+asynchronously; the caller gets `202` back immediately and does not await
+phase completion.
 
 **Scope is tenant(+agent)-wide, not project-scoped.** The request's
 authenticated project header binds and authorizes the call the same as any

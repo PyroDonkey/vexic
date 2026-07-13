@@ -75,6 +75,18 @@ UserPromptSubmit relevance injection is not part of this slice.
 
 - A dedicated no-query fresh-context endpoint that ranks by scope, recency,
   salience, and session summary/tail without relying on search terms.
+
+  > Amended by ADR 0024. This shipped. A `summarize` dream phase compacts Tier 1
+  > spans (`src/vexic/summarize.py`), and `POST /v1/fresh_context`
+  > (`src/vexic/hosted_http.py`, capability `MemoryCapability.FRESH_CONTEXT`)
+  > returns a bounded recap-plus-tail with no search query. SessionStart priming
+  > no longer depends on the broad-query search reuse the Consequences describe.
 - UserPromptSubmit per-turn relevance injection for mid-session topic drift.
 - Cross-agent priming hooks for Codex and other runtimes.
 - Changing the MCP enable/disable model from ADR 0017.
+
+  > Amended by ADR 0027. This was changed. The connect leg no longer hand-writes
+  > a disabled `.mcp.json` scaffold; `vexic setup <client>` prints the client's
+  > own `mcp add` command and the user running it is the opt-in step
+  > (`src/vexic/recorders/mcp_connect.py`). MCP stays off by default, so this
+  > ADR's split between default priming and opt-in on-demand pull is unchanged.

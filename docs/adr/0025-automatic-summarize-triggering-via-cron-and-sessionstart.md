@@ -122,6 +122,16 @@ error path and never crash the server. The existing `run_dream_phase` rate
 rule (6/hour, shared with the CLI/admin dream-phase path) still applies on
 top of the lock and yields `429` on exceed.
 
+> Amended by ADR 0032. The lock is no longer in-process. It is now backed by a
+> durable per-(tenant, agent) lease in the control-plane catalog:
+> `_acquire_dream_trigger_lock` in `src/vexic/hosted.py` claims it through
+> `acquire_dream_lease` in `src/vexic/hosted_local.py`, and a live holder
+> heartbeats the lease for the life of the chain
+> (`_start_dream_lease_heartbeat`, `src/vexic/hosted.py`). The skip semantics
+> above -- `{"status": "skipped", "reason": "already_running"}` on a concurrent
+> trigger for the same scope -- are unchanged; only the mechanism behind them
+> is. The rate rule described here is unaffected.
+
 **Accepted risks, deliberately not solved here:**
 
 - The in-process task is lost on restart or redeploy mid-sweep. The next
@@ -136,6 +146,14 @@ top of the lock and yields `429` on exceed.
   6/hour *per replica* rather than a global cap. Revisit with a durable
   queue or a shared limiter before scaling the hosted service horizontally;
   tracked as future work, not solved in this ADR.
+
+  > Amended by ADR 0032, in part. The lock half of this accepted risk was not
+  > survivable even on the current deploy: a rolling deploy overlaps two
+  > containers, so the "verified single-process" premise was already false, and
+  > the lock is now a durable control-plane lease (see the amendment on D3
+  > above). The rate-limiter half still stands as written --
+  > `HostedInMemoryRateLimiter` in `src/vexic/hosted.py` is still process-local,
+  > and a shared limiter remains future work.
 
 ### D4 -- Recorder prime trigger: detached subprocess, not a fourth serial call
 
@@ -178,6 +196,13 @@ fix it and this work does not make it worse (the new subprocess is detached
 and adds no serial wait).
 
 ### D5 -- Cron producer: a new, deliberately dumb scheduled workflow
+
+> Retired by ADR 0030. The external cron producer is gone:
+> `.github/workflows/dream-cron.yml` and its three repo secrets were retired
+> with the move to an in-server per-tenant dream sweeper, and the file no longer
+> exists in this repo. Read the present tense below as the state at the time of
+> the decision. The trigger endpoint it called still exists and still owns
+> dedup, rate limiting, and budget; only the producer changed.
 
 `.github/workflows/dream-cron.yml` is the first `schedule:`-triggered
 workflow in this repo (every existing workflow is push- or
@@ -249,6 +274,13 @@ practice.
 - Multi-replica hardening for the in-flight lock and rate limiter (D3) --
   durable queue or shared limiter, deferred until the hosted service
   actually scales beyond one instance.
+
+  > Amended by ADR 0032, in part. The in-flight lock was hardened without
+  > waiting for a scale-out: ADR 0032 shows a rolling deploy already overlaps
+  > two containers, so this deferral's trigger condition was already met. The
+  > lock is now a durable control-plane lease (`src/vexic/hosted.py`,
+  > `src/vexic/hosted_local.py`). The rate limiter is still process-local and
+  > its share of this deferral stands.
 - Tightening prime's pre-existing serial-timeout budget (D4) -- a known,
   pre-existing follow-up, unrelated to and not worsened by this work.
 
