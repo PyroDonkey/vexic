@@ -4,6 +4,7 @@ import json
 import time
 import urllib.error
 import urllib.request
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -287,6 +288,16 @@ class TenantTokenCache:
     *only* time source consulted in ``get_token`` -- this makes expiry
     deterministic and testable via a fake clock, with no wall-clock reads
     in the logic.
+
+    ``max_entries`` bounds the cache (ADR 0019 Addendum 2). TTL alone does
+    not: an
+    expired entry is never *served*, but it is only evicted when that same
+    ``db_name`` is asked for again, so a process that sees a long tail of
+    tenants would otherwise retain a token entry per tenant forever. The
+    bound is enforced as LRU over an ``OrderedDict`` -- a hit moves the key
+    to the most-recently-used end, and an insert past the bound pops the
+    least-recently-used key. TTL still governs *freshness*; the bound
+    governs *size*. The two are independent and neither replaces the other.
     """
 
     def __init__(
@@ -297,29 +308,44 @@ class TenantTokenCache:
         clock: Callable[[], float] = time.monotonic,
         expiration: str = "15m",
         read_only: bool = False,
+        max_entries: int = 512,
     ) -> None:
+        if max_entries < 1:
+            raise ValueError("max_entries must be at least 1")
         self._port = port
         self._ttl_seconds = ttl_seconds
         self._clock = clock
         self._expiration = expiration
         self._read_only = read_only
-        self._cache: dict[str, tuple[str, float]] = {}
+        self._max_entries = max_entries
+        self._cache: OrderedDict[str, tuple[str, float]] = OrderedDict()
+
+    def __len__(self) -> int:
+        """Number of cached entries. Never exceeds ``max_entries``."""
+        return len(self._cache)
 
     def get_token(self, db_name: str) -> str:
         """Returns a cached token for ``db_name`` if present and not yet
         expired (per ``clock()`` and ``ttl_seconds``); otherwise mints a
         fresh one via the port, caches it with the current timestamp, and
         returns it. Never logs or prints the token.
+
+        A cache hit marks ``db_name`` most-recently-used; an insert evicts
+        the least-recently-used entry once the cache is at ``max_entries``.
         """
         cached = self._cache.get(db_name)
         if cached is not None:
             token, minted_at = cached
             if self._clock() - minted_at < self._ttl_seconds:
+                self._cache.move_to_end(db_name)
                 return token
         token = self._port.mint_token(
             db_name, expiration=self._expiration, read_only=self._read_only
         )
         self._cache[db_name] = (token, self._clock())
+        self._cache.move_to_end(db_name)
+        while len(self._cache) > self._max_entries:
+            self._cache.popitem(last=False)
         return token
 
     def invalidate(self, db_name: str) -> None:
