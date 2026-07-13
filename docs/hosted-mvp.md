@@ -416,8 +416,10 @@ Known follow-ups, deliberately not built in this cutover:
   the fault surfaces on the first query), and the driver's `timeout` argument
   does not bound remote request duration. The fix is a deadline that surfaces as
   a retryable storage fault, so it flows into the existing 503
-  `storage_unavailable` + `Retry-After` path; server-side retry of a query is
-  not the answer and is unsafe for writes. See ADR 0019 Addendum 6.
+  `storage_unavailable` classification; server-side retry of a query is not the
+  answer and is unsafe for writes. That 503 carries no `Retry-After` header
+  today (only the 429 rate-limit responses do), so whether a client-retryable
+  503 should advertise one is itself open. See ADR 0019 Addendum 6.
 - Some adapter type annotations (e.g. around the injected HTTP transport and
   provisioning seams) are looser than ideal and are flagged for a precision
   pass.

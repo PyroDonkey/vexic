@@ -428,8 +428,12 @@ driver rather than reasoned about:
 
 The real gap is unbounded *query* duration against a degraded remote, which
 is tracked separately (COA-377). The shape that fits is a **deadline**, not a
-retry: `hosted_http.py` already maps a retryable storage fault to a 503
-`storage_unavailable` with `Retry-After`, deliberately pushing retry to the
-client, and server-side re-execution of a query is unsafe for writes anyway.
-A hang must surface as a retryable storage fault so it flows into that
-existing path.
+retry: `hosted_http.py` already classifies a retryable storage fault into a
+503 `storage_unavailable`, leaving the retry decision to the client, and
+server-side re-execution of a query is unsafe for writes anyway. A hang must
+surface as a retryable storage fault so it flows into that existing path.
+
+Note that the 503 carries no `Retry-After` header today -- that header is
+attached only to the 429 rate-limit responses. Whether a client-retryable 503
+should advertise one is an open question for COA-377, not a settled contract
+this addendum can lean on.

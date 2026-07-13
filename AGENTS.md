@@ -232,9 +232,10 @@ Tracking rules):
 `scripts/check_doc_drift.py` enforces the in-repo half of this loop. It checks
 that `docs/adr/README.md` lists every ADR file, that the documented service
 surface matches `src/vexic`, and that the living docs' references still resolve
-against the code: file and directory paths, `vexic` CLI commands and their
-subcommands, cited ADR ids, cited test counts, and the environment variables the
-code actually reads. CI runs it with `--ci` on every PR. A local agent
+against the code: file paths carrying a known suffix (bare directory references
+are not checked), `vexic` CLI commands and their subcommands, cited ADR ids,
+cited test counts, and the environment variables the code actually reads. CI
+runs it with `--ci` on every PR. A local agent
 hook may call the same script, but `.claude/` configuration is machine-local and
 ignored by Git. A hook cannot read the external tracking system, so closing the
 loop against the tracking docs remains a manual step under the triggers above.
