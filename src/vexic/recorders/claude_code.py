@@ -8,7 +8,12 @@ from typing import Any
 
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 
-from vexic.contract import PRIME_CONTEXT_HEADER, SourceTranscriptMessage
+from vexic.contract import (
+    PRIME_CONTEXT_HEADER,
+    SourceTranscriptMessage,
+    harness_envelope_reason,
+    strip_system_reminder_blocks,
+)
 from vexic.recorders.transcript_cursor import TranscriptCursor, line_sha256
 from vexic.storage import single_message_adapter
 
@@ -56,9 +61,16 @@ def source_message_from_claude_code_row(
     text = _content_text(message.get("content"))
     if text is None:
         return None
+    text = strip_system_reminder_blocks(text)
+    if not text:
+        return None
     if PRIME_CONTEXT_HEADER in text:
         # Injected SessionStart priming recap, echoed back into the JSONL
         # transcript by the host; never re-ingest it into Tier 1 (WI-6).
+        return None
+    if harness_envelope_reason(text) is not None:
+        # Slash-command envelopes and other harness-injected payloads are
+        # never conversation (Memory Invariant #2, ADR 0034).
         return None
 
     role = message.get("role")
