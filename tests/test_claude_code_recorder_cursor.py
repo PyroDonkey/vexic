@@ -1,0 +1,421 @@
+"""Recorder-local transcript cursor.
+
+The Stop hook re-reads the Claude Code JSONL transcript on every invocation.
+A recorder-local cursor lets a run resume from the last processed row instead
+of re-POSTing the whole session. Correctness must never depend on the cursor:
+the hosted source ledger stays the duplicate guard, and every stale, missing,
+corrupt, truncated, or rotated cursor falls back to a full reread.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+from urllib.parse import urlsplit
+
+from fastapi.testclient import TestClient
+
+from vexic.contract import (
+    MemoryCapability,
+    MemoryScope,
+    Principal,
+    PrincipalType,
+    SearchTranscriptRequest,
+    TrustBoundary,
+)
+from vexic.hosted import HostedMemoryService
+from vexic.hosted_http import create_app
+from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
+from vexic.recorders.cli import main as recorder_main
+
+
+def _user_row(uuid: str, text: str, *, session_id: str = "claude-session") -> str:
+    return json.dumps(
+        {
+            "type": "user",
+            "sessionId": session_id,
+            "uuid": uuid,
+            "message": {"role": "user", "content": text},
+        }
+    )
+
+
+def _write_transcript(path: Path, rows: list[str], *, trailing_newline: bool = True) -> None:
+    text = "\n".join(rows)
+    if trailing_newline and rows:
+        text += "\n"
+    path.write_text(text, encoding="utf-8")
+
+
+class _RecorderHarness:
+    """Drives `vexic recorder ingest` against a temp home and records posts."""
+
+    def __init__(self, root: Path, *, source_session_id: str = "claude-session") -> None:
+        self.root = root
+        self.transcript = root / "claude-session.jsonl"
+        self.config_path = root / "vexic" / "claude-code-recorder.json"
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        self.status_path = root / "vexic" / "claude-code-recorder-status.json"
+        self.config_path.write_text(
+            json.dumps(
+                {
+                    "base_url": "https://api.example.test",
+                    "api_key": "vx_secret",
+                    "project_id": "project-a",
+                    "session_id": "vexic-session",
+                    "status_path": str(self.status_path),
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.hook_path = root / "hook.json"
+        self.hook_path.write_text(
+            json.dumps(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": source_session_id,
+                    "transcript_path": str(self.transcript),
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.posted: list[list[str]] = []
+
+    @property
+    def cursor_dir(self) -> Path:
+        return self.config_path.parent / "cursors"
+
+    def cursor_files(self) -> list[Path]:
+        if not self.cursor_dir.exists():
+            return []
+        return sorted(self.cursor_dir.iterdir())
+
+    def run(self, *, post_error: Exception | None = None) -> int:
+        def fake_post(config, *, messages, forbidden_values):
+            self.posted.append([message.source_message_id for message in messages])
+            if post_error is not None:
+                raise post_error
+            return {"items": [{"status": "inserted"} for _ in messages]}
+
+        with (
+            patch("vexic.recorders.cli.post_source_messages", fake_post),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            return recorder_main(
+                ["ingest", "--config", str(self.config_path), "--hook-input", str(self.hook_path)]
+            )
+
+    def posted_ids(self) -> list[str]:
+        return [message_id for batch in self.posted for message_id in batch]
+
+
+class RecorderTranscriptCursorTests(unittest.TestCase):
+    def test_second_run_posts_only_rows_appended_since_the_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            harness = _RecorderHarness(Path(temp))
+            _write_transcript(
+                harness.transcript,
+                [_user_row("uuid-1", "remember cedar"), _user_row("uuid-2", "and orchid")],
+            )
+
+            self.assertEqual(harness.run(), 0)
+            self.assertEqual(harness.posted_ids(), ["uuid-1", "uuid-2"])
+
+            with harness.transcript.open("a", encoding="utf-8") as handle:
+                handle.write(_user_row("uuid-3", "and juniper") + "\n")
+            harness.posted.clear()
+
+            self.assertEqual(harness.run(), 0)
+            self.assertEqual(harness.posted_ids(), ["uuid-3"])
+
+    def test_unchanged_transcript_posts_no_rows_on_the_next_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            harness = _RecorderHarness(Path(temp))
+            _write_transcript(harness.transcript, [_user_row("uuid-1", "remember cedar")])
+
+            self.assertEqual(harness.run(), 0)
+            harness.posted.clear()
+
+            self.assertEqual(harness.run(), 0)
+            self.assertEqual(harness.posted_ids(), [])
+
+    def test_removed_cursor_falls_back_to_a_full_reread(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            harness = _RecorderHarness(Path(temp))
+            _write_transcript(
+                harness.transcript,
+                [_user_row("uuid-1", "remember cedar"), _user_row("uuid-2", "and orchid")],
+            )
+            self.assertEqual(harness.run(), 0)
+
+            for path in harness.cursor_files():
+                path.unlink()
+            harness.posted.clear()
+
+            self.assertEqual(harness.run(), 0)
+            self.assertEqual(harness.posted_ids(), ["uuid-1", "uuid-2"])
+
+    def test_corrupt_cursor_falls_back_to_a_full_reread(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            harness = _RecorderHarness(Path(temp))
+            _write_transcript(
+                harness.transcript,
+                [_user_row("uuid-1", "remember cedar"), _user_row("uuid-2", "and orchid")],
+            )
+            self.assertEqual(harness.run(), 0)
+
+            cursor_files = harness.cursor_files()
+            self.assertEqual(len(cursor_files), 1)
+            cursor_files[0].write_text("{not json", encoding="utf-8")
+            harness.posted.clear()
+
+            self.assertEqual(harness.run(), 0)
+            self.assertEqual(harness.posted_ids(), ["uuid-1", "uuid-2"])
+
+    def test_cursor_with_impossible_offsets_falls_back_to_a_full_reread(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            harness = _RecorderHarness(Path(temp))
+            _write_transcript(
+                harness.transcript,
+                [_user_row("uuid-1", "remember cedar"), _user_row("uuid-2", "and orchid")],
+            )
+            self.assertEqual(harness.run(), 0)
+
+            cursor_files = harness.cursor_files()
+            self.assertEqual(len(cursor_files), 1)
+            cursor_files[0].write_text(
+                json.dumps(
+                    {
+                        "source_session_id": "claude-session",
+                        "byte_offset": 4096,
+                        "last_line_offset": -5,
+                        "last_line_sha256": "0" * 64,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            harness.posted.clear()
+
+            self.assertEqual(harness.run(), 0)
+            self.assertEqual(harness.posted_ids(), ["uuid-1", "uuid-2"])
+
+    def test_truncated_transcript_triggers_a_full_reread(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            harness = _RecorderHarness(Path(temp))
+            _write_transcript(
+                harness.transcript,
+                [
+                    _user_row("uuid-1", "remember cedar"),
+                    _user_row("uuid-2", "and orchid"),
+                    _user_row("uuid-3", "and juniper"),
+                ],
+            )
+            self.assertEqual(harness.run(), 0)
+
+            # File is now shorter than the recorded cursor offset.
+            _write_transcript(harness.transcript, [_user_row("uuid-4", "restarted")])
+            harness.posted.clear()
+
+            self.assertEqual(harness.run(), 0)
+            self.assertEqual(harness.posted_ids(), ["uuid-4"])
+
+    def test_rotated_transcript_of_equal_length_triggers_a_full_reread(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            harness = _RecorderHarness(Path(temp))
+            _write_transcript(
+                harness.transcript,
+                [_user_row("uuid-1", "remember cedar"), _user_row("uuid-2", "and orchid")],
+            )
+            self.assertEqual(harness.run(), 0)
+            original_size = harness.transcript.stat().st_size
+
+            # Same path, same byte length, different rows: the cursor offset is
+            # still inside the file but points at a row that no longer matches.
+            _write_transcript(
+                harness.transcript,
+                [_user_row("uuid-3", "remember cedar"), _user_row("uuid-4", "and orchid")],
+            )
+            self.assertEqual(harness.transcript.stat().st_size, original_size)
+            harness.posted.clear()
+
+            self.assertEqual(harness.run(), 0)
+            self.assertEqual(harness.posted_ids(), ["uuid-3", "uuid-4"])
+
+    def test_new_source_session_at_the_same_path_triggers_a_full_reread(self) -> None:
+        # The cursor is keyed by transcript path *and* source session. A hook that
+        # reports a different session for the same path cannot be resumed, even
+        # when the bytes on disk still fingerprint clean.
+        with tempfile.TemporaryDirectory() as temp:
+            harness = _RecorderHarness(Path(temp))
+            rows = [_user_row("uuid-1", "remember cedar"), _user_row("uuid-2", "and orchid")]
+            _write_transcript(harness.transcript, rows)
+            self.assertEqual(harness.run(), 0)
+
+            replacement = _RecorderHarness(Path(temp), source_session_id="claude-session-2")
+            self.assertEqual(replacement.transcript, harness.transcript)
+            self.assertEqual(replacement.cursor_dir, harness.cursor_dir)
+
+            self.assertEqual(replacement.run(), 0)
+            self.assertEqual(replacement.posted_ids(), ["uuid-1", "uuid-2"])
+
+    def test_failed_post_does_not_advance_the_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            harness = _RecorderHarness(Path(temp))
+            _write_transcript(
+                harness.transcript,
+                [_user_row("uuid-1", "remember cedar"), _user_row("uuid-2", "and orchid")],
+            )
+
+            code = harness.run(post_error=RuntimeError("hosted ingest failed: HTTP 503"))
+            self.assertEqual(code, 2)
+            self.assertEqual(harness.cursor_files(), [])
+            harness.posted.clear()
+
+            self.assertEqual(harness.run(), 0)
+            self.assertEqual(harness.posted_ids(), ["uuid-1", "uuid-2"])
+
+    def test_unterminated_final_row_is_ingested_and_reread_until_it_is_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            harness = _RecorderHarness(Path(temp))
+            _write_transcript(
+                harness.transcript,
+                [_user_row("uuid-1", "remember cedar"), _user_row("uuid-2", "and orchid")],
+                trailing_newline=False,
+            )
+
+            self.assertEqual(harness.run(), 0)
+            self.assertEqual(harness.posted_ids(), ["uuid-1", "uuid-2"])
+
+            # The cursor never advances past a row that is not newline-terminated,
+            # so the partially flushed row is re-read (and ledger-deduped) rather
+            # than skipped once the host finishes writing it.
+            with harness.transcript.open("a", encoding="utf-8") as handle:
+                handle.write("\n" + _user_row("uuid-3", "and juniper") + "\n")
+            harness.posted.clear()
+
+            self.assertEqual(harness.run(), 0)
+            self.assertEqual(harness.posted_ids(), ["uuid-2", "uuid-3"])
+
+
+class RecorderCursorLedgerDedupTests(unittest.TestCase):
+    """The hosted source ledger, never the cursor, is the duplicate guard."""
+
+    def test_full_reread_after_cursor_loss_is_deduped_by_the_hosted_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            catalog = HostedTenantCatalog(root)
+            keys = HostedApiKeyStore(root)
+            catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+            api_key = keys.create_key(
+                tenant_id="tenant-a",
+                principal_id="agent-a",
+                capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH},
+                project_ids={"project-a"},
+            ).raw_key
+            client = TestClient(create_app(HostedMemoryService(catalog, keys, telemetry=catalog)))
+
+            harness = _RecorderHarness(root)
+            harness.config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://testserver",
+                        "api_key": api_key,
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                        "status_path": str(harness.status_path),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            _write_transcript(
+                harness.transcript,
+                [
+                    _user_row("uuid-1", "remember hosted-orchid"),
+                    _user_row("uuid-2", "and hosted-juniper"),
+                ],
+            )
+
+            class _Response:
+                def __init__(self, content: bytes) -> None:
+                    self._content = content
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc):
+                    return False
+
+                def read(self) -> bytes:
+                    return self._content
+
+            def fake_urlopen(request, timeout):
+                response = client.request(
+                    request.get_method(),
+                    urlsplit(request.full_url).path,
+                    headers=dict(request.header_items()),
+                    content=request.data,
+                )
+                response.raise_for_status()
+                return _Response(response.content)
+
+            def run_hook() -> dict:
+                with (
+                    patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    code = recorder_main(
+                        [
+                            "ingest",
+                            "--config",
+                            str(harness.config_path),
+                            "--hook-input",
+                            str(harness.hook_path),
+                        ]
+                    )
+                self.assertEqual(code, 0)
+                return json.loads(harness.status_path.read_text(encoding="utf-8"))
+
+            first = run_hook()
+
+            # Lose the cursor: the run must reread the whole transcript and the
+            # ledger must skip -- not re-insert -- every already-ingested row.
+            for path in harness.cursor_files():
+                path.unlink()
+            second = run_hook()
+
+            search_response = client.post(
+                "/v1/search_transcript",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json=SearchTranscriptRequest(
+                    scope=MemoryScope(
+                        tenant_id="tenant-a",
+                        project_id="project-a",
+                        session_id="session-a",
+                        principal=Principal(
+                            principal_id="agent-a",
+                            principal_type=PrincipalType.HUMAN,
+                        ),
+                        trust_boundary=TrustBoundary.LOCAL_TRUSTED,
+                        capabilities={MemoryCapability.SEARCH},
+                    ),
+                    query="hosted-orchid",
+                ).model_dump(mode="json"),
+            )
+
+            self.assertEqual((first["inserted"], first["skipped"]), (2, 0))
+            self.assertEqual((second["inserted"], second["skipped"]), (0, 2))
+            self.assertEqual(search_response.status_code, 200)
+            self.assertEqual(
+                [hit["body"] for hit in search_response.json()["hits"]],
+                ["User: remember hosted-orchid"],
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -26,6 +26,7 @@ from vexic.contract import (
 from vexic.hosted import HOSTED_WRITE_MAX_CHARS, HostedMemoryService
 from vexic.hosted_http import create_app
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
+from vexic.recorders.claude_code import TranscriptScan
 from vexic.recorders.cli import main as recorder_main
 from vexic.recorders.claude_setup import (
     install_claude_code_setup,
@@ -581,8 +582,10 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
 
             with (
                 patch(
-                    "vexic.recorders.cli.iter_claude_code_source_messages",
-                    return_value=iter(messages),
+                    "vexic.recorders.cli.scan_claude_code_transcript",
+                    return_value=TranscriptScan(
+                        messages=messages, ignored=0, cursor=None, resumed=False
+                    ),
                 ),
                 patch("vexic.recorders.cli.post_source_messages", fake_post),
             ):
@@ -650,8 +653,10 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
 
             with (
                 patch(
-                    "vexic.recorders.cli.iter_claude_code_source_messages",
-                    return_value=iter(messages),
+                    "vexic.recorders.cli.scan_claude_code_transcript",
+                    return_value=TranscriptScan(
+                        messages=messages, ignored=0, cursor=None, resumed=False
+                    ),
                 ),
                 patch("vexic.recorders.cli.post_source_messages") as post_source_messages_mock,
             ):
