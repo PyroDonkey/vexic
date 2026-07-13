@@ -157,6 +157,8 @@ The HTTP API accepts `Authorization: Bearer <raw-key>` or `X-Vexic-Api-Key` on
 - `POST /v1/expand_history`
 - `POST /v1/fresh_context`
 - `POST /v1/load_active_context`
+- `POST /v1/trigger_dream_phase`
+- `POST /v1/setup/exchange`
 - `POST /mcp`
 - `/control/v1/*` when started through `vexic.hosted_control_plane_http`
 
@@ -247,11 +249,13 @@ the local setup guidance in
 treat Vexic as authoritative only for memory that reaches Vexic through the
 hosted HTTP append route, recorder, or importer path. Claude Code hosted
 auto-recording uses `vexic setup claude-code`; the command installs user-local
-Claude Code hook config and Vexic recorder config, then scaffolds the project
-MCP entry that Claude Code asks the user to approve. The recorder sends cleaned
-transcript rows to `/v1/ingest_source_transcript`; the SessionStart primer
-injects capped hosted memory context on `startup` and `clear`; approved MCP
-reads go through the read-only hosted `/mcp` route for targeted on-demand
+Claude Code hook config and Vexic recorder config, then prints a vendor
+`claude mcp add` command for the user to run
+([ADR 0027](adr/0027-agent-mcp-connect-uses-vendor-add-commands.md)). Vexic
+writes no `.mcp.json`. The recorder sends cleaned transcript rows to
+`/v1/ingest_source_transcript`; the SessionStart primer injects capped hosted
+memory context on `startup` and `clear`; once the user runs the connect command,
+MCP reads go through the read-only hosted `/mcp` route for targeted on-demand
 search. The Claude Code host transcript
 recorder flow is documented in
 [usage.md](usage.md#claude-code-transcript-import) and
@@ -285,19 +289,20 @@ MCP tools.
 
 For hosted auto-recording, run `vexic setup claude-code` with the hosted base
 URL, raw key, project ID, and session ID. It installs user-local Claude Code
-hook config plus Vexic recorder config, then scaffolds a project `.mcp.json`
-entry for Vexic. The Stop hook posts cleaned Claude Code transcript rows to
-`/v1/ingest_source_transcript`; the SessionStart hook primes new/cleared
-sessions through hosted read endpoints using the same recorder config; after
-the user approves the project MCP server in Claude Code, targeted reads go
-through the scaffolded stdio proxy to hosted `/mcp`. The raw API key stays in
-the user-local recorder config, not `.mcp.json` or Claude settings.
+hook config plus Vexic recorder config, then prints a `claude mcp add` command
+for the user to run (ADR 0027). The Stop hook posts cleaned Claude Code
+transcript rows to `/v1/ingest_source_transcript`; the SessionStart hook primes
+new/cleared sessions through hosted read endpoints using the same recorder
+config; once the user runs the connect command, targeted reads go through the
+stdio proxy to hosted `/mcp`. The raw API key stays in the user-local recorder
+config, never in Claude settings; the connect command is derived from the
+recorder config path, so no raw key appears in it.
 
-Passing the raw key on the setup command line is the current interim path.
-The accepted target flow is a console-minted, single-use setup token that the
-CLI exchanges for the scoped key
-([ADR 0026](adr/0026-agent-setup-token-exchange.md)); follow-up issues own
-that implementation.
+Passing the raw key on the setup command line is the interim path. The target
+flow is a console-minted, single-use setup token that the CLI exchanges for the
+scoped key ([ADR 0026](adr/0026-agent-setup-token-exchange.md)). That exchange
+has landed: the Console mints a single-use token through the control-plane
+setup-token route, and the CLI redeems it against `POST /v1/setup/exchange`.
 
 ## Turso/libSQL Storage Backend
 
@@ -320,8 +325,8 @@ directory does that, per ADR 0008/0013 precedent.
   reading `VEXIC_CONTROL_PLANE_TARGET` (`"local"` default, or `"turso"`, ADR
   0019 Addendum 5); `turso` sends the catalog to a managed Turso
   control-plane database via `control_plane_target(env)`. Both flags carry no
-  credential, so both stay in `src/vexic`. The deployed alpha runs both on
-  `turso`.
+  credential, so both stay in `src/vexic`. A hosted deployment sets both to
+  `turso`; see "Required Railway config" below.
 - **Per-tenant provisioning, not a shared dogfood override.** `adapters/turso_adapter.py`
   provides `TursoProvisioningPort` (`create_database`/`mint_token`/`destroy_database`/
   `provision`, all against the Turso Platform API, mocked HTTP transport in
@@ -426,22 +431,44 @@ Use the committed `Dockerfile`; do not rely on Railway Nixpacks for this slice.
 The image installs Python 3.13 dependencies with `uv` and includes
 `sqlite-vec`.
 
-Alpha storage split: the Turso/libSQL cutover (ADR 0019, see "Turso/libSQL
-Storage Backend" above) has landed on the deployed Railway alpha, which runs
-`VEXIC_STORAGE_BACKEND=turso` and `VEXIC_CONTROL_PLANE_TARGET=turso`. Customer
-memory lives in per-tenant Turso databases addressed by the control-plane
-`tenants.customer_target` DSN. The control-plane catalog and API-key store also
-run on Turso (ADR 0019 Addendum 5), migrated off the volume with
-`vexic.migrate_control_plane`. The Railway persistent volume stays mounted at
-`/data/vexic` (`VEXIC_HOSTED_ROOT=/data/vexic`), but the `control-plane.db` it
-holds is now a retained rollback handle -- unset `VEXIC_CONTROL_PLANE_TARGET`
-to fall back to it -- not the live catalog.
+> **This file does not record what the live service currently runs** (ADR 0033).
+> Deployment state is not a property of the repo: a sentence asserting it is
+> correct the day it is written and rots silently afterwards, which is exactly
+> how an empty-volume reading was once mistaken for an empty database. What
+> follows is the *recipe* a hosted deployment must satisfy. To see what a
+> deployment actually has set, read it from the deployment -- `railway variables`
+> for the names, and the control-plane database for tenant routing.
 
-Any `customer-*.db` files left on the volume are vestigial artifacts of the
-pre-cutover layout, as is the now-unwritten `control-plane.db`. Do not read them
-to inspect live state: resolve `tenants.customer_target` (customer memory) or
-the Turso control-plane database (catalog, keys, `dream_sweep_state`) and query
-Turso instead.
+Storage split (ADR 0019, see "Turso/libSQL Storage Backend" above): a hosted
+deployment sets `VEXIC_STORAGE_BACKEND=turso` and
+`VEXIC_CONTROL_PLANE_TARGET=turso`. Customer memory then lives in per-tenant
+Turso databases addressed by the control-plane `tenants.customer_target` DSN,
+and the control-plane catalog and API-key store live in a managed Turso database
+(ADR 0019 Addendum 5), migrated off the volume with
+`vexic.migrate_control_plane`. The Railway persistent volume stays mounted at
+`/data/vexic` (`VEXIC_HOSTED_ROOT=/data/vexic`), but its `control-plane.db` is
+then only a rollback handle -- setting `VEXIC_CONTROL_PLANE_TARGET=local` falls
+back to it -- not the catalog the service reads.
+
+**Operator hazard.** Under that configuration the volume's databases are not
+live state. Any `customer-*.db` files on it are vestigial artifacts of the
+pre-cutover layout, and its `control-plane.db` is neither read nor written by
+the serving app. Reading them tells you nothing about the service and has
+already produced one confident, wrong diagnosis: empty files on the volume are
+what a correctly-working Turso deployment looks like. Resolve
+`tenants.customer_target` for customer memory, or query the Turso control-plane
+database for the catalog, keys, and `dream_sweep_state`.
+
+> **The operator CLI resolves the control plane from the environment, not from
+> `--root`.** `python -m vexic.hosted_http issue-key|revoke-key` and
+> `run-dream-phase` go through the same store-building seam as
+> `create_service_from_env`, so they honor `VEXIC_CONTROL_PLANE_TARGET` (and
+> `run-dream-phase` also honors `VEXIC_STORAGE_BACKEND` for customer memory).
+> To manage keys on a Turso-backed deployment, run the CLI with the service's
+> environment loaded (e.g. `railway run ...`, or export the flag plus the Turso
+> connection variables). Run without those variables and the CLI operates on
+> the local `control-plane.db` under `--root`, which a Turso-backed service
+> never reads. The CLI examples below are written for a local root.
 
 Required Railway config (variable names only; values are set in the Railway
 service, never committed):
@@ -450,23 +477,34 @@ service, never committed):
 - `VEXIC_HOSTED_ROOT=/data/vexic`
 - `VEXIC_CONTROL_PLANE_TOKENS=<comma-separated Console service tokens>`
 - `VEXIC_STORAGE_BACKEND=turso`
+- `VEXIC_CONTROL_PLANE_TARGET=turso`
 - `TURSO_ORG`, `TURSO_GROUP`, `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`,
   `TURSO_PLATFORM_API_TOKEN` (see "Turso storage backend" in
   `docs/configuration.md`)
 - `VEXIC_PROVISION_EXISTING_TURSO_TARGETS=1` to backfill Turso databases for
   stores provisioned before the Turso backend
 - `VEXIC_DREAM_PHASE_ADAPTER=/app/adapters/openrouter_live_adapter.py` and the
-  provider credential it reads (`OPENROUTER_API_KEY`): set in production so the
-  in-server dream sweeper (ADR 0030) runs. These are optional for the process
-  to boot -- leaving them unset keeps model-backed operations failing closed,
-  as detailed under "Dream-phase / embedding model port config" below -- but
-  the deployed alpha sets them, so they are part of its required config.
+  provider credential it reads (`OPENROUTER_API_KEY`). These are optional for
+  the process to boot -- leaving them unset keeps model-backed operations
+  failing closed, as detailed under "Dream-phase / embedding model port config"
+  below -- but the in-server dream sweeper (ADR 0030) cannot run without them,
+  so a deployment that is meant to dream must set them.
 - Persistent volume mounted at `/data/vexic`
 - Health check path: `/health`
 
-Omitting `VEXIC_STORAGE_BACKEND` silently selects the `local` backend, so the
-service ignores `tenants.customer_target` and serves tenant memory from local
-`customer-*.db` files on the volume instead of Turso. Set it explicitly.
+`VEXIC_DOGFOOD_TENANT_ID` is optional; when set, `create_service_from_env`
+provisions a per-tenant Turso database for that tenant if it has no
+`customer_target` yet.
+
+Both backend flags default to `local` and neither raises when omitted, so each
+has the same silent-downgrade failure mode. Set both explicitly:
+
+- Omitting `VEXIC_STORAGE_BACKEND` serves tenant memory from local
+  `customer-*.db` files on the volume, ignoring `tenants.customer_target`.
+- Omitting `VEXIC_CONTROL_PLANE_TARGET` routes the tenant catalog and API-key
+  store to the volume's stale `control-plane.db`, so the service authenticates
+  against a control plane the Console does not write. A deployment provisioned
+  from a config list that omits it will look healthy and reject every live key.
 
 Dream-phase / embedding model port config (optional; unset keeps every
 model-backed operation, including the `search_long_term` vector path, failing
@@ -484,9 +522,9 @@ closed with `HostPortNotConfigured`):
   never by `src/vexic`.
 - Optional model selection read by the adapter: `VEXIC_LIVE_EMBEDDING_MODEL`
   (default `openai/text-embedding-3-small`), `VEXIC_LIVE_MODEL` (default
-  `deepseek/deepseek-v4-pro`, which is also the value the deployed Railway
-  alpha uses), or a per-group override such as
-  `VEXIC_LIVE_HOSTED_DREAM_MODEL` for the `hosted-dream` group.
+  `deepseek/deepseek-v4-pro`), or a per-group override such as
+  `VEXIC_LIVE_HOSTED_DREAM_MODEL` for the `hosted-dream` group. These defaults
+  are the code's, not a record of what any deployment has set (ADR 0033).
 
 GitHub Actions deploy trigger:
 
@@ -495,7 +533,11 @@ GitHub Actions deploy trigger:
 - The workflow keeps one hosted deploy active per ref, lets an in-progress
   deploy finish before the next pending run, runs `uv run pytest`, builds the
   hosted Docker image, deploys with Railway CLI `5.23.1`, then checks
-  `https://api.vexic.dev/health` with bounded curl timeouts and retries.
+  `https://api.vexic.dev/health` with bounded curl timeouts and retries, and
+  finally asserts that an unauthenticated `/control/v1/*` request returns `401`
+  so a deploy cannot silently expose the control plane.
+- The deploy job runs in the `railway-alpha` GitHub environment; environment
+  protection rules therefore gate every hosted deploy.
 - Required GitHub secret: `RAILWAY_TOKEN`, a Railway project token scoped to
   the `production` environment.
 - Required GitHub variable: `RAILWAY_PROJECT_ID=<railway-project-id>`.
@@ -516,20 +558,30 @@ repository, not here):
 - A full Light/REM/Deep promotion/search path passed with tenant isolation
   intact and hosted job usage counters recorded. (REM is a local heuristic per
   ADR 0020, so a fresh smoke records zero REM model usage.)
-- Tester keys are alpha-only and should be revoked after each check.
+- Tester keys are alpha-only and should be revoked after each check. Revoke them
+  through the Console control plane, not the CLI -- see the warning above.
 
-One-off key issuance can run against the same volume:
+One-off key issuance against a local hosted root:
 
 ```powershell
-uv run --no-sync python -m vexic.hosted_http issue-key --root /data/vexic --tenant-id tenant-a --project-id project-a --principal-id claude-code --capability memory:write --capability memory:search --capability memory:admin:rebuild
+uv run --no-sync python -m vexic.hosted_http issue-key --root .hosted-memory --tenant-id tenant-a --project-id project-a --principal-id claude-code --capability memory:write --capability memory:search --capability memory:admin:rebuild
 ```
+
+Issuing no `--capability` at all yields a key with `memory:write` and
+`memory:search`.
 
 Run one hosted dream phase through a host-owned adapter:
 
 ```powershell
 $env:VEXIC_API_KEY = "<raw-key>"
-uv run --no-sync python -m vexic.hosted_http run-dream-phase --root /data/vexic --api-key-env VEXIC_API_KEY --adapter /app/adapters/openrouter_live_adapter.py --model-group hosted-dream --tenant-id tenant-a --project-id project-a --session-id session-a --agent-id agent-a --phase light
+uv run --no-sync python -m vexic.hosted_http run-dream-phase --root .hosted-memory --api-key-env VEXIC_API_KEY --adapter ./adapters/openrouter_live_adapter.py --model-group hosted-dream --tenant-id tenant-a --project-id project-a --session-id session-a --agent-id agent-a --phase light
 ```
+
+These examples use a local root deliberately. The CLI currently resolves its
+control plane and customer memory from `--root` alone, so pointing it at
+`/data/vexic` on a Turso-backed container reaches the stale volume databases,
+not Turso. In a hosted deployment the in-server sweeper (ADR 0030) runs the
+dream phases; the CLI is not that path.
 
 `--adapter` defaults to `VEXIC_DREAM_PHASE_ADAPTER` and `--model-group` to
 `VEXIC_DREAM_PHASE_MODEL_GROUP` (then `hosted-dream`), so in a deployed
@@ -562,13 +614,12 @@ other phase value with `400` (light/rem/deep triggering has a different
 cost/abuse profile and is a separate decision). A header-bound scope
 authenticates the same way as the other `/v1/*` routes.
 
-- Requires capability `memory:dream:trigger`, a new capability distinct from
-  `memory:admin:rebuild`: trigger-only keys (the recorder and the cron
-  workflow below) never need admin-rebuild just to kick off a sweep. Issue a
-  trigger key with, for example:
+- Requires capability `memory:dream:trigger`, a capability distinct from
+  `memory:admin:rebuild`: trigger-only keys (such as the recorder's) never need
+  admin-rebuild just to kick off a sweep. Issue a trigger key with, for example:
 
   ```powershell
-  uv run --no-sync python -m vexic.hosted_http issue-key --root /data/vexic --tenant-id tenant-a --project-id project-a --principal-id cron --capability memory:dream:trigger
+  uv run --no-sync python -m vexic.hosted_http issue-key --root .hosted-memory --tenant-id tenant-a --project-id project-a --principal-id recorder --capability memory:dream:trigger
   ```
 
   A priming key that should also self-trigger from `recorder prime` needs
@@ -576,7 +627,9 @@ authenticates the same way as the other `/v1/*` routes.
   memory:dream:trigger`.
 - Returns `202` with `{"status": "scheduled"}`, or `{"status": "skipped",
   "reason": "already_running"}` when a sweep for the same (tenant, agent) is
-  already in flight (an in-process lock -- see "Known limitations" below).
+  already in flight. The guard is a durable control-plane lease with a
+  heartbeat (ADR 0032), so it holds across processes and across the overlapping
+  containers of a rolling deploy, not just within one process.
 - Missing/invalid key: `401`. Key without `memory:dream:trigger`: `403`.
   `phase` other than `"summarize"`: `400`. No `build_summary_agent` port
   configured: `503 host_port_not_configured`, checked synchronously before
@@ -665,11 +718,12 @@ exits `0` and never affects prime's own output or exit code.
 
 **Known limitations, accepted for v1** (see ADR 0025):
 
-- The in-flight dedup lock and the 6/hour rate limiter are in-process. The
-  current deploy is verified single-process/single-instance; if the hosted
-  service ever scales to multiple replicas, dedup stops deduping across
-  replicas and the rate cap becomes per-replica rather than global. Revisit
-  with a durable queue or a shared limiter before scaling out.
+- The 6/hour rate limiter is in-process, so under multiple replicas the rate
+  cap becomes per-replica rather than global. Revisit with a shared limiter
+  before scaling out. The in-flight dedup guard is no longer in this bucket:
+  ADR 0032 made it a durable control-plane lease after the single-replica
+  assumption broke on ordinary rolling deploys, where the old and new
+  containers overlap and both swept the same tenant.
 - A scheduled trigger task is in-memory: it does not survive a process
   restart or redeploy mid-sweep. The next trigger (cron or prime) re-runs
   idempotently, so no data is lost, but an in-flight sweep at deploy time is
@@ -682,8 +736,15 @@ exits `0` and never affects prime's own output or exit code.
 Revoke a throwaway key by key id, not by raw key:
 
 ```powershell
-uv run --no-sync python -m vexic.hosted_http revoke-key --root /data/vexic --key-id <key-id> --revoked-by <operator>
+uv run --no-sync python -m vexic.hosted_http revoke-key --root .hosted-memory --key-id <key-id> --revoked-by <operator>
 ```
+
+This revokes against the control plane selected by `VEXIC_CONTROL_PLANE_TARGET`
+in the CLI's environment (unset or `local` falls back to the local
+`control-plane.db` under `--root`). To revoke a key on a Turso-backed
+deployment, run the command with the service's environment loaded (e.g.
+`railway run ...`) so the revocation lands on the same control plane the
+service authenticates against.
 
 This is internal-alpha infrastructure for throwaway data. It is not a
 production customer-data launch, public MCP endpoint, billing portal, dashboard,
@@ -698,9 +759,14 @@ explicit security/engineering owner risk acceptance is recorded.
 Internal-only today:
 
 - in-process Python API boundary and internal-alpha HTTP adapter;
-- local SQLite-compatible tenant databases;
-- repo-local SQLite control-plane tenant catalog and API-key/revocation adapter;
-- sanitized local SQLite control-plane audit, usage, and job lifecycle ledgers;
+- per-tenant Turso databases for customer memory, and a managed Turso
+  control-plane database holding the tenant catalog, API-key/revocation records,
+  and the sanitized audit, usage, and job lifecycle ledgers, when the backend
+  flags select Turso (ADR 0019 and its Addendum 5). The local SQLite path
+  remains supported and is what the unset flags select;
+- control-plane DR on Turso's free tier is a scripted `turso db dump`
+  (`.github/workflows/turso-backup.yml`); that tier has no PITR, so ADR 0008's
+  point-in-time recovery target is not met by it;
 - single-process in-memory authenticated request limiter;
 - one `LocalMemoryService` instance is created per hosted request;
 - hosted Light/REM/Deep/Summarize jobs run only with injected host model

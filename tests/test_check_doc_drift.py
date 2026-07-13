@@ -3,6 +3,11 @@
 Each test builds a minimal, self-consistent repository tree in `tmp_path` and
 then introduces exactly one drift, so the assertions pin the checker's
 behavior rather than the current state of the real repository.
+
+The environment-variable check is pinned the same way. It exists because prose
+drifted from code in both directions at once: a live flag went undocumented
+while three dead names outlived the workflow that read them. A gate that cannot
+fail would have caught neither, so those tests drive it to failure deliberately.
 """
 
 from __future__ import annotations
@@ -16,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def _load_hook() -> ModuleType:
+    """Load scripts/check_doc_drift.py, which is a script, not a package."""
     spec = importlib.util.spec_from_file_location(
         "check_doc_drift", ROOT / "scripts" / "check_doc_drift.py"
     )
@@ -60,8 +66,27 @@ def _repo(tmp_path: Path) -> Path:
         "### v0.1 Local Service Surface\n\n- `append_transcript`\n\n---\n",
         encoding="utf-8",
     )
+    _write_config_doc(tmp_path, "")
     (tmp_path / "tests").mkdir()
     return tmp_path
+
+
+def _write_config_doc(root: Path, rows: str) -> Path:
+    """Write docs/configuration.md with `rows` as its variable table body."""
+    doc = root / "docs" / "configuration.md"
+    doc.parent.mkdir(parents=True, exist_ok=True)
+    doc.write_text(
+        "| Variable | Component | Default | Notes |\n| --- | --- | --- | --- |\n"
+        + rows,
+        encoding="utf-8",
+    )
+    return doc
+
+
+def _write_env_code(root: Path, body: str) -> None:
+    """Write a src/ module whose environment reads the env gate must see."""
+    (root / "src").mkdir(parents=True, exist_ok=True)
+    (root / "src" / "mod.py").write_text(body, encoding="utf-8")
 
 
 def test_flags_doc_reference_to_a_path_that_does_not_exist(tmp_path: Path) -> None:
@@ -266,4 +291,145 @@ def test_does_not_read_code_identifiers_as_paths(tmp_path: Path) -> None:
     warnings, notes = hook.collect_warnings(root)
 
     assert notes == []
+    assert warnings == []
+
+
+def _env_warnings(tmp_path: Path, *, code: str, rows: str) -> list[str]:
+    """Run only the environment-variable check over a fixture repo."""
+    hook = _load_hook()
+    root = _repo(tmp_path)
+    _write_env_code(root, code)
+    _write_config_doc(root, rows)
+    warnings: list[str] = []
+    hook._check_env_vars(root, warnings)
+    return warnings
+
+
+def test_environment_check_is_registered_in_the_gate(tmp_path: Path) -> None:
+    """The env gate must fire through `collect_warnings`, not just when called
+    directly. Registration is what a careless merge drops silently: the four
+    doc-reference checks would still pass and the suite would still look green
+    while a shipped check had quietly stopped running."""
+    hook = _load_hook()
+    root = _repo(tmp_path)
+    _write_env_code(root, 'import os\nos.environ.get("VEXIC_TURSO_TOKEN", "")\n')
+
+    warnings, notes = hook.collect_warnings(root)
+
+    assert notes == []
+    assert any("VEXIC_TURSO_TOKEN" in warning for warning in warnings)
+
+
+def test_documented_and_read_variable_does_not_drift(tmp_path: Path) -> None:
+    assert (
+        _env_warnings(
+            tmp_path,
+            code='import os\nos.environ.get("VEXIC_CONTROL_PLANE_TARGET", "local")\n',
+            rows="| `VEXIC_CONTROL_PLANE_TARGET` | x | `local` | y |\n",
+        )
+        == []
+    )
+
+
+def test_variable_read_but_undocumented_is_drift(tmp_path: Path) -> None:
+    """The live-flag failure: an operator rebuilding from the docs would miss it
+    and silently get the default."""
+    (warning,) = _env_warnings(
+        tmp_path,
+        code="import os\n"
+        'os.environ.get("PORT", "8000")\n'
+        'os.environ.get("VEXIC_CONTROL_PLANE_TARGET", "local")\n',
+        rows="| `PORT` | x | `8000` | y |\n",
+    )
+
+    assert "VEXIC_CONTROL_PLANE_TARGET" in warning
+    assert "does not document" in warning
+
+
+def test_documented_but_dead_variable_is_drift(tmp_path: Path) -> None:
+    """The retired dream-cron names: documented long after the code that read
+    them was deleted."""
+    (warning,) = _env_warnings(
+        tmp_path,
+        code='import os\nos.environ.get("PORT", "8000")\n',
+        rows="| `PORT` | x | `8000` | y |\n"
+        "| `VEXIC_DREAM_TRIGGER_URL` | x | -- | y |\n",
+    )
+
+    assert "VEXIC_DREAM_TRIGGER_URL" in warning
+    assert "appear nowhere" in warning
+
+
+def test_env_read_through_a_mapping_parameter_counts(tmp_path: Path) -> None:
+    """`resolve_storage_backend(env)` takes a Mapping rather than touching
+    os.environ, so a literal read through it must still count as a read."""
+    (warning,) = _env_warnings(
+        tmp_path,
+        code="import os\n"
+        'os.environ.get("PORT", "8000")\n'
+        "def resolve(env):\n"
+        '    return env.get("VEXIC_STORAGE_BACKEND", "local")\n',
+        rows="| `PORT` | x | `8000` | y |\n",
+    )
+
+    assert "VEXIC_STORAGE_BACKEND" in warning
+
+
+def test_dynamically_read_name_is_not_reported_dead(tmp_path: Path) -> None:
+    """`VEXIC_API_KEY` is read through a variable key -- `--api-key-env` names it
+    at runtime. It is documented and alive, so the dead-name direction must not
+    flag it merely because no literal env-read context exists."""
+    assert (
+        _env_warnings(
+            tmp_path,
+            code='import os\ndef read(name="VEXIC_API_KEY"):\n'
+            "    return os.environ.get(name)\n",
+            rows="| `VEXIC_API_KEY` | x | -- | y |\n",
+        )
+        == []
+    )
+
+
+def test_unrelated_getenv_helper_is_not_an_environment_read(tmp_path: Path) -> None:
+    """Only `os.getenv` reads the process environment. A helper that happens to
+    have a method of the same name must not force a docs row for its argument,
+    or an unrelated API could block the gate."""
+    assert (
+        _env_warnings(
+            tmp_path,
+            code="import os\n"
+            'os.environ.get("PORT", "8000")\n'
+            "settings = object()\n"
+            'settings.getenv("FEATURE_FLAG")\n',
+            rows="| `PORT` | x | `8000` | y |\n",
+        )
+        == []
+    )
+
+
+def test_name_mentioned_only_inside_a_larger_literal_is_not_dead(
+    tmp_path: Path,
+) -> None:
+    """A documented name whose only literal is embedded in a message -- an error
+    string, an f-string fragment -- is still alive. A false dead flag blocks a
+    merge, which is worse than the narrow miss this allows."""
+    assert (
+        _env_warnings(
+            tmp_path,
+            code="import os\n"
+            'os.environ.get("PORT", "8000")\n'
+            'raise RuntimeError("OPENROUTER_API_KEY is required")\n',
+            rows="| `PORT` | x | `8000` | y |\n"
+            "| `OPENROUTER_API_KEY` | x | -- | y |\n",
+        )
+        == []
+    )
+
+
+def test_real_repo_has_no_environment_drift() -> None:
+    """The gate must hold against the committed tree, not just fixtures."""
+    hook = _load_hook()
+    warnings: list[str] = []
+    hook._check_env_vars(ROOT, warnings)
+
     assert warnings == []

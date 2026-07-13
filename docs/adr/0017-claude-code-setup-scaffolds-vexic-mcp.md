@@ -94,3 +94,8 @@ follow-up issue, built test-first.
   header goes stale).
 - User-level (`~/.claude.json`) scaffolding.
 - Cross-agent (Codex, OpenClaw, Hermes) MCP scaffolding.
+
+  > Amended by ADR 0027. Codex shipped: `install_codex_connect` in
+  > `src/vexic/recorders/mcp_connect.py`, reached through `vexic setup codex`
+  > (`src/vexic/cli.py`), alongside a generic path for other MCP clients.
+  > OpenClaw and Hermes remain genuinely deferred.

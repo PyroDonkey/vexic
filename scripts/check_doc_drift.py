@@ -13,12 +13,19 @@ in-repo half of the "Docs Are Downstream Of Code" loop in AGENTS.md:
 2. The MemoryService contract Protocol and LocalMemoryService expose the same
    operation surface, and AGENTS.md mentions each operation, so an
    operation added in code without a doc update is surfaced.
-3. Every repo-relative file path cited in a living doc or in a src/vexic
+3. docs/configuration.md catalogues every environment variable the code reads,
+   and names no variable the code does not read. Both directions have drifted at
+   once before: `VEXIC_CONTROL_PLANE_TARGET` was read but undocumented (an
+   operator rebuilding from the docs would silently get the local control
+   plane), while three `VEXIC_DREAM_TRIGGER_*` names outlived the cron workflow
+   that read them.
+4. Every repo-relative file path cited in a living doc or in a src/vexic
    comment or docstring exists on disk.
-4. Every `vexic ...` / `python -m vexic.<module> ...` command cited in a living
+5. Every `vexic ...` / `python -m vexic.<module> ...` command cited in a living
    doc names a module that exists and a subcommand the module still knows.
-5. Every `ADR NNNN` cited in a doc or in a src/vexic comment or docstring has a
+6. Every `ADR NNNN` cited in a doc or in a src/vexic comment or docstring has a
    matching file under docs/adr/.
+7. Every suite test count cited in a living doc matches what pytest collects.
 
 Only mechanically checkable claims are checked. A free-text assertion in a
 comment ("this is the only caller") is not statically decidable, so it is left
@@ -40,6 +47,11 @@ import tokenize
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# Directories whose Python files are code this repo ships, relative to a root.
+# Every check takes `root` so the suite can point it at a fixture repo; module
+# constants pinned to REPO_ROOT would make that impossible.
+CODE_DIRS = ("src", "adapters")
 
 ADR_FILE_RE = re.compile(r"^(\d{4})-.+\.md$")
 ADR_INDEX_RE = re.compile(r"^\|\s*(\d{4})\s*\|")
@@ -89,6 +101,20 @@ SUBCOMMAND_RE = re.compile(r"[a-z][a-z0-9-]*$")
 # ("adds 3 tests"), not a suite total, so a cue word must appear on the line.
 TEST_COUNT_RE = re.compile(r"\b(\d[\d,_]*)\s+(?:tests?|passed)\b", re.IGNORECASE)
 TEST_COUNT_CUES = ("suite", "collected", "pass", "total", "green", "pytest")
+
+# An environment variable name as it appears as a string literal in code and as
+# a backticked token in the docs. Deliberately excludes the `VEXIC_LIVE_<GROUP>
+# _MODEL` doc row: that angle-bracketed name is a *pattern* (the model group is
+# interpolated at runtime), not a literal, so it never matches here and needs no
+# allowlist entry.
+ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,}$")
+DOC_ENV_RE = re.compile(r"`([A-Z][A-Z0-9_]{2,})`")
+DOC_ENV_TOKEN_RE = re.compile(r"[A-Z][A-Z0-9_]{2,}")
+
+# Mapping parameters that carry the process environment. `resolve_storage_backend
+# (env)` and friends take `env: Mapping[str, str]` rather than reading
+# `os.environ` directly, so a literal read through one of these names counts.
+ENV_MAPPING_NAMES = frozenset({"env", "environ"})
 
 
 def _emit(additional_context: str | None, system_message: str | None) -> None:
@@ -278,6 +304,128 @@ def _check_path_refs(root: Path, warnings: list[str]) -> None:
                 + ", ".join(dangling)
                 + ". Fix the reference or restore the path."
             )
+
+
+def _is_env_source(node: ast.expr) -> bool:
+    """True if `node` evaluates to the process environment.
+
+    Recognizes `os.environ` and a bare `env`/`environ` mapping parameter.
+    """
+    if isinstance(node, ast.Attribute) and node.attr == "environ":
+        return True
+    return isinstance(node, ast.Name) and node.id in ENV_MAPPING_NAMES
+
+
+def _is_getenv(node: ast.expr) -> bool:
+    """True only for `os.getenv`.
+
+    Matching any attribute named `getenv` would treat an unrelated helper such
+    as `settings.getenv("FEATURE_FLAG")` as a process-environment read and
+    demand a docs row for it, so an unrelated API could block the gate.
+    """
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "getenv"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "os"
+    )
+
+
+def _env_names_read(tree: ast.AST) -> set[str]:
+    """Env var names read through a literal key.
+
+    Strict on purpose: only `os.environ["X"]`, `os.environ.get("X")`,
+    `os.getenv("X")`, and `env.get("X")` count. A dynamic read
+    (`os.environ.get(name)`) yields no name here, which is why the reverse
+    direction below searches for bare literals instead of demanding an env-read
+    context.
+    """
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        key: ast.expr | None = None
+        if isinstance(node, ast.Subscript) and _is_env_source(node.value):
+            key = node.slice
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if _is_getenv(func) and node.args:
+                key = node.args[0]
+            elif (
+                isinstance(func, ast.Attribute)
+                and func.attr == "get"
+                and _is_env_source(func.value)
+                and node.args
+            ):
+                key = node.args[0]
+        if (
+            isinstance(key, ast.Constant)
+            and isinstance(key.value, str)
+            and ENV_NAME_RE.match(key.value)
+        ):
+            names.add(key.value)
+    return names
+
+
+def _names_mentioned(tree: ast.AST) -> set[str]:
+    """Env-shaped tokens appearing anywhere inside a string literal.
+
+    Substring scan, not exact match: a name is "mentioned" even when it is
+    embedded in a larger string, such as the `"OPENROUTER_API_KEY is required"`
+    of an error message or an f-string fragment. Only the dead-name direction
+    uses this. Requiring a standalone literal there would flag a live variable
+    as dead the moment its only literal moved into a message, and a false dead
+    flag blocks a merge -- a worse failure than the narrow miss this allows (a
+    variable named in an error string but no longer read).
+    """
+    mentioned: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            mentioned.update(DOC_ENV_TOKEN_RE.findall(node.value))
+    return mentioned
+
+
+def _check_env_vars(root: Path, warnings: list[str]) -> None:
+    read: set[str] = set()
+    mentioned: set[str] = set()
+    for code_dir in CODE_DIRS:
+        for path in (root / code_dir).rglob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            read |= _env_names_read(tree)
+            mentioned |= _names_mentioned(tree)
+
+    config_doc = root / "docs" / "configuration.md"
+    documented = {
+        name
+        for line in config_doc.read_text(encoding="utf-8").splitlines()
+        if line.lstrip().startswith("|")
+        for name in DOC_ENV_RE.findall(line.split("|")[1] if "|" in line else "")
+    }
+
+    undocumented = sorted(read - documented)
+    if undocumented:
+        warnings.append(
+            "docs/configuration.md does not document environment variable(s) "
+            "read by src/ or adapters/: "
+            + ", ".join(undocumented)
+            + ". That file claims to catalogue every variable the code reads, "
+            "and an operator rebuilding the deployment from it would silently "
+            "get the default. Add a row (name only, never a value)."
+        )
+
+    # Reverse direction, deliberately looser: a documented name only has to be
+    # mentioned in a string literal somewhere in the code, not read in an
+    # env-read context. `VEXIC_API_KEY` is read through a variable key
+    # (`--api-key-env` names it at runtime), so demanding an env-read context
+    # here would flag a live variable as dead. A genuinely dead name -- the
+    # retired `VEXIC_DREAM_TRIGGER_*` trio -- is mentioned nowhere at all.
+    dead = sorted(documented - mentioned)
+    if dead:
+        warnings.append(
+            "docs/configuration.md documents environment variable(s) that "
+            "appear nowhere in src/ or adapters/: "
+            + ", ".join(dead)
+            + ". Remove the row, or the docs will outlive the code that read "
+            "them."
+        )
 
 
 def _cited_test_counts(text: str) -> set[int]:
@@ -489,6 +637,7 @@ def collect_warnings(root: Path) -> tuple[list[str], list[str]]:
     checks = (
         ("ADR index", _check_adr_index),
         ("service surface", _check_service_surface),
+        ("environment variables", _check_env_vars),
         ("path reference", _check_path_refs),
         ("CLI reference", _check_cli_refs),
         ("ADR reference", _check_adr_refs),
@@ -503,8 +652,9 @@ def collect_warnings(root: Path) -> tuple[list[str], list[str]]:
 
 
 SUMMARY = (
-    "Doc drift check: ADR index, LocalMemoryService surface, and doc "
-    "references match the in-repo source of truth."
+    "Doc drift check: ADR index, LocalMemoryService surface, documented "
+    "environment variables, and doc references match the in-repo source of "
+    "truth."
 )
 
 

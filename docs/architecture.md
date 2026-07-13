@@ -314,9 +314,10 @@ the committed managed control-plane store (Addendum 5).
 ## v0.1 Service Surface
 
 `LocalMemoryService` implements the local read/write core for transcript ingest,
-source-ledger transcript ingest, long-term search, retrieval telemetry, fact
-retirement, export, replay, rebuild, and scope tombstones. Dream phase
-orchestration is deliberately port-backed: the local adapter authorizes and
+source-ledger transcript ingest, transcript search, verbatim history expansion,
+fresh context, active-context load, long-term search, retrieval telemetry, fact
+retirement, export, replay, rebuild, scope tombstones, and scope purge. Dream
+phase orchestration is deliberately port-backed: the local adapter authorizes and
 checks lifecycle state, executes Light, REM, or Deep only when explicit dream
 phase ports are supplied, and fails closed with `HostPortNotConfigured` when no
 host execution adapter is supplied. Within those ports, embedding may fall back

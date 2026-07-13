@@ -86,6 +86,15 @@ Agent setup moves to a short-lived setup token exchange.
 This is a decision record. The token store, endpoints, console UI, and CLI
 exchange path are implemented under follow-up issues, built test-first.
 
+> Amended: those follow-ups have shipped. The setup-token store and the mint /
+> revoke / list control-plane surfaces live in
+> `src/vexic/hosted_control_plane_http.py`, the exchange surface is
+> `POST /v1/setup/exchange` in `src/vexic/hosted_http.py`, the CLI exchange path
+> is `exchange_setup_token` in `src/vexic/recorders/setup_exchange.py`, and the
+> behavior is pinned by `tests/test_setup_exchange.py`. The console leg lives in
+> the companion `vexic-website` repo. The contract described above is unchanged;
+> only its "not yet built" status is.
+
 ## Security notes
 
 - The browser handles only a credential that is single-use and expires in
@@ -106,6 +115,15 @@ exchange path are implemented under follow-up issues, built test-first.
   obtained.
 - Follow-up issues: setup-token store and endpoints; console "Connect agent"
   UI; CLI `--token` exchange path; generalization to other MCP clients.
+
+  > Amended: all of these have shipped (see the amendment above for the store,
+  > endpoints, and CLI path). The generalization to other MCP clients landed
+  > with ADR 0027: `src/vexic/recorders/mcp_connect.py` provides
+  > `install_codex_connect` for Codex and `install_generic_connect` for clients
+  > without a dedicated installer, and `vexic setup codex` /
+  > `vexic setup mcp-client` route to them (`src/vexic/cli.py`). As this ADR
+  > predicted, they reuse the same mint-and-exchange contract and differ only in
+  > the local installer.
 
 ## Deferred
 

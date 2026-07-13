@@ -2,6 +2,19 @@
 
 Status: accepted
 
+> Amended by this ADR's own Addendum 5 (2026-07-10). Read that addendum before
+> reading the title, the Decision, the Deferred section, or the Consequences as
+> live. The Neon thread in this record is retired: the control-plane catalog was
+> cut over to managed Turso/libSQL, so Turso -- not Neon -- is the managed
+> control-plane store, and the "second cutover, libSQL catalog to Neon" the
+> Consequences accept by design will not happen. The title and the original body
+> stay as written because they are the record of what was decided at the time;
+> Addendum 5 is what corrects them. The wiring is at
+> `src/vexic/hosted_http.py` (`build_control_plane_target` and the
+> control-plane target branch in the service factory) and
+> `adapters/turso_adapter.py` (`control_plane_target`). Neon appears nowhere in
+> `src/`, `adapters/`, or `pyproject.toml`.
+
 ## Context
 
 ADR audit AUDIT-002 (COA-264) found the deployed hosted alpha runs plain
@@ -118,6 +131,14 @@ explicitly deferred with the Neon promotion below. Restore preserves the ADR
 0005/0008 path: restore to an isolated replacement database, verify, rebuild
 projections, atomically repoint the catalog, quarantine the stale handle, and
 hold the one-customer-to-one-active-database invariant.
+
+> Amended by Addendum 5 below. Turso PITR is not the recovery mechanism in the
+> deployed alpha: the deployment sits on Turso's free tier, which has no
+> point-in-time recovery. Real DR today is scheduled `turso db dump` exports of
+> the control-plane and per-tenant databases
+> (`.github/workflows/turso-backup.yml`), plus the retained local
+> `control-plane.db` as a rollback handle. PITR remains the intended mechanism
+> only if the deployment moves to a paid tier.
 
 ## Deferred
 
@@ -312,6 +333,12 @@ referenced only by tests; no runtime path wires it into the service factory.
 It is dead code embodying the never-shipped catalog-on-Turso leg, and whether
 to delete it or wire it is a separate decision (tracked on COA-359), not part
 of this correction.
+
+> Superseded by Addendum 5 below. `control_plane_target` is no longer dead code:
+> it is the wired runtime path. `src/vexic/hosted_http.py` resolves the
+> control-plane target and calls `build_control_plane_target`, which builds the
+> Turso `StorageTarget` through `control_plane_target` in
+> `adapters/turso_adapter.py`. The catalog-on-Turso leg shipped.
 
 The eventual managed control-plane store remains ADR 0008's readiness target
 and this ADR's deferred Neon Postgres promotion; that work, when taken, is the
