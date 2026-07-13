@@ -183,6 +183,22 @@ Each doc owns one thing. Avoid duplicate status and copied platform history.
 If a doc describes contract fields or operation semantics, verify it against
 `src/vexic/contract` and the relevant tests.
 
+### Docs Do Not Record Deployed State
+
+Deployment state is not a property of this repository (ADR 0033). Versioned docs
+state what the code does, what configuration it reads, and the recipe a
+deployment must follow. They never state what the live service currently has
+set, is currently running, or currently holds on disk, and they never record a
+configuration value read from a live environment.
+
+Recipe, not report: "set `VEXIC_CONTROL_PLANE_TARGET=turso` to route the catalog
+to managed Turso" stays true as long as the code does. "The deployed alpha runs
+`VEXIC_CONTROL_PLANE_TARGET=turso`" is stale the moment someone changes the
+variable, and it rots while still looking authoritative - that is how a stale
+sentence once turned an empty Railway volume into a confident, wrong "the
+service has no traffic." Point the reader at how to check the deployment
+instead of caching the answer in prose.
+
 ### Docs Are Downstream Of Code
 
 In-repo `AGENTS.md` and `docs/adr/*` are authoritative for architecture

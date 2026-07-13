@@ -48,6 +48,7 @@ index (and the reverse).
 | 0030 | The hosted service schedules per-tenant dreaming itself with an in-server sweeper | accepted |
 | 0031 | Light drops miscited candidates instead of failing the batch | accepted (Context corrected: it did not cause the 2026-07 hosted Light failures; see ADR 0032) |
 | 0032 | The dream in-flight lock is a durable control-plane lease | accepted |
+| 0033 | Versioned docs do not record deployed state | accepted |
 
 Notes:
 

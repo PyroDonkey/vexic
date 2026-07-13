@@ -325,8 +325,8 @@ directory does that, per ADR 0008/0013 precedent.
   reading `VEXIC_CONTROL_PLANE_TARGET` (`"local"` default, or `"turso"`, ADR
   0019 Addendum 5); `turso` sends the catalog to a managed Turso
   control-plane database via `control_plane_target(env)`. Both flags carry no
-  credential, so both stay in `src/vexic`. The deployed alpha runs both on
-  `turso`.
+  credential, so both stay in `src/vexic`. A hosted deployment sets both to
+  `turso`; see "Required Railway config" below.
 - **Per-tenant provisioning, not a shared dogfood override.** `adapters/turso_adapter.py`
   provides `TursoProvisioningPort` (`create_database`/`mint_token`/`destroy_database`/
   `provision`, all against the Turso Platform API, mocked HTTP transport in
@@ -431,22 +431,33 @@ Use the committed `Dockerfile`; do not rely on Railway Nixpacks for this slice.
 The image installs Python 3.13 dependencies with `uv` and includes
 `sqlite-vec`.
 
-Alpha storage split: the Turso/libSQL cutover (ADR 0019, see "Turso/libSQL
-Storage Backend" above) has landed on the deployed Railway alpha, which runs
-`VEXIC_STORAGE_BACKEND=turso` and `VEXIC_CONTROL_PLANE_TARGET=turso`. Customer
-memory lives in per-tenant Turso databases addressed by the control-plane
-`tenants.customer_target` DSN. The control-plane catalog and API-key store also
-run on Turso (ADR 0019 Addendum 5), migrated off the volume with
-`vexic.migrate_control_plane`. The Railway persistent volume stays mounted at
-`/data/vexic` (`VEXIC_HOSTED_ROOT=/data/vexic`), but the `control-plane.db` it
-holds is now a retained rollback handle -- unset `VEXIC_CONTROL_PLANE_TARGET`
-to fall back to it -- not the live catalog.
+> **This file does not record what the live service currently runs** (ADR 0033).
+> Deployment state is not a property of the repo: a sentence asserting it is
+> correct the day it is written and rots silently afterwards, which is exactly
+> how an empty-volume reading was once mistaken for an empty database. What
+> follows is the *recipe* a hosted deployment must satisfy. To see what a
+> deployment actually has set, read it from the deployment -- `railway variables`
+> for the names, and the control-plane database for tenant routing.
 
-Any `customer-*.db` files left on the volume are vestigial artifacts of the
-pre-cutover layout, and the volume's `control-plane.db` is no longer read or
-written by the serving app. Do not read either to inspect live state: resolve
-`tenants.customer_target` (customer memory) or the Turso control-plane database
-(catalog, keys, `dream_sweep_state`) and query Turso instead.
+Storage split (ADR 0019, see "Turso/libSQL Storage Backend" above): a hosted
+deployment sets `VEXIC_STORAGE_BACKEND=turso` and
+`VEXIC_CONTROL_PLANE_TARGET=turso`. Customer memory then lives in per-tenant
+Turso databases addressed by the control-plane `tenants.customer_target` DSN,
+and the control-plane catalog and API-key store live in a managed Turso database
+(ADR 0019 Addendum 5), migrated off the volume with
+`vexic.migrate_control_plane`. The Railway persistent volume stays mounted at
+`/data/vexic` (`VEXIC_HOSTED_ROOT=/data/vexic`), but its `control-plane.db` is
+then only a rollback handle -- setting `VEXIC_CONTROL_PLANE_TARGET=local` falls
+back to it -- not the catalog the service reads.
+
+**Operator hazard.** Under that configuration the volume's databases are not
+live state. Any `customer-*.db` files on it are vestigial artifacts of the
+pre-cutover layout, and its `control-plane.db` is neither read nor written by
+the serving app. Reading them tells you nothing about the service and has
+already produced one confident, wrong diagnosis: empty files on the volume are
+what a correctly-working Turso deployment looks like. Resolve
+`tenants.customer_target` for customer memory, or query the Turso control-plane
+database for the catalog, keys, and `dream_sweep_state`.
 
 > **The operator CLI does not yet honor `VEXIC_CONTROL_PLANE_TARGET`.**
 > `python -m vexic.hosted_http issue-key|revoke-key` and `run-dream-phase`
@@ -454,9 +465,9 @@ written by the serving app. Do not read either to inspect live state: resolve
 > `--root /data/vexic` they read and write the volume's stale `control-plane.db`
 > rather than the Turso control plane the service authenticates against. A key
 > issued that way will not authenticate, and a key revoked that way **stays
-> live**. Until the CLI is fixed, do not use it to manage live alpha keys --
-> issue and revoke through the Console control plane instead. The CLI examples
-> below are written for a local root.
+> live**. Until the CLI is fixed, do not use it to manage keys on a
+> Turso-backed deployment -- issue and revoke through the Console control plane
+> instead. The CLI examples below are written for a local root.
 
 Required Railway config (variable names only; values are set in the Railway
 service, never committed):
@@ -472,17 +483,17 @@ service, never committed):
 - `VEXIC_PROVISION_EXISTING_TURSO_TARGETS=1` to backfill Turso databases for
   stores provisioned before the Turso backend
 - `VEXIC_DREAM_PHASE_ADAPTER=/app/adapters/openrouter_live_adapter.py` and the
-  provider credential it reads (`OPENROUTER_API_KEY`): set in production so the
-  in-server dream sweeper (ADR 0030) runs. These are optional for the process
-  to boot -- leaving them unset keeps model-backed operations failing closed,
-  as detailed under "Dream-phase / embedding model port config" below -- but
-  the deployed alpha sets them, so they are part of its required config.
+  provider credential it reads (`OPENROUTER_API_KEY`). These are optional for
+  the process to boot -- leaving them unset keeps model-backed operations
+  failing closed, as detailed under "Dream-phase / embedding model port config"
+  below -- but the in-server dream sweeper (ADR 0030) cannot run without them,
+  so a deployment that is meant to dream must set them.
 - Persistent volume mounted at `/data/vexic`
 - Health check path: `/health`
 
-`VEXIC_DOGFOOD_TENANT_ID` is optional and unset on the deployed alpha; when set,
-`create_service_from_env` provisions a per-tenant Turso database for that tenant
-if it has no `customer_target` yet.
+`VEXIC_DOGFOOD_TENANT_ID` is optional; when set, `create_service_from_env`
+provisions a per-tenant Turso database for that tenant if it has no
+`customer_target` yet.
 
 Both backend flags default to `local` and neither raises when omitted, so each
 has the same silent-downgrade failure mode. Set both explicitly:
@@ -510,9 +521,9 @@ closed with `HostPortNotConfigured`):
   never by `src/vexic`.
 - Optional model selection read by the adapter: `VEXIC_LIVE_EMBEDDING_MODEL`
   (default `openai/text-embedding-3-small`), `VEXIC_LIVE_MODEL` (default
-  `deepseek/deepseek-v4-pro`, which is also the value the deployed Railway
-  alpha uses), or a per-group override such as
-  `VEXIC_LIVE_HOSTED_DREAM_MODEL` for the `hosted-dream` group.
+  `deepseek/deepseek-v4-pro`), or a per-group override such as
+  `VEXIC_LIVE_HOSTED_DREAM_MODEL` for the `hosted-dream` group. These defaults
+  are the code's, not a record of what any deployment has set (ADR 0033).
 
 GitHub Actions deploy trigger:
 
@@ -567,9 +578,9 @@ uv run --no-sync python -m vexic.hosted_http run-dream-phase --root .hosted-memo
 
 These examples use a local root deliberately. The CLI currently resolves its
 control plane and customer memory from `--root` alone, so pointing it at
-`/data/vexic` on the deployed container reaches the stale volume databases, not
-Turso. On the deployed alpha the in-server sweeper (ADR 0030) runs the dream
-phases; the CLI is not the production path.
+`/data/vexic` on a Turso-backed container reaches the stale volume databases,
+not Turso. In a hosted deployment the in-server sweeper (ADR 0030) runs the
+dream phases; the CLI is not that path.
 
 `--adapter` defaults to `VEXIC_DREAM_PHASE_ADAPTER` and `--model-group` to
 `VEXIC_DREAM_PHASE_MODEL_GROUP` (then `hosted-dream`), so in a deployed
@@ -728,10 +739,10 @@ uv run --no-sync python -m vexic.hosted_http revoke-key --root .hosted-memory --
 ```
 
 This revokes against the control plane selected by `--root`. It does **not**
-revoke a key on the deployed alpha: the CLI never consults
+revoke a key on a Turso-backed deployment: the CLI never consults
 `VEXIC_CONTROL_PLANE_TARGET`, so a `--root /data/vexic` revocation is written to
 the volume's stale `control-plane.db` while the service keeps authenticating the
-key against Turso. Revoke live alpha keys through the Console control plane.
+key against Turso. Revoke those keys through the Console control plane.
 
 This is internal-alpha infrastructure for throwaway data. It is not a
 production customer-data launch, public MCP endpoint, billing portal, dashboard,
@@ -748,11 +759,12 @@ Internal-only today:
 - in-process Python API boundary and internal-alpha HTTP adapter;
 - per-tenant Turso databases for customer memory, and a managed Turso
   control-plane database holding the tenant catalog, API-key/revocation records,
-  and the sanitized audit, usage, and job lifecycle ledgers (ADR 0019 and its
-  Addendum 5). The local SQLite path remains supported and is the default when
-  the backend flags are unset, but it is not what the deployed alpha runs;
-- control-plane DR is a scripted `turso db dump`
-  (`.github/workflows/turso-backup.yml`), not PITR: the free tier has none;
+  and the sanitized audit, usage, and job lifecycle ledgers, when the backend
+  flags select Turso (ADR 0019 and its Addendum 5). The local SQLite path
+  remains supported and is what the unset flags select;
+- control-plane DR on Turso's free tier is a scripted `turso db dump`
+  (`.github/workflows/turso-backup.yml`); that tier has no PITR, so ADR 0008's
+  point-in-time recovery target is not met by it;
 - single-process in-memory authenticated request limiter;
 - one `LocalMemoryService` instance is created per hosted request;
 - hosted Light/REM/Deep/Summarize jobs run only with injected host model

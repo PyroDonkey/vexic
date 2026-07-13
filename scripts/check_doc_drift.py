@@ -51,6 +51,7 @@ ADR_INDEX_RE = re.compile(r"^\|\s*(\d{4})\s*\|")
 # allowlist entry.
 ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,}$")
 DOC_ENV_RE = re.compile(r"`([A-Z][A-Z0-9_]{2,})`")
+DOC_ENV_TOKEN_RE = re.compile(r"[A-Z][A-Z0-9_]{2,}")
 
 # Mapping parameters that carry the process environment. `resolve_storage_backend
 # (env)` and friends take `env: Mapping[str, str]` rather than reading
@@ -179,7 +180,18 @@ def _is_env_source(node: ast.expr) -> bool:
 
 
 def _is_getenv(node: ast.expr) -> bool:
-    return isinstance(node, ast.Attribute) and node.attr == "getenv"
+    """True only for `os.getenv`.
+
+    Matching any attribute named `getenv` would treat an unrelated helper such
+    as `settings.getenv("FEATURE_FLAG")` as a process-environment read and
+    demand a docs row for it, so an unrelated API could block the gate.
+    """
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "getenv"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "os"
+    )
 
 
 def _env_names_read(tree: ast.AST) -> set[str]:
@@ -216,22 +228,32 @@ def _env_names_read(tree: ast.AST) -> set[str]:
     return names
 
 
-def _string_literals(tree: ast.AST) -> set[str]:
-    return {
-        node.value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Constant) and isinstance(node.value, str)
-    }
+def _names_mentioned(tree: ast.AST) -> set[str]:
+    """Env-shaped tokens appearing anywhere inside a string literal.
+
+    Substring scan, not exact match: a name is "mentioned" even when it is
+    embedded in a larger string, such as the `"OPENROUTER_API_KEY is required"`
+    of an error message or an f-string fragment. Only the dead-name direction
+    uses this. Requiring a standalone literal there would flag a live variable
+    as dead the moment its only literal moved into a message, and a false dead
+    flag blocks a merge -- a worse failure than the narrow miss this allows (a
+    variable named in an error string but no longer read).
+    """
+    mentioned: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            mentioned.update(DOC_ENV_TOKEN_RE.findall(node.value))
+    return mentioned
 
 
 def _check_env_vars(warnings: list[str]) -> None:
     read: set[str] = set()
-    literals: set[str] = set()
+    mentioned: set[str] = set()
     for code_dir in CODE_DIRS:
         for path in code_dir.rglob("*.py"):
             tree = ast.parse(path.read_text(encoding="utf-8"))
             read |= _env_names_read(tree)
-            literals |= _string_literals(tree)
+            mentioned |= _names_mentioned(tree)
 
     documented = {
         name
@@ -251,13 +273,13 @@ def _check_env_vars(warnings: list[str]) -> None:
             "get the default. Add a row (name only, never a value)."
         )
 
-    # Reverse direction, deliberately looser: a documented name only has to
-    # appear as a string literal somewhere in the code, not in an env-read
-    # context. `VEXIC_API_KEY` is read through a variable key
+    # Reverse direction, deliberately looser: a documented name only has to be
+    # mentioned in a string literal somewhere in the code, not read in an
+    # env-read context. `VEXIC_API_KEY` is read through a variable key
     # (`--api-key-env` names it at runtime), so demanding an env-read context
     # here would flag a live variable as dead. A genuinely dead name -- the
-    # retired `VEXIC_DREAM_TRIGGER_*` trio -- appears nowhere at all.
-    dead = sorted(documented - literals)
+    # retired `VEXIC_DREAM_TRIGGER_*` trio -- is mentioned nowhere at all.
+    dead = sorted(documented - mentioned)
     if dead:
         warnings.append(
             "docs/configuration.md documents environment variable(s) that "

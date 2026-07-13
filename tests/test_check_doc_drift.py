@@ -139,6 +139,44 @@ def test_dynamically_read_name_is_not_reported_dead(
     assert _run(drift, monkeypatch, code_dir=code_dir, doc=doc) == []
 
 
+def test_unrelated_getenv_helper_is_not_an_environment_read(
+    drift: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only `os.getenv` reads the process environment. A helper that happens to
+    have a method of the same name must not force a docs row for its argument,
+    or an unrelated API could block the gate."""
+    code_dir = _write_code(
+        tmp_path,
+        "import os\n"
+        'os.environ.get("PORT", "8000")\n'
+        "settings = object()\n"
+        'settings.getenv("FEATURE_FLAG")\n',
+    )
+    doc = _write_doc(tmp_path, "| `PORT` | x | `8000` | y |\n")
+
+    assert _run(drift, monkeypatch, code_dir=code_dir, doc=doc) == []
+
+
+def test_name_mentioned_only_inside_a_larger_literal_is_not_dead(
+    drift: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A documented name whose only literal is embedded in a message -- an error
+    string, an f-string fragment -- is still alive. A false dead flag blocks a
+    merge, which is worse than the narrow miss this allows."""
+    code_dir = _write_code(
+        tmp_path,
+        "import os\n"
+        'os.environ.get("PORT", "8000")\n'
+        'raise RuntimeError("OPENROUTER_API_KEY is required")\n',
+    )
+    doc = _write_doc(
+        tmp_path,
+        "| `PORT` | x | `8000` | y |\n| `OPENROUTER_API_KEY` | x | -- | y |\n",
+    )
+
+    assert _run(drift, monkeypatch, code_dir=code_dir, doc=doc) == []
+
+
 def test_real_repo_has_no_environment_drift(drift: ModuleType) -> None:
     """The gate must hold against the committed tree, not just fixtures."""
     warnings: list[str] = []
