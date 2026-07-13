@@ -229,9 +229,12 @@ Tracking rules):
   `uv run pytest` and update any tracking doc that cites a test count to the
   fresh number. Do not carry a hand-typed count forward; verify it.
 
-`scripts/check_doc_drift.py` enforces the in-repo half of this loop: it checks
-that `docs/adr/README.md` lists every ADR file and that the documented service
-surface matches `src/vexic`. CI runs it with `--ci` on every PR. A local agent
+`scripts/check_doc_drift.py` enforces the in-repo half of this loop. It checks
+that `docs/adr/README.md` lists every ADR file, that the documented service
+surface matches `src/vexic`, and that the living docs' references still resolve
+against the code: file and directory paths, `vexic` CLI commands and their
+subcommands, cited ADR ids, cited test counts, and the environment variables the
+code actually reads. CI runs it with `--ci` on every PR. A local agent
 hook may call the same script, but `.claude/` configuration is machine-local and
 ignored by Git. A hook cannot read the external tracking system, so closing the
 loop against the tracking docs remains a manual step under the triggers above.

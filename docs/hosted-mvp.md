@@ -410,12 +410,14 @@ directory does that, per ADR 0008/0013 precedent.
 
 Known follow-ups, deliberately not built in this cutover:
 
-- `connect()` has no explicit timeout or retry/backoff on the hot path against
-  remote libSQL; a slow or transiently-failing Turso call currently propagates
-  directly rather than being retried.
-- `TenantTokenCache` has no size-bounded eviction -- it is an unbounded `dict`
-  keyed by database name, acceptable at current dogfood tenant counts but not
-  reviewed for large tenant fleets.
+- A remote libSQL **query** has no duration bound, so a degraded or unreachable
+  Turso endpoint can hang the hot path. Note this is a *query* gap, not a
+  `connect()` gap: `libsql.connect()` performs no network I/O (it is lazy, and
+  the fault surfaces on the first query), and the driver's `timeout` argument
+  does not bound remote request duration. The fix is a deadline that surfaces as
+  a retryable storage fault, so it flows into the existing 503
+  `storage_unavailable` + `Retry-After` path; server-side retry of a query is
+  not the answer and is unsafe for writes. See ADR 0019 Addendum 6.
 - Some adapter type annotations (e.g. around the injected HTTP transport and
   provisioning seams) are looser than ideal and are flagged for a precision
   pass.

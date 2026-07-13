@@ -102,8 +102,9 @@ fix belongs in the harness or the rules, not only in the working tree.
   `AGENTS.md` is a settled-rule change; surface it to the requester
   rather than rewriting boundaries unilaterally.
 - If the failure is a drift that a check could have caught, prefer a check.
-  The repository already has `scripts/check_doc_drift.py` for ADR/service
-  surface drift and `scripts/check_branch_sync.py` for read-only branch drift
+  The repository already has `scripts/check_doc_drift.py` for ADR-index,
+  service-surface, path, CLI, ADR-id, test-count, and environment-variable
+  drift, and `scripts/check_branch_sync.py` for read-only branch drift
   reporting. Local agent hooks may call these scripts, but hook configuration
   stays out of Git.
 - Close the loop in-session where the triggers fire. `AGENTS.md` lists
