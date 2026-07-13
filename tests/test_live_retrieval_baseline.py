@@ -132,6 +132,28 @@ class LiveRetrievalBaselineTests(unittest.TestCase):
         self.assertIn("max-rows", stderr.getvalue())
         self.assertFalse(marker.exists())
 
+    def test_extraction_task_transcript_fixture_pins_coa_358_shape(self) -> None:
+        # Light extraction once returned zero candidates on assistant-heavy
+        # working-session transcripts while stated-preference transcripts
+        # extracted fine. This fixture pins both shapes for the live smoke
+        # harness; the task row must stay assistant-majority or it stops
+        # reproducing the failing shape. The row guards extraction (nonzero
+        # Tier 2 candidates); promotion and retrieval outcomes are not pinned.
+        fixture = REPO_ROOT / "tests" / "fixtures" / "extraction_task_transcript_smoke.jsonl"
+
+        rows = self.baseline._load_fixture(fixture, max_rows=2)
+
+        self.assertEqual(
+            [row.row_id for row in rows],
+            ["task_transcript_project_context", "stated_preference_regression"],
+        )
+        task_row = rows[0]
+        roles = [
+            turn.role if not isinstance(turn, str) else "user"
+            for turn in task_row.transcript
+        ]
+        self.assertGreater(roles.count("assistant"), roles.count("user"))
+
     def test_invalid_fixture_turn_rejected_before_adapter_import(self) -> None:
         marker = self.root / "imported.txt"
         adapter = self.root / "adapter.py"

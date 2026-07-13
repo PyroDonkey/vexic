@@ -295,6 +295,13 @@ Fixture rows are JSONL objects with `id`, `transcript`, `question`, and
 "assistant", "content": "..." }` objects mapped from a host-supplied
 LongMemEval_S artifact. Do not vendor the benchmark artifact into this repo.
 
+`tests/fixtures/extraction_task_transcript_smoke.jsonl` is a committed
+synthetic fixture for Light extraction: one assistant-heavy working-session
+row (the transcript shape that once extracted zero candidates) and one
+stated-preference row as a regression guard. Run it through the same command
+with `--max-messages-per-row 15`; the extraction guard is a nonzero Tier 2
+candidate count on both rows.
+
 The harness runs each row in a disposable SQLite database and writes
 `retrieval_metrics.json` and `answer_synthesis_metrics.json` under
 `--output-dir`. Retrieval metrics classify failures as extraction miss,
