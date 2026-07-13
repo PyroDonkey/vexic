@@ -58,6 +58,10 @@ asked for, not in what the assistant did on its own.
 Use the closed category vocabulary exactly: preference, fact, goal, event,
 relationship, skill, constraint, context.
 Every candidate must include source_message_ids from the [message_id=N] markers.
+Because every fact is grounded in the user, source_message_ids must include
+at least one User message -- the request or correction that establishes the
+fact. Cite the Assistant message that carries the detail alongside it, never
+alone.
 When the transcript states or clearly implies a temporal reference for when
 the fact occurred (a date, month, year, or relative time you can resolve
 against context), populate occurred_at with an ISO 8601 string at whatever
