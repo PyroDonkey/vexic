@@ -134,9 +134,10 @@ risk).
 - Do not run the live provider smoke (`vexic.live_retrieval_baseline`); it is
   opt-in behind `--allow-live` and `OPENROUTER_API_KEY`. Out of scope.
 - Hook awareness: Claude runtime hooks are local-only and are not committed.
-  `scripts/check_doc_drift.py --ci` is the committed ADR-index and
-  service-surface parity check. Verify any change weakening local guardrails
-  manually.
+  `scripts/check_doc_drift.py --ci` is the committed doc-drift gate: ADR-index
+  and service-surface parity, plus path, CLI, ADR-id, test-count, and
+  environment-variable references in the living docs. Verify any change
+  weakening local guardrails manually.
 - `expand_history` has no dedicated audit hook on the local stdio path yet;
   treat any change that widens that egress as high-risk until audit coverage
   exists.

@@ -258,6 +258,10 @@ landed:
 Known, deliberately deferred follow-ups (not blocking this ADR's acceptance,
 tracked as fix-soon items rather than open decisions):
 
+> The first and third bullets below are resolved by Addendum 6. The token-cache
+> bound landed; the `connect()` bullet was withdrawn as misdiagnosed. Read
+> Addendum 6 before acting on either.
+
 - `connect()` has no explicit timeout or retry/backoff on the hot path against
   remote libSQL.
 - A live run of the restore drill against a real Turso point-in-time-recovery
@@ -392,3 +396,44 @@ scripted `turso db dump` exports of the control-plane and per-tenant databases
 (a scheduled GitHub Actions workflow), plus the retained local `control-plane.db`
 as a rollback handle. Turso PITR remains the intended mechanism if the
 deployment moves to a paid tier.
+
+## Addendum 6 -- 2026-07-13: hot-path follow-ups resolved (COA-335)
+
+Addendum 2 listed two hot-path follow-ups. One landed; the other was
+withdrawn as misdiagnosed. This addendum supersedes both bullets.
+
+**Landed: the token cache is bounded.** `TenantTokenCache` (in
+`adapters/turso_adapter.py`, where it stays because it holds raw minted
+tokens) now enforces LRU eviction over an `OrderedDict` with a
+`max_entries` bound. TTL and the size bound are independent and neither
+subsumes the other: TTL alone never evicts, because an expired entry is
+only dropped when that same `db_name` is requested again, so a long tail of
+tenants would otherwise retain an entry each for the life of the process.
+TTL governs freshness; the bound governs size. The existing TTL and its
+injected clock are unchanged.
+
+**Withdrawn: a `connect()` timeout and retry would do nothing.** Addendum 2
+assumed a degraded remote could hang the hot path inside `connect()`. It
+cannot, and both halves of the premise were checked against the installed
+driver rather than reasoned about:
+
+- `libsql.connect()` performs no network I/O. Against a nonexistent host it
+  returns in milliseconds; the connection is lazy. The fault surfaces on the
+  first *query*. A retry/backoff loop around `connect()` is therefore
+  unreachable code -- it would never observe the network fault it exists to
+  retry.
+- The driver's `timeout` argument does not bound remote request duration.
+  Against a black-holed address, a query hung past a 35-second hard kill with
+  the timeout set to both 1s and 4s.
+
+The real gap is unbounded *query* duration against a degraded remote, which
+is tracked separately (COA-377). The shape that fits is a **deadline**, not a
+retry: `hosted_http.py` already classifies a retryable storage fault into a
+503 `storage_unavailable`, leaving the retry decision to the client, and
+server-side re-execution of a query is unsafe for writes anyway. A hang must
+surface as a retryable storage fault so it flows into that existing path.
+
+Note that the 503 carries no `Retry-After` header today -- that header is
+attached only to the 429 rate-limit responses. Whether a client-retryable 503
+should advertise one is an open question for COA-377, not a settled contract
+this addendum can lean on.
