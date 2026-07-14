@@ -196,6 +196,38 @@ def test_same_key_follower_wait_is_bounded_and_retryable():
         assert owner.result(timeout=2) == "jwt-tenant-a-1"
 
 
+def test_invalidate_with_no_mint_in_flight_drops_the_entry_and_remints():
+    """The quiet path: no contention, just drop the token and re-mint on demand.
+
+    This is the shape a revocation would use -- the in-flight race below is the
+    hard case, not the common one.
+    """
+    port = FakePort()
+    cache = TenantTokenCache(port, clock=FakeClock())
+
+    assert cache.get_token("tenant-a") == "jwt-tenant-a-1"
+    assert len(cache) == 1
+
+    cache.invalidate("tenant-a")
+    assert len(cache) == 0
+
+    # The cached token is gone, so the next caller mints rather than serving it.
+    assert cache.get_token("tenant-a") == "jwt-tenant-a-2"
+    assert port.calls == ["tenant-a", "tenant-a"]
+
+
+def test_invalidate_is_a_noop_for_a_db_name_that_was_never_cached():
+    port = FakePort()
+    cache = TenantTokenCache(port, clock=FakeClock())
+    cache.get_token("tenant-a")
+
+    cache.invalidate("tenant-b")
+
+    assert len(cache) == 1
+    assert cache.get_token("tenant-a") == "jwt-tenant-a-1"
+    assert port.calls == ["tenant-a"]
+
+
 def test_invalidate_during_mint_discards_result_and_remints():
     class InvalidatablePort(FakePort):
         def __init__(self) -> None:

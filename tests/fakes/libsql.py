@@ -135,6 +135,12 @@ class HangingLibsqlConn(FakeLibsqlConn):
         self._gate.wait()
         super().commit()
 
+    def __exit__(self, *exc: Any) -> Any:
+        # The commit-on-clean-exit (and the rollback on an exceptional one) is
+        # a driver round-trip like any other, so it hangs with the remote too.
+        self._gate.wait()
+        return super().__exit__(*exc)
+
     def close(self) -> None:
         self.close_calls += 1
         super().close()
