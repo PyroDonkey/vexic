@@ -18,7 +18,8 @@ library and MCP server need none of these by default; variables marked
 | `PORT` | `vexic.hosted_entrypoint` | `8000` | HTTP listen port; provided by Railway. |
 | `VEXIC_RUNTIME_USER` | `vexic.hosted_entrypoint` | `vexic` | Unprivileged user the server drops to after fixing volume ownership. |
 | `VEXIC_HOSTED_ROOT` | `vexic.hosted`, `vexic.hosted_http`, `vexic.hosted_entrypoint` | `.hosted-memory` (CLI); `/data/vexic` (entrypoint) | Root directory for hosted key/tenant state and local per-store databases. |
-| `VEXIC_STORAGE_BACKEND` | `vexic.hosted`, `vexic.hosted_http` | `local` | `local` or `turso`. Selects the per-store storage backend (non-secret flag). |
+| `VEXIC_STORAGE_BACKEND` | `vexic.hosted`, `vexic.hosted_http` | `local` | `local` or `turso`. Selects the per-store storage backend (non-secret flag). Routes customer memory only. |
+| `VEXIC_CONTROL_PLANE_TARGET` | `vexic.hosted`, `vexic.hosted_http` | `local` | `local` or `turso`. Selects where the control-plane catalog and API-key store live (non-secret flag; ADR 0019). Independent of `VEXIC_STORAGE_BACKEND`: that flag routes only customer memory, this one routes only the control plane. Omitting it silently selects the local filesystem `control-plane.db` under `VEXIC_HOSTED_ROOT` -- the same silent-`local` footgun `VEXIC_STORAGE_BACKEND` has. |
 | `VEXIC_CONTROL_PLANE_TOKENS` | `vexic.hosted_control_plane_http` | -- (endpoints disabled) | Comma-separated bearer tokens for the Console control-plane API. |
 | `VEXIC_MCP_ALLOWED_ORIGINS` | `vexic.mcp_http` | -- | Comma-separated extra `Origin` values allowed on the hosted MCP endpoint. |
 | `VEXIC_DOGFOOD_TENANT_ID` | `vexic.hosted_http` | -- | Tenant id whose telemetry is tagged as dogfood traffic. |
@@ -31,17 +32,39 @@ library and MCP server need none of these by default; variables marked
 | `VEXIC_DREAM_INTERVAL_SECONDS` | `vexic.hosted_sweeper` | `86400` | Minimum gap between full Light -> REM -> Deep chains per tenant. |
 | *(names passed via `--secret-env`)* | `vexic.hosted` CLI | -- | `run-dream-phase --secret-env NAME` reads each named variable and threads it to the adapter as a forbidden secret value. |
 
-## Turso storage backend (operator-only)
+## Turso backends (operator-only)
 
-Required when `VEXIC_STORAGE_BACKEND=turso`.
+The two Turso flags gate different variables. Each variable below is listed
+under the flag that actually causes it to be read; setting one flag does not
+make the other flag's variables required.
+
+### Customer-memory provisioning -- required when `VEXIC_STORAGE_BACKEND=turso`
+
+Read by `TursoProvisioningPort.from_env` (and `vexic.hosted_http` for the org
+slug) to create and address per-tenant customer databases.
 
 | Variable | Component | Default | Notes |
 | --- | --- | --- | --- |
-| `TURSO_ORG` | `vexic.hosted_http` | -- (required) | Turso organization slug used for provisioning. |
+| `TURSO_ORG` | `vexic.hosted_http`, `adapters/turso_adapter.py` | -- (required) | Turso organization slug used for provisioning and for resolving per-tenant DSNs. |
 | `TURSO_GROUP` | `adapters/turso_adapter.py` | -- (required) | Turso database group new per-store databases are created in. |
 | `TURSO_PLATFORM_API_TOKEN` | `adapters/turso_adapter.py` | -- (required) | Platform API token used to create databases and mint DB tokens. |
-| `TURSO_DATABASE_URL` | `adapters/turso_adapter.py` | -- (required) | libSQL DSN of the control/metadata database. |
+
+### Control-plane database -- required when `VEXIC_CONTROL_PLANE_TARGET=turso`
+
+Read by `control_plane_target()` to address the managed control-plane database.
+Also read by `vexic.migrate_control_plane --target-from-env`, which resolves the
+same target regardless of `VEXIC_STORAGE_BACKEND`.
+
+| Variable | Component | Default | Notes |
+| --- | --- | --- | --- |
+| `TURSO_DATABASE_URL` | `adapters/turso_adapter.py` | -- (required) | libSQL DSN of the control-plane database (tenant catalog, API keys, telemetry). |
 | `TURSO_AUTH_TOKEN` | `adapters/turso_adapter.py` | -- (required) | Auth token for `TURSO_DATABASE_URL`. |
+
+### Remote query deadline -- read when either Turso flag is `turso`
+
+| Variable | Component | Default | Notes |
+| --- | --- | --- | --- |
+| `VEXIC_REMOTE_QUERY_DEADLINE_SECONDS` | `adapters/turso_adapter.py` | `30.0` | Wall-clock deadline on each remote libSQL driver call (ADR 0019 Addendum 7). A hang past the deadline surfaces as a retryable 503 `storage_unavailable`. Absent or malformed falls back to the default. Local SQLite is never bounded. |
 
 ## OpenRouter live adapter (operator-only)
 
@@ -51,15 +74,9 @@ dream-phase adapter.
 | Variable | Component | Default | Notes |
 | --- | --- | --- | --- |
 | `OPENROUTER_API_KEY` | live adapter | -- (required) | OpenRouter platform key; read only inside the adapter module. |
-| `VEXIC_LIVE_MODEL` | live adapter | `deepseek/deepseek-v4-pro` | Default agent model for all model groups. |
-| `VEXIC_LIVE_<GROUP>_MODEL` | live adapter | -- | Per-group override, e.g. `VEXIC_LIVE_HOSTED_DREAM_MODEL` for the `hosted-dream` group. Wins over `VEXIC_LIVE_MODEL`. |
+| `VEXIC_LIVE_MODEL` | live adapter | `deepseek/deepseek-v4-pro` (dream agents only) | Fallback agent model when a model group has no per-group override. The default applies to the dream agents; the recall judge has no implicit default -- with neither the per-group name nor `VEXIC_LIVE_MODEL` set it raises `RuntimeError` rather than fall through, so a silent fallback cannot misattribute recall scores to the wrong judge model. |
+| *(pattern)* `VEXIC_LIVE_<GROUP>_MODEL` | live adapter | -- | Name pattern, not a literal variable: the model group is upper-snake-cased into the name, e.g. `VEXIC_LIVE_HOSTED_DREAM_MODEL` for the `hosted-dream` group. Wins over `VEXIC_LIVE_MODEL`. |
 | `VEXIC_SUMMARY_MODEL` | live adapter | `deepseek/deepseek-v4-pro` | Model for the summarize phase (not routed by model group). |
 | `VEXIC_LIVE_EMBEDDING_MODEL` | live adapter | `openai/text-embedding-3-small` | Embedding model. |
 | `VEXIC_LIVE_MAX_OUTPUT_TOKENS` | live adapter | `8192` per dream agent (extraction, contradiction, summary); the recall judge is uncapped | Per-request output token cap. Set it to override the extraction, contradiction, and summary defaults with one value; the recall judge stays uncapped even when this is set, so a long structured verdict reason cannot truncate into a judge error. The default model reasons before it emits and thinking tokens count against this cap, so size it for the reasoning, not the visible output -- a cap sized to the output truncates the agent into `finish_reason=length`. |
 | `VEXIC_LIVE_REQUEST_TIMEOUT_SECONDS` | live adapter | `60.0` | Per-request timeout. |
-
-## External cron caller (documented convention, not read by this repo)
-
-The dream-trigger cron service documented in [`hosted-mvp.md`](hosted-mvp.md)
-uses `VEXIC_DREAM_TRIGGER_URL`, `VEXIC_DREAM_TRIGGER_KEY`, and
-`VEXIC_DREAM_PROJECT_ID`. No code in `src/` or `adapters/` reads them.

@@ -1,20 +1,28 @@
 from __future__ import annotations
 
 import json
+import math
+import threading
 import time
 import urllib.error
 import urllib.request
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from urllib.parse import urlencode, urlsplit
 
-from vexic.storage.connection import StorageTarget
+from vexic.storage.connection import DEFAULT_QUERY_DEADLINE_SECONDS, StorageTarget
+from vexic.storage.errors import QueryDeadlineExceeded
 
 if TYPE_CHECKING:
     from vexic.hosted import HostedTenant
 
 PLATFORM_API_BASE = "https://api.turso.tech"
+PLATFORM_API_TIMEOUT_SECONDS = 30.0
+_TOKEN_RESOLUTION_UNAVAILABLE_MESSAGE = (
+    "Turso token resolution was unavailable; retry later"
+)
 
 HttpCall = Callable[[str, str, Mapping[str, str], bytes | None], tuple[int, dict]]
 
@@ -26,10 +34,32 @@ def _require(env: Mapping[str, str], name: str) -> str:
     return v
 
 
+def query_deadline_from_env(env: Mapping[str, str]) -> float:
+    """Wall-clock query deadline for remote libSQL calls (ADR 0019 Addendum 7).
+
+    Reads ``VEXIC_REMOTE_QUERY_DEADLINE_SECONDS``; absent or malformed falls
+    back to the module default. Parsed here in ``adapters/`` so ``src/vexic``
+    stays free of ambient environment reads.
+    """
+    raw = env.get("VEXIC_REMOTE_QUERY_DEADLINE_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_QUERY_DEADLINE_SECONDS
+    try:
+        deadline = float(raw)
+    except ValueError:
+        return DEFAULT_QUERY_DEADLINE_SECONDS
+    # 0/negative would time out every query instantly and poison its
+    # connection; nan/inf break the wait bound. Fall back rather than fail.
+    if not math.isfinite(deadline) or deadline <= 0:
+        return DEFAULT_QUERY_DEADLINE_SECONDS
+    return deadline
+
+
 def control_plane_target(env: Mapping[str, str]) -> StorageTarget:
     return StorageTarget(
         _require(env, "TURSO_DATABASE_URL"),
         auth_token=_require(env, "TURSO_AUTH_TOKEN"),
+        query_deadline_seconds=query_deadline_from_env(env),
     )
 
 
@@ -118,7 +148,10 @@ def _default_http_call(
     """
     request = urllib.request.Request(url, data=body, headers=dict(headers), method=method)
     try:
-        with urllib.request.urlopen(request) as response:  # noqa: S310 - fixed https host
+        with urllib.request.urlopen(  # noqa: S310 - fixed https host
+            request,
+            timeout=PLATFORM_API_TIMEOUT_SECONDS,
+        ) as response:
             status = response.status
             raw = response.read()
     except urllib.error.HTTPError as exc:
@@ -226,11 +259,20 @@ class TursoProvisioningPort:
     ) -> str:
         """Returns the raw jwt. Never logged."""
         authorization = "read-only" if read_only else "full-access"
-        status, payload = self._call(
-            "POST",
-            f"/databases/{db_name}/auth/tokens",
-            query={"expiration": expiration, "authorization": authorization},
-        )
+        try:
+            status, payload = self._call(
+                "POST",
+                f"/databases/{db_name}/auth/tokens",
+                query={"expiration": expiration, "authorization": authorization},
+            )
+        except (TimeoutError, ConnectionError, urllib.error.URLError) as exc:
+            # Token minting is part of resolving a tenant's storage target.
+            # Keep transport details (which can contain hosts or credentials)
+            # out of the public fault while preserving the original exception
+            # for diagnostics through exception chaining.
+            raise QueryDeadlineExceeded(
+                _TOKEN_RESOLUTION_UNAVAILABLE_MESSAGE
+            ) from exc
         if not (200 <= status < 300):
             raise RuntimeError(
                 f"Turso mint_token({db_name!r}) failed with status {status}."
@@ -274,7 +316,7 @@ class TenantTokenCache:
     on cache miss/expiry and caches it in memory only, keyed by
     ``db_name``. Raw tokens are NEVER persisted anywhere -- not to the
     control-plane catalog, not to disk -- per ADR 0019 ("mint short-lived
-    tokens, do not persist raw"). The cache is a plain ``dict`` attribute
+    tokens, do not persist raw"). The cache is an in-memory ordered mapping
     on the instance; process restart or GC drops it, which is intentional.
 
     ``ttl_seconds`` (cache lifetime) must be kept shorter than the minted
@@ -283,10 +325,21 @@ class TenantTokenCache:
     would expire -- callers never hand out a token that is valid per the
     cache but rejected by Turso.
 
-    The ``clock`` is injected (defaults to ``time.monotonic``) and is the
-    *only* time source consulted in ``get_token`` -- this makes expiry
-    deterministic and testable via a fake clock, with no wall-clock reads
-    in the logic.
+    The ``clock`` is injected (defaults to ``time.monotonic``) and is the only
+    time source used for token freshness, which makes expiry deterministic in
+    tests. Same-key mint wait bounds deliberately use real monotonic time so a
+    stalled owner cannot leave followers blocked when a fake TTL clock stands
+    still.
+
+    ``max_entries`` bounds the cache (ADR 0019 Addendum 2). TTL alone does
+    not: an
+    expired entry is never *served*, but it is only evicted when that same
+    ``db_name`` is asked for again, so a process that sees a long tail of
+    tenants would otherwise retain a token entry per tenant forever. The
+    bound is enforced as LRU over an ``OrderedDict`` -- a hit moves the key
+    to the most-recently-used end, and an insert past the bound pops the
+    least-recently-used key. TTL still governs *freshness*; the bound
+    governs *size*. The two are independent and neither replaces the other.
     """
 
     def __init__(
@@ -297,36 +350,106 @@ class TenantTokenCache:
         clock: Callable[[], float] = time.monotonic,
         expiration: str = "15m",
         read_only: bool = False,
+        max_entries: int = 512,
+        mint_wait_timeout_seconds: float = PLATFORM_API_TIMEOUT_SECONDS,
     ) -> None:
+        if max_entries < 1:
+            raise ValueError("max_entries must be at least 1")
+        if not math.isfinite(mint_wait_timeout_seconds) or mint_wait_timeout_seconds <= 0:
+            raise ValueError("mint_wait_timeout_seconds must be finite and positive")
         self._port = port
         self._ttl_seconds = ttl_seconds
         self._clock = clock
         self._expiration = expiration
         self._read_only = read_only
-        self._cache: dict[str, tuple[str, float]] = {}
+        self._max_entries = max_entries
+        self._mint_wait_timeout_seconds = mint_wait_timeout_seconds
+        self._cache: OrderedDict[str, tuple[str, float]] = OrderedDict()
+        self._condition = threading.Condition()
+        self._minting: set[str] = set()
+        self._invalidated_while_minting: set[str] = set()
+
+    def __len__(self) -> int:
+        """Number of cached entries. Never exceeds ``max_entries``."""
+        with self._condition:
+            return len(self._cache)
 
     def get_token(self, db_name: str) -> str:
         """Returns a cached token for ``db_name`` if present and not yet
         expired (per ``clock()`` and ``ttl_seconds``); otherwise mints a
         fresh one via the port, caches it with the current timestamp, and
         returns it. Never logs or prints the token.
+
+        A cache hit marks ``db_name`` most-recently-used; an insert evicts
+        the least-recently-used entry once the cache is at ``max_entries``.
         """
-        cached = self._cache.get(db_name)
-        if cached is not None:
-            token, minted_at = cached
-            if self._clock() - minted_at < self._ttl_seconds:
-                return token
-        token = self._port.mint_token(
-            db_name, expiration=self._expiration, read_only=self._read_only
-        )
-        self._cache[db_name] = (token, self._clock())
-        return token
+        # The resolver is called from both request/event-loop workers and
+        # background dream/sweeper threads. Cache/LRU transitions are atomic,
+        # and one thread mints a given database's token while peers wait for
+        # its result. The network call runs outside the condition, so a slow
+        # mint for one tenant does not block cached hits or another tenant's
+        # independent mint.
+        wait_deadline: float | None = None
+        while True:
+            with self._condition:
+                cached = self._cache.get(db_name)
+                if cached is not None:
+                    token, minted_at = cached
+                    if self._clock() - minted_at < self._ttl_seconds:
+                        self._cache.move_to_end(db_name)
+                        return token
+                if db_name not in self._minting:
+                    self._minting.add(db_name)
+                    wait_deadline = None
+                else:
+                    if wait_deadline is None:
+                        wait_deadline = time.monotonic() + self._mint_wait_timeout_seconds
+                    remaining = wait_deadline - time.monotonic()
+                    if remaining <= 0 or not self._condition.wait(timeout=remaining):
+                        raise QueryDeadlineExceeded(
+                            _TOKEN_RESOLUTION_UNAVAILABLE_MESSAGE
+                        )
+                    continue
+
+            try:
+                token = self._port.mint_token(
+                    db_name, expiration=self._expiration, read_only=self._read_only
+                )
+                minted_at = self._clock()
+            except BaseException:
+                with self._condition:
+                    self._minting.remove(db_name)
+                    self._invalidated_while_minting.discard(db_name)
+                    self._condition.notify_all()
+                raise
+
+            with self._condition:
+                invalidated = db_name in self._invalidated_while_minting
+                self._invalidated_while_minting.discard(db_name)
+                self._minting.remove(db_name)
+                if not invalidated:
+                    self._cache[db_name] = (token, minted_at)
+                    self._cache.move_to_end(db_name)
+                    while len(self._cache) > self._max_entries:
+                        self._cache.popitem(last=False)
+                self._condition.notify_all()
+                if not invalidated:
+                    return token
+            # An invalidate linearized while the mint was in flight. Discard
+            # its result and loop so neither this caller nor a follower serves
+            # the invalidated credential.
 
     def invalidate(self, db_name: str) -> None:
-        """Drops any cached token for ``db_name``, forcing a re-mint on
-        the next ``get_token`` call. No-op if nothing is cached.
+        """Ensure the next token served for ``db_name`` comes from a new mint.
+
+        Drops a cached token immediately. If a mint is already in flight, its
+        result is discarded and a fresh mint completes before any caller can
+        serve a token. No-op when neither state exists.
         """
-        self._cache.pop(db_name, None)
+        with self._condition:
+            self._cache.pop(db_name, None)
+            if db_name in self._minting:
+                self._invalidated_while_minting.add(db_name)
 
 
 def _db_name_from_dsn(customer_target: str, org: str) -> str:
@@ -345,7 +468,10 @@ def _db_name_from_dsn(customer_target: str, org: str) -> str:
 
 
 def make_customer_target_resolver(
-    token_cache: TenantTokenCache, *, org: str
+    token_cache: TenantTokenCache,
+    *,
+    org: str,
+    query_deadline_seconds: float | None = None,
 ) -> "Callable[[HostedTenant], StorageTarget | None]":
     """Build the per-tenant customer-memory resolver.
 
@@ -367,6 +493,10 @@ def make_customer_target_resolver(
         if not customer_target:
             return None
         db_name = _db_name_from_dsn(customer_target, org)
-        return StorageTarget(customer_target, token_cache.get_token(db_name))
+        return StorageTarget(
+            customer_target,
+            token_cache.get_token(db_name),
+            query_deadline_seconds=query_deadline_seconds,
+        )
 
     return resolve

@@ -299,24 +299,24 @@ rows portable through export/replay, proving hosted adapter conformance against
 local SQLite behavior, and treating FTS/vector tables as rebuildable projections
 rather than source of truth.
 
-The deployed hosted alpha splits storage across two tiers (ADR 0019, cutover
-executed in its Addendum 5; full description in `docs/hosted-mvp.md`). Customer
-memory -- transcript, candidates, long-term facts, and dream-run records --
-lives in a per-tenant managed Turso/libSQL database, addressed by the
-control-plane catalog's `tenants.customer_target` DSN. The control-plane
-catalog itself (tenant registry, API keys, operational telemetry, and the dream
-sweeper's `dream_sweep_state`) runs in a separate managed Turso control-plane
-database, selected by `VEXIC_CONTROL_PLANE_TARGET=turso`. Both tiers are on
-Turso; the local `control-plane.db` on the Railway volume under
-`VEXIC_HOSTED_ROOT` is retained only as a rollback handle. Turso, not Neon, is
-the committed managed control-plane store (Addendum 5).
+The hosted adapter supports a two-tier managed-storage recipe (ADR 0019,
+Addendum 5; full description in `docs/hosted-mvp.md`). With the Turso backend
+selected, customer memory -- transcript, candidates, long-term facts, and
+dream-run records -- uses a per-tenant managed Turso/libSQL database addressed
+by the control-plane catalog's `tenants.customer_target` DSN. Setting
+`VEXIC_CONTROL_PLANE_TARGET=turso` routes the tenant registry, API keys,
+operational telemetry, and `dream_sweep_state` to a separate managed Turso
+control-plane database. Unset flags retain the local SQLite paths. Turso, not
+Neon, is the committed managed control-plane option; this repository does not
+record which option a live deployment selects.
 
 ## v0.1 Service Surface
 
 `LocalMemoryService` implements the local read/write core for transcript ingest,
-source-ledger transcript ingest, long-term search, retrieval telemetry, fact
-retirement, export, replay, rebuild, and scope tombstones. Dream phase
-orchestration is deliberately port-backed: the local adapter authorizes and
+source-ledger transcript ingest, transcript search, verbatim history expansion,
+fresh context, active-context load, long-term search, retrieval telemetry, fact
+retirement, export, replay, rebuild, scope tombstones, and scope purge. Dream
+phase orchestration is deliberately port-backed: the local adapter authorizes and
 checks lifecycle state, executes Light, REM, or Deep only when explicit dream
 phase ports are supplied, and fails closed with `HostPortNotConfigured` when no
 host execution adapter is supplied. Within those ports, embedding may fall back

@@ -5,6 +5,37 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
+_TRACKING_REFERENCE_ALLOWED_PREFIXES = ("docs/adr/",)
+_TRACKING_REFERENCE_ALLOWED_FILES = frozenset({"README.md", "docs/provenance.md"})
+
+
+def _tracked_public_text_files() -> list[Path]:
+    """Tracked public text, excluding the locations allowed to cite tickets."""
+    tracked = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    paths: list[Path] = []
+    for name in tracked.split("\0"):
+        if (
+            not name
+            or name in _TRACKING_REFERENCE_ALLOWED_FILES
+            or name.startswith(_TRACKING_REFERENCE_ALLOWED_PREFIXES)
+        ):
+            continue
+        path = ROOT / name
+        if not path.is_file():
+            continue
+        try:
+            path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        paths.append(path)
+    return paths
+
 
 def test_vexic_runtime_does_not_import_predecessor_engine() -> None:
     source_files = (ROOT / "src" / "vexic").rglob("*.py")
@@ -113,31 +144,46 @@ def test_console_and_website_are_not_tracked_in_this_repository() -> None:
     assert tracked == ""
 
 
+def test_tracking_reference_guard_covers_root_docs_and_public_text_assets() -> None:
+    scanned = {
+        path.relative_to(ROOT).as_posix() for path in _tracked_public_text_files()
+    }
+
+    assert {
+        "AGENTS.md",
+        "CLAUDE.md",
+        "CODE_OF_CONDUCT.md",
+        "CONTRIBUTING.md",
+        "Dockerfile",
+        "LICENSE",
+        "SECURITY.md",
+        ".gitignore",
+        ".github/pull_request_template.md",
+        ".github/workflows/ci.yml",
+        "pyproject.toml",
+        "tests/fixtures/extraction_task_transcript_smoke.jsonl",
+        "tests/fixtures/longmemeval_s_smoke.jsonl",
+        "tests/fixtures/longmemeval_s_subset_10.jsonl",
+        "uv.lock",
+    } <= scanned
+    assert "README.md" not in scanned
+    assert "docs/provenance.md" not in scanned
+    assert not any(name.startswith("docs/adr/") for name in scanned)
+
+
 def test_public_tree_does_not_embed_tracking_references() -> None:
     """Code and non-ADR docs must not reference the private issue tracker.
 
-    Allowed locations (per AGENTS.md): docs/adr/ (decision
-    provenance) and docs/provenance.md. The match is case-insensitive so a
-    lowercase real id (e.g. coa-281) cannot slip past the guard; generic
-    placeholders like coa-<id> never match because \\d+ requires a digit.
+    Allowed locations (per AGENTS.md): root README.md, docs/adr/ (decision
+    provenance), and docs/provenance.md. The match is case-insensitive so a
+    lowercase real id cannot slip past the guard. Python-safe underscore
+    spellings are also forbidden; generic placeholders like coa-<id> never
+    match because \\d+ requires a digit.
     """
-    ticket_pattern = re.compile(r"\b" + "C" + r"OA-\d+\b", re.IGNORECASE)
-    allowed = ("docs/adr/", "docs/provenance.md")
+    ticket_pattern = re.compile(r"\b" + "C" + r"OA[-_]\d+\b", re.IGNORECASE)
     offenders: list[str] = []
-    scan_dirs = ("src", "tests", "adapters", "scripts", "docs")
-    # Root-level agent docs (AGENTS.md is the repo-root source of truth, CLAUDE.md
-    # its pointer) are public and non-ADR, so they get the same tracker-leak guard.
-    root_docs = (ROOT / "AGENTS.md", ROOT / "CLAUDE.md")
-    scanned = [p for scan in scan_dirs for p in (ROOT / scan).rglob("*")]
-    scanned.extend(root_docs)
-    for path in scanned:
-        if not path.is_file() or path.suffix not in {".py", ".md"}:
-            continue
+    for path in _tracked_public_text_files():
         rel = path.relative_to(ROOT).as_posix()
-        if rel == "tests/test_public_boundary.py":
-            continue
-        if rel.startswith(allowed):
-            continue
         lines = path.read_text(encoding="utf-8").splitlines()
         for line_number, line in enumerate(lines, 1):
             if ticket_pattern.search(line):

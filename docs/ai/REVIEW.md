@@ -10,7 +10,7 @@ read-only, diff-line, duplicate, and output-format constraints still win.
 ## What Vexic is
 
 Python 3.13, managed with `uv`. Core is `src/vexic`: an executable public
-contract (`contract/__init__.py`), a local SQLite reference service
+contract (`src/vexic/contract/__init__.py`), a local SQLite reference service
 (`LocalMemoryService`), storage tiers under `storage/**`, host-supplied ports
 (`ports.py`), and the promotion/redaction pipeline. Hosted
 FastAPI + MCP adapters (`hosted*.py`, `*_http.py`, `*_mcp.py`) are multi-tenant
@@ -56,7 +56,7 @@ mint/exchange response (ADR 0026).
 reading provider secrets/env or wiring provider SDKs instead of host ports (a
 missing port must fail closed with `HostPortNotConfigured` via
 `missing_host_port`; `run_dream_phase` is host-port-only); a contract change in
-`contract/__init__.py` without a matching `CONTRACT_VERSION` bump or tests;
+`src/vexic/contract/__init__.py` without a matching `CONTRACT_VERSION` bump or tests;
 storage correct on SQLite but broken on libSQL/Turso - cursor lifecycle,
 iteration after a caught exception, or transaction semantics (ADR 0019); a
 missing capability check on a scoped operation; a fact or candidate destroyed
@@ -100,7 +100,7 @@ stdlib or a one-line solution over a new abstraction).
    skill, constraint, context`.
 8. Host ports own all LLM/provider work (`ports.py`); core never reads provider
    secrets or wires provider SDKs.
-9. `contract/__init__.py` is the executable contract source of truth (version,
+9. `src/vexic/contract/__init__.py` is the executable contract source of truth (version,
    `MemoryScope`, `MemoryCapability`, models, redaction, `MemoryService`);
    markdown follows code.
 10. No private tracker / source-host identifiers (e.g. Linear/COA issue IDs,
@@ -134,9 +134,10 @@ risk).
 - Do not run the live provider smoke (`vexic.live_retrieval_baseline`); it is
   opt-in behind `--allow-live` and `OPENROUTER_API_KEY`. Out of scope.
 - Hook awareness: Claude runtime hooks are local-only and are not committed.
-  `scripts/check_doc_drift.py --ci` is the committed ADR-index and
-  service-surface parity check. Verify any change weakening local guardrails
-  manually.
+  `scripts/check_doc_drift.py --ci` is the committed doc-drift gate: ADR-index
+  and service-surface parity, plus path, CLI, ADR-id, test-count, and
+  environment-variable references in the living docs. Verify any change
+  weakening local guardrails manually.
 - `expand_history` has no dedicated audit hook on the local stdio path yet;
   treat any change that widens that egress as high-risk until audit coverage
   exists.
@@ -171,7 +172,7 @@ and posts.
 - **Full 6 sub-agents** - 6+ files or more than 300 changed lines, or any
   security-sensitive or cross-cutting work; scale toward six as domain spread
   grows and shard by independent domain (never point all six at the same files):
-  1. Contract & scope - `contract/__init__.py`, `MemoryScope` /
+  1. Contract & scope - `src/vexic/contract/__init__.py`, `MemoryScope` /
      `MemoryCapability`, tenant isolation, redaction requirements,
      `CONTRACT_VERSION`.
   2. Storage & schema - `storage/**`, `schema.py`, `migration.py`, the

@@ -2,7 +2,6 @@ import contextlib
 import hashlib
 import importlib.util
 import os
-from contextlib import closing
 from datetime import datetime
 
 import pytest
@@ -27,7 +26,8 @@ _HAS_TURSO = bool(_TURSO_URL and _TURSO_TOKEN and importlib.util.find_spec("libs
 def test_fake_rejects_named_params_and_row_factory():
     c = FakeLibsqlConn()
     c.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
-    c.execute("INSERT INTO t (v) VALUES (?)", ("x",)); c.commit()
+    c.execute("INSERT INTO t (v) VALUES (?)", ("x",))
+    c.commit()
     assert c.execute("SELECT v FROM t").fetchone() == ("x",)
     with pytest.raises(AttributeError):
         c.enable_load_extension(True)
@@ -1185,9 +1185,9 @@ def test_replacement_scope_unrelated_valueerror_still_propagates(monkeypatch, tm
 
 
 # ---------------------------------------------------------------------------
-# In-process auth cache in front of a remote (StorageTarget) control
-# plane. Each authenticate() otherwise costs a network round-trip per
-# _load_key; the cache serves within a short TTL and is evicted on revoke.
+# Remote (StorageTarget) authentication. Each authenticate() deliberately
+# re-reads the revocable record so a CLI process or peer replica's revoke takes
+# effect immediately; last-used writes are still throttled independently.
 
 
 def _patch_connect_counting(monkeypatch, fake_conn: FakeLibsqlConn) -> dict:
@@ -1218,7 +1218,7 @@ def _remote_key_store(monkeypatch, tmp_path):
     return keys, provisioned, counter
 
 
-def test_auth_cache_hit_skips_control_plane_reads(monkeypatch, tmp_path):
+def test_remote_auth_rechecks_control_plane_on_every_request(monkeypatch, tmp_path):
     keys, provisioned, counter = _remote_key_store(monkeypatch, tmp_path)
 
     before = counter["n"]
@@ -1227,37 +1227,37 @@ def test_auth_cache_hit_skips_control_plane_reads(monkeypatch, tmp_path):
     after_first = counter["n"]
     assert after_first > before  # first auth reached the control plane
 
-    # Repeated auth within the TTL is served from cache: no new connections.
+    # Every authentication re-reads revocable state. This intentionally costs
+    # one remote read per request so another process's revoke is authoritative.
     keys.authenticate(provisioned.raw_key)
+    after_second = counter["n"]
     keys.authenticate(provisioned.raw_key)
-    assert counter["n"] == after_first
-    assert provisioned.key_id in keys._auth_cache
+    assert after_second > after_first
+    assert counter["n"] > after_second
 
 
-def test_auth_cache_expiry_refetches(monkeypatch, tmp_path):
-    keys, provisioned, counter = _remote_key_store(monkeypatch, tmp_path)
-    keys._AUTH_CACHE_TTL_SECONDS = -1.0  # every entry is immediately stale
-
-    keys.authenticate(provisioned.raw_key)
-    after_first = counter["n"]
-    keys.authenticate(provisioned.raw_key)
-    assert counter["n"] > after_first  # stale entry forces a re-read
-
-
-def test_revoke_evicts_auth_cache(monkeypatch, tmp_path):
+def test_remote_auth_observes_revoke_from_another_store(monkeypatch, tmp_path):
     keys, provisioned, _counter = _remote_key_store(monkeypatch, tmp_path)
+    target = keys._control_target
+    assert isinstance(target, StorageTarget)
+    revoker = HostedApiKeyStore(control_target=target)
 
     keys.authenticate(provisioned.raw_key)
-    assert provisioned.key_id in keys._auth_cache
-
-    keys.revoke_key(provisioned.key_id)
-    assert provisioned.key_id not in keys._auth_cache
+    revoker.revoke_key(provisioned.key_id, revoked_by="operator-cli")
     with pytest.raises(PermissionError):
         keys.authenticate(provisioned.raw_key)
 
 
-def test_local_control_plane_is_not_auth_cached(tmp_path):
-    # Local file control plane: auth reads a local sqlite file, no cache.
+def test_same_store_revoke_denies_authentication(monkeypatch, tmp_path):
+    keys, provisioned, _counter = _remote_key_store(monkeypatch, tmp_path)
+
+    keys.authenticate(provisioned.raw_key)
+    keys.revoke_key(provisioned.key_id)
+    with pytest.raises(PermissionError):
+        keys.authenticate(provisioned.raw_key)
+
+
+def test_local_control_plane_authenticates_without_remote_state(tmp_path):
     keys = HostedApiKeyStore(tmp_path)
     provisioned = keys.create_key(
         tenant_id="tenant-a",
@@ -1265,5 +1265,4 @@ def test_local_control_plane_is_not_auth_cached(tmp_path):
         capabilities={MemoryCapability.SEARCH},
         project_ids={"project-a"},
     )
-    keys.authenticate(provisioned.raw_key)
-    assert keys._auth_cache == {}
+    assert keys.authenticate(provisioned.raw_key).key_id == provisioned.key_id

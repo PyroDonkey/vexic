@@ -214,6 +214,57 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "limit must be at least 1"):
             search_messages(self.db_path, "cedar", limit=0)
 
+    async def test_append_transcript_rejects_harness_envelope(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        envelope = ModelRequest(
+            parts=[
+                UserPromptPart(
+                    content=(
+                        "<command-name>/clear</command-name>\n"
+                        "<command-message>clear</command-message>"
+                    )
+                )
+            ]
+        )
+
+        with self.assertRaisesRegex(ValueError, "command envelope"):
+            await service.append_transcript(
+                AppendTranscriptRequest(
+                    scope=_scope(capabilities={MemoryCapability.WRITE}),
+                    messages_json=[
+                        single_message_adapter.dump_json(envelope).decode()
+                    ],
+                    redaction=RedactionContext(forbidden_values=()),
+                )
+            )
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 0)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0],
+                0,
+            )
+
+    def test_save_messages_preflights_entire_batch_before_connect(self) -> None:
+        messages = [
+            ModelRequest(parts=[UserPromptPart(content="clean cedar")]),
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content="<local-command-stdout>hidden</local-command-stdout>"
+                    )
+                ]
+            ),
+        ]
+
+        with patch("vexic.storage.transcript.connect") as connect_mock:
+            with self.assertRaisesRegex(ValueError, "command envelope"):
+                save_messages(self.db_path, messages)
+        connect_mock.assert_not_called()
+
     async def test_search_long_term_uses_default_embedder_for_facts(self) -> None:
         from vexic.service import LocalMemoryService
 
@@ -1905,6 +1956,70 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                 conn.execute("SELECT COUNT(*) FROM source_transcript_ledger").fetchone()[0],
                 1,
             )
+
+    async def test_ingest_source_transcript_rejects_harness_envelope_rows(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+
+        def source_message(source_message_id: str, text: str) -> SourceTranscriptMessage:
+            return SourceTranscriptMessage(
+                source_host="claude-code",
+                source_session_id="session-1",
+                source_message_id=source_message_id,
+                message_json=single_message_adapter.dump_json(
+                    ModelRequest(parts=[UserPromptPart(content=text)])
+                ).decode(),
+            )
+
+        result = await service.ingest_source_transcript(
+            IngestSourceTranscriptRequest(
+                scope=_scope().model_copy(
+                    update={"capabilities": {MemoryCapability.WRITE}}
+                ),
+                messages=[
+                    source_message(
+                        "command-envelope",
+                        "<command-name>/clear</command-name>\n"
+                        "<command-message>clear</command-message>\n"
+                        "<command-args></command-args>",
+                    ),
+                    source_message(
+                        "command-stdout",
+                        "<local-command-stdout>Set model</local-command-stdout>",
+                    ),
+                    source_message(
+                        "paired-reminder",
+                        # A well-formed reminder block at the boundary means the
+                        # recorder guard was bypassed: reject, never strip.
+                        "real text\n<system-reminder>hidden</system-reminder>",
+                    ),
+                    source_message(
+                        "unpaired-reminder",
+                        "real text\n<system-reminder>\nunterminated",
+                    ),
+                    source_message("clean", "clean cedar"),
+                ],
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+
+        self.assertEqual(
+            [row.status for row in result.items],
+            ["rejected", "rejected", "rejected", "rejected", "inserted"],
+        )
+        self.assertEqual(
+            [row.reason for row in result.items[:4]],
+            [
+                "claude-code command envelope is not transcript text",
+                "claude-code command envelope is not transcript text",
+                "system-reminder block is not transcript text",
+                "system-reminder block is not transcript text",
+            ],
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 1)
 
     async def test_ingest_source_transcript_rejects_forbidden_source_keys(self) -> None:
         from vexic.service import LocalMemoryService

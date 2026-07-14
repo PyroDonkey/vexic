@@ -66,6 +66,40 @@ _RETRYABLE_MARKERS = (
     "sqlite_cantopen",
 )
 
+# Errors produced specifically by parsing an FTS5 MATCH expression. Search
+# callers intentionally degrade these to no hits because the query cannot be
+# evaluated. Other operational faults (missing tables, connectivity, busy
+# databases, deadlines) must propagate so an availability failure never looks
+# like an authoritative empty result.
+_MALFORMED_FTS_MARKERS = (
+    "malformed match",
+    "fts5: syntax error",
+    "unterminated string",
+    "unterminated quote",
+)
+
+
+class QueryDeadlineExceeded(ValueError):
+    """A remote storage call could not complete within its availability bound.
+
+    This covers a remote libSQL query deadline and bounded prerequisite work
+    such as resolving its short-lived database token (ADR 0019 Addendum 7).
+    Subclasses :class:`ValueError` so hosted HTTP boundaries route it through
+    the retryable 503 ``storage_unavailable`` path. The classifiers recognize
+    it by type, not message. The message must never embed SQL text, parameters,
+    credentials, or transport details.
+    """
+
+
+class MutationOutcomeUnknown(ValueError):
+    """A timed-out remote mutation may have committed after the deadline.
+
+    Unlike :class:`QueryDeadlineExceeded`, this fault is deliberately not
+    retryable: the driver exposes no safe cancellation primitive, so blindly
+    retrying could duplicate an append-only transcript row or another durable
+    observation. The message never includes SQL or parameters.
+    """
+
 
 def _is_reaped_stream_error(message: str) -> bool:
     """True for the Hrana ``api error`` 404 raised when Turso reaps an idle
@@ -76,6 +110,17 @@ def _is_reaped_stream_error(message: str) -> bool:
     is not reclassified as a storage fault. ``message`` is lowercased.
     """
     return "hrana" in message and "stream not found" in message
+
+
+def _is_remote_connect_error(message: str) -> bool:
+    """True for the Hrana ``http error`` raised when the driver cannot reach
+    the remote at all (DNS failure, refused, or black-holed TCP connect --
+    observed live 2026-07-13). The remote being unreachable is transient from
+    the caller's viewpoint, so it classifies as retryable. Requires the Hrana
+    payload context so a domain ``ValueError`` that merely mentions connecting
+    is not reclassified. ``message`` is lowercased.
+    """
+    return "hrana" in message and "error trying to connect" in message
 
 
 def _message(exc: BaseException) -> str:
@@ -117,11 +162,15 @@ def is_operational_error(exc: BaseException) -> bool:
     """
     if isinstance(exc, sqlite3.OperationalError):
         return True
+    if isinstance(exc, (MutationOutcomeUnknown, QueryDeadlineExceeded)):
+        return True
     if isinstance(exc, ValueError):
         message = _message(exc).lower()
-        return any(
-            marker.lower() in message for marker in _OPERATIONAL_MARKERS
-        ) or _is_reaped_stream_error(message)
+        return (
+            any(marker.lower() in message for marker in _OPERATIONAL_MARKERS)
+            or _is_reaped_stream_error(message)
+            or _is_remote_connect_error(message)
+        )
     return False
 
 
@@ -134,11 +183,40 @@ def is_retryable_operational_error(exc: BaseException) -> bool:
     form. A non-retryable operational error (e.g. a syntax error) returns
     ``False``; non-storage exceptions return ``False``.
     """
+    if isinstance(exc, QueryDeadlineExceeded):
+        return True
+    if isinstance(exc, MutationOutcomeUnknown):
+        return False
     if isinstance(exc, sqlite3.OperationalError) or (
         isinstance(exc, ValueError) and is_operational_error(exc)
     ):
         message = _message(exc).lower()
-        return any(
-            marker in message for marker in _RETRYABLE_MARKERS
-        ) or _is_reaped_stream_error(message)
+        return (
+            any(marker in message for marker in _RETRYABLE_MARKERS)
+            or _is_reaped_stream_error(message)
+            or _is_remote_connect_error(message)
+        )
     return False
+
+
+def is_malformed_fts_query_error(exc: BaseException) -> bool:
+    """True only for an invalid FTS5 MATCH expression.
+
+    SQLite reports these as :class:`sqlite3.OperationalError`; hosted libSQL
+    reports the same messages inside a bare Hrana :class:`ValueError`. The
+    narrow message check is intentional: callers may treat malformed free-text
+    search as no hits, but must not swallow an unavailable or corrupt backend.
+    """
+    if not isinstance(exc, (sqlite3.OperationalError, ValueError)):
+        return False
+    if isinstance(exc, (MutationOutcomeUnknown, QueryDeadlineExceeded)):
+        return False
+    message = _message(exc).lower()
+    if isinstance(exc, ValueError) and not message.lstrip().startswith("hrana: `"):
+        # A bare domain ValueError can contain parser-like wording too. The
+        # hosted driver form is recognizable by its Hrana envelope; without
+        # that context it must propagate rather than masquerade as no hits.
+        return False
+    return any(marker in message for marker in _MALFORMED_FTS_MARKERS) or (
+        "no such column:" in message and "match clause" in message
+    )

@@ -17,9 +17,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType
-from typing import Awaitable, Callable, Protocol, TypeVar
+from typing import Any, Awaitable, Callable, Protocol, TypeVar
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 from vexic.contract import (
     AppendTranscriptRequest,
     AppendTranscriptResult,
@@ -68,6 +68,11 @@ from vexic.service import (
     _run_dream_phase_with_usage as _run_local_dream_phase_with_usage,
 )
 from vexic.storage.connection import StorageTarget
+from vexic.storage.errors import (
+    is_operational_error,
+    is_retryable_operational_error,
+    is_unique_violation,
+)
 from vexic.usage import UsageSummary
 
 
@@ -228,7 +233,7 @@ async def _handle_hosted_write(
         scope = _write_scope_from_headers(request, auth)
         payload = build(scope)
     except PermissionError as exc:
-        service._record_request(
+        service._record_request_failure_best_effort(
             operation,
             None,
             status="error",
@@ -239,27 +244,64 @@ async def _handle_hosted_write(
             return error_response(401, "unauthorized", "Invalid hosted API key.")
         return error_response(403, "permission_denied", str(exc))
     except ValueError as exc:
-        service._record_request(
+        service._record_request_failure_best_effort(
             operation,
             None,
             status="error",
             error_type=type(exc).__name__,
             auth=auth,
         )
+        if isinstance(exc, ValidationError):
+            return error_response(400, "invalid_request", str(exc))
+        storage_error = _hosted_write_storage_error_response(exc, error_response)
+        if storage_error is not None:
+            return storage_error
         return error_response(400, "invalid_request", str(exc))
     except Exception as exc:
-        service._record_request(
+        service._record_request_failure_best_effort(
             operation,
             None,
             status="error",
             error_type=type(exc).__name__,
             auth=auth,
         )
+        storage_error = _hosted_write_storage_error_response(exc, error_response)
+        if storage_error is not None:
+            return storage_error
         return error_response(500, "internal_error", "Hosted memory request failed.")
     cap_error = _hosted_write_cap_error(payload, error_response)
     if cap_error is not None:
         return cap_error
     return await handle_payload(api_key, payload, call)
+
+
+def _hosted_write_storage_error_response(
+    exc: BaseException,
+    error_response: Callable[[int, str, str], object],
+) -> object | None:
+    """Sanitize storage failures raised before the common HTTP handler.
+
+    Header-bound writes authenticate and construct their scope before they
+    enter ``hosted_http._handle_payload``. Remote control-plane failures at
+    that earlier boundary therefore need the same classification here.
+    """
+    if is_retryable_operational_error(exc):
+        logger.warning(
+            "hosted storage error category=retryable_operational exception_type=%s",
+            type(exc).__name__,
+        )
+        return error_response(
+            503,
+            "storage_unavailable",
+            "Hosted storage is temporarily unavailable.",
+        )
+    if is_operational_error(exc) or is_unique_violation(exc) or "hrana" in str(exc).lower():
+        logger.warning(
+            "hosted storage error category=operational exception_type=%s",
+            type(exc).__name__,
+        )
+        return error_response(500, "internal_error", "Hosted memory request failed.")
+    return None
 
 
 def _write_scope_from_headers(request: object, auth: HostedAuthContext) -> MemoryScope:
@@ -720,7 +762,7 @@ class HostedMemoryService:
             self.rate_limiter.check(operation, auth)
             result = self._schedule_dream_trigger(bound, tenant, auth)
         except HostedRateLimitExceeded as exc:
-            self._record_request(
+            self._record_request_failure_best_effort(
                 operation,
                 bound,
                 status="rate_limited",
@@ -729,7 +771,7 @@ class HostedMemoryService:
             )
             raise
         except Exception as exc:
-            self._record_request(
+            self._record_request_failure_best_effort(
                 operation,
                 bound,
                 status="error",
@@ -1209,7 +1251,7 @@ class HostedMemoryService:
             self.rate_limiter.check(operation, auth)
             result = await delegate(bound, tenant)
         except HostedRateLimitExceeded as exc:
-            self._record_request(
+            self._record_request_failure_best_effort(
                 operation,
                 bound,
                 status="rate_limited",
@@ -1218,7 +1260,7 @@ class HostedMemoryService:
             )
             raise
         except Exception as exc:
-            self._record_request(
+            self._record_request_failure_best_effort(
                 operation,
                 bound,
                 status="error",
@@ -1383,6 +1425,30 @@ class HostedMemoryService:
             )
         )
 
+    def _record_request_failure_best_effort(
+        self,
+        operation: str,
+        request: MemoryRequest | None,
+        *,
+        status: str,
+        error_type: str | None = None,
+        auth: HostedAuthContext | None = None,
+    ) -> None:
+        """Record a failed request without replacing its primary exception."""
+        try:
+            self._record_request(
+                operation,
+                request,
+                status=status,
+                error_type=error_type,
+                auth=auth,
+            )
+        except Exception as exc:
+            logger.warning(
+                "hosted failure telemetry error exception_type=%s",
+                type(exc).__name__,
+            )
+
     def record_job_usage(
         self,
         *,
@@ -1528,17 +1594,36 @@ def add_run_dream_phase_subcommand(
     run_phase.add_argument("--secret-env", action="append", default=[])
 
 
-def run_dream_phase_command(args: argparse.Namespace) -> int:
+def run_dream_phase_command(
+    args: argparse.Namespace,
+    *,
+    catalog: Any | None = None,
+    keys: Any | None = None,
+    customer_target_resolver: Callable[[HostedTenant], StorageTarget | None]
+    | None = None,
+) -> int:
+    """Run one dream phase from the operator CLI.
+
+    The CLI entry point (`vexic.hosted_http.main`) builds `catalog`/`keys`/
+    `customer_target_resolver` through the shared `_build_hosted_stores` seam
+    so this command honors `VEXIC_CONTROL_PLANE_TARGET` and
+    `VEXIC_STORAGE_BACKEND` exactly like `create_service_from_env`.
+    The local-filesystem fallback below serves only direct callers in tests.
+    """
     from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 
     root = _hosted_root_arg(args.root)
-    catalog = HostedTenantCatalog(root)
+    if catalog is None:
+        catalog = HostedTenantCatalog(root)
+    if keys is None:
+        keys = HostedApiKeyStore(root)
     service = HostedMemoryService(
         catalog,
-        HostedApiKeyStore(root),
+        keys,
         telemetry=catalog,
         rate_limiter=HostedInMemoryRateLimiter(),
         dream_phase_ports=_dream_phase_ports(args),
+        customer_target_resolver=customer_target_resolver,
     )
     # NOTE(alpha): staging CLI assumes no concurrent tenant writers; add event ids if shared.
     usage_event_offset = len(catalog.usage_events(args.tenant_id))

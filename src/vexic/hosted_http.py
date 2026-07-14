@@ -5,7 +5,7 @@ import hashlib
 import json
 import logging
 import os
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -46,7 +46,11 @@ from vexic.hosted import (
 from vexic.mcp_http import register_mcp_routes
 from vexic.mcp_http import _scope_from_headers as _read_scope_from_headers
 from vexic.ports import HostPortNotConfigured
-from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
+from vexic.hosted_local import (
+    HostedApiKeyStore,
+    HostedTenantCatalog,
+    hosted_auth_request_context,
+)
 from vexic.storage.errors import (
     is_operational_error,
     is_retryable_operational_error,
@@ -72,10 +76,19 @@ class _TursoProvisioning:
 
         return TursoProvisioningPort.from_env(env)
 
-    def build_resolver(self, token_cache: object, *, org: str) -> object:
-        from adapters.turso_adapter import make_customer_target_resolver
+    def build_resolver(
+        self, token_cache: object, *, org: str, env: Mapping[str, str] | None = None
+    ) -> object:
+        from adapters.turso_adapter import (
+            make_customer_target_resolver,
+            query_deadline_from_env,
+        )
 
-        return make_customer_target_resolver(token_cache, org=org)
+        return make_customer_target_resolver(
+            token_cache,
+            org=org,
+            query_deadline_seconds=query_deadline_from_env(env or {}),
+        )
 
     def build_token_cache(self, port: object) -> object:
         from adapters.turso_adapter import TenantTokenCache
@@ -158,21 +171,34 @@ def create_app(
         request: Request,
         call_next: Callable[[Request], Awaitable[object]],
     ) -> object:
-        if request.method in {"POST", "PUT", "PATCH"}:
-            content_length = request.headers.get("content-length")
-            if content_length is not None:
-                try:
-                    body_size = int(content_length)
-                except ValueError:
-                    return _error_response(400, "invalid_request", "Invalid Content-Length header.")
-                if body_size < 0:
-                    return _error_response(400, "invalid_request", "Invalid Content-Length header.")
-                if body_size > MAX_BODY_BYTES:
+        with hosted_auth_request_context():
+            if request.method in {"POST", "PUT", "PATCH"}:
+                content_length = request.headers.get("content-length")
+                if content_length is not None:
+                    try:
+                        body_size = int(content_length)
+                    except ValueError:
+                        return _error_response(
+                            400,
+                            "invalid_request",
+                            "Invalid Content-Length header.",
+                        )
+                    if body_size < 0:
+                        return _error_response(
+                            400,
+                            "invalid_request",
+                            "Invalid Content-Length header.",
+                        )
+                    if body_size > MAX_BODY_BYTES:
+                        return _error_response(
+                            413,
+                            "request_too_large",
+                            "Request body is too large.",
+                        )
+                body = await request.body()
+                if len(body) > MAX_BODY_BYTES:
                     return _error_response(413, "request_too_large", "Request body is too large.")
-            body = await request.body()
-            if len(body) > MAX_BODY_BYTES:
-                return _error_response(413, "request_too_large", "Request body is too large.")
-        return await call_next(request)
+            return await call_next(request)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_: Request, __: RequestValidationError) -> JSONResponse:
@@ -237,7 +263,10 @@ def create_app(
             exchange = service.api_keys.exchange_setup_token(token.strip())
         except PermissionError:
             return _error_response(401, "unauthorized", "Invalid setup token.")
-        except Exception:
+        except Exception as exc:
+            storage_error = _storage_error_response(exc)
+            if storage_error is not None:
+                return storage_error
             return _error_response(500, "internal_error", "Setup token exchange failed.")
         agent_scope = exchange.agent_scope
         return JSONResponse(
@@ -284,20 +313,56 @@ def create_service_from_env(
     including the ``search_long_term`` vector path, fail closed with
     ``HostPortNotConfigured``).
     """
-    backend = resolve_storage_backend(os.environ)
     root = Path(os.environ.get("VEXIC_HOSTED_ROOT", ".hosted-memory"))
     provisioning = turso_provisioning or _TursoProvisioning()
+    catalog, keys, customer_target_resolver = _build_hosted_stores(
+        root, provisioning=provisioning, env=os.environ
+    )
+    if resolve_storage_backend(os.environ) == "turso":
+        if os.environ.get("VEXIC_PROVISION_EXISTING_TURSO_TARGETS", "").strip() == "1":
+            catalog.provision_missing_customer_targets()
+        _ensure_dogfood_tenant_target(catalog)
+    return HostedMemoryService(
+        catalog,
+        keys,
+        telemetry=catalog,
+        rate_limiter=HostedInMemoryRateLimiter(),
+        dream_phase_ports=dream_phase_ports_from_env(os.environ),
+        customer_target_resolver=customer_target_resolver,
+    )
+
+
+def _build_hosted_stores(
+    root: Path,
+    *,
+    provisioning: _TursoProvisioning,
+    env: Mapping[str, str],
+    customer_memory: bool = True,
+) -> tuple[HostedTenantCatalog, HostedApiKeyStore, object | None]:
+    """Build the catalog, API-key store, and customer-target resolver from the
+    `VEXIC_CONTROL_PLANE_TARGET` / `VEXIC_STORAGE_BACKEND` flags.
+
+    This is the single seam both `create_service_from_env` and the operator
+    CLI (`main`) go through, so runbook commands and the serving app always
+    resolve the same control plane from the same environment.
+
+    ``customer_memory=False`` skips the `VEXIC_STORAGE_BACKEND` branch
+    entirely: control-plane-only commands (`revoke-key`) must never be blocked
+    by missing customer-provisioning configuration (`TURSO_ORG`, platform API
+    token), or a production revocation could fail before the key is revoked.
+    """
+    backend = resolve_storage_backend(env) if customer_memory else "local"
     # Control-plane target is independent of the customer-memory backend
     # (ADR 0019 Addendum 4): `turso` routes the catalog + API-key
     # store to the managed libSQL control-plane database; `local` (default)
     # keeps the filesystem `control-plane.db`. `None` here means local.
     control_target = None
-    if resolve_control_plane_target(os.environ) == "turso":
-        control_target = provisioning.build_control_plane_target(dict(os.environ))
+    if resolve_control_plane_target(env) == "turso":
+        control_target = provisioning.build_control_plane_target(dict(env))
     customer_target_resolver = None
     if backend == "turso":
-        org = os.environ["TURSO_ORG"].strip()
-        port = provisioning.build_port(dict(os.environ))
+        org = env["TURSO_ORG"].strip()
+        port = provisioning.build_port(dict(env))
         catalog = HostedTenantCatalog(
             root,
             control_target=control_target,
@@ -307,21 +372,11 @@ def create_service_from_env(
         )
         keys = HostedApiKeyStore(root, control_target=control_target)
         cache = provisioning.build_token_cache(port)
-        if os.environ.get("VEXIC_PROVISION_EXISTING_TURSO_TARGETS", "").strip() == "1":
-            catalog.provision_missing_customer_targets()
-        _ensure_dogfood_tenant_target(catalog)
-        customer_target_resolver = provisioning.build_resolver(cache, org=org)
+        customer_target_resolver = provisioning.build_resolver(cache, org=org, env=env)
     else:
         catalog = HostedTenantCatalog(root, control_target=control_target)
         keys = HostedApiKeyStore(root, control_target=control_target)
-    return HostedMemoryService(
-        catalog,
-        keys,
-        telemetry=catalog,
-        rate_limiter=HostedInMemoryRateLimiter(),
-        dream_phase_ports=dream_phase_ports_from_env(os.environ),
-        customer_target_resolver=customer_target_resolver,
-    )
+    return catalog, keys, customer_target_resolver
 
 
 def _ensure_dogfood_tenant_target(catalog: HostedTenantCatalog) -> None:
@@ -412,7 +467,10 @@ async def _handle_search(
         return _error_response(403, "permission_denied", str(exc))
     except ValueError as exc:
         return _value_error_response(exc)
-    except Exception:
+    except Exception as exc:
+        storage_error = _storage_error_response(exc)
+        if storage_error is not None:
+            return storage_error
         return _error_response(500, "internal_error", "Hosted memory request failed.")
     return await _handle_payload(api_key, payload, call)
 
@@ -448,7 +506,10 @@ async def _handle_fresh_context(
         return _error_response(403, "permission_denied", str(exc))
     except ValueError as exc:
         return _value_error_response(exc)
-    except Exception:
+    except Exception as exc:
+        storage_error = _storage_error_response(exc)
+        if storage_error is not None:
+            return storage_error
         return _error_response(500, "internal_error", "Hosted memory request failed.")
     return await _handle_payload(api_key, payload, service.fresh_context)
 
@@ -489,7 +550,10 @@ async def _handle_expand_history(
         return _error_response(403, "permission_denied", str(exc))
     except ValueError as exc:
         return _value_error_response(exc)
-    except Exception:
+    except Exception as exc:
+        storage_error = _storage_error_response(exc)
+        if storage_error is not None:
+            return storage_error
         return _error_response(500, "internal_error", "Hosted memory request failed.")
     return await _handle_payload(
         api_key,
@@ -534,7 +598,10 @@ async def _handle_load_active_context(
         return _error_response(403, "permission_denied", str(exc))
     except ValueError as exc:
         return _value_error_response(exc)
-    except Exception:
+    except Exception as exc:
+        storage_error = _storage_error_response(exc)
+        if storage_error is not None:
+            return storage_error
         return _error_response(500, "internal_error", "Hosted memory request failed.")
     return await _handle_payload(api_key, payload, service.load_active_context)
 
@@ -599,7 +666,12 @@ async def _handle_trigger_dream_phase(
         if str(exc) == "Invalid hosted API key.":
             return _error_response(401, "unauthorized", "Invalid hosted API key.")
         return _error_response(403, "permission_denied", str(exc))
-    except Exception:
+    except ValueError as exc:
+        return _value_error_response(exc)
+    except Exception as exc:
+        storage_error = _storage_error_response(exc)
+        if storage_error is not None:
+            return storage_error
         return _error_response(500, "internal_error", "Hosted memory request failed.")
 
     try:
@@ -638,7 +710,10 @@ async def _handle_trigger_dream_phase(
         return _error_response(403, "permission_denied", str(exc))
     except ValueError as exc:
         return _value_error_response(exc)
-    except Exception:
+    except Exception as exc:
+        storage_error = _storage_error_response(exc)
+        if storage_error is not None:
+            return storage_error
         return _error_response(500, "internal_error", "Hosted memory request failed.")
     return JSONResponse(result.model_dump(mode="json"), status_code=202)
 
@@ -681,6 +756,19 @@ def _value_error_response(exc: ValueError) -> JSONResponse:
     """
     if isinstance(exc, ValidationError):
         return _error_response(400, "invalid_request", str(exc))
+    storage_error = _storage_error_response(exc)
+    if storage_error is not None:
+        return storage_error
+    return _error_response(400, "invalid_request", str(exc))
+
+
+def _storage_error_response(exc: BaseException) -> JSONResponse | None:
+    """Return a sanitized response for a recognized storage failure.
+
+    Unlike ``_value_error_response``, this accepts typed sqlite exceptions as
+    well as libSQL's bare ``ValueError`` so early auth/setup boundaries cannot
+    accidentally downgrade a retryable backend outage to a generic 500.
+    """
     if is_retryable_operational_error(exc):
         _log_storage_value_error("retryable_operational", exc)
         return _error_response(
@@ -691,10 +779,10 @@ def _value_error_response(exc: ValueError) -> JSONResponse:
     if is_operational_error(exc) or is_unique_violation(exc) or "hrana" in str(exc).lower():
         _log_storage_value_error("operational", exc)
         return _error_response(500, "internal_error", "Hosted memory request failed.")
-    return _error_response(400, "invalid_request", str(exc))
+    return None
 
 
-def _log_storage_value_error(category: str, exc: ValueError) -> None:
+def _log_storage_value_error(category: str, exc: BaseException) -> None:
     logger.warning(
         "hosted storage error category=%s exception_type=%s",
         category,
@@ -730,7 +818,10 @@ async def _handle_payload(
         return _error_response(403, "permission_denied", str(exc))
     except ValueError as exc:
         return _value_error_response(exc)
-    except Exception:
+    except Exception as exc:
+        storage_error = _storage_error_response(exc)
+        if storage_error is not None:
+            return storage_error
         return _error_response(500, "internal_error", "Hosted memory request failed.")
     return JSONResponse(result.model_dump(mode="json"))
 
@@ -877,7 +968,11 @@ def _capabilities(values: list[str]) -> set[MemoryCapability]:
     return {MemoryCapability(value) for value in values}
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    turso_provisioning: _TursoProvisioning | None = None,
+) -> int:
     parser = argparse.ArgumentParser(description="Manage the Vexic hosted alpha adapter.")
     subcommands = parser.add_subparsers(dest="command", required=True)
 
@@ -899,14 +994,24 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        if args.command == "run-dream-phase":
-            return run_dream_phase_command(args)
-
         root = _root_arg(args.root)
-        keys = HostedApiKeyStore(root)
+        provisioning = turso_provisioning or _TursoProvisioning()
+        catalog, keys, customer_target_resolver = _build_hosted_stores(
+            root,
+            provisioning=provisioning,
+            env=os.environ,
+            customer_memory=args.command != "revoke-key",
+        )
+
+        if args.command == "run-dream-phase":
+            return run_dream_phase_command(
+                args,
+                catalog=catalog,
+                keys=keys,
+                customer_target_resolver=customer_target_resolver,
+            )
 
         if args.command == "issue-key":
-            catalog = HostedTenantCatalog(root)
             catalog.provision_tenant(args.tenant_id, project_ids=set(args.project_id))
             api_key = keys.create_key(
                 tenant_id=args.tenant_id,
@@ -931,9 +1036,15 @@ def main(argv: list[str] | None = None) -> int:
         keys.revoke_key(args.key_id, revoked_by=args.revoked_by)
         print(json.dumps({"key_id": args.key_id, "revoked": True}, sort_keys=True))
         return 0
-    except (HostPortNotConfigured, PermissionError, ValueError) as exc:
+    except (HostPortNotConfigured, PermissionError) as exc:
         parser.exit(2, f"{exc}\n")
     except Exception as exc:
+        if is_retryable_operational_error(exc):
+            parser.exit(1, "Hosted storage is temporarily unavailable.\n")
+        if is_operational_error(exc) or is_unique_violation(exc) or "hrana" in str(exc).lower():
+            parser.exit(1, "Hosted command failed due to a storage error.\n")
+        if isinstance(exc, ValueError):
+            parser.exit(2, f"{exc}\n")
         parser.exit(1, f"hosted command failed: {type(exc).__name__}: {exc}\n")
 
 

@@ -13,6 +13,7 @@ Key types: :class:`MemoryService` (the operation protocol),
 
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from typing import ClassVar, Literal, Protocol, Self, runtime_checkable
 
@@ -25,6 +26,44 @@ CONTRACT_VERSION = "0.1.0"
 # guard so injected priming text can never re-enter Tier 1 transcript storage
 # and, downstream, Light extraction (WI-6).
 PRIME_CONTEXT_HEADER = "Vexic memory priming:"
+
+# Claude Code harness command envelopes (slash-command invocations and their
+# stdout). Rows carrying any of these markers are harness noise, never
+# conversation; recorders drop them and ingest rejects them so they cannot
+# reach Tier 1 transcript storage (Memory Invariant #2, ADR 0034).
+HARNESS_ENVELOPE_MARKERS = (
+    "<command-name>",
+    "<command-message>",
+    "<command-args>",
+    "<local-command-stdout>",
+)
+
+# Harness-attached reminder blocks may share a user turn with genuine user
+# text; recorders strip the paired blocks and keep the rest. A tag that
+# survives stripping (unpaired or seen at the ingest boundary) marks the
+# whole message as harness noise (ADR 0034).
+SYSTEM_REMINDER_OPEN = "<system-reminder>"
+SYSTEM_REMINDER_CLOSE = "</system-reminder>"
+
+_SYSTEM_REMINDER_BLOCK = re.compile(
+    re.escape(SYSTEM_REMINDER_OPEN) + ".*?" + re.escape(SYSTEM_REMINDER_CLOSE),
+    flags=re.DOTALL,
+)
+
+
+def strip_system_reminder_blocks(text: str) -> str:
+    """Remove paired system-reminder blocks, keeping surrounding text."""
+    return _SYSTEM_REMINDER_BLOCK.sub("", text).strip()
+
+
+def harness_envelope_reason(text: str) -> str | None:
+    """Reason ``text`` is harness-injected envelope noise, or None if clean."""
+    for marker in HARNESS_ENVELOPE_MARKERS:
+        if marker in text:
+            return "claude-code command envelope is not transcript text"
+    if SYSTEM_REMINDER_OPEN in text or SYSTEM_REMINDER_CLOSE in text:
+        return "system-reminder block is not transcript text"
+    return None
 
 
 class ContractVersion(StrEnum):

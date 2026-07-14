@@ -48,6 +48,8 @@ index (and the reverse).
 | 0030 | The hosted service schedules per-tenant dreaming itself with an in-server sweeper | accepted |
 | 0031 | Light drops miscited candidates instead of failing the batch | accepted (Context corrected: it did not cause the 2026-07 hosted Light failures; see ADR 0032) |
 | 0032 | The dream in-flight lock is a durable control-plane lease | accepted |
+| 0033 | Versioned docs do not record deployed state | accepted |
+| 0034 | Claude Code harness envelopes are filtered, not ingested | accepted |
 
 Notes:
 
@@ -99,8 +101,9 @@ Notes:
   carry forward.
 - 0018 settles COA-262: the default Claude Code read path is SessionStart
   priming from the existing recorder config plus an opt-in MCP on-demand pull
-  leg. UserPromptSubmit relevance injection and a dedicated no-query priming
-  endpoint stay deferred.
+  leg. UserPromptSubmit relevance injection stays deferred; the no-query
+  priming endpoint it also deferred shipped later as ADR 0024's
+  `fresh_context`.
 - 0020 settles COA-275 and extends 0016's LLM-floor reduction: REM becomes a
   local deterministic embedding-centrality heuristic, the REM agent port and
   adapter symbol are deleted, and the remaining dream-phase LLM legs are Light

@@ -19,6 +19,7 @@ Turso credentials.
 from __future__ import annotations
 
 import sqlite3
+import threading
 from typing import Any
 
 
@@ -34,7 +35,10 @@ class FakeLibsqlConn:
     """Minimal stand-in for a managed libSQL connection, backed by sqlite3."""
 
     def __init__(self) -> None:
-        self._conn = sqlite3.connect(":memory:")
+        # check_same_thread=False: the real driver has no sqlite3-style
+        # same-thread restriction, and the query-deadline wrapper (ADR 0019 Addendum 7)
+        # legitimately invokes driver calls from a worker thread.
+        self._conn = sqlite3.connect(":memory:", check_same_thread=False)
 
     def execute(self, sql: str, parameters: Any = (), /) -> Any:
         _reject_dict_params(parameters)
@@ -86,3 +90,51 @@ class FakeLibsqlConn:
             "(the managed libSQL connection exposes no settable row_factory; "
             "use vexic.storage.connection.rows_as_dicts instead)"
         )
+
+
+class _HangingCursor:
+    """Cursor whose round-trips block on the shared gate."""
+
+    def __init__(self, cursor: Any, gate: threading.Event) -> None:
+        self._cursor = cursor
+        self._gate = gate
+
+    def execute(self, sql: str, parameters: Any = (), /) -> Any:
+        self._gate.wait()
+        return self._cursor.execute(sql, parameters)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._cursor, name)
+
+
+class HangingLibsqlConn(FakeLibsqlConn):
+    """A ``FakeLibsqlConn`` whose driver calls block until ``gate`` is set.
+
+    Models the deadline-wrapper failure mode (ADR 0019 Addendum 7): a degraded/black-holed remote where the
+    query round-trip never returns. Tests hold the gate closed to simulate the
+    hang and set it in teardown so the abandoned worker thread exits.
+    """
+
+    def __init__(self, gate: threading.Event) -> None:
+        super().__init__()
+        self._gate = gate
+        self.close_calls = 0
+
+    def execute(self, sql: str, parameters: Any = (), /) -> Any:
+        self._gate.wait()
+        return super().execute(sql, parameters)
+
+    def cursor(self) -> Any:
+        return _HangingCursor(super().cursor(), self._gate)
+
+    def executemany(self, sql: str, parameters: Any, /) -> Any:
+        self._gate.wait()
+        return super().executemany(sql, parameters)
+
+    def commit(self) -> None:
+        self._gate.wait()
+        super().commit()
+
+    def close(self) -> None:
+        self.close_calls += 1
+        super().close()

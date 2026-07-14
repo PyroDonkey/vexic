@@ -97,7 +97,7 @@ characters.
 
 ### Native Agent Memory
 
-[ADR 0004](docs/adr/0004-native-agent-memory-is-host-integration-policy.md)
+[ADR 0004](adr/0004-native-agent-memory-is-host-integration-policy.md)
 treats runtime-native memory suppression as host integration policy. When Claude
 Code, Codex, or another local agent is connected to Vexic, disable that
 runtime's own durable memory where the runtime exposes a supported switch. Vexic
@@ -135,7 +135,7 @@ memory ingested through its recorder or importer path. Runtime-local memory
 remains outside Vexic replay, export, redaction, and deletion semantics.
 For the host transcript recorder flow, see
 [Claude Code Transcript Import](#claude-code-transcript-import) and
-[ADR 0002](docs/adr/0002-host-recorders-ingest-complete-cleaned-transcripts.md).
+[ADR 0002](adr/0002-host-recorders-ingest-complete-cleaned-transcripts.md).
 
 ## Claude Code Transcript Import
 
@@ -295,6 +295,13 @@ Fixture rows are JSONL objects with `id`, `transcript`, `question`, and
 "assistant", "content": "..." }` objects mapped from a host-supplied
 LongMemEval_S artifact. Do not vendor the benchmark artifact into this repo.
 
+`tests/fixtures/extraction_task_transcript_smoke.jsonl` is a committed
+synthetic fixture for Light extraction: one assistant-heavy working-session
+row (the transcript shape that once extracted zero candidates) and one
+stated-preference row as a regression guard. Run it through the same command
+with `--max-messages-per-row 15`; the extraction guard is a nonzero Tier 2
+candidate count on both rows.
+
 The harness runs each row in a disposable SQLite database and writes
 `retrieval_metrics.json` and `answer_synthesis_metrics.json` under
 `--output-dir`. Retrieval metrics classify failures as extraction miss,
@@ -314,7 +321,7 @@ factories, and measures Tier 3 retrieval quality with per-stage diagnostics.
 ```bash
 # Local, provider-free transcript-FTS run:
 uv run python -m vexic.longmemeval \
-  --dataset data/longmemeval_oracle.json --split oracle \
+  --dataset /path/to/longmemeval_oracle.json --split oracle \
   --output-dir .eval-runs/longmemeval --skip-dream
 
 # Provider-backed judged-recall run (env-driven adapter secrets). The
@@ -324,7 +331,7 @@ uv run python -m vexic.longmemeval \
 OPENROUTER_API_KEY=... VEXIC_LIVE_CLAUDE_MODEL=anthropic/claude-sonnet-5 \
   uv run python -m vexic.longmemeval \
   --allow-live --adapter adapters/openrouter_live_adapter.py \
-  --dataset data/longmemeval_s_cleaned.json --split s \
+  --dataset /path/to/longmemeval_s_cleaned.json --split s \
   --output-dir .eval-runs/longmemeval --answer-mode judged-recall --limit 12
 ```
 
@@ -364,8 +371,9 @@ direct `/v1/search_*` calls instead of guessing a tenant id.
 Claude Code hosted auto-recording is installed with `vexic setup claude-code`.
 It writes cleaned transcript rows through `/v1/ingest_source_transcript` and
 installs a SessionStart priming hook that injects capped hosted memory context
-on new/cleared sessions. It also scaffolds a project MCP entry that, once
-approved in Claude Code, proxies targeted read-only search to hosted `/mcp`.
+on new/cleared sessions. It writes no client MCP config: read-only memory search
+is opt-in (ADR 0027), so setup only *prints* a `claude mcp add vexic -- ...`
+command that you run yourself to connect the local stdio launcher.
 
 The SessionStart primer now leads that injected context with a recap built
 from `POST /v1/fresh_context`: a bounded assembly of the session's summary

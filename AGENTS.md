@@ -183,6 +183,22 @@ Each doc owns one thing. Avoid duplicate status and copied platform history.
 If a doc describes contract fields or operation semantics, verify it against
 `src/vexic/contract` and the relevant tests.
 
+### Docs Do Not Record Deployed State
+
+Deployment state is not a property of this repository (ADR 0033). Versioned docs
+state what the code does, what configuration it reads, and the recipe a
+deployment must follow. They never state what the live service currently has
+set, is currently running, or currently holds on disk, and they never record a
+configuration value read from a live environment.
+
+Recipe, not report: "set `VEXIC_CONTROL_PLANE_TARGET=turso` to route the catalog
+to managed Turso" stays true as long as the code does. "The deployed alpha runs
+`VEXIC_CONTROL_PLANE_TARGET=turso`" is stale the moment someone changes the
+variable, and it rots while still looking authoritative - that is how a stale
+sentence once turned an empty Railway volume into a confident, wrong "the
+service has no traffic." Point the reader at how to check the deployment
+instead of caching the answer in prose.
+
 ### Docs Are Downstream Of Code
 
 In-repo `AGENTS.md` and `docs/adr/*` are authoritative for architecture
@@ -213,9 +229,13 @@ Tracking rules):
   `uv run pytest` and update any tracking doc that cites a test count to the
   fresh number. Do not carry a hand-typed count forward; verify it.
 
-`scripts/check_doc_drift.py` enforces the in-repo half of this loop: it checks
-that `docs/adr/README.md` lists every ADR file and that the documented service
-surface matches `src/vexic`. CI runs it with `--ci` on every PR. A local agent
+`scripts/check_doc_drift.py` enforces the in-repo half of this loop. It checks
+that `docs/adr/README.md` lists every ADR file, that the documented service
+surface matches `src/vexic`, and that the living docs' references still resolve
+against the code: file paths carrying a known suffix (bare directory references
+are not checked), `vexic` CLI commands and their subcommands, cited ADR ids,
+cited test counts, and the environment variables the code actually reads. CI
+runs it with `--ci` on every PR. A local agent
 hook may call the same script, but `.claude/` configuration is machine-local and
 ignored by Git. A hook cannot read the external tracking system, so closing the
 loop against the tracking docs remains a manual step under the triggers above.

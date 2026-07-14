@@ -16,16 +16,16 @@ memory contract gains one additive operation; `CONTRACT_VERSION` stays `0.1.0`.
   serialized transcript messages a host can replay as model message history
   instead of rendered priming text.
 - LongMemEval evaluation harness rehomed into `vexic.longmemeval` with a CLI,
-  host-port judge wiring, and an `--allow-live` provider-call gate (COA-342).
+  host-port judge wiring, and an `--allow-live` provider-call gate.
 - Hosted control-plane catalog can route to Turso behind a flag, with a
-  `migrate_control_plane` migration path (COA-360).
+  `migrate_control_plane` migration path.
 
 ### Changed
 
 - Dream sweeper storage routes through the customer-target resolver, and raised
-  dream-phase output token caps with surfaced sweeper logs (COA-352, COA-355).
+  dream-phase output token caps with surfaced sweeper logs.
 - Hosted ingest storage `ValueError`s are classified as 5xx and surface only a
-  stable error code (COA-356).
+  stable error code.
 
 ### Fixed
 

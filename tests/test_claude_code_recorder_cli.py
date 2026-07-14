@@ -26,6 +26,7 @@ from vexic.contract import (
 from vexic.hosted import HOSTED_WRITE_MAX_CHARS, HostedMemoryService
 from vexic.hosted_http import create_app
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
+from vexic.recorders.claude_code import TranscriptScan
 from vexic.recorders.cli import main as recorder_main
 from vexic.recorders.claude_setup import (
     install_claude_code_setup,
@@ -38,6 +39,26 @@ from vexic.recorders.hosted_prime import (
     fetch_prime_context,
 )
 from vexic.recorders.status import RecorderStatus, write_status
+
+
+def _ingest_result(
+    messages: list[SourceTranscriptMessage],
+    statuses: list[str] | None = None,
+) -> dict[str, object]:
+    resolved_statuses = statuses or ["inserted"] * len(messages)
+    if len(resolved_statuses) != len(messages):
+        raise AssertionError("test result statuses must match messages")
+    return {
+        "items": [
+            {
+                "source_host": message.source_host,
+                "source_session_id": message.source_session_id,
+                "source_message_id": message.source_message_id,
+                "status": status,
+            }
+            for message, status in zip(messages, resolved_statuses, strict=True)
+        ]
+    }
 
 
 class ClaudeCodeRecorderCliTests(unittest.TestCase):
@@ -443,7 +464,7 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
                     return self._data.decode("cp1252", "surrogateescape")
 
             def fake_post(config, *, messages, forbidden_values):
-                return {"items": [{"status": "inserted"} for _ in messages]}
+                return _ingest_result(messages)
 
             with (
                 patch("vexic.recorders.cli.sys.stdin", _WindowsLikeStdin(payload_bytes)),
@@ -495,13 +516,13 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
             def fake_post(config, *, messages, forbidden_values):
                 calls.append(messages)
                 if len(calls) == 1:
-                    return {"items": [{"status": "inserted"} for _ in messages]}
+                    return _ingest_result(messages)
                 if len(calls) == 2:
-                    return {
-                        "items": [{"status": "skipped"} for _ in messages[:-1]]
-                        + [{"status": "rejected"}]
-                    }
-                return {"items": [{"status": "inserted"} for _ in messages]}
+                    return _ingest_result(
+                        messages,
+                        ["skipped"] * (len(messages) - 1) + ["rejected"],
+                    )
+                return _ingest_result(messages)
 
             stdout = io.StringIO()
             with (
@@ -577,12 +598,14 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
 
             def fake_post(config, *, messages, forbidden_values):
                 calls.append(messages)
-                return {"items": [{"status": "inserted"} for _ in messages]}
+                return _ingest_result(messages)
 
             with (
                 patch(
-                    "vexic.recorders.cli.iter_claude_code_source_messages",
-                    return_value=iter(messages),
+                    "vexic.recorders.cli.scan_claude_code_transcript",
+                    return_value=TranscriptScan(
+                        messages=messages, ignored=0, cursor=None, resumed=False
+                    ),
                 ),
                 patch("vexic.recorders.cli.post_source_messages", fake_post),
             ):
@@ -650,8 +673,10 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
 
             with (
                 patch(
-                    "vexic.recorders.cli.iter_claude_code_source_messages",
-                    return_value=iter(messages),
+                    "vexic.recorders.cli.scan_claude_code_transcript",
+                    return_value=TranscriptScan(
+                        messages=messages, ignored=0, cursor=None, resumed=False
+                    ),
                 ),
                 patch("vexic.recorders.cli.post_source_messages") as post_source_messages_mock,
             ):
@@ -1565,7 +1590,7 @@ class ClaudeCodeSetupTests(unittest.TestCase):
 
             def fake_post(config, *, messages, forbidden_values):
                 calls.append((config, messages, forbidden_values))
-                return {"items": [{"status": "inserted"}]}
+                return _ingest_result(messages)
 
             with patch("vexic.recorders.cli.post_source_messages", fake_post):
                 code = recorder_main(
@@ -1666,7 +1691,9 @@ class ClaudeCodeRecorderIngestCommandMoreTests(unittest.TestCase):
             with (
                 patch(
                     "vexic.recorders.cli.post_source_messages",
-                    return_value={"items": [{"status": "inserted"}]},
+                    side_effect=lambda _config, *, messages, forbidden_values: (
+                        _ingest_result(messages)
+                    ),
                 ),
                 patch("vexic.recorders.cli.write_status", side_effect=OSError("disk full")),
             ):
@@ -1828,7 +1855,9 @@ class ClaudeCodeRecorderIngestCommandMoreTests(unittest.TestCase):
 
             with patch(
                 "vexic.recorders.cli.post_source_messages",
-                return_value={"items": [{"status": "inserted"}]},
+                side_effect=lambda _config, *, messages, forbidden_values: (
+                    _ingest_result(messages)
+                ),
             ):
                 code = vexic_main(
                     [

@@ -1,9 +1,102 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
+
+from vexic.storage.errors import MutationOutcomeUnknown, QueryDeadlineExceeded
+
+
+# A permanently black-holed driver call cannot be cancelled safely. Cap the
+# number of workers that can be abandoned process-wide so repeated requests do
+# not create an unbounded number of daemon threads and retained connections.
+# Slots return automatically if the remote eventually responds.
+MAX_OUTSTANDING_REMOTE_CALLS = 64
+_REMOTE_CALL_SLOTS = threading.BoundedSemaphore(MAX_OUTSTANDING_REMOTE_CALLS)
+
+_MUTATING_SQL_KEYWORDS = frozenset(
+    {
+        "ALTER",
+        "ANALYZE",
+        "ATTACH",
+        "COMMIT",
+        "CREATE",
+        "DELETE",
+        "DETACH",
+        "DROP",
+        "END",
+        "INSERT",
+        "REINDEX",
+        "RELEASE",
+        "REPLACE",
+        "TRUNCATE",
+        "UPDATE",
+        "VACUUM",
+    }
+)
+_RETRYABLE_CONNECTION_LOCAL_PRAGMAS = frozenset({"FOREIGN_KEYS"})
+
+
+def _strip_leading_sql_comments(sql: str) -> str:
+    """Remove leading SQLite line/block comments before statement routing."""
+    index = 0
+    length = len(sql)
+    while True:
+        while index < length and sql[index].isspace():
+            index += 1
+        if sql.startswith("--", index):
+            newline = sql.find("\n", index + 2)
+            if newline < 0:
+                return ""
+            index = newline + 1
+            continue
+        if sql.startswith("/*", index):
+            comment_end = sql.find("*/", index + 2)
+            if comment_end < 0:
+                return ""
+            index = comment_end + 2
+            continue
+        return sql[index:]
+
+
+def _pragma_may_mutate_durably(normalized: str) -> bool:
+    """Classify assigned PRAGMAs, excluding safe abandoned-connection state."""
+    body = normalized.removeprefix("PRAGMA").strip()
+    if "=" not in body:
+        return False
+    assignment_target = body.split("=", 1)[0].strip().split()
+    if not assignment_target:
+        # Malformed assignment SQL should reach the driver for its real error,
+        # but if that call hangs, conservatively avoid an automatic retry.
+        return True
+    pragma_name = assignment_target[-1]
+    pragma_name = pragma_name.rsplit(".", 1)[-1]
+    return pragma_name not in _RETRYABLE_CONNECTION_LOCAL_PRAGMAS
+
+
+def _sql_may_mutate(sql: str) -> bool:
+    """Conservatively classify SQL whose timeout leaves a durable ambiguity."""
+    normalized = " ".join(_strip_leading_sql_comments(sql).upper().split())
+    if not normalized:
+        return False
+    keyword = normalized.partition(" ")[0]
+    if keyword in _MUTATING_SQL_KEYWORDS:
+        return True
+    if keyword == "PRAGMA":
+        # `foreign_keys` changes only this connection. Once a timeout poisons
+        # and abandons that connection, repeating it on a fresh connection is
+        # safe. Other assigned PRAGMAs remain conservative unknown outcomes.
+        return _pragma_may_mutate_durably(normalized)
+    if keyword == "WITH":
+        # A CTE may prefix DML. This errs toward preventing an unsafe retry;
+        # normal SELECT CTEs remain read-only unless they contain a DML verb.
+        words = set(normalized.replace("(", " ").replace(")", " ").split())
+        return bool(words & {"INSERT", "UPDATE", "DELETE", "REPLACE"})
+    return False
+
 
 @dataclass(frozen=True)
 class StorageTarget:
@@ -12,6 +105,9 @@ class StorageTarget:
     never be logged: it is excluded from repr/eq/hash."""
     target: str
     auth_token: str | None = field(default=None, repr=False, compare=False, hash=False)
+    # Wall-clock bound on each remote driver call (ADR 0019 Addendum 7). ``None`` means the
+    # module default; ignored for local SQLite targets.
+    query_deadline_seconds: float | None = None
 
     def __repr__(self) -> str:
         tok = "***" if self.auth_token else None
@@ -25,6 +121,11 @@ class StorageTarget:
 # ":memory:" is the local SQLite backend. ``str.startswith`` accepts the tuple.
 _LIBSQL_SCHEMES = ("libsql://", "https://", "http://", "wss://", "ws://")
 _PLAINTEXT_LIBSQL_SCHEMES = ("http://", "ws://")
+
+# Wall-clock bound on each remote libSQL driver call (ADR 0019 Addendum 7). Well above
+# observed Turso latencies and the ~10s idle-stream reap; well below "hangs
+# forever". Local SQLite is never bounded.
+DEFAULT_QUERY_DEADLINE_SECONDS = 30.0
 
 
 class StorageConnection(Protocol):
@@ -58,6 +159,200 @@ class StorageConnection(Protocol):
     def __exit__(self, *exc: Any) -> Any: ...
 
 
+class DeadlineConnection:
+    """Bound every remote libSQL driver call with a wall-clock deadline (ADR 0019 Addendum 7).
+
+    The driver's ``timeout=`` kwarg is not a network deadline and ``connect()``
+    does no I/O (ADR 0019 Addendum 6), so a degraded remote can hang any query
+    round-trip indefinitely. Each call runs on a daemon worker thread; if it
+    outruns ``deadline_seconds`` the caller gets :class:`QueryDeadlineExceeded`
+    -- a retryable storage fault -- and the hung call is abandoned (the daemon
+    thread dies with the process rather than blocking interpreter shutdown,
+    which a ``ThreadPoolExecutor``'s non-daemon threads would). Outstanding
+    workers are capped process-wide. A mutating call that times out raises
+    :class:`MutationOutcomeUnknown`, because the driver cannot prove whether
+    that mutation committed after the caller's deadline.
+    """
+
+    def __init__(self, conn: Any, *, deadline_seconds: float) -> None:
+        self._conn = conn
+        self._deadline_seconds = deadline_seconds
+        self._poisoned = False
+
+    def _run(
+        self,
+        call: Callable[[], Any],
+        *,
+        mutation_outcome_unknown: bool = False,
+        wait_for_worker_capacity: bool = True,
+    ) -> Any:
+        if self._poisoned:
+            raise QueryDeadlineExceeded(
+                "remote libSQL connection was abandoned after a query deadline "
+                "timeout; open a fresh connection"
+            )
+
+        started_at = time.monotonic()
+        worker_slots = _REMOTE_CALL_SLOTS
+        capacity_timeout = self._deadline_seconds if wait_for_worker_capacity else 0
+        if not worker_slots.acquire(timeout=capacity_timeout):
+            # No driver call started, so even a would-be mutation is safe to
+            # retry on a fresh request.
+            raise QueryDeadlineExceeded(
+                "remote libSQL worker capacity was exhausted before the call "
+                "started; retry later"
+            )
+        if time.monotonic() - started_at >= self._deadline_seconds:
+            worker_slots.release()
+            raise QueryDeadlineExceeded(
+                "remote libSQL query deadline elapsed before the call started; "
+                "retry later"
+            )
+
+        outcome: dict[str, Any] = {}
+        done = threading.Event()
+
+        def worker() -> None:
+            try:
+                outcome["result"] = call()
+            except BaseException as exc:  # noqa: BLE001 - re-raised in caller
+                outcome["error"] = exc
+            finally:
+                worker_slots.release()
+                done.set()
+
+        thread = threading.Thread(
+            target=worker,
+            name="vexic-libsql-deadline",
+            daemon=True,
+        )
+        try:
+            thread.start()
+        except BaseException:
+            worker_slots.release()
+            raise
+
+        remaining = max(0.0, self._deadline_seconds - (time.monotonic() - started_at))
+        if not done.wait(remaining):
+            self._poisoned = True
+            if mutation_outcome_unknown:
+                raise MutationOutcomeUnknown(
+                    "remote libSQL mutation exceeded its query deadline; the "
+                    "outcome is unknown and must not be retried automatically"
+                )
+            raise QueryDeadlineExceeded(
+                f"remote libSQL call exceeded the {self._deadline_seconds}s "
+                "query deadline; abandoning the connection"
+            )
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["result"]
+
+    def execute(self, sql: str, parameters: Any = (), /) -> "DeadlineCursor":
+        # Wrap the returned cursor: ``conn.execute(...).fetchall()`` is the
+        # dominant call-site pattern, and remote work deferred until fetch
+        # must run under the same deadline.
+        return DeadlineCursor(
+            self._run(
+                lambda: self._conn.execute(sql, parameters),
+                mutation_outcome_unknown=_sql_may_mutate(sql),
+            ),
+            self,
+        )
+
+    def executemany(self, sql: str, parameters: Any, /) -> "DeadlineCursor":
+        return DeadlineCursor(
+            self._run(
+                lambda: self._conn.executemany(sql, parameters),
+                mutation_outcome_unknown=_sql_may_mutate(sql),
+            ),
+            self,
+        )
+
+    def cursor(self) -> "DeadlineCursor":
+        # Cursors execute independently and share the connection's stream, so
+        # they run under the same deadline and poison the whole connection.
+        return DeadlineCursor(self._run(self._conn.cursor), self)
+
+    def commit(self) -> None:
+        self._run(self._conn.commit, mutation_outcome_unknown=True)
+
+    def rollback(self) -> None:
+        self._run(self._conn.rollback)
+
+    def close(self) -> None:
+        # A poisoned connection's underlying close() could hang on the same
+        # dead remote; drop the reference instead. Callers universally use
+        # ``with closing(connect(...))``, so close() must never raise or block.
+        if self._poisoned:
+            return
+        try:
+            # If every slot belongs to an abandoned worker, cleanup must not
+            # impose a second full deadline after the request already failed.
+            self._run(self._conn.close, wait_for_worker_capacity=False)
+        except QueryDeadlineExceeded:
+            # Closing is cleanup, not a request operation. The process-wide
+            # worker cap contains an unresponsive close just like any other
+            # remote call, and callers must not lose a successful result to it.
+            return
+
+    def __enter__(self) -> Any:
+        self._run(self._conn.__enter__)
+        return self
+
+    def __exit__(self, *exc: Any) -> Any:
+        # After a timeout the rollback-on-exit round-trip would hang on the
+        # same dead remote; skip it and let the timeout itself propagate.
+        if self._poisoned:
+            return False
+        return self._run(
+            lambda: self._conn.__exit__(*exc),
+            mutation_outcome_unknown=not exc or exc[0] is None,
+        )
+
+
+class DeadlineCursor:
+    """Cursor companion to :class:`DeadlineConnection`.
+
+    Round-trip methods run under the parent connection's deadline via its
+    shared runner, so a hung cursor call poisons the whole connection (the
+    dead stream is common to both). Non-round-trip attributes (``description``,
+    ``lastrowid``, ...) pass through.
+    """
+
+    def __init__(self, cursor: Any, parent: DeadlineConnection) -> None:
+        self._cursor = cursor
+        self._parent = parent
+
+    def execute(self, sql: str, parameters: Any = (), /) -> Any:
+        self._parent._run(
+            lambda: self._cursor.execute(sql, parameters),
+            mutation_outcome_unknown=_sql_may_mutate(sql),
+        )
+        return self
+
+    def executemany(self, sql: str, parameters: Any, /) -> Any:
+        self._parent._run(
+            lambda: self._cursor.executemany(sql, parameters),
+            mutation_outcome_unknown=_sql_may_mutate(sql),
+        )
+        return self
+
+    def fetchone(self) -> Any:
+        return self._parent._run(self._cursor.fetchone)
+
+    def fetchmany(self, size: int | None = None) -> Any:
+        if size is None:
+            return self._parent._run(self._cursor.fetchmany)
+        return self._parent._run(lambda: self._cursor.fetchmany(size))
+
+    def fetchall(self) -> Any:
+        return self._parent._run(self._cursor.fetchall)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._cursor, name)
+
+
 def _is_libsql_target(target: str | Path) -> bool:
     """True when ``target`` names a hosted libSQL database rather than a local
     SQLite file or ``:memory:``."""
@@ -85,9 +380,12 @@ def connect(
     from the environment (ADR 0019). The ``libsql`` client is an optional
     ``hosted`` extra, imported lazily so the local path needs no extra dependency.
     """
+    deadline_seconds = DEFAULT_QUERY_DEADLINE_SECONDS
     if isinstance(target, StorageTarget):
         if auth_token is not None:
             raise ValueError("Pass auth_token via StorageTarget or the kwarg, not both.")
+        if target.query_deadline_seconds is not None:
+            deadline_seconds = target.query_deadline_seconds
         target, auth_token = target.as_connect_args()
 
     if _is_libsql_target(target):
@@ -105,8 +403,10 @@ def connect(
             ) from exc
 
         if auth_token is None:
-            return libsql.connect(target)
-        return libsql.connect(target, auth_token=auth_token)
+            raw = libsql.connect(target)
+        else:
+            raw = libsql.connect(target, auth_token=auth_token)
+        return DeadlineConnection(raw, deadline_seconds=deadline_seconds)
     return sqlite3.connect(target, **kwargs)
 
 

@@ -2,14 +2,27 @@
 
 Status: accepted
 
+> Amended by this ADR's own Addendum 5 (2026-07-10). Read that addendum before
+> reading the title, the Decision, the Deferred section, or the Consequences as
+> live. The Neon thread in this record is retired: the control-plane catalog was
+> cut over to managed Turso/libSQL, so Turso -- not Neon -- is the managed
+> control-plane store, and the "second cutover, libSQL catalog to Neon" the
+> Consequences accept by design will not happen. The title and the original body
+> stay as written because they are the record of what was decided at the time;
+> Addendum 5 is what corrects them. The wiring is at
+> `src/vexic/hosted_http.py` (`build_control_plane_target` and the
+> control-plane target branch in the service factory) and
+> `adapters/turso_adapter.py` (`control_plane_target`). Neon appears nowhere in
+> `src/`, `adapters/`, or `pyproject.toml`.
+
 ## Context
 
-ADR audit AUDIT-002 (COA-264) found the deployed hosted alpha runs plain
-SQLite files on a Railway volume for both customer memory databases and the
-control-plane catalog, rather than the managed Turso (customer memory) and Neon
-Postgres (control plane) posture that ADR 0005 and ADR 0008 name as readiness
-targets. COA-232 ran only the Railway-volume drill and recorded Turso PITR and
-Neon recovery as blocked follow-ups.
+ADR audit AUDIT-002 (COA-264) recorded that the initial hosted-alpha
+implementation used plain SQLite files on a Railway volume for both customer
+memory databases and the control-plane catalog, rather than the managed Turso
+(customer memory) and Neon Postgres (control plane) posture that ADR 0005 and
+ADR 0008 name as readiness targets. COA-232 ran only the Railway-volume drill
+and recorded Turso PITR and Neon recovery as blocked follow-ups.
 
 ADR 0008 frames Turso/Neon as readiness targets, not day-one bootstrap, and its
 Consequences say the encryption/backup decision closes "without adding provider
@@ -118,6 +131,12 @@ explicitly deferred with the Neon promotion below. Restore preserves the ADR
 0005/0008 path: restore to an isolated replacement database, verify, rebuild
 projections, atomically repoint the catalog, quarantine the stale handle, and
 hold the one-customer-to-one-active-database invariant.
+
+> Amended by Addendum 5 below. Turso's free tier has no point-in-time recovery.
+> A deployment using that tier must use the scheduled `turso db dump` export
+> recipe in `.github/workflows/turso-backup.yml`; PITR is available only on a
+> tier that provides it. Inspect the deployment and its backup evidence rather
+> than inferring either from this repository.
 
 ## Deferred
 
@@ -237,6 +256,10 @@ landed:
 Known, deliberately deferred follow-ups (not blocking this ADR's acceptance,
 tracked as fix-soon items rather than open decisions):
 
+> The first and third bullets below are resolved by Addendum 6. The token-cache
+> bound landed; the `connect()` bullet was withdrawn as misdiagnosed. Read
+> Addendum 6 before acting on either.
+
 - `connect()` has no explicit timeout or retry/backoff on the hot path against
   remote libSQL.
 - A live run of the restore drill against a real Turso point-in-time-recovery
@@ -277,9 +300,9 @@ reliance, not an oversight:
 ## Addendum 4 -- 2026-07-10: the control-plane catalog stayed local (COA-359)
 
 Correction of record. The Decision above (and Addendum 2's "All items in the
-Decision ... are implemented" summary) is inaccurate about *one* store: the
-control-plane catalog did **not** move to managed Turso/libSQL. What actually
-shipped, and what the deployed Railway alpha runs today, is a split:
+Decision ... are implemented" summary) was inaccurate about *one* store: the
+control-plane catalog did **not** move to managed Turso/libSQL in that
+implementation slice. Addendum 2 shipped this split:
 
 - **Customer memory** -- one isolated Turso/libSQL database per tenant,
   addressed by the catalog's `tenants.customer_target` DSN. This half of the
@@ -313,16 +336,22 @@ It is dead code embodying the never-shipped catalog-on-Turso leg, and whether
 to delete it or wire it is a separate decision (tracked on COA-359), not part
 of this correction.
 
+> Superseded by Addendum 5 below. `control_plane_target` is no longer dead code:
+> it is the wired runtime path. `src/vexic/hosted_http.py` resolves the
+> control-plane target and calls `build_control_plane_target`, which builds the
+> Turso `StorageTarget` through `control_plane_target` in
+> `adapters/turso_adapter.py`. The catalog-on-Turso leg shipped.
+
 The eventual managed control-plane store remains ADR 0008's readiness target
 and this ADR's deferred Neon Postgres promotion; that work, when taken, is the
 place to actually move `control-plane.db` off the Railway volume.
 
 ## Addendum 5 -- 2026-07-10: control-plane cutover executed (COA-360)
 
-Addendum 4 recorded that the control-plane catalog had stayed local. That is no
-longer true: the catalog was moved to managed Turso/libSQL and the deployed
-Railway alpha now runs on it. This addendum supersedes Addendum 4's
-"stayed local" status and the Decision's original narrowing.
+Addendum 4 recorded that the control-plane catalog had stayed local. The next
+implementation slice added the managed Turso/libSQL control-plane path. This
+addendum supersedes Addendum 4's "stayed local" implementation record and the
+Decision's original narrowing.
 
 What shipped and was executed:
 
@@ -333,24 +362,25 @@ What shipped and was executed:
   helper is no longer dead code -- it is the wired runtime path. Setting the
   flag to `turso` is reversible: unset it and the service reads the local
   `control-plane.db` again.
-- **Auth cache.** With the catalog remote, each API-key check is a network
-  round-trip, so `HostedApiKeyStore` gained a short-TTL in-process auth cache
-  (active only against a `StorageTarget`), evicted on revoke. Its bounded
-  multi-replica stale-revocation window is documented in code as an accepted
-  risk that is zero on the current single instance and must be revisited before
-  a second replica.
+- **Auth reads.** An initial short-TTL in-process record cache was removed after
+  the operator CLI became an out-of-process control-plane writer: process-local
+  eviction could not make revocation immediate even with one serving replica.
+  Authentication now reads the control-plane record on every request. Repeated
+  binding checks inside that same HTTP request reuse its decision, but the
+  request context is cleared at the response boundary; no credential decision
+  survives into the next request. Only the non-security-sensitive `last_used`
+  write remains throttled.
 - **Migration.** `vexic.migrate_control_plane` copies every control-plane table
   from the local `control-plane.db` into an empty Turso target, parents-first
   (foreign-key-safe), with plain `INSERT` and exact row-count verification, and
   emits counts only (never key hashes). The dogfood catalog (3 tenants, their
   API keys, and operational telemetry) was migrated this way and verified.
 
-Consequently the tenant registry, API keys, operational telemetry, and
-`dream_sweep_state` now live in the managed Turso control-plane database, not in
-the Railway-volume `control-plane.db`. That local file is retained, unwritten,
-as the instant rollback target. This realizes clean frontend / backend /
-database tier separation: the database tier (customer memory and control plane
-both on Turso) no longer lives inside the backend's compute volume.
+Consequently, selecting the Turso control-plane target routes the tenant
+registry, API keys, operational telemetry, and `dream_sweep_state` to the
+managed control-plane database rather than the local `control-plane.db`. This
+supports clean frontend / backend / database tier separation without recording
+which target any live deployment currently selects.
 
 Direction change: the eventual managed control-plane store is now **Turso**, the
 same provider as customer memory, decided in favor of provider consolidation and
@@ -358,10 +388,116 @@ the already-built libSQL seam over ADR 0008's deferred Neon Postgres target.
 Neon is no longer the planned control-plane home; the "libSQL catalog to Neon"
 second cutover named in the Consequences is retired.
 
-Backup posture (current tier reality): the deployment is on Turso's free tier,
-which has no point-in-time recovery, so the Turso PITR recovery mechanism named
-in "Backup, restore, and readiness" above is not available here. DR is instead
-scripted `turso db dump` exports of the control-plane and per-tenant databases
-(a scheduled GitHub Actions workflow), plus the retained local `control-plane.db`
-as a rollback handle. Turso PITR remains the intended mechanism if the
-deployment moves to a paid tier.
+Backup posture is tier-dependent. Turso's free tier has no point-in-time
+recovery, so a deployment using it must rely on the scripted `turso db dump`
+exports of the control-plane and per-tenant databases. A deployment on a tier
+with PITR may use the recovery mechanism named in "Backup, restore, and
+readiness" above. The repository does not record which tier is deployed.
+
+## Addendum 6 -- 2026-07-13: hot-path follow-ups resolved (COA-335)
+
+Addendum 2 listed two hot-path follow-ups. One landed; the other was
+withdrawn as misdiagnosed. This addendum supersedes both bullets.
+
+**Landed: the token cache is bounded.** `TenantTokenCache` (in
+`adapters/turso_adapter.py`, where it stays because it holds raw minted
+tokens) now enforces LRU eviction over an `OrderedDict` with a
+`max_entries` bound. TTL and the size bound are independent and neither
+subsumes the other: TTL alone never evicts, because an expired entry is
+only dropped when that same `db_name` is requested again, so a long tail of
+tenants would otherwise retain an entry each for the life of the process.
+TTL governs freshness; the bound governs size. The existing TTL and its
+injected clock are unchanged.
+
+**Withdrawn: a `connect()` timeout and retry would do nothing.** Addendum 2
+assumed a degraded remote could hang the hot path inside `connect()`. It
+cannot, and both halves of the premise were checked against the installed
+driver rather than reasoned about:
+
+- `libsql.connect()` performs no network I/O. Against a nonexistent host it
+  returns in milliseconds; the connection is lazy. The fault surfaces on the
+  first *query*. A retry/backoff loop around `connect()` is therefore
+  unreachable code -- it would never observe the network fault it exists to
+  retry.
+- The driver's `timeout` argument does not bound remote request duration.
+  Against a black-holed address, a query hung past a 35-second hard kill with
+  the timeout set to both 1s and 4s.
+
+The real gap is unbounded *query* duration against a degraded remote, which
+is tracked separately (COA-377). The shape that fits is a **deadline**, not a
+retry: `hosted_http.py` already classifies a retryable storage fault into a
+503 `storage_unavailable`, leaving the retry decision to the client, and
+server-side re-execution of a query is unsafe for writes anyway. A hang must
+surface as a retryable storage fault so it flows into that existing path.
+
+Note that the 503 carries no `Retry-After` header today -- that header is
+attached only to the 429 rate-limit responses. Whether a client-retryable 503
+should advertise one is an open question for COA-377, not a settled contract
+this addendum can lean on.
+
+## Addendum 7 -- 2026-07-13: remote query deadline (COA-377)
+
+Closes the gap Addendum 6 left open: a degraded or black-holed remote could
+hang any query round-trip indefinitely, because the driver's `timeout`
+argument is not a network deadline and `connect()` does no I/O.
+
+**Mechanism.** `connect()` in `src/vexic/storage/connection.py` wraps the
+libSQL branch's raw driver connection in a `DeadlineConnection` (cursors in a
+companion `DeadlineCursor`). Every round-trip method -- `execute`,
+`executemany`, `commit`, `rollback`, `close`, cursor execute/fetch -- runs on
+a daemon worker thread bounded by a wall-clock deadline. The local SQLite
+branch returns the raw `sqlite3.Connection` untouched; a deadline there is
+meaningless and would tax every local call site and the test suite.
+
+Daemon threads rather than a `ThreadPoolExecutor`: the executor's non-daemon
+workers are joined at interpreter exit, so a hung driver call would block
+process shutdown -- the exact hang being eliminated. An abandoned worker dies
+with the process. A process-wide 64-slot semaphore bounds retained connections
+and daemon workers when calls never return. Capacity exhaustion fails before a
+driver call starts, and cleanup does not wait through a second deadline merely
+to acquire a slot.
+
+**Fault shape.** A read-only timeout, or capacity exhaustion before any driver
+call starts, raises `QueryDeadlineExceeded`
+(`src/vexic/storage/errors.py`). It is recognized by type as a retryable
+operational error and the hosted boundaries route it to a sanitized 503
+`storage_unavailable`. A timed-out mutation, commit, or successful transaction
+exit instead raises `MutationOutcomeUnknown`: the driver has no safe
+cancellation primitive, so the write may land after the caller receives the
+error and automatic retry could duplicate an append-only row. That exception is
+operational but deliberately non-retryable and is returned only as a sanitized
+500. SQL mutability is inferred conservatively from the statement class; known
+DML/DDL, mutating PRAGMAs, and DML-prefixed CTEs use the unknown-outcome path.
+Both exception messages omit SQL text and parameters, and classifiers match
+their types rather than fabricated Hrana messages.
+
+**Poisoning.** A timed-out connection is poisoned: the hung Hrana stream is
+never reused, every subsequent method fails fast with
+`QueryDeadlineExceeded`, and `close()`/`__exit__` skip the underlying driver
+call entirely (a rollback or close round-trip would hang on the same dead
+remote). The original timed-out mutation still reports
+`MutationOutcomeUnknown`; poisoning must not erase that ambiguity. Callers
+recover by opening a fresh connection, which is what every
+`with closing(connect(...))` call site already does per operation.
+
+**Configuration.** The deadline defaults to
+`DEFAULT_QUERY_DEADLINE_SECONDS = 30.0` -- above observed Turso latencies and
+the ~10s idle-stream reap, far below "hangs forever". Operators tune it with
+`VEXIC_REMOTE_QUERY_DEADLINE_SECONDS`, parsed only in
+`adapters/turso_adapter.py` (`query_deadline_from_env`) and threaded through
+`StorageTarget.query_deadline_seconds`; `src/vexic` stays free of ambient
+environment reads.
+
+**Retry-After: resolved as omitted.** The open question from Addendum 6 is
+settled: the retryable 503 does not advertise `Retry-After`. The 429's header
+is computed from real limiter state; a 503 from a black-holed remote has no
+principled retry horizon, and inventing one would be speculative contract. A
+test pins the header's absence.
+
+**Connect-phase faults classify retryable too.** The live verification of the
+deadline surfaced an adjacent gap: the driver's Hrana ``http error: error
+trying to connect`` payload (DNS failure, refused, black-holed TCP connect)
+previously matched no classifier and fell through to a 500. An unreachable
+remote is transient from the caller's viewpoint, so
+`_is_remote_connect_error` now classifies it as a retryable operational
+error, joining the reaped-stream case in the 503 `storage_unavailable` path.
