@@ -1,6 +1,10 @@
 import pytest
-from adapters.turso_adapter import control_plane_target, reconcile_tenant_databases
-from vexic.storage.connection import StorageTarget
+from adapters.turso_adapter import (
+    control_plane_target,
+    query_deadline_from_env,
+    reconcile_tenant_databases,
+)
+from vexic.storage.connection import DEFAULT_QUERY_DEADLINE_SECONDS, StorageTarget
 
 def test_reads_env_into_redacted_target():
     env = {"TURSO_DATABASE_URL": "libsql://db.turso.io", "TURSO_AUTH_TOKEN": "JWT"}
@@ -11,6 +15,24 @@ def test_reads_env_into_redacted_target():
 def test_missing_env_raises():
     with pytest.raises(ValueError):
         control_plane_target({})
+
+
+def test_query_deadline_env_read_into_control_plane_target():
+    env = {
+        "TURSO_DATABASE_URL": "libsql://db.turso.io",
+        "TURSO_AUTH_TOKEN": "JWT",
+        "VEXIC_REMOTE_QUERY_DEADLINE_SECONDS": "12.5",
+    }
+    assert control_plane_target(env).query_deadline_seconds == 12.5
+
+
+def test_query_deadline_env_absent_or_malformed_falls_back_to_default():
+    assert query_deadline_from_env({}) == DEFAULT_QUERY_DEADLINE_SECONDS
+    assert (
+        query_deadline_from_env({"VEXIC_REMOTE_QUERY_DEADLINE_SECONDS": "soon"})
+        == DEFAULT_QUERY_DEADLINE_SECONDS
+    )
+    assert query_deadline_from_env({"VEXIC_REMOTE_QUERY_DEADLINE_SECONDS": "5"}) == 5.0
 
 
 def test_reconcile_flags_platform_db_with_no_referencing_tenant_as_orphan():

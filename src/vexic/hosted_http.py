@@ -72,10 +72,19 @@ class _TursoProvisioning:
 
         return TursoProvisioningPort.from_env(env)
 
-    def build_resolver(self, token_cache: object, *, org: str) -> object:
-        from adapters.turso_adapter import make_customer_target_resolver
+    def build_resolver(
+        self, token_cache: object, *, org: str, env: Mapping[str, str] | None = None
+    ) -> object:
+        from adapters.turso_adapter import (
+            make_customer_target_resolver,
+            query_deadline_from_env,
+        )
 
-        return make_customer_target_resolver(token_cache, org=org)
+        return make_customer_target_resolver(
+            token_cache,
+            org=org,
+            query_deadline_seconds=query_deadline_from_env(env or {}),
+        )
 
     def build_token_cache(self, port: object) -> object:
         from adapters.turso_adapter import TenantTokenCache
@@ -343,7 +352,7 @@ def _build_hosted_stores(
         )
         keys = HostedApiKeyStore(root, control_target=control_target)
         cache = provisioning.build_token_cache(port)
-        customer_target_resolver = provisioning.build_resolver(cache, org=org)
+        customer_target_resolver = provisioning.build_resolver(cache, org=org, env=env)
     else:
         catalog = HostedTenantCatalog(root, control_target=control_target)
         keys = HostedApiKeyStore(root, control_target=control_target)

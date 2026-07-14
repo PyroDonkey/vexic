@@ -100,6 +100,42 @@ def test_resolver_builds_storage_target_and_strips_org_suffix_for_db_name():
     assert port.calls[0][0] == "vexic-t123"
 
 
+def test_resolver_threads_query_deadline_into_storage_target():
+    cache = TenantTokenCache(_FakePort())
+    resolver = make_customer_target_resolver(
+        cache, org="example-org", query_deadline_seconds=12.5
+    )
+
+    target = resolver(_tenant("libsql://vexic-t123-example-org.turso.io"))
+
+    assert target.query_deadline_seconds == 12.5
+
+
+def test_resolver_without_deadline_leaves_module_default_in_charge():
+    cache = TenantTokenCache(_FakePort())
+    resolver = make_customer_target_resolver(cache, org="example-org")
+
+    target = resolver(_tenant("libsql://vexic-t123-example-org.turso.io"))
+
+    # None defers to the connect() module default rather than pinning a copy.
+    assert target.query_deadline_seconds is None
+
+
+def test_provisioning_seam_reads_query_deadline_env_into_resolver():
+    from vexic.hosted_http import _TursoProvisioning
+
+    cache = TenantTokenCache(_FakePort())
+    resolver = _TursoProvisioning().build_resolver(
+        cache,
+        org="example-org",
+        env={"VEXIC_REMOTE_QUERY_DEADLINE_SECONDS": "12.5"},
+    )
+
+    target = resolver(_tenant("libsql://vexic-t123-example-org.turso.io"))
+
+    assert target.query_deadline_seconds == 12.5
+
+
 def test_resolver_db_name_without_org_suffix_is_used_verbatim():
     # If the first hostname label does not carry the `-{org}` suffix, the
     # label is used as-is (removesuffix is a no-op).
@@ -205,7 +241,7 @@ class _FakeProvisioning:
     def build_token_cache(self, port):
         return TenantTokenCache(port)
 
-    def build_resolver(self, token_cache, *, org: str):
+    def build_resolver(self, token_cache, *, org: str, env=None):
         return make_customer_target_resolver(token_cache, org=org)
 
 

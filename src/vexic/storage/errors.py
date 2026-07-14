@@ -67,6 +67,16 @@ _RETRYABLE_MARKERS = (
 )
 
 
+class QueryDeadlineExceeded(ValueError):
+    """A remote libSQL driver call outran its wall-clock deadline (ADR 0019 Addendum 7).
+
+    Subclasses :class:`ValueError` so the hosted HTTP boundaries' existing
+    ``except ValueError`` -> classifier -> 503 ``storage_unavailable`` path
+    handles it without edits. The classifiers below recognize it by type, not
+    message. The message must never embed SQL text or parameters.
+    """
+
+
 def _is_reaped_stream_error(message: str) -> bool:
     """True for the Hrana ``api error`` 404 raised when Turso reaps an idle
     stream (~10s) before the next round-trip -- typically ``commit()``. The
@@ -117,6 +127,8 @@ def is_operational_error(exc: BaseException) -> bool:
     """
     if isinstance(exc, sqlite3.OperationalError):
         return True
+    if isinstance(exc, QueryDeadlineExceeded):
+        return True
     if isinstance(exc, ValueError):
         message = _message(exc).lower()
         return any(
@@ -134,6 +146,8 @@ def is_retryable_operational_error(exc: BaseException) -> bool:
     form. A non-retryable operational error (e.g. a syntax error) returns
     ``False``; non-storage exceptions return ``False``.
     """
+    if isinstance(exc, QueryDeadlineExceeded):
+        return True
     if isinstance(exc, sqlite3.OperationalError) or (
         isinstance(exc, ValueError) and is_operational_error(exc)
     ):
