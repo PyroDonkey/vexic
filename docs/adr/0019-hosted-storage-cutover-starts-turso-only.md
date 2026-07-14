@@ -501,3 +501,44 @@ previously matched no classifier and fell through to a 500. An unreachable
 remote is transient from the caller's viewpoint, so
 `_is_remote_connect_error` now classifies it as a retryable operational
 error, joining the reaped-stream case in the 503 `storage_unavailable` path.
+
+## Addendum 8 -- 2026-07-14: readiness probe supersedes "retry around connect() is unreachable"
+
+Addendum 6 withdrew a `connect()` retry as unreachable code because
+`libsql.connect()` performs no network I/O. The driver half of that premise
+still holds; the conclusion no longer does. Three live transient Turso faults
+in ~14 hours on 2026-07-13 -- Hrana `api error` `status=502 Bad Gateway,
+connect to upstream failed` -- surfaced on a fresh connection's *first
+round-trip* and killed a Deep dream phase mid-run, because nothing recovered
+at either connection seam.
+
+**Mechanism.** The remote branch of `connect()` now executes a `SELECT 1`
+readiness probe (materialized with `fetchone()`, so a lazily-fetching driver
+still round-trips) through the `DeadlineConnection` wrapper before returning.
+One classified retryable fault discards the handle and rebuilds on a single
+fresh one; a second consecutive fault propagates. The control-plane
+`_connect_control_db` applies the same retry-once policy around its setup
+PRAGMA. This makes the fault Addendum 6 called unobservable at `connect()`
+observable there by construction -- the probe is the round-trip.
+
+**Retry budget.** Rebuilds happen only on fast-fail classified faults
+(`is_retryable_operational_error`), never on `QueryDeadlineExceeded`: an
+immediate rebuild cannot unhang a dead remote and would double the caller's
+wait. Each probe call (`execute`, `fetchone`) is individually bounded by the
+per-call deadline of Addendum 7; there is no shared probe budget. The two
+seams retry independently: a control-plane acquisition that fails the probe
+once and the PRAGMA once can consume up to four raw driver handles worst
+case. That is accepted -- both retried statements are connection-local and
+idempotent, and the alternative (a cross-seam attempt ledger) is machinery
+without a demonstrated need.
+
+**Cost.** Every remote `connect()` now pays one extra round-trip on the hot
+path, per operation. Accepted as the price of absorbing connect-time faults
+at one seam instead of at every call site; local SQLite targets are
+unchanged and never probed.
+
+**Classification.** The observed fault shape joins the Addendum 7 connect
+classifiers: `_is_upstream_connect_error` requires the Hrana `api error`
+envelope plus the `connect to upstream failed` phrase (status code
+deliberately unpinned; a 503/504 variant of the same edge fault is equally
+transient) and routes to the sanitized 503 `storage_unavailable`.

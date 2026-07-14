@@ -2260,6 +2260,29 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(response.json()["error"]["code"], "storage_unavailable")
         self.assertNotIn("SQLITE_BUSY", response.text)
 
+    def test_hosted_ingest_maps_upstream_connect_failure_to_503(self) -> None:
+        # The exact Turso edge fault observed live 2026-07-13: the
+        # Hrana api error 502 must surface as the retryable 503, not a 500.
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE})
+
+        with patch.object(
+            type(self.service),
+            "ingest_source_transcript",
+            side_effect=ValueError(
+                "Hrana: `api error: `status=502 Bad Gateway, "
+                'body={"error":"connect to upstream failed"}``'
+            ),
+        ):
+            response = self.client.post(
+                "/v1/ingest_source_transcript",
+                headers=self._write_headers(api_key),
+                json=self._ingest_body(),
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "storage_unavailable")
+        self.assertNotIn("upstream", response.text)
+
     def test_hosted_ingest_maps_query_deadline_timeout_to_503_without_retry_after(self) -> None:
         api_key = self._api_key(capabilities={MemoryCapability.WRITE})
 
