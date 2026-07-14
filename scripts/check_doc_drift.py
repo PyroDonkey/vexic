@@ -215,7 +215,15 @@ def _markdown_files(root: Path) -> list[Path]:
 
 
 def _source_files(root: Path) -> list[Path]:
-    return sorted((root / "src" / "vexic").rglob("*.py"))
+    """Python sources whose comments and docstrings make checkable claims.
+
+    `adapters/` is source here, not just an env-read scan target: it carries
+    the same path and ADR citations `src/vexic` does, and a stale one there
+    outlived a green gate.
+    """
+    return sorted(
+        path for code_dir in CODE_DIRS for path in (root / code_dir).rglob("*.py")
+    )
 
 
 def _is_living(root: Path, path: Path) -> bool:

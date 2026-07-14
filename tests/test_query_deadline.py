@@ -93,6 +93,22 @@ def test_timeout_inside_transaction_context_propagates_cleanly(gate) -> None:
             conn.execute("SELECT 1")
 
 
+def test_clean_transaction_exit_timeout_has_nonretryable_unknown_outcome(gate) -> None:
+    """A commit that may still land must never come back retryable.
+
+    ``with conn:`` commits on a clean exit, so a timeout there leaves the write
+    in the same unknown state an ``executemany`` timeout does. This is the one
+    place the outcome is decided by the context-manager state rather than the
+    SQL text -- classify it retryable and a client retry double-writes.
+    """
+    conn = DeadlineConnection(HangingLibsqlConn(gate), deadline_seconds=_TEST_DEADLINE)
+    with pytest.raises(MutationOutcomeUnknown) as excinfo:
+        with conn:
+            pass
+    assert is_operational_error(excinfo.value)
+    assert not is_retryable_operational_error(excinfo.value)
+
+
 def test_executemany_exceeding_deadline_has_nonretryable_unknown_outcome(gate) -> None:
     conn = DeadlineConnection(HangingLibsqlConn(gate), deadline_seconds=_TEST_DEADLINE)
     with pytest.raises(MutationOutcomeUnknown) as excinfo:
