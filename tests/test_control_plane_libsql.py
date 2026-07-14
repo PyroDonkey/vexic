@@ -1184,6 +1184,30 @@ def test_replacement_scope_unrelated_valueerror_still_propagates(monkeypatch, tm
         )
 
 
+def test_replacement_scope_transient_fault_propagates_not_permission_error(
+    monkeypatch, tmp_path
+):
+    # A retryable storage fault while reading the replacement's migration
+    # metadata is an availability failure, not "no migration metadata": it
+    # must propagate as the retryable fault rather than being swallowed into
+    # a clean (and wrong) PermissionError.
+    fake_conn = FakeLibsqlConn()
+    transient = ValueError(
+        "Hrana: `api error: `status=502 Bad Gateway, "
+        'body={"error":"connect to upstream failed"}``'
+    )
+    _patch_connect_with_raising_replacement(monkeypatch, fake_conn, transient)
+    control_target = StorageTarget("libsql://fake-control-plane", auth_token="s3cr3t-token")
+
+    catalog = HostedTenantCatalog(tmp_path, control_target=control_target)
+    catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+
+    with pytest.raises(ValueError, match="connect to upstream failed"):
+        catalog.activate_replacement_database(
+            "tenant-a", "libsql://replacement-customer-db"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Remote (StorageTarget) authentication. Each authenticate() deliberately
 # re-reads the revocable record so a CLI process or peer replica's revoke takes
@@ -1266,3 +1290,181 @@ def test_local_control_plane_authenticates_without_remote_state(tmp_path):
         project_ids={"project-a"},
     )
     assert keys.authenticate(provisioned.raw_key).key_id == provisioned.key_id
+
+
+# ---------------------------------------------------------------------------
+# `_connect_control_db` first-round-trip retry. `libsql.connect()`
+# is lazy (no network I/O), so a transient Turso edge fault first surfaces on
+# the setup PRAGMA. The acquisition must retry once on a fresh handle for a
+# classified retryable fault, and must always close a handle whose PRAGMA
+# raised (previously leaked).
+
+
+_UPSTREAM_502 = ValueError(
+    "Hrana: `api error: `status=502 Bad Gateway, "
+    'body={"error":"connect to upstream failed"}``'
+)
+
+
+class _PragmaFaultConn:
+    """Fake remote connection whose first execute (the PRAGMA) may raise."""
+
+    def __init__(self, fault: BaseException | None) -> None:
+        self._fault = fault
+        self.closed = False
+        self.executed: list[str] = []
+
+    def execute(self, sql, parameters=(), /):
+        self.executed.append(sql)
+        if self._fault is not None:
+            raise self._fault
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _control_target() -> StorageTarget:
+    return StorageTarget(target="libsql://control.example.turso.io", auth_token="t")
+
+
+def test_connect_control_db_retries_once_on_transient_pragma_fault(monkeypatch):
+    from vexic import hosted_local
+
+    conns = [_PragmaFaultConn(_UPSTREAM_502), _PragmaFaultConn(None)]
+    handed_out: list[_PragmaFaultConn] = []
+
+    def fake_connect(target, *args, **kwargs):
+        handed_out.append(conns[len(handed_out)])
+        return handed_out[-1]
+
+    monkeypatch.setattr(hosted_local, "connect", fake_connect)
+    conn = hosted_local._connect_control_db(_control_target())
+
+    assert conn is conns[1]
+    assert conns[0].closed is True
+    assert conns[1].closed is False
+    assert conns[1].executed == ["PRAGMA foreign_keys = ON"]
+
+
+def test_connect_control_db_does_not_retry_nonretryable_fault(monkeypatch):
+    from vexic import hosted_local
+
+    fault = ValueError(
+        'Hrana: `api error: `status=404 Not Found, body={"error":"database not found"}``'
+    )
+    conns = [_PragmaFaultConn(fault), _PragmaFaultConn(None)]
+    handed_out: list[_PragmaFaultConn] = []
+
+    def fake_connect(target, *args, **kwargs):
+        handed_out.append(conns[len(handed_out)])
+        return handed_out[-1]
+
+    monkeypatch.setattr(hosted_local, "connect", fake_connect)
+    with pytest.raises(ValueError, match="database not found"):
+        hosted_local._connect_control_db(_control_target())
+
+    assert len(handed_out) == 1
+    assert conns[0].closed is True
+
+
+def test_connect_control_db_second_transient_fault_propagates(monkeypatch):
+    from vexic import hosted_local
+
+    conns = [_PragmaFaultConn(_UPSTREAM_502), _PragmaFaultConn(_UPSTREAM_502)]
+    handed_out: list[_PragmaFaultConn] = []
+
+    def fake_connect(target, *args, **kwargs):
+        handed_out.append(conns[len(handed_out)])
+        return handed_out[-1]
+
+    monkeypatch.setattr(hosted_local, "connect", fake_connect)
+    with pytest.raises(ValueError, match="connect to upstream failed"):
+        hosted_local._connect_control_db(_control_target())
+
+    assert len(handed_out) == 2
+    assert conns[0].closed is True
+    assert conns[1].closed is True
+
+
+def test_connect_control_db_through_real_connect_seam_absorbs_probe_fault(monkeypatch):
+    # Integration across both retry seams with only the `libsql` driver module
+    # stubbed: the readiness probe inside `storage.connection.connect` absorbs
+    # the transient fault on a fresh driver handle, and `_connect_control_db`'s
+    # setup PRAGMA then runs on the ready connection.
+    import sys
+    import types
+
+    from vexic import hosted_local
+
+    class _FaultingDriverConn:
+        def __init__(self, fault):
+            self._fault = fault
+            self.closed = False
+            self.executed = []
+
+        def execute(self, sql, parameters=(), /):
+            self.executed.append(sql)
+            if self._fault is not None:
+                raise self._fault
+
+            class _Cursor:
+                def fetchone(self):
+                    return (1,)
+
+            return _Cursor()
+
+        def close(self):
+            self.closed = True
+
+    first = _FaultingDriverConn(
+        ValueError(
+            "Hrana: `api error: `status=502 Bad Gateway, "
+            'body={"error":"connect to upstream failed"}``'
+        )
+    )
+    second = _FaultingDriverConn(None)
+    driver_conns = [first, second]
+    handed_out = []
+
+    def fake_driver_connect(url, **kwargs):
+        handed_out.append(driver_conns[len(handed_out)])
+        return handed_out[-1]
+
+    stub = types.ModuleType("libsql")
+    stub.connect = fake_driver_connect
+    monkeypatch.setitem(sys.modules, "libsql", stub)
+
+    conn = hosted_local._connect_control_db(
+        StorageTarget("libsql://control.example.turso.io", auth_token="t")
+    )
+
+    assert len(handed_out) == 2
+    assert first.closed is True
+    assert second.executed == ["SELECT 1", "PRAGMA foreign_keys = ON"]
+    conn.close()
+
+
+def test_connect_control_db_does_not_retry_hung_remote(monkeypatch):
+    # A hung remote (QueryDeadlineExceeded from the deadline wrapper) is not
+    # fixed by an immediate rebuild: retrying would make one acquisition wait
+    # through two deadline windows and abandon two remote calls.
+    from vexic import hosted_local
+    from vexic.storage.errors import QueryDeadlineExceeded
+
+    fault = QueryDeadlineExceeded(
+        "remote libSQL call exceeded the 30.0s query deadline; abandoning the connection"
+    )
+    conns = [_PragmaFaultConn(fault), _PragmaFaultConn(None)]
+    handed_out: list[_PragmaFaultConn] = []
+
+    def fake_connect(target, *args, **kwargs):
+        handed_out.append(conns[len(handed_out)])
+        return handed_out[-1]
+
+    monkeypatch.setattr(hosted_local, "connect", fake_connect)
+    with pytest.raises(QueryDeadlineExceeded):
+        hosted_local._connect_control_db(_control_target())
+
+    assert len(handed_out) == 1
+    assert conns[0].closed is True

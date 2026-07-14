@@ -26,7 +26,11 @@ from vexic.hosted import (
 )
 from vexic.service import LocalMemoryService
 from vexic.storage.connection import StorageTarget, _is_libsql_target, connect
-from vexic.storage.errors import is_operational_error
+from vexic.storage.errors import (
+    QueryDeadlineExceeded,
+    is_operational_error,
+    is_retryable_operational_error,
+)
 
 
 _CONTROL_DB_MODE = 0o600
@@ -921,6 +925,12 @@ class HostedTenantCatalog:
                     """
                 ).fetchone()
         except (sqlite3.DatabaseError, ValueError) as exc:
+            # A retryable storage fault (e.g. a transient Turso edge 502) is
+            # an availability failure, not evidence of missing metadata: it
+            # must propagate so the caller sees the retryable fault instead
+            # of a clean (and wrong) PermissionError.
+            if is_retryable_operational_error(exc):
+                raise
             # A missing `canonical_migration_imports` table (or otherwise
             # unreadable replacement db) is a "no migration metadata" signal:
             # local sqlite raises a typed `sqlite3.DatabaseError` (preserved
@@ -2363,13 +2373,38 @@ def _nullable_strings_json(values: frozenset[str | None]) -> str:
 
 
 def _connect_control_db(target: str | Path | StorageTarget) -> sqlite3.Connection:
+    """Open a ready control-plane connection, retrying the first round-trip once.
+
+    ``libsql.connect()`` is lazy (no network I/O, ADR 0019), so a transient
+    Turso edge fault -- e.g. the Hrana 502 ``connect to upstream failed``
+    observed live 2026-07-13 -- first surfaces on the setup PRAGMA. A
+    classified retryable fault there discards the handle and retries the whole
+    acquisition on one fresh handle; a second fault propagates. The failed
+    handle is always closed, retryable or not.
+    """
     _ensure_control_db_permissions(target)
-    if isinstance(target, StorageTarget):
-        conn = connect(target)
-    else:
-        conn = connect(target, timeout=30)
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+    for attempt in (0, 1):
+        if isinstance(target, StorageTarget):
+            conn = connect(target)
+        else:
+            conn = connect(target, timeout=30)
+        try:
+            conn.execute("PRAGMA foreign_keys = ON")
+        except Exception as exc:
+            with suppress(Exception):
+                conn.close()
+            # A hung remote (QueryDeadlineExceeded) is not fixed by an
+            # immediate rebuild; retrying would double the caller's wait for
+            # the same outcome. Rebuild only on fast-fail faults.
+            if (
+                attempt == 0
+                and not isinstance(exc, QueryDeadlineExceeded)
+                and is_retryable_operational_error(exc)
+            ):
+                continue
+            raise
+        return conn
+    raise AssertionError("unreachable")
 
 
 def _ensure_control_db_permissions(target: str | Path | StorageTarget) -> None:

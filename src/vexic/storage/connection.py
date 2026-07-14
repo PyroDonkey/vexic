@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 import threading
 import time
@@ -7,7 +8,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from vexic.storage.errors import MutationOutcomeUnknown, QueryDeadlineExceeded
+from vexic.storage.errors import (
+    MutationOutcomeUnknown,
+    QueryDeadlineExceeded,
+    is_retryable_operational_error,
+)
 
 
 # A permanently black-holed driver call cannot be cancelled safely. Cap the
@@ -162,9 +167,10 @@ class StorageConnection(Protocol):
 class DeadlineConnection:
     """Bound every remote libSQL driver call with a wall-clock deadline (ADR 0019 Addendum 7).
 
-    The driver's ``timeout=`` kwarg is not a network deadline and ``connect()``
-    does no I/O (ADR 0019 Addendum 6), so a degraded remote can hang any query
-    round-trip indefinitely. Each call runs on a daemon worker thread; if it
+    The driver's ``timeout=`` kwarg is not a network deadline and
+    ``libsql.connect()`` does no I/O (ADR 0019 Addendum 6; Vexic's ``connect()``
+    seam adds one round-trip via the Addendum 8 readiness probe), so a degraded
+    remote can hang any query round-trip indefinitely. Each call runs on a daemon worker thread; if it
     outruns ``deadline_seconds`` the caller gets :class:`QueryDeadlineExceeded`
     -- a retryable storage fault -- and the hung call is abandoned (the daemon
     thread dies with the process rather than blocking interpreter shutdown,
@@ -402,11 +408,37 @@ def connect(
                 "it with `uv sync --extra hosted` (or `pip install vexic[hosted]`)."
             ) from exc
 
-        if auth_token is None:
-            raw = libsql.connect(target)
-        else:
-            raw = libsql.connect(target, auth_token=auth_token)
-        return DeadlineConnection(raw, deadline_seconds=deadline_seconds)
+        # Readiness probe with one rebuild: ``libsql.connect()`` is
+        # lazy, so a transient edge fault -- e.g. the Hrana 502 ``connect to
+        # upstream failed`` observed live 2026-07-13 -- first surfaces on the
+        # connection's first round-trip. Absorb one classified retryable fault
+        # by discarding the handle and rebuilding on a fresh one; a second
+        # fault propagates. The probe runs through DeadlineConnection so a
+        # hung remote raises QueryDeadlineExceeded here rather than hanging
+        # the caller's first business statement.
+        for attempt in (0, 1):
+            if auth_token is None:
+                raw = libsql.connect(target)
+            else:
+                raw = libsql.connect(target, auth_token=auth_token)
+            conn = DeadlineConnection(raw, deadline_seconds=deadline_seconds)
+            try:
+                conn.execute("SELECT 1").fetchone()
+            except Exception as exc:
+                with contextlib.suppress(Exception):
+                    conn.close()
+                # A hung remote (QueryDeadlineExceeded) is not fixed by an
+                # immediate rebuild; retrying would double the caller's wait
+                # for the same outcome. Rebuild only on fast-fail faults.
+                if (
+                    attempt == 0
+                    and not isinstance(exc, QueryDeadlineExceeded)
+                    and is_retryable_operational_error(exc)
+                ):
+                    continue
+                raise
+            return conn
+        raise AssertionError("unreachable")
     return sqlite3.connect(target, **kwargs)
 
 
