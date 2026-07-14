@@ -55,14 +55,38 @@ CODE_DIRS = ("src", "adapters")
 
 ADR_FILE_RE = re.compile(r"^(\d{4})-.+\.md$")
 ADR_INDEX_RE = re.compile(r"^\|\s*(\d{4})\s*\|")
-ADR_REF_RE = re.compile(r"\bADR[ -](\d{4})\b")
+ADR_REF_RE = re.compile(
+    r"\bADRs?[ -]"
+    r"(\d{4}(?:(?:\s*/\s*|\s*,\s*(?:(?:and|or)\s+)?|"
+    r"\s+(?:and|or)\s+)\d{4})*)\b",
+    re.IGNORECASE,
+)
 
 # Top-level directories whose contents are code or docs this repo owns, so a
 # reference to a path under one of them is a claim about this repo.
-REPO_DIRS = ("src", "tests", "scripts", "docs", "adapters", "examples", "pypi")
-PATH_RE = re.compile(
-    r"(?:" + "|".join(REPO_DIRS) + r")[/\\][A-Za-z0-9_./\\-]+",
+REPO_DIRS = (
+    ".github",
+    "src",
+    "tests",
+    "scripts",
+    "docs",
+    "adapters",
+    "examples",
+    "pypi",
 )
+PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_.:/\\-])(?:"
+    r"(?:\.\.?[/\\])+(?:[A-Za-z0-9_.-]+(?:[/\\][A-Za-z0-9_.-]+)*)"
+    r"|(?:\.[A-Za-z0-9_-]+|[A-Za-z0-9_-]+)"
+    r"(?:[/\\][A-Za-z0-9_.-]+)+"
+    r")",
+)
+# A slash-free filename is too ambiguous in prose or inline code: generated
+# artifacts such as `retrieval_metrics.json` and symbols such as `schema.py`
+# are not necessarily repository paths. A Markdown link target is an explicit
+# path assertion, however, so bare links such as (`SECURITY.md`) are safe to
+# validate without maintaining a shortlist of special root filenames.
+MARKDOWN_LINK_TARGET_RE = re.compile(r"\]\(\s*<?([^)>\s]+)")
 # Only paths that name a file, not a bare prose fragment that happens to start
 # with a repo directory name.
 PATH_SUFFIXES = frozenset(
@@ -127,7 +151,12 @@ CLI_SUBCOMMAND_DEPTH = 2
 # total, and it is the one cited form that carries no other cue word on the
 # line. `passes`/`passing` are deliberately not cues -- they describe a run's
 # outcome, not its size.
-TEST_COUNT_RE = re.compile(r"\b(\d[\d,_]*)\s+(?:tests?|passed)\b", re.IGNORECASE)
+TEST_TOTAL_RE = re.compile(r"\b(\d[\d,_]*)\s+tests?\b", re.IGNORECASE)
+PYTEST_OUTCOME_RE = re.compile(
+    r"\b(\d[\d,_]*)\s+"
+    r"(?:passed|failed|skipped|xfailed|xpassed|deselected|errors?)\b",
+    re.IGNORECASE,
+)
 TEST_COUNT_CUES = ("suite", "collected", "passed", "total", "green", "pytest")
 TEST_COUNT_CUE_RE = re.compile(
     r"\b(?:" + "|".join(TEST_COUNT_CUES) + r")\b", re.IGNORECASE
@@ -197,12 +226,46 @@ def _is_living(root: Path, path: Path) -> bool:
 def _path_refs(text: str) -> set[str]:
     """Repo-relative file paths asserted by `text`."""
     refs = set()
-    for match in PATH_RE.finditer(text):
-        ref = match.group(0).replace("\\", "/").rstrip(".,;:)`'\"")
+    raw_refs = [(match.group(0), False) for match in PATH_RE.finditer(text)]
+    raw_refs.extend(
+        (match.group(1), True) for match in MARKDOWN_LINK_TARGET_RE.finditer(text)
+    )
+    for raw_ref, is_link_target in raw_refs:
+        ref = raw_ref.replace("\\", "/").rstrip(".,;:)`'\"")
+        ref = ref.split("#", 1)[0].split("?", 1)[0]
+        if not ref or "://" in ref or ref.startswith(("mailto:", "#")):
+            continue
+        if ref.startswith("./") and not is_link_target:
+            # A bare `./fixture.json` in a shell example is normally a
+            # caller-created input, not a claim that the repository tracks it.
+            # Explicit link targets are path assertions, and command paths
+            # under a repository-owned top-level directory are assertions too.
+            first = ref[2:].split("/", 1)[0]
+            if first not in REPO_DIRS:
+                continue
         if "*" in ref or Path(ref).suffix not in PATH_SUFFIXES:
+            continue
+        if ref.startswith(("http/", "https/")):
             continue
         refs.add(ref)
     return refs
+
+
+def _path_target(root: Path, source_name: str, ref: str) -> Path:
+    """Resolve an asserted path using repository or document-relative rules."""
+    source = root / source_name
+    if ref.startswith("./"):
+        # Commands execute from the repository root, so an explicit `./` in a
+        # documented command is repository-CWD-relative, not Markdown-relative.
+        return root / ref
+    if ref.startswith("../"):
+        return source.parent / ref
+    first = ref.split("/", 1)[0]
+    if first in REPO_DIRS:
+        return root / ref
+    if source.suffix == ".md":
+        return source.parent / ref
+    return root / ref
 
 
 def _comments_and_docstrings(path: Path) -> str:
@@ -328,7 +391,11 @@ def _check_path_refs(root: Path, warnings: list[str]) -> None:
         for path in _source_files(root)
     ]
     for name, text in sources:
-        dangling = sorted(ref for ref in _path_refs(text) if not (root / ref).exists())
+        dangling = sorted(
+            ref
+            for ref in _path_refs(text)
+            if not _path_target(root, name, ref).exists()
+        )
         if dangling:
             warnings.append(
                 f"{name} references path(s) that do not exist: "
@@ -362,6 +429,88 @@ def _is_getenv(node: ast.expr) -> bool:
     )
 
 
+def _env_read_key(node: ast.AST) -> ast.expr | None:
+    """The key expression when `node` is a supported environment read."""
+    if isinstance(node, ast.Subscript) and _is_env_source(node.value):
+        return node.slice
+    if not isinstance(node, ast.Call):
+        return None
+    func = node.func
+    if _is_getenv(func) and node.args:
+        return node.args[0]
+    if (
+        isinstance(func, ast.Attribute)
+        and func.attr == "get"
+        and _is_env_source(func.value)
+        and node.args
+    ):
+        return node.args[0]
+    return None
+
+
+def _constant_env_bindings(tree: ast.AST) -> dict[str, set[str]]:
+    """Statically named environment values assigned to identifiers/defaults."""
+    bindings: dict[str, set[str]] = {}
+
+    def bind(name: str, value: ast.expr | None) -> None:
+        if (
+            isinstance(value, ast.Constant)
+            and isinstance(value.value, str)
+            and ENV_NAME_RE.fullmatch(value.value)
+        ):
+            bindings.setdefault(name, set()).add(value.value)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    bind(target.id, node.value)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            bind(node.target.id, node.value)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            positional = [*node.args.posonlyargs, *node.args.args]
+            defaults = [None] * (len(positional) - len(node.args.defaults)) + list(
+                node.args.defaults
+            )
+            for argument, default in zip(positional, defaults, strict=True):
+                bind(argument.arg, default)
+    return bindings
+
+
+def _resolved_env_names(
+    key: ast.expr | None, bindings: dict[str, set[str]]
+) -> set[str]:
+    if (
+        isinstance(key, ast.Constant)
+        and isinstance(key.value, str)
+        and ENV_NAME_RE.fullmatch(key.value)
+    ):
+        return {key.value}
+    if isinstance(key, ast.Name):
+        return set(bindings.get(key.id, ()))
+    return set()
+
+
+def _env_helper_parameters(
+    tree: ast.AST,
+) -> dict[str, tuple[tuple[int, str], ...]]:
+    """Function parameters that are themselves used as environment keys."""
+    helpers: dict[str, tuple[tuple[int, str], ...]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        positional = [*node.args.posonlyargs, *node.args.args]
+        indexes = {argument.arg: index for index, argument in enumerate(positional)}
+        key_parameters: set[tuple[int, str]] = set()
+        for child in ast.walk(node):
+            key = _env_read_key(child)
+            if isinstance(key, ast.Name) and key.id in indexes:
+                key_parameters.add((indexes[key.id], key.id))
+        if key_parameters:
+            helpers[node.name] = tuple(sorted(key_parameters))
+    return helpers
+
+
 def _env_names_read(tree: ast.AST) -> set[str]:
     """Env var names read through a literal key.
 
@@ -372,27 +521,19 @@ def _env_names_read(tree: ast.AST) -> set[str]:
     context.
     """
     names: set[str] = set()
+    bindings = _constant_env_bindings(tree)
+    helpers = _env_helper_parameters(tree)
     for node in ast.walk(tree):
-        key: ast.expr | None = None
-        if isinstance(node, ast.Subscript) and _is_env_source(node.value):
-            key = node.slice
-        elif isinstance(node, ast.Call):
-            func = node.func
-            if _is_getenv(func) and node.args:
-                key = node.args[0]
-            elif (
-                isinstance(func, ast.Attribute)
-                and func.attr == "get"
-                and _is_env_source(func.value)
-                and node.args
-            ):
-                key = node.args[0]
-        if (
-            isinstance(key, ast.Constant)
-            and isinstance(key.value, str)
-            and ENV_NAME_RE.match(key.value)
-        ):
-            names.add(key.value)
+        names.update(_resolved_env_names(_env_read_key(node), bindings))
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        for index, parameter in helpers.get(node.func.id, ()):
+            key = node.args[index] if index < len(node.args) else None
+            if key is None:
+                key = next(
+                    (kw.value for kw in node.keywords if kw.arg == parameter), None
+                )
+            names.update(_resolved_env_names(key, bindings))
     return names
 
 
@@ -465,8 +606,14 @@ def _cited_test_counts(text: str) -> set[int]:
     for line in text.splitlines():
         if not TEST_COUNT_CUE_RE.search(line):
             continue
-        for match in TEST_COUNT_RE.finditer(line):
+        for match in TEST_TOTAL_RE.finditer(line):
             counts.add(int(match.group(1).replace(",", "").replace("_", "")))
+        outcomes = [
+            int(match.group(1).replace(",", "").replace("_", ""))
+            for match in PYTEST_OUTCOME_RE.finditer(line)
+        ]
+        if outcomes:
+            counts.add(sum(outcomes))
     return counts
 
 
@@ -515,6 +662,14 @@ def _check_test_counts(root: Path, warnings: list[str]) -> None:
             )
 
 
+def _adr_refs(text: str) -> set[str]:
+    return {
+        number
+        for match in ADR_REF_RE.finditer(text)
+        for number in re.findall(r"\d{4}", match.group(1))
+    }
+
+
 def _check_adr_refs(root: Path, warnings: list[str]) -> None:
     """Every cited ADR number must have a file. ADR numbers never get reused."""
     adr_dir = root / "docs" / "adr"
@@ -532,13 +687,7 @@ def _check_adr_refs(root: Path, warnings: list[str]) -> None:
         for path in _source_files(root)
     ]
     for name, text in sources:
-        dangling = sorted(
-            {
-                match.group(1)
-                for match in ADR_REF_RE.finditer(text)
-                if match.group(1) not in known
-            }
-        )
+        dangling = sorted(_adr_refs(text) - known)
         if dangling:
             warnings.append(
                 f"{name} cites ADR(s) with no file under docs/adr/: "
@@ -558,38 +707,102 @@ def _module_path(root: Path, dotted: str) -> Path | None:
     return None
 
 
-def _string_literals(root: Path, path: Path) -> set[str]:
-    """String literals in `path` and in the vexic modules it imports.
+def _parser_subcommands(tree: ast.AST) -> set[str]:
+    """Literal names passed to argparse's `add_parser`."""
+    return {
+        node.args[0].value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "add_parser"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    }
 
-    A subcommand name reaches argparse (or a dispatch comparison) as a literal,
-    so a command the code still knows is a literal somewhere in the module that
-    handles it. Following imports one hop covers `vexic.cli`, which delegates
-    `recorder` and `mcp-stdio` to sibling modules.
-    """
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    literals = set()
-    imported = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            literals.add(node.value)
-        elif isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
-            "vexic"
-        ):
-            imported.add(node.module or "")
-        elif isinstance(node, ast.Import):
-            imported.update(
-                alias.name for alias in node.names if alias.name.startswith("vexic")
-            )
-    for dotted in imported:
-        target = _module_path(root, dotted)
-        if target is None:
+
+def _argv_slice(node: ast.expr) -> bool:
+    return (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Name)
+        and (node.value.id in {"args", "argv"})
+    )
+
+
+def _command_path_comparison(node: ast.Compare) -> tuple[str, ...] | None:
+    if len(node.ops) != 1 or not isinstance(node.ops[0], ast.Eq):
+        return None
+    left, right = node.left, node.comparators[0]
+    for selector, literal in ((left, right), (right, left)):
+        if isinstance(selector, ast.Attribute) and selector.attr == "command":
+            if isinstance(literal, ast.Constant) and isinstance(literal.value, str):
+                return (literal.value,)
+        if not _argv_slice(selector):
             continue
-        literals.update(
-            node.value
-            for node in ast.walk(ast.parse(target.read_text(encoding="utf-8")))
-            if isinstance(node, ast.Constant) and isinstance(node.value, str)
-        )
-    return literals
+        if isinstance(literal, ast.Constant) and isinstance(literal.value, str):
+            return (literal.value,)
+        if isinstance(literal, (ast.List, ast.Tuple)) and all(
+            isinstance(item, ast.Constant) and isinstance(item.value, str)
+            for item in literal.elts
+        ):
+            return tuple(item.value for item in literal.elts)
+    return None
+
+
+def _condition_command_paths(test: ast.expr) -> set[tuple[str, ...]]:
+    return {
+        path
+        for node in ast.walk(test)
+        if isinstance(node, ast.Compare)
+        and (path := _command_path_comparison(node)) is not None
+    }
+
+
+def _registered_command_paths(root: Path, path: Path) -> set[tuple[str, ...]]:
+    """Command paths registered by argparse or explicit argv dispatch."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    commands = {(name,) for name in _parser_subcommands(tree)}
+    imported_functions = {
+        alias.asname or alias.name: node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        and node.module is not None
+        and node.module.startswith("vexic")
+        for alias in node.names
+    }
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        paths = _condition_command_paths(node.test)
+        commands.update(paths)
+        for prefix in (path for path in paths if len(path) == 1):
+            called_names = {
+                child.func.id
+                for child in ast.walk(ast.Module(body=node.body, type_ignores=[]))
+                if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+            }
+            imported_modules = {
+                child.module
+                for child in ast.walk(ast.Module(body=node.body, type_ignores=[]))
+                if isinstance(child, ast.ImportFrom)
+                and child.module is not None
+                and child.module.startswith("vexic")
+            }
+            imported_modules.update(
+                imported_functions[name]
+                for name in called_names
+                if name in imported_functions
+            )
+            for module in imported_modules:
+                imported_path = _module_path(root, module)
+                if imported_path is None:
+                    continue
+                imported_tree = ast.parse(imported_path.read_text(encoding="utf-8"))
+                commands.update(
+                    prefix + (subcommand,)
+                    for subcommand in _parser_subcommands(imported_tree)
+                )
+    return commands
 
 
 def _documented_commands(text: str) -> set[tuple[str, tuple[str, ...]]]:
@@ -652,12 +865,11 @@ def _check_cli_refs(root: Path, warnings: list[str]) -> None:
                 continue
             if not subcommands:
                 continue
-            literals = _string_literals(root, target)
-            unknown = [token for token in subcommands if token not in literals]
-            if unknown:
+            registered = _registered_command_paths(root, target)
+            if subcommands not in registered:
                 warnings.append(
-                    f"{name} documents subcommand(s) {', '.join(unknown)} for "
-                    f"`{module}`, but the module no longer defines them. Fix "
+                    f"{name} documents command path {' '.join(subcommands)} for "
+                    f"`{module}`, but the module no longer registers it. Fix "
                     "the doc or restore the command."
                 )
 

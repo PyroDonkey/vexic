@@ -2,9 +2,9 @@
 
 A degraded or black-holed remote can hang a query indefinitely: the driver's
 ``timeout=`` kwarg is not a network deadline and ``connect()`` does no I/O.
-``DeadlineConnection`` bounds each driver call with a wall-clock deadline and
-surfaces a timeout as a retryable storage fault so it flows into the existing
-503 ``storage_unavailable`` path.
+``DeadlineConnection`` bounds each driver call with a wall-clock deadline.
+Read-only timeouts are retryable; a timed-out mutation has an unknown outcome
+and must not be retried automatically.
 
 Deadlines here are tiny real waits (~0.05s) -- this is a genuine wall-clock
 bound, the one behavior an injected clock cannot substitute for. Keep them
@@ -23,6 +23,7 @@ from typing import Any
 import pytest
 
 from tests.fakes.libsql import FakeLibsqlConn, HangingLibsqlConn
+from vexic.storage import connection as connection_module
 from vexic.storage.connection import (
     DEFAULT_QUERY_DEADLINE_SECONDS,
     DeadlineConnection,
@@ -30,7 +31,9 @@ from vexic.storage.connection import (
     connect,
 )
 from vexic.storage.errors import (
+    MutationOutcomeUnknown,
     QueryDeadlineExceeded,
+    is_operational_error,
     is_retryable_operational_error,
     is_unique_violation,
 )
@@ -90,11 +93,108 @@ def test_timeout_inside_transaction_context_propagates_cleanly(gate) -> None:
             conn.execute("SELECT 1")
 
 
-def test_executemany_exceeding_deadline_raises_retryable_fault(gate) -> None:
+def test_executemany_exceeding_deadline_has_nonretryable_unknown_outcome(gate) -> None:
     conn = DeadlineConnection(HangingLibsqlConn(gate), deadline_seconds=_TEST_DEADLINE)
-    with pytest.raises(QueryDeadlineExceeded) as excinfo:
+    with pytest.raises(MutationOutcomeUnknown) as excinfo:
         conn.executemany("INSERT INTO t VALUES (?)", [("a",)])
+    assert is_operational_error(excinfo.value)
+    assert not is_retryable_operational_error(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "-- request trace\nINSERT INTO t VALUES ('late')",
+        "/* request trace */\n-- second trace\nUPDATE t SET value = 'late'",
+    ],
+)
+def test_comment_prefixed_mutation_timeout_has_unknown_outcome(sql, gate) -> None:
+    conn = DeadlineConnection(HangingLibsqlConn(gate), deadline_seconds=_TEST_DEADLINE)
+
+    with pytest.raises(MutationOutcomeUnknown):
+        conn.execute(sql)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "PRAGMA foreign_keys=ON",
+        "/* connection setup */ PRAGMA main.foreign_keys = ON",
+    ],
+)
+def test_foreign_keys_pragma_timeout_remains_retryable(sql, gate) -> None:
+    conn = DeadlineConnection(HangingLibsqlConn(gate), deadline_seconds=_TEST_DEADLINE)
+
+    with pytest.raises(QueryDeadlineExceeded) as excinfo:
+        conn.execute(sql)
+
     assert is_retryable_operational_error(excinfo.value)
+
+
+def test_durable_pragma_assignment_timeout_has_unknown_outcome(gate) -> None:
+    conn = DeadlineConnection(HangingLibsqlConn(gate), deadline_seconds=_TEST_DEADLINE)
+
+    with pytest.raises(MutationOutcomeUnknown) as excinfo:
+        conn.execute("-- configure storage\nPRAGMA journal_mode=WAL")
+
+    assert not is_retryable_operational_error(excinfo.value)
+
+
+def test_mutation_can_land_after_unknown_outcome_is_reported(gate) -> None:
+    landed = threading.Event()
+
+    class _LateMutationConn(FakeLibsqlConn):
+        def __init__(self) -> None:
+            super().__init__()
+            self._conn.execute("CREATE TABLE t (value TEXT)")
+
+        def execute(self, sql, parameters=(), /):
+            if sql.lstrip().upper().startswith("INSERT"):
+                gate.wait()
+                cursor = super().execute(sql, parameters)
+                landed.set()
+                return cursor
+            return super().execute(sql, parameters)
+
+    fake = _LateMutationConn()
+    conn = DeadlineConnection(fake, deadline_seconds=_TEST_DEADLINE)
+
+    with pytest.raises(MutationOutcomeUnknown, match="must not be retried") as excinfo:
+        conn.execute("INSERT INTO t VALUES (?)", ("late",))
+    assert not is_retryable_operational_error(excinfo.value)
+
+    # The wrapper cannot cancel the driver's in-flight operation. Prove why
+    # callers receive the distinct outcome-unknown fault instead of a
+    # retryable read deadline.
+    gate.set()
+    assert landed.wait(1.0)
+    assert fake._conn.execute("SELECT value FROM t").fetchall() == [("late",)]
+
+
+def test_outstanding_worker_cap_prevents_unbounded_threads(monkeypatch, gate) -> None:
+    limited_slots = threading.BoundedSemaphore(1)
+    monkeypatch.setattr(connection_module, "_REMOTE_CALL_SLOTS", limited_slots)
+
+    first = DeadlineConnection(HangingLibsqlConn(gate), deadline_seconds=_TEST_DEADLINE)
+    with pytest.raises(QueryDeadlineExceeded):
+        first.execute("SELECT 1")
+
+    class _CountingConn(FakeLibsqlConn):
+        calls = 0
+
+        def execute(self, sql, parameters=(), /):
+            self.calls += 1
+            return super().execute(sql, parameters)
+
+    second_fake = _CountingConn()
+    second = DeadlineConnection(second_fake, deadline_seconds=_TEST_DEADLINE)
+    with pytest.raises(QueryDeadlineExceeded, match="capacity.*before.*started"):
+        second.execute("SELECT 1")
+    assert second_fake.calls == 0
+
+    start = time.monotonic()
+    second.close()
+    assert time.monotonic() - start < _TEST_DEADLINE
 
 
 def test_hanging_cursor_execute_times_out_and_poisons_connection(gate) -> None:

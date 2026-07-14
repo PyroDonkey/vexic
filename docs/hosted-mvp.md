@@ -408,18 +408,17 @@ directory does that, per ADR 0008/0013 precedent.
   hosted-migration runbook is maintained in the private hosted-ops repository);
   only the automated decision logic above is exercised in CI.
 
+Remote libSQL round trips use the wall-clock deadline from ADR 0019 Addendum 7.
+A read-only timeout, or worker-capacity exhaustion before a call starts, is a
+retryable storage fault and produces a sanitized 503 `storage_unavailable`
+without a speculative `Retry-After`. A mutation or commit that times out may
+still land after the response, so it produces the non-retryable,
+sanitized `MutationOutcomeUnknown` failure instead. At most 64 abandoned remote
+workers are retained process-wide; once that cap is occupied, new work fails
+before starting a driver call.
+
 Known follow-ups, deliberately not built in this cutover:
 
-- A remote libSQL **query** has no duration bound, so a degraded or unreachable
-  Turso endpoint can hang the hot path. Note this is a *query* gap, not a
-  `connect()` gap: `libsql.connect()` performs no network I/O (it is lazy, and
-  the fault surfaces on the first query), and the driver's `timeout` argument
-  does not bound remote request duration. The fix is a deadline that surfaces as
-  a retryable storage fault, so it flows into the existing 503
-  `storage_unavailable` classification; server-side retry of a query is not the
-  answer and is unsafe for writes. That 503 carries no `Retry-After` header
-  today (only the 429 rate-limit responses do), so whether a client-retryable
-  503 should advertise one is itself open. See ADR 0019 Addendum 6.
 - Some adapter type annotations (e.g. around the injected HTTP transport and
   provisioning seams) are looser than ideal and are flagged for a precision
   pass.
@@ -563,7 +562,8 @@ repository, not here):
   intact and hosted job usage counters recorded. (REM is a local heuristic per
   ADR 0020, so a fresh smoke records zero REM model usage.)
 - Tester keys are alpha-only and should be revoked after each check. Revoke them
-  through the Console control plane, not the CLI -- see the warning above.
+  through the Console control plane or run the CLI with the service's
+  control-plane environment loaded, as described below.
 
 One-off key issuance against a local hosted root:
 
@@ -581,16 +581,17 @@ $env:VEXIC_API_KEY = "<raw-key>"
 uv run --no-sync python -m vexic.hosted_http run-dream-phase --root .hosted-memory --api-key-env VEXIC_API_KEY --adapter ./adapters/openrouter_live_adapter.py --model-group hosted-dream --tenant-id tenant-a --project-id project-a --session-id session-a --agent-id agent-a --phase light
 ```
 
-These examples use a local root deliberately. The CLI currently resolves its
-control plane and customer memory from `--root` alone, so pointing it at
-`/data/vexic` on a Turso-backed container reaches the stale volume databases,
-not Turso. In a hosted deployment the in-server sweeper (ADR 0030) runs the
-dream phases; the CLI is not that path.
+These examples use a local root deliberately. The operator CLI uses the same
+environment-driven store builder as the hosted service: it honors
+`VEXIC_CONTROL_PLANE_TARGET`, and `run-dream-phase` also honors
+`VEXIC_STORAGE_BACKEND` for customer memory. With those variables unset it
+falls back to the local databases under `--root`; load the target deployment's
+environment before operating on its managed stores.
 
 `--adapter` defaults to `VEXIC_DREAM_PHASE_ADAPTER` and `--model-group` to
-`VEXIC_DREAM_PHASE_MODEL_GROUP` (then `hosted-dream`), so in a deployed
-environment that already carries the dream-phase env config both flags may be
-omitted. The adapter file must define `embed_texts`, `build_extraction_agent`,
+`VEXIC_DREAM_PHASE_MODEL_GROUP` (then `hosted-dream`), so when the invocation
+environment carries the dream-phase configuration both flags may be omitted.
+The adapter file must define `embed_texts`, `build_extraction_agent`,
 and `build_contradiction_agent`. `build_summary_agent` is optional: an
 adapter that omits it can still run `light`/`rem`/`deep`, but
 `run-dream-phase --phase summarize` (and the trigger endpoint below) fails
@@ -678,7 +679,7 @@ Model used for summarization: `VEXIC_SUMMARY_MODEL`, read by
 
 ### In-server dream sweeper (ADR 0030)
 
-The deployed app runs its own periodic sweeper in the FastAPI lifespan
+The hosted app starts its own periodic sweeper in the FastAPI lifespan
 (`vexic.hosted_sweeper.DreamSweeper`) -- this replaced the earlier
 single-tenant `dream-cron.yml` GitHub workflow and its three repo secrets.
 Every tick (`VEXIC_DREAM_SWEEP_TICK_SECONDS`, default 1800) it walks every
@@ -760,7 +761,7 @@ External customer-memory readiness is blocked by the hosted readiness gate.
 This hosted shell remains internal-only until that gate is satisfied or an
 explicit security/engineering owner risk acceptance is recorded.
 
-Internal-only today:
+Internal-only code surface:
 
 - in-process Python API boundary and internal-alpha HTTP adapter;
 - per-tenant Turso databases for customer memory, and a managed Turso
@@ -768,9 +769,9 @@ Internal-only today:
   and the sanitized audit, usage, and job lifecycle ledgers, when the backend
   flags select Turso (ADR 0019 and its Addendum 5). The local SQLite path
   remains supported and is what the unset flags select;
-- control-plane DR on Turso's free tier is a scripted `turso db dump`
-  (`.github/workflows/turso-backup.yml`); that tier has no PITR, so ADR 0008's
-  point-in-time recovery target is not met by it;
+- deployments using Turso's free tier must use the scripted `turso db dump`
+  recipe (`.github/workflows/turso-backup.yml`); that tier has no PITR and
+  therefore does not meet ADR 0008's point-in-time recovery target;
 - single-process in-memory authenticated request limiter;
 - one `LocalMemoryService` instance is created per hosted request;
 - hosted Light/REM/Deep/Summarize jobs run only with injected host model
@@ -835,28 +836,27 @@ These artifacts satisfy documentation/tabletop evidence only; they do
 not close the hosted readiness gate or make hosted Vexic external/customer-data
 ready.
 
-### Current Production Gaps
+### Production Customer-Data Readiness Requirements
 
-Not production/customer-data ready yet:
+Before a deployment handles production customer data, its operators must:
 
-- the control-plane catalog, audit/usage/job stores, and API-key store now run
-  on managed Turso (`VEXIC_CONTROL_PLANE_TARGET=turso`, ADR 0019 Addendum 5),
-  but on Turso's free tier with no point-in-time recovery: backup is
-  scripted `turso db dump` exports (`.github/workflows/turso-backup.yml`), not
-  managed PITR, and the customer-readiness durability bar is not met;
-- no customer-readiness restore drill signed off end-to-end, incident
-  tabletop/security-review signoff, network hardening, distributed rate
-  limiting, or implemented support-access workflow; the Railway-volume alpha
-  restore drill passed with caveats (recorded in the private hosted-ops
-  repository restore-drill artifact). The Turso
-  restore-drill *decision logic* (`vexic.restore.run_restore_drill`:
-  provision -> import -> verify -> activate-or-destroy) is implemented and
-  unit tested, but an actual live run against a real Turso PITR snapshot is a
-  manual/operator-run step that has not been executed and recorded as an
-  artifact; Neon control-plane recovery and S3 Object Lock export restore
-  remain blocked/deferred;
-- no Cloudflare/WAF configuration, origin lock-down, auth-failure throttling,
-  alerting, or abuse override workflow;
-- no billing, dashboard, portal, enterprise SSO, or compliance claims;
-- physical purge remains backend/SLA-specific and limited by the current local
-  service implementation.
+- select backup capabilities that meet ADR 0008 for both the control plane and
+  customer-memory databases. A Turso tier without point-in-time recovery does
+  not meet that bar through the scripted `turso db dump` recipe alone;
+- execute and sign off an end-to-end restore drill against the deployment's
+  actual managed backup/PITR mechanism, plus the required incident tabletop
+  and security review. `vexic.restore.run_restore_drill` supplies unit-tested
+  provision -> import -> verify -> activate-or-destroy decision logic, but the
+  live drill and its evidence remain operator-owned. S3 Object Lock export
+  restore needs the same evidence before it can support a readiness claim;
+- configure network hardening, distributed rate limiting, a support-access
+  workflow, Cloudflare/WAF or equivalent origin protection, auth-failure
+  throttling, alerting, and an abuse-override workflow;
+- implement any billing, dashboard, portal, enterprise SSO, and compliance
+  surfaces required by the product launch; and
+- define and verify a backend/SLA-specific physical-purge mechanism beyond the
+  local service implementation.
+
+The private hosted-ops repository, not this versioned document, records whether
+a particular deployment has completed those steps and the evidence for them
+(ADR 0033).

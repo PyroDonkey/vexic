@@ -66,14 +66,38 @@ _RETRYABLE_MARKERS = (
     "sqlite_cantopen",
 )
 
+# Errors produced specifically by parsing an FTS5 MATCH expression. Search
+# callers intentionally degrade these to no hits because the query cannot be
+# evaluated. Other operational faults (missing tables, connectivity, busy
+# databases, deadlines) must propagate so an availability failure never looks
+# like an authoritative empty result.
+_MALFORMED_FTS_MARKERS = (
+    "malformed match",
+    "fts5: syntax error",
+    "unterminated string",
+    "unterminated quote",
+)
+
 
 class QueryDeadlineExceeded(ValueError):
-    """A remote libSQL driver call outran its wall-clock deadline (ADR 0019 Addendum 7).
+    """A remote storage call could not complete within its availability bound.
 
-    Subclasses :class:`ValueError` so the hosted HTTP boundaries' existing
-    ``except ValueError`` -> classifier -> 503 ``storage_unavailable`` path
-    handles it without edits. The classifiers below recognize it by type, not
-    message. The message must never embed SQL text or parameters.
+    This covers a remote libSQL query deadline and bounded prerequisite work
+    such as resolving its short-lived database token (ADR 0019 Addendum 7).
+    Subclasses :class:`ValueError` so hosted HTTP boundaries route it through
+    the retryable 503 ``storage_unavailable`` path. The classifiers recognize
+    it by type, not message. The message must never embed SQL text, parameters,
+    credentials, or transport details.
+    """
+
+
+class MutationOutcomeUnknown(ValueError):
+    """A timed-out remote mutation may have committed after the deadline.
+
+    Unlike :class:`QueryDeadlineExceeded`, this fault is deliberately not
+    retryable: the driver exposes no safe cancellation primitive, so blindly
+    retrying could duplicate an append-only transcript row or another durable
+    observation. The message never includes SQL or parameters.
     """
 
 
@@ -138,7 +162,7 @@ def is_operational_error(exc: BaseException) -> bool:
     """
     if isinstance(exc, sqlite3.OperationalError):
         return True
-    if isinstance(exc, QueryDeadlineExceeded):
+    if isinstance(exc, (MutationOutcomeUnknown, QueryDeadlineExceeded)):
         return True
     if isinstance(exc, ValueError):
         message = _message(exc).lower()
@@ -161,6 +185,8 @@ def is_retryable_operational_error(exc: BaseException) -> bool:
     """
     if isinstance(exc, QueryDeadlineExceeded):
         return True
+    if isinstance(exc, MutationOutcomeUnknown):
+        return False
     if isinstance(exc, sqlite3.OperationalError) or (
         isinstance(exc, ValueError) and is_operational_error(exc)
     ):
@@ -171,3 +197,26 @@ def is_retryable_operational_error(exc: BaseException) -> bool:
             or _is_remote_connect_error(message)
         )
     return False
+
+
+def is_malformed_fts_query_error(exc: BaseException) -> bool:
+    """True only for an invalid FTS5 MATCH expression.
+
+    SQLite reports these as :class:`sqlite3.OperationalError`; hosted libSQL
+    reports the same messages inside a bare Hrana :class:`ValueError`. The
+    narrow message check is intentional: callers may treat malformed free-text
+    search as no hits, but must not swallow an unavailable or corrupt backend.
+    """
+    if not isinstance(exc, (sqlite3.OperationalError, ValueError)):
+        return False
+    if isinstance(exc, (MutationOutcomeUnknown, QueryDeadlineExceeded)):
+        return False
+    message = _message(exc).lower()
+    if isinstance(exc, ValueError) and not message.lstrip().startswith("hrana: `"):
+        # A bare domain ValueError can contain parser-like wording too. The
+        # hosted driver form is recognizable by its Hrana envelope; without
+        # that context it must propagate rather than masquerade as no hits.
+        return False
+    return any(marker in message for marker in _MALFORMED_FTS_MARKERS) or (
+        "no such column:" in message and "match clause" in message
+    )

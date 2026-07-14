@@ -321,7 +321,7 @@ factories, and measures Tier 3 retrieval quality with per-stage diagnostics.
 ```bash
 # Local, provider-free transcript-FTS run:
 uv run python -m vexic.longmemeval \
-  --dataset data/longmemeval_oracle.json --split oracle \
+  --dataset /path/to/longmemeval_oracle.json --split oracle \
   --output-dir .eval-runs/longmemeval --skip-dream
 
 # Provider-backed judged-recall run (env-driven adapter secrets). The
@@ -331,7 +331,7 @@ uv run python -m vexic.longmemeval \
 OPENROUTER_API_KEY=... VEXIC_LIVE_CLAUDE_MODEL=anthropic/claude-sonnet-5 \
   uv run python -m vexic.longmemeval \
   --allow-live --adapter adapters/openrouter_live_adapter.py \
-  --dataset data/longmemeval_s_cleaned.json --split s \
+  --dataset /path/to/longmemeval_s_cleaned.json --split s \
   --output-dir .eval-runs/longmemeval --answer-mode judged-recall --limit 12
 ```
 

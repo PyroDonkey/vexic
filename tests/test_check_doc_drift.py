@@ -105,6 +105,129 @@ def test_flags_doc_reference_to_a_path_that_does_not_exist(tmp_path: Path) -> No
     assert not any("src/vexic/service.py" in warning for warning in warnings)
 
 
+def test_flags_hidden_root_and_doc_relative_paths_that_do_not_exist(
+    tmp_path: Path,
+) -> None:
+    hook = _load_hook()
+    root = _repo(tmp_path)
+    (root / "docs" / "usage.md").write_text(
+        "CI uses `.github/workflows/missing.yml`.\n"
+        "Contributors follow [`CONTRIBUTING.md`](../CONTRIBUTING.md).\n"
+        "The adjacent decision is `adr/missing.md`.\n",
+        encoding="utf-8",
+    )
+
+    warnings, notes = hook.collect_warnings(root)
+
+    assert notes == []
+    joined = "\n".join(warnings)
+    assert ".github/workflows/missing.yml" in joined
+    assert "CONTRIBUTING.md" in joined
+    assert "adr/missing.md" in joined
+
+
+def test_accepts_root_and_doc_relative_paths_that_exist(tmp_path: Path) -> None:
+    hook = _load_hook()
+    root = _repo(tmp_path)
+    workflow = root / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text("name: CI\n", encoding="utf-8")
+    (root / "CONTRIBUTING.md").write_text("# Contributing\n", encoding="utf-8")
+    (root / "docs" / "usage.md").write_text(
+        "CI uses `.github/workflows/ci.yml`.\n"
+        "Contributors follow [`CONTRIBUTING.md`](../CONTRIBUTING.md).\n"
+        "The adjacent decision is `adr/0001-first-decision.md`.\n",
+        encoding="utf-8",
+    )
+
+    warnings, notes = hook.collect_warnings(root)
+
+    assert notes == []
+    assert warnings == []
+
+
+def test_flags_dot_relative_paths_that_do_not_exist(tmp_path: Path) -> None:
+    hook = _load_hook()
+    root = _repo(tmp_path)
+    (root / "docs" / "usage.md").write_text(
+        "The project overview is `../MISSING.md`.\n"
+        "Load `./adapters/missing_adapter.py` from the repository root.\n",
+        encoding="utf-8",
+    )
+
+    warnings, notes = hook.collect_warnings(root)
+
+    assert notes == []
+    joined = "\n".join(warnings)
+    assert "../MISSING.md" in joined
+    assert "./adapters/missing_adapter.py" in joined
+
+
+def test_accepts_dot_relative_paths_with_their_documented_resolution(
+    tmp_path: Path,
+) -> None:
+    hook = _load_hook()
+    root = _repo(tmp_path)
+    (root / "README.md").write_text("# Fixture repository\n", encoding="utf-8")
+    adapter = root / "adapters" / "live_adapter.py"
+    adapter.parent.mkdir()
+    adapter.write_text("# fixture adapter\n", encoding="utf-8")
+    (root / "docs" / "usage.md").write_text(
+        "The project overview is `../README.md`.\n"
+        "Load `./adapters/live_adapter.py` from the repository root.\n",
+        encoding="utf-8",
+    )
+
+    warnings, notes = hook.collect_warnings(root)
+
+    assert notes == []
+    assert warnings == []
+
+
+def test_ignores_dot_relative_caller_owned_command_input(tmp_path: Path) -> None:
+    """A shell fixture is not a claim that the repository tracks that file."""
+    hook = _load_hook()
+    root = _repo(tmp_path)
+    (root / "docs" / "usage.md").write_text(
+        "Replay a captured hook with `./claude-hook-replay.json`.\n",
+        encoding="utf-8",
+    )
+
+    warnings, notes = hook.collect_warnings(root)
+
+    assert notes == []
+    assert warnings == []
+
+
+def test_flags_formatted_bare_root_file_that_does_not_exist(tmp_path: Path) -> None:
+    hook = _load_hook()
+    root = _repo(tmp_path)
+    (root / "CONTRIBUTING.md").write_text(
+        "Report vulnerabilities through [`SECURITY.md`](SECURITY.md).\n",
+        encoding="utf-8",
+    )
+
+    warnings, notes = hook.collect_warnings(root)
+
+    assert notes == []
+    assert any("SECURITY.md" in warning for warning in warnings)
+
+
+def test_accepts_formatted_bare_root_file_that_exists(tmp_path: Path) -> None:
+    hook = _load_hook()
+    root = _repo(tmp_path)
+    (root / "SECURITY.md").write_text("# Security\n", encoding="utf-8")
+    (root / "CONTRIBUTING.md").write_text(
+        "Report vulnerabilities through [`SECURITY.md`](SECURITY.md).\n",
+        encoding="utf-8",
+    )
+
+    warnings, notes = hook.collect_warnings(root)
+
+    assert notes == []
+    assert warnings == []
+
+
 def test_flags_source_comment_claiming_a_path_that_does_not_exist(
     tmp_path: Path,
 ) -> None:
@@ -193,7 +316,11 @@ def test_flags_a_second_level_subcommand_the_cli_no_longer_knows(
     hook = _load_hook()
     root = _repo(tmp_path)
     (root / "src" / "vexic" / "cli.py").write_text(
-        'SUBCOMMANDS = ("recorder", "ingest")\n', encoding="utf-8"
+        "def main(args):\n"
+        '    if args[:2] == ["recorder", "ingest"]:\n'
+        "        return 0\n"
+        "    return 2\n",
+        encoding="utf-8",
     )
     (root / "docs" / "usage.md").write_text(
         "```\n"
@@ -227,7 +354,11 @@ def test_does_not_read_a_positional_argument_value_as_a_subcommand(
     hook = _load_hook()
     root = _repo(tmp_path)
     (root / "src" / "vexic" / "cli.py").write_text(
-        'SUBCOMMANDS = ("setup", "mcp-client")\n', encoding="utf-8"
+        "def main(args):\n"
+        '    if args[:2] == ["setup", "mcp-client"]:\n'
+        "        return 0\n"
+        "    return 2\n",
+        encoding="utf-8",
     )
     (root / "docs" / "usage.md").write_text(
         "```\nvexic setup mcp-client myagent --base-url https://api.vexic.dev\n```\n",
@@ -246,11 +377,10 @@ def test_resolves_a_subcommand_through_a_module_the_cli_imports(
     """`vexic recorder ingest` resolves through `vexic.cli` into
     `vexic.recorders.cli`, where the `ingest` literal actually lives.
 
-    Every other CLI fixture keeps the literal in `cli.py` itself, so the one-hop
-    import walk in `_string_literals` never executes and a regression in it
-    would ship green. `ingest` is deliberately absent from `cli.py` here: the
-    only way it can resolve is through the import, and the stale `retired-step`
-    on the next line proves the check is live rather than vacuously silent.
+    `ingest` is deliberately absent from `cli.py`: the only way it can resolve
+    is through the imported parser builder called by the `recorder` dispatch
+    branch. The stale `retired-step` on the next line proves the check is live
+    rather than vacuously silent.
     """
     hook = _load_hook()
     root = _repo(tmp_path)
@@ -287,6 +417,32 @@ def test_resolves_a_subcommand_through_a_module_the_cli_imports(
     joined = "\n".join(warnings)
     assert "retired-step" in joined
     assert "ingest" not in joined
+
+
+def test_unrelated_string_literal_is_not_a_live_subcommand(tmp_path: Path) -> None:
+    hook = _load_hook()
+    root = _repo(tmp_path)
+    (root / "src" / "vexic" / "cli.py").write_text(
+        "import argparse\n"
+        'ERROR = "retired"\n'
+        "def main(argv):\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    subcommands = parser.add_subparsers()\n"
+        '    subcommands.add_parser("live")\n'
+        "    return 0\n",
+        encoding="utf-8",
+    )
+    (root / "docs" / "usage.md").write_text(
+        "``\nvexic live\nvexic retired\n``\n",
+        encoding="utf-8",
+    )
+
+    warnings, notes = hook.collect_warnings(root)
+
+    assert notes == []
+    joined = "\n".join(warnings)
+    assert "retired" in joined
+    assert "live" not in joined
 
 
 def test_does_not_read_a_python_import_example_as_a_cli_call(tmp_path: Path) -> None:
@@ -339,6 +495,23 @@ def test_accepts_a_suite_test_count_that_matches(tmp_path: Path, monkeypatch) ->
         "`uv run pytest` reports 742 passed.\n", encoding="utf-8"
     )
     monkeypatch.setattr(hook, "_collect_test_count", lambda _root: 742)
+
+    warnings, notes = hook.collect_warnings(root)
+
+    assert notes == []
+    assert warnings == []
+
+
+def test_passed_and_skipped_pytest_summary_matches_collected_total(
+    tmp_path: Path, monkeypatch
+) -> None:
+    hook = _load_hook()
+    root = _repo(tmp_path)
+    (root / "README.md").write_text(
+        "`uv run pytest` reports 1118 passed, 17 skipped.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(hook, "_collect_test_count", lambda _root: 1135)
 
     warnings, notes = hook.collect_warnings(root)
 
@@ -431,6 +604,24 @@ def test_flags_reference_to_an_adr_that_does_not_exist(tmp_path: Path) -> None:
     joined = "\n".join(warnings)
     assert "0099" in joined
     assert "0098" in joined
+    assert "0001" not in joined
+
+
+def test_flags_every_adr_in_plural_and_slash_shorthand(tmp_path: Path) -> None:
+    hook = _load_hook()
+    root = _repo(tmp_path)
+    (root / "docs" / "architecture.md").write_text(
+        "ADRs 0097, 0098, and 0001/0099 govern this path.\n",
+        encoding="utf-8",
+    )
+
+    warnings, notes = hook.collect_warnings(root)
+
+    assert notes == []
+    joined = "\n".join(warnings)
+    assert "0097" in joined
+    assert "0098" in joined
+    assert "0099" in joined
     assert "0001" not in joined
 
 
@@ -529,6 +720,29 @@ def test_env_read_through_a_mapping_parameter_counts(tmp_path: Path) -> None:
     )
 
     assert "VEXIC_STORAGE_BACKEND" in warning
+
+
+def test_env_read_through_a_constant_key_counts(tmp_path: Path) -> None:
+    (warning,) = _env_warnings(
+        tmp_path,
+        code='import os\nNAME = "VEXIC_HIDDEN"\nos.environ.get(NAME)\n',
+        rows="",
+    )
+
+    assert "VEXIC_HIDDEN" in warning
+
+
+def test_env_read_through_a_helper_key_parameter_counts(tmp_path: Path) -> None:
+    (warning,) = _env_warnings(
+        tmp_path,
+        code="import os\n"
+        "def require(env, name):\n"
+        "    return env.get(name)\n"
+        'require(os.environ, "VEXIC_HELPER_READ")\n',
+        rows="",
+    )
+
+    assert "VEXIC_HELPER_READ" in warning
 
 
 def test_dynamically_read_name_is_not_reported_dead(tmp_path: Path) -> None:

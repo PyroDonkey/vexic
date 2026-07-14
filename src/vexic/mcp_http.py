@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 from typing import Any, Literal
 
 from fastapi import FastAPI, Request
@@ -34,6 +35,13 @@ from vexic.mcp_stdio import (
 )
 from vexic.ports import HostPortNotConfigured
 from vexic.redaction import assert_no_forbidden_secret_values
+from vexic.storage.errors import (
+    MutationOutcomeUnknown,
+    QueryDeadlineExceeded,
+    is_operational_error,
+    is_retryable_operational_error,
+    is_unique_violation,
+)
 
 
 class JsonRpcRequest(BaseModel):
@@ -84,7 +92,10 @@ def register_mcp_routes(
             auth = service.api_keys.authenticate(api_key)
         except PermissionError:
             return _http_error(401, "unauthorized", "Invalid hosted API key.")
-        except Exception:
+        except Exception as exc:
+            storage_error = _storage_error_response(exc)
+            if storage_error is not None:
+                return storage_error
             return _http_error(500, "internal_error", "Hosted memory request failed.")
 
         try:
@@ -118,6 +129,11 @@ def register_mcp_routes(
                 "Hosted rate limit exceeded.",
                 headers={"Retry-After": str(exc.retry_after_seconds)},
             )
+        except Exception as exc:
+            storage_error = _storage_error_response(exc)
+            if storage_error is not None:
+                return storage_error
+            return _http_error(500, "internal_error", "Hosted memory request failed.")
         if response is None:
             return JSONResponse(_jsonrpc_error(rpc.id, -32601, "method not found"))
         return JSONResponse(response)
@@ -258,10 +274,19 @@ async def _call_tool(
         return _tool_error(f"unknown tool: {name}")
     except HostedRateLimitExceeded:
         raise
-    except (HostPortNotConfigured, PermissionError, ValueError) as exc:
+    except (HostPortNotConfigured, PermissionError) as exc:
         # Deliberate operator/caller-facing messages; safe to echo.
         return _tool_error(str(exc))
-    except Exception:
+    except ValueError as exc:
+        # libSQL exposes storage faults as ValueError. Let the HTTP boundary
+        # classify those as sanitized 503/500 responses; only domain/input
+        # ValueErrors are safe JSON-RPC tool errors.
+        if _is_storage_error(exc):
+            raise
+        return _tool_error(str(exc))
+    except Exception as exc:
+        if _is_storage_error(exc):
+            raise
         return _tool_error("Hosted memory request failed.")
 
 
@@ -296,3 +321,39 @@ def _http_error(
         status_code=status_code,
         headers=headers,
     )
+
+
+def _is_storage_error(exc: BaseException) -> bool:
+    if isinstance(exc, (MutationOutcomeUnknown, QueryDeadlineExceeded)):
+        return True
+    if isinstance(exc, sqlite3.Error):
+        return is_operational_error(exc) or is_unique_violation(exc)
+    if not isinstance(exc, ValueError):
+        return False
+
+    # libSQL's untyped failures have a stable Hrana envelope. Require that
+    # envelope before applying message-based SQL classifiers; otherwise a
+    # caller-controlled validation/domain error containing words such as
+    # "hrana", "database is locked", or "UNIQUE constraint failed" could
+    # spoof an infrastructure fault and change a JSON-RPC tool error into an
+    # HTTP 500/503.
+    message = str(exc).lstrip().lower()
+    if not message.startswith("hrana: `"):
+        return False
+    # The exact envelope is itself the provenance signal. Unknown Hrana error
+    # codes must still be sanitized rather than echoed as a domain tool error;
+    # the classifiers below only decide whether the recognized storage fault
+    # is retryable.
+    return True
+
+
+def _storage_error_response(exc: BaseException) -> JSONResponse | None:
+    if not _is_storage_error(exc):
+        return None
+    if is_retryable_operational_error(exc):
+        return _http_error(
+            503,
+            "storage_unavailable",
+            "Hosted storage is temporarily unavailable.",
+        )
+    return _http_error(500, "internal_error", "Hosted memory request failed.")

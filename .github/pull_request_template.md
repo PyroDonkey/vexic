@@ -11,10 +11,10 @@ See docs/branch-sync.md for the command sequences.
 ## Linear (maintainers only)
 
 <!-- Maintainers: link the internal issue so Linear auto-closes it on merge,
-     e.g. "Fixes COA-123". External contributors: delete this section --
+     e.g. "Fixes COA-<id>". External contributors: delete this section --
      reference a GitHub issue in the summary instead if one exists. -->
 
-Fixes COA-
+Fixes COA-<id>
 
 ## Checklist
 
