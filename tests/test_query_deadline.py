@@ -1,8 +1,10 @@
 """Remote libSQL query deadline (ADR 0019 Addendum 7).
 
 A degraded or black-holed remote can hang a query indefinitely: the driver's
-``timeout=`` kwarg is not a network deadline and ``connect()`` does no I/O.
-``DeadlineConnection`` bounds each driver call with a wall-clock deadline.
+``timeout=`` kwarg is not a network deadline and ``libsql.connect()`` does no
+I/O (Vexic's ``connect()`` now performs one, via the readiness probe of ADR
+0019 Addendum 8). ``DeadlineConnection`` bounds each driver call with a
+wall-clock deadline.
 Read-only timeouts are retryable; a timed-out mutation has an unknown outcome
 and must not be retried automatically.
 
@@ -361,6 +363,42 @@ def test_remote_connect_probe_retries_once_on_transient_fault(monkeypatch) -> No
     assert len(handed_out) == 2
     assert first.closed is True
     assert isinstance(conn, DeadlineConnection)
+    conn.execute("CREATE TABLE t (v TEXT)")
+
+
+class _LazyFetchFaultLibsqlConn:
+    """Driver-level fake whose execute succeeds but whose cursor faults on
+    fetch — a lazy-materializing driver shape."""
+
+    def __init__(self, fault: BaseException) -> None:
+        self._fault = fault
+        self.closed = False
+
+    def execute(self, sql, parameters=(), /):
+        fault = self._fault
+
+        class _LazyCursor:
+            def fetchone(self):
+                raise fault
+
+        return _LazyCursor()
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_remote_connect_probe_covers_lazy_fetch_fault(monkeypatch) -> None:
+    # The probe materializes its result (fetchone), so a driver that defers
+    # the round-trip to fetch still surfaces the transient fault inside the
+    # probe — and gets the same one-rebuild recovery.
+    first = _LazyFetchFaultLibsqlConn(_upstream_502())
+    second = FakeLibsqlConn()
+    handed_out = _patch_libsql_sequence(monkeypatch, [first, second])
+
+    conn = connect("libsql://example.turso.io", auth_token="tok")
+
+    assert len(handed_out) == 2
+    assert first.closed is True
     conn.execute("CREATE TABLE t (v TEXT)")
 
 

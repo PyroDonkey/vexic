@@ -124,14 +124,21 @@ def _is_remote_connect_error(message: str) -> bool:
 
 
 def _is_upstream_connect_error(message: str) -> bool:
-    """True for the Hrana ``api error`` 502 raised when the Turso edge cannot
-    reach the database primary (``connect to upstream failed`` -- observed live
-    2026-07-13). The edge losing its upstream is transient from the caller's
-    viewpoint, so it classifies as retryable. Requires the Hrana payload
-    context so a domain ``ValueError`` that merely mentions an upstream is not
-    reclassified. ``message`` is lowercased.
+    """True for the Hrana ``api error`` raised when the Turso edge cannot
+    reach the database primary (``connect to upstream failed`` -- observed
+    live 2026-07-13 as ``status=502 Bad Gateway``). The edge losing its
+    upstream is transient from the caller's viewpoint, so it classifies as
+    retryable. Requires the Hrana ``api error`` envelope -- not just any
+    Hrana message -- so a payload that merely echoes the phrase is not
+    reclassified. The status code is deliberately not pinned: a 503/504
+    variant of the same edge fault is equally transient. ``message`` is
+    lowercased.
     """
-    return "hrana" in message and "connect to upstream failed" in message
+    return (
+        "hrana" in message
+        and "api error" in message
+        and "connect to upstream failed" in message
+    )
 
 
 def _message(exc: BaseException) -> str:

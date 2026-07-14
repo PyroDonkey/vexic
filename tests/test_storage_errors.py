@@ -253,6 +253,14 @@ def test_retryable_ignores_domain_upstream_phrase_value_error() -> None:
     assert is_retryable_operational_error(exc) is False
 
 
+def test_retryable_ignores_upstream_phrase_outside_api_error_envelope() -> None:
+    # The phrase must appear inside the Hrana ``api error`` envelope; a Hrana
+    # message of another shape that merely echoes it must not classify.
+    exc = ValueError("Hrana: `stream error: connect to upstream failed in app text`")
+    assert is_operational_error(exc) is False
+    assert is_retryable_operational_error(exc) is False
+
+
 def test_retryable_ignores_unrelated_value_error() -> None:
     assert is_retryable_operational_error(ValueError("nope")) is False
 

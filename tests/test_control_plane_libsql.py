@@ -1184,6 +1184,30 @@ def test_replacement_scope_unrelated_valueerror_still_propagates(monkeypatch, tm
         )
 
 
+def test_replacement_scope_transient_fault_propagates_not_permission_error(
+    monkeypatch, tmp_path
+):
+    # A retryable storage fault while reading the replacement's migration
+    # metadata is an availability failure, not "no migration metadata": it
+    # must propagate as the retryable fault rather than being swallowed into
+    # a clean (and wrong) PermissionError.
+    fake_conn = FakeLibsqlConn()
+    transient = ValueError(
+        "Hrana: `api error: `status=502 Bad Gateway, "
+        'body={"error":"connect to upstream failed"}``'
+    )
+    _patch_connect_with_raising_replacement(monkeypatch, fake_conn, transient)
+    control_target = StorageTarget("libsql://fake-control-plane", auth_token="s3cr3t-token")
+
+    catalog = HostedTenantCatalog(tmp_path, control_target=control_target)
+    catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+
+    with pytest.raises(ValueError, match="connect to upstream failed"):
+        catalog.activate_replacement_database(
+            "tenant-a", "libsql://replacement-customer-db"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Remote (StorageTarget) authentication. Each authenticate() deliberately
 # re-reads the revocable record so a CLI process or peer replica's revoke takes

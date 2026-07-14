@@ -925,6 +925,12 @@ class HostedTenantCatalog:
                     """
                 ).fetchone()
         except (sqlite3.DatabaseError, ValueError) as exc:
+            # A retryable storage fault (e.g. a transient Turso edge 502) is
+            # an availability failure, not evidence of missing metadata: it
+            # must propagate so the caller sees the retryable fault instead
+            # of a clean (and wrong) PermissionError.
+            if is_retryable_operational_error(exc):
+                raise
             # A missing `canonical_migration_imports` table (or otherwise
             # unreadable replacement db) is a "no migration metadata" signal:
             # local sqlite raises a typed `sqlite3.DatabaseError` (preserved
