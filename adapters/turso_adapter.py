@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 import urllib.error
 import urllib.request
@@ -38,9 +39,14 @@ def query_deadline_from_env(env: Mapping[str, str]) -> float:
     if not raw:
         return DEFAULT_QUERY_DEADLINE_SECONDS
     try:
-        return float(raw)
+        deadline = float(raw)
     except ValueError:
         return DEFAULT_QUERY_DEADLINE_SECONDS
+    # 0/negative would time out every query instantly and poison its
+    # connection; nan/inf break the wait bound. Fall back rather than fail.
+    if not math.isfinite(deadline) or deadline <= 0:
+        return DEFAULT_QUERY_DEADLINE_SECONDS
+    return deadline
 
 
 def control_plane_target(env: Mapping[str, str]) -> StorageTarget:

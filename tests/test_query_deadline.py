@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import types
+from typing import Any
 
 import pytest
 
@@ -105,6 +106,28 @@ def test_hanging_cursor_execute_times_out_and_poisons_connection(gate) -> None:
     # The parent connection shares the dead stream: poisoned too.
     with pytest.raises(QueryDeadlineExceeded, match="abandoned"):
         conn.execute("SELECT 1")
+
+
+def test_execute_returns_deadline_bounded_cursor(gate) -> None:
+    # ``conn.execute(...).fetchall()`` is the dominant call-site pattern; any
+    # remote work deferred until fetch must run under the same deadline.
+    class _HangingFetchConn(FakeLibsqlConn):
+        def execute(self, sql, parameters=(), /):
+            cursor = super().execute(sql, parameters)
+
+            class _LazyFetchCursor:
+                def fetchall(inner) -> Any:
+                    gate.wait()
+                    return cursor.fetchall()
+
+                def __getattr__(inner, name):
+                    return getattr(cursor, name)
+
+            return _LazyFetchCursor()
+
+    conn = DeadlineConnection(_HangingFetchConn(), deadline_seconds=_TEST_DEADLINE)
+    with pytest.raises(QueryDeadlineExceeded):
+        conn.execute("SELECT 1").fetchall()
 
 
 def test_cursor_under_deadline_round_trips() -> None:

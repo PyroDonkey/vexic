@@ -114,11 +114,18 @@ class DeadlineConnection:
             raise outcome["error"]
         return outcome["result"]
 
-    def execute(self, sql: str, parameters: Any = (), /) -> Any:
-        return self._run(lambda: self._conn.execute(sql, parameters))
+    def execute(self, sql: str, parameters: Any = (), /) -> "DeadlineCursor":
+        # Wrap the returned cursor: ``conn.execute(...).fetchall()`` is the
+        # dominant call-site pattern, and remote work deferred until fetch
+        # must run under the same deadline.
+        return DeadlineCursor(
+            self._run(lambda: self._conn.execute(sql, parameters)), self
+        )
 
-    def executemany(self, sql: str, parameters: Any, /) -> Any:
-        return self._run(lambda: self._conn.executemany(sql, parameters))
+    def executemany(self, sql: str, parameters: Any, /) -> "DeadlineCursor":
+        return DeadlineCursor(
+            self._run(lambda: self._conn.executemany(sql, parameters)), self
+        )
 
     def cursor(self) -> "DeadlineCursor":
         # Cursors execute independently and share the connection's stream, so

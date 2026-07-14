@@ -35,6 +35,14 @@ def test_query_deadline_env_absent_or_malformed_falls_back_to_default():
     assert query_deadline_from_env({"VEXIC_REMOTE_QUERY_DEADLINE_SECONDS": "5"}) == 5.0
 
 
+def test_query_deadline_env_nonpositive_or_nonfinite_falls_back_to_default():
+    # 0/negative would make every remote query time out instantly and poison
+    # its connection; nan/inf break the wait bound. All fall back.
+    for bad in ("0", "-5", "nan", "inf", "-inf"):
+        env = {"VEXIC_REMOTE_QUERY_DEADLINE_SECONDS": bad}
+        assert query_deadline_from_env(env) == DEFAULT_QUERY_DEADLINE_SECONDS, bad
+
+
 def test_reconcile_flags_platform_db_with_no_referencing_tenant_as_orphan():
     report = reconcile_tenant_databases(
         platform_db_targets=["libsql://orphan.turso.io"],
