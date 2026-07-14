@@ -1419,3 +1419,28 @@ def test_connect_control_db_through_real_connect_seam_absorbs_probe_fault(monkey
     assert first.closed is True
     assert second.executed == ["SELECT 1", "PRAGMA foreign_keys = ON"]
     conn.close()
+
+
+def test_connect_control_db_does_not_retry_hung_remote(monkeypatch):
+    # A hung remote (QueryDeadlineExceeded from the deadline wrapper) is not
+    # fixed by an immediate rebuild: retrying would make one acquisition wait
+    # through two deadline windows and abandon two remote calls.
+    from vexic import hosted_local
+    from vexic.storage.errors import QueryDeadlineExceeded
+
+    fault = QueryDeadlineExceeded(
+        "remote libSQL call exceeded the 30.0s query deadline; abandoning the connection"
+    )
+    conns = [_PragmaFaultConn(fault), _PragmaFaultConn(None)]
+    handed_out: list[_PragmaFaultConn] = []
+
+    def fake_connect(target, *args, **kwargs):
+        handed_out.append(conns[len(handed_out)])
+        return handed_out[-1]
+
+    monkeypatch.setattr(hosted_local, "connect", fake_connect)
+    with pytest.raises(QueryDeadlineExceeded):
+        hosted_local._connect_control_db(_control_target())
+
+    assert len(handed_out) == 1
+    assert conns[0].closed is True

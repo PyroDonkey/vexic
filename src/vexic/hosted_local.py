@@ -26,7 +26,11 @@ from vexic.hosted import (
 )
 from vexic.service import LocalMemoryService
 from vexic.storage.connection import StorageTarget, _is_libsql_target, connect
-from vexic.storage.errors import is_operational_error, is_retryable_operational_error
+from vexic.storage.errors import (
+    QueryDeadlineExceeded,
+    is_operational_error,
+    is_retryable_operational_error,
+)
 
 
 _CONTROL_DB_MODE = 0o600
@@ -2383,7 +2387,14 @@ def _connect_control_db(target: str | Path | StorageTarget) -> sqlite3.Connectio
         except Exception as exc:
             with suppress(Exception):
                 conn.close()
-            if attempt == 0 and is_retryable_operational_error(exc):
+            # A hung remote (QueryDeadlineExceeded) is not fixed by an
+            # immediate rebuild; retrying would double the caller's wait for
+            # the same outcome. Rebuild only on fast-fail faults.
+            if (
+                attempt == 0
+                and not isinstance(exc, QueryDeadlineExceeded)
+                and is_retryable_operational_error(exc)
+            ):
                 continue
             raise
         return conn
