@@ -1266,3 +1266,98 @@ def test_local_control_plane_authenticates_without_remote_state(tmp_path):
         project_ids={"project-a"},
     )
     assert keys.authenticate(provisioned.raw_key).key_id == provisioned.key_id
+
+
+# ---------------------------------------------------------------------------
+# `_connect_control_db` first-round-trip retry (COA-376). `libsql.connect()`
+# is lazy (no network I/O), so a transient Turso edge fault first surfaces on
+# the setup PRAGMA. The acquisition must retry once on a fresh handle for a
+# classified retryable fault, and must always close a handle whose PRAGMA
+# raised (previously leaked).
+
+
+_UPSTREAM_502 = ValueError(
+    "Hrana: `api error: `status=502 Bad Gateway, "
+    'body={"error":"connect to upstream failed"}``'
+)
+
+
+class _PragmaFaultConn:
+    """Fake remote connection whose first execute (the PRAGMA) may raise."""
+
+    def __init__(self, fault: BaseException | None) -> None:
+        self._fault = fault
+        self.closed = False
+        self.executed: list[str] = []
+
+    def execute(self, sql, parameters=(), /):
+        self.executed.append(sql)
+        if self._fault is not None:
+            raise self._fault
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _control_target() -> StorageTarget:
+    return StorageTarget(target="libsql://control.example.turso.io", auth_token="t")
+
+
+def test_connect_control_db_retries_once_on_transient_pragma_fault(monkeypatch):
+    from vexic import hosted_local
+
+    conns = [_PragmaFaultConn(_UPSTREAM_502), _PragmaFaultConn(None)]
+    handed_out: list[_PragmaFaultConn] = []
+
+    def fake_connect(target, *args, **kwargs):
+        handed_out.append(conns[len(handed_out)])
+        return handed_out[-1]
+
+    monkeypatch.setattr(hosted_local, "connect", fake_connect)
+    conn = hosted_local._connect_control_db(_control_target())
+
+    assert conn is conns[1]
+    assert conns[0].closed is True
+    assert conns[1].closed is False
+    assert conns[1].executed == ["PRAGMA foreign_keys = ON"]
+
+
+def test_connect_control_db_does_not_retry_nonretryable_fault(monkeypatch):
+    from vexic import hosted_local
+
+    fault = ValueError(
+        'Hrana: `api error: `status=404 Not Found, body={"error":"database not found"}``'
+    )
+    conns = [_PragmaFaultConn(fault), _PragmaFaultConn(None)]
+    handed_out: list[_PragmaFaultConn] = []
+
+    def fake_connect(target, *args, **kwargs):
+        handed_out.append(conns[len(handed_out)])
+        return handed_out[-1]
+
+    monkeypatch.setattr(hosted_local, "connect", fake_connect)
+    with pytest.raises(ValueError, match="database not found"):
+        hosted_local._connect_control_db(_control_target())
+
+    assert len(handed_out) == 1
+    assert conns[0].closed is True
+
+
+def test_connect_control_db_second_transient_fault_propagates(monkeypatch):
+    from vexic import hosted_local
+
+    conns = [_PragmaFaultConn(_UPSTREAM_502), _PragmaFaultConn(_UPSTREAM_502)]
+    handed_out: list[_PragmaFaultConn] = []
+
+    def fake_connect(target, *args, **kwargs):
+        handed_out.append(conns[len(handed_out)])
+        return handed_out[-1]
+
+    monkeypatch.setattr(hosted_local, "connect", fake_connect)
+    with pytest.raises(ValueError, match="connect to upstream failed"):
+        hosted_local._connect_control_db(_control_target())
+
+    assert len(handed_out) == 2
+    assert conns[0].closed is True
+    assert conns[1].closed is True
