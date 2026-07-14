@@ -1,11 +1,12 @@
-"""Bounded eviction for the per-tenant Turso token cache (ADR 0019 Addendum 2).
+"""Bounded eviction for the per-tenant Turso token cache (ADR 0019 Addendum 6).
 
-Addendum 2 records ``TenantTokenCache`` as "an unbounded in-process dict" with
-no size-bounded eviction. TTL alone does not bound it: an expired entry is never
-*served*, but it is only dropped when that same ``db_name`` is asked for again,
-so a process that sees a long tail of tenants retains an entry per tenant
-forever. TTL governs freshness; the bound governs size. These tests pin both,
-and pin that neither cannibalizes the other.
+Addendum 2 recorded ``TenantTokenCache`` as "an unbounded in-process dict" with
+no size-bounded eviction; Addendum 6 supersedes it and records the bound landing.
+TTL alone does not bound the cache: an expired entry is never *served*, but it is
+only dropped when that same ``db_name`` is asked for again, so a process that sees
+a long tail of tenants would retain an entry per tenant forever. TTL governs
+freshness; the bound governs size. These tests pin both, and pin that neither
+cannibalizes the other.
 
 Hermetic: the provisioning port and TTL clock are fakes, so nothing here touches
 the network or mints a real token. Contention tests use short real monotonic waits
