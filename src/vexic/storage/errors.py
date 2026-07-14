@@ -20,6 +20,7 @@ errors) still propagate, never silently swallowed.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 
 # libSQL/Hrana ``code:`` fragments and message substrings that mark an
@@ -128,16 +129,14 @@ def _is_upstream_connect_error(message: str) -> bool:
     reach the database primary (``connect to upstream failed`` -- observed
     live 2026-07-13 as ``status=502 Bad Gateway``). The edge losing its
     upstream is transient from the caller's viewpoint, so it classifies as
-    retryable. Requires the Hrana ``api error`` envelope -- not just any
-    Hrana message -- so a payload that merely echoes the phrase is not
-    reclassified. The status code is deliberately not pinned: a 503/504
-    variant of the same edge fault is equally transient. ``message`` is
-    lowercased.
+    retryable. Requires the structural ``hrana: `api error:`` envelope prefix
+    -- not just any Hrana message whose echoed text contains the substrings --
+    so a payload that merely mentions the phrase is not reclassified. The
+    status code is deliberately not pinned: a 503/504 variant of the same edge
+    fault is equally transient. ``message`` is lowercased.
     """
-    return (
-        "hrana" in message
-        and "api error" in message
-        and "connect to upstream failed" in message
+    return bool(
+        re.search(r"hrana: `api error:.*connect to upstream failed", message)
     )
 
 

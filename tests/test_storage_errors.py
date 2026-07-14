@@ -261,6 +261,17 @@ def test_retryable_ignores_upstream_phrase_outside_api_error_envelope() -> None:
     assert is_retryable_operational_error(exc) is False
 
 
+def test_retryable_requires_structural_api_error_envelope() -> None:
+    # A non-api-error Hrana message whose echoed text happens to contain both
+    # marker substrings must still not classify: the match is structural
+    # (``Hrana: `api error:`` prefix), not bag-of-substrings.
+    exc = ValueError(
+        "Hrana: `stream error: app text api error: connect to upstream failed`"
+    )
+    assert is_operational_error(exc) is False
+    assert is_retryable_operational_error(exc) is False
+
+
 def test_retryable_ignores_unrelated_value_error() -> None:
     assert is_retryable_operational_error(ValueError("nope")) is False
 

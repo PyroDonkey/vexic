@@ -167,9 +167,10 @@ class StorageConnection(Protocol):
 class DeadlineConnection:
     """Bound every remote libSQL driver call with a wall-clock deadline (ADR 0019 Addendum 7).
 
-    The driver's ``timeout=`` kwarg is not a network deadline and ``connect()``
-    does no I/O (ADR 0019 Addendum 6), so a degraded remote can hang any query
-    round-trip indefinitely. Each call runs on a daemon worker thread; if it
+    The driver's ``timeout=`` kwarg is not a network deadline and
+    ``libsql.connect()`` does no I/O (ADR 0019 Addendum 6; Vexic's ``connect()``
+    seam adds one round-trip via the Addendum 8 readiness probe), so a degraded
+    remote can hang any query round-trip indefinitely. Each call runs on a daemon worker thread; if it
     outruns ``deadline_seconds`` the caller gets :class:`QueryDeadlineExceeded`
     -- a retryable storage fault -- and the hung call is abandoned (the daemon
     thread dies with the process rather than blocking interpreter shutdown,
