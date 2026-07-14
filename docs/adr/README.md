@@ -50,7 +50,7 @@ index (and the reverse).
 | 0032 | The dream in-flight lock is a durable control-plane lease | accepted |
 | 0033 | Versioned docs do not record deployed state | accepted |
 | 0034 | Claude Code harness envelopes are filtered, not ingested | accepted |
-| 0035 | Hosted dreaming runs on per-tenant provisioned provider keys | accepted |
+| 0035 | Hosted dreaming runs on per-tenant provisioned provider keys | accepted (not yet implemented; hosted dreaming still reads the single `OPENROUTER_API_KEY` until COA-381 lands) |
 
 Notes:
 

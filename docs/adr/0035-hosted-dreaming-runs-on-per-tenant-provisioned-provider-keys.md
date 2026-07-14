@@ -115,13 +115,31 @@ new route, and would be worse here because it is an expected condition rather
 than a transient fault. Limit exhaustion is a terminal, queryable outcome with
 its own error type, not an exception that vanishes into a killed phase.
 
+## Status of the implementation
+
+This ADR records a decision. It is **not yet implemented**, and the code
+described below does not exist at the time of writing.
+
+Until the implementation lands, hosted dreaming still runs on the single ambient
+`OPENROUTER_API_KEY`, and the hosted configuration docs
+(`docs/hosted-mvp.md`, `docs/configuration.md`) correctly say so. Those docs
+describe what the code reads, per ADR 0033; they are not stale, and they must not
+be rewritten to describe the provisioning flow before that flow exists. An
+operator deploying today configures `OPENROUTER_API_KEY` and is correct to.
+
+Retiring that variable from the hosted path, and updating those two docs in the
+same change, is part of the implementation's scope -- not a follow-up. Reading
+this ADR as a description of current behavior is the specific misreading it is
+written to prevent.
+
 ## Consequences
 
-- `adapters/openrouter_live_adapter.py` stops reading `OPENROUTER_API_KEY` for
-  hosted per-tenant dreaming and takes the tenant's key from the control plane
-  via `DreamPhasePorts.secrets`. The ambient env read remains valid for
+- `adapters/openrouter_live_adapter.py` will stop reading `OPENROUTER_API_KEY`
+  for hosted per-tenant dreaming and will take the tenant's key from the control
+  plane via `DreamPhasePorts.secrets`. The ambient env read stays valid for
   single-key, non-hosted use (the local live-retrieval baseline harness,
   `docs/usage.md`), which is not multi-tenant and has no tenant to attribute to.
+  So the variable does not disappear; it stops being the hosted path's answer.
 - The control plane gains per-tenant provider-key state: the key id, its limit,
   and its lifecycle status. The key *secret* is returned once at creation and is
   stored under the same posture as other tenant secrets (ADR 0008/0023) -- or
