@@ -248,6 +248,50 @@ def test_flags_source_comment_claiming_a_path_that_does_not_exist(
     assert "src/vexic/storage/schema.py" in joined
 
 
+def test_flags_adapter_comment_claiming_a_path_that_does_not_exist(
+    tmp_path: Path,
+) -> None:
+    """`adapters/` is source the gate must read, not just scan for env reads.
+
+    The Turso adapter carries the same kind of path and ADR claims `src/vexic`
+    does, and a stale one there survived a green gate.
+    """
+    hook = _load_hook()
+    root = _repo(tmp_path)
+    adapters = root / "adapters"
+    adapters.mkdir()
+    (adapters / "turso_adapter.py").write_text(
+        '"""Turso adapter.\n\nPinned by tests/test_turso_removed.py.\n"""\n'
+        "\n"
+        "# Mirrors the target built in src/vexic/storage/gone.py.\n"
+        "VALUE = 1\n",
+        encoding="utf-8",
+    )
+
+    warnings, _ = hook.collect_warnings(root)
+
+    joined = "\n".join(warnings)
+    assert "tests/test_turso_removed.py" in joined
+    assert "src/vexic/storage/gone.py" in joined
+
+
+def test_flags_adapter_comment_citing_an_adr_that_does_not_exist(
+    tmp_path: Path,
+) -> None:
+    hook = _load_hook()
+    root = _repo(tmp_path)
+    adapters = root / "adapters"
+    adapters.mkdir()
+    (adapters / "turso_adapter.py").write_text(
+        "# Bounds the cache (ADR 0042).\n" "VALUE = 1\n",
+        encoding="utf-8",
+    )
+
+    warnings, _ = hook.collect_warnings(root)
+
+    assert any("0042" in warning for warning in warnings)
+
+
 def test_ignores_path_claims_in_historical_records(tmp_path: Path) -> None:
     """ADRs, provenance, and the changelog describe the repo as it was."""
     hook = _load_hook()

@@ -331,10 +331,9 @@ class TenantTokenCache:
     stalled owner cannot leave followers blocked when a fake TTL clock stands
     still.
 
-    ``max_entries`` bounds the cache (ADR 0019 Addendum 2). TTL alone does
-    not: an
-    expired entry is never *served*, but it is only evicted when that same
-    ``db_name`` is asked for again, so a process that sees a long tail of
+    ``max_entries`` bounds the cache (ADR 0019 Addendum 6). TTL alone does
+    not: an expired entry is never *served*, but it is only evicted when that
+    same ``db_name`` is asked for again, so a process that sees a long tail of
     tenants would otherwise retain a token entry per tenant forever. The
     bound is enforced as LRU over an ``OrderedDict`` -- a hit moves the key
     to the most-recently-used end, and an insert past the bound pops the

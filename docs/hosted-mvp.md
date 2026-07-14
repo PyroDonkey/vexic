@@ -339,8 +339,10 @@ directory does that, per ADR 0008/0013 precedent.
 - **Token store decision: mint short-lived, cache in-process, never persist
   raw.** `TenantTokenCache` mints a fresh, DB-scoped token via
   `TursoProvisioningPort.mint_token` on cache miss/expiry and holds it only in
-  an in-memory `dict` keyed by database name, with an injectable clock for
-  deterministic TTL tests. The cache TTL (default 600s) is kept shorter than
+  an in-memory `OrderedDict` keyed by database name, bounded by LRU eviction
+  (default 512 entries, ADR 0019 Addendum 6), with an injectable clock for
+  deterministic TTL tests. TTL governs freshness and the bound governs size;
+  neither replaces the other. The cache TTL (default 600s) is kept shorter than
   the minted token's own expiration (default `15m`) so a cached token is
   always re-minted well before Turso would reject it. Nothing is written to
   the catalog, disk, or any persistent store; a process restart or GC simply

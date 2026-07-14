@@ -1,11 +1,12 @@
-"""Bounded eviction for the per-tenant Turso token cache (ADR 0019 Addendum 2).
+"""Bounded eviction for the per-tenant Turso token cache (ADR 0019 Addendum 6).
 
-Addendum 2 records ``TenantTokenCache`` as "an unbounded in-process dict" with
-no size-bounded eviction. TTL alone does not bound it: an expired entry is never
-*served*, but it is only dropped when that same ``db_name`` is asked for again,
-so a process that sees a long tail of tenants retains an entry per tenant
-forever. TTL governs freshness; the bound governs size. These tests pin both,
-and pin that neither cannibalizes the other.
+Addendum 2 recorded ``TenantTokenCache`` as "an unbounded in-process dict" with
+no size-bounded eviction; Addendum 6 supersedes it and records the bound landing.
+TTL alone does not bound the cache: an expired entry is never *served*, but it is
+only dropped when that same ``db_name`` is asked for again, so a process that sees
+a long tail of tenants would retain an entry per tenant forever. TTL governs
+freshness; the bound governs size. These tests pin both, and pin that neither
+cannibalizes the other.
 
 Hermetic: the provisioning port and TTL clock are fakes, so nothing here touches
 the network or mints a real token. Contention tests use short real monotonic waits
@@ -193,6 +194,38 @@ def test_same_key_follower_wait_is_bounded_and_retryable():
         assert time.monotonic() - started_at < 0.5
         assert is_retryable_operational_error(excinfo.value)
         assert owner.result(timeout=2) == "jwt-tenant-a-1"
+
+
+def test_invalidate_with_no_mint_in_flight_drops_the_entry_and_remints():
+    """The quiet path: no contention, just drop the token and re-mint on demand.
+
+    This is the shape a revocation would use -- the in-flight race below is the
+    hard case, not the common one.
+    """
+    port = FakePort()
+    cache = TenantTokenCache(port, clock=FakeClock())
+
+    assert cache.get_token("tenant-a") == "jwt-tenant-a-1"
+    assert len(cache) == 1
+
+    cache.invalidate("tenant-a")
+    assert len(cache) == 0
+
+    # The cached token is gone, so the next caller mints rather than serving it.
+    assert cache.get_token("tenant-a") == "jwt-tenant-a-2"
+    assert port.calls == ["tenant-a", "tenant-a"]
+
+
+def test_invalidate_is_a_noop_for_a_db_name_that_was_never_cached():
+    port = FakePort()
+    cache = TenantTokenCache(port, clock=FakeClock())
+    cache.get_token("tenant-a")
+
+    cache.invalidate("tenant-b")
+
+    assert len(cache) == 1
+    assert cache.get_token("tenant-a") == "jwt-tenant-a-1"
+    assert port.calls == ["tenant-a"]
 
 
 def test_invalidate_during_mint_discards_result_and_remints():
