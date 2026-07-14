@@ -485,3 +485,11 @@ settled: the retryable 503 does not advertise `Retry-After`. The 429's header
 is computed from real limiter state; a 503 from a black-holed remote has no
 principled retry horizon, and inventing one would be speculative contract. A
 test pins the header's absence.
+
+**Connect-phase faults classify retryable too.** The live verification of the
+deadline surfaced an adjacent gap: the driver's Hrana ``http error: error
+trying to connect`` payload (DNS failure, refused, black-holed TCP connect)
+previously matched no classifier and fell through to a 500. An unreachable
+remote is transient from the caller's viewpoint, so
+`_is_remote_connect_error` now classifies it as a retryable operational
+error, joining the reaped-stream case in the 503 `storage_unavailable` path.

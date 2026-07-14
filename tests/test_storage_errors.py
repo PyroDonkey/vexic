@@ -197,6 +197,32 @@ def test_retryable_ignores_unrelated_api_404_value_error() -> None:
     assert is_retryable_operational_error(exc) is False
 
 
+def _hrana_connect_error() -> ValueError:
+    """The Hrana ``http error`` payload raised when the driver cannot reach
+    the remote at all (observed live 2026-07-13 against a black-holed IP)."""
+    return ValueError(
+        "Hrana: `http error: `error trying to connect: tcp connect error: "
+        "Operation timed out (os error 60)``"
+    )
+
+
+def test_operational_error_libsql_connect_failure() -> None:
+    assert is_operational_error(_hrana_connect_error()) is True
+
+
+def test_retryable_libsql_connect_failure() -> None:
+    # An unreachable remote is transient from the caller's viewpoint: it must
+    # surface as the retryable 503, not a 400/500.
+    assert is_retryable_operational_error(_hrana_connect_error()) is True
+
+
+def test_retryable_ignores_domain_connect_phrase_value_error() -> None:
+    # The phrase without the Hrana payload context must not classify.
+    exc = ValueError("error trying to connect the widget")
+    assert is_operational_error(exc) is False
+    assert is_retryable_operational_error(exc) is False
+
+
 def test_retryable_ignores_unrelated_value_error() -> None:
     assert is_retryable_operational_error(ValueError("nope")) is False
 
