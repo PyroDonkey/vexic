@@ -5,6 +5,7 @@ import json
 import re
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Iterator
 
@@ -31,7 +32,11 @@ from vexic.recorders.hosted_ingest import HostedIngestConfig, post_source_messag
 from vexic.recorders.mcp_connect import install_codex_connect, install_generic_connect
 from vexic.recorders.setup_exchange import SetupExchangeConfig, exchange_setup_token
 from vexic.recorders.status import RecorderStatus, write_status
-from vexic.recorders.transcript_cursor import TranscriptCursor, read_cursor, write_cursor
+from vexic.recorders.transcript_cursor import (
+    TranscriptCursor,
+    read_cursor,
+    write_cursor,
+)
 
 # Client names become the `~/.vexic/<name>-mcp.json` creds filename, so keep
 # them to a safe single filename component (no path separators or traversal).
@@ -124,12 +129,7 @@ def _validated_ingest_items(
 
     expected = [_source_key(message) for message in messages]
     actual = [_source_key(item) for item in result.items]
-    if (
-        len(expected) != len(set(expected))
-        or len(actual) != len(expected)
-        or len(actual) != len(set(actual))
-        or set(actual) != set(expected)
-    ):
+    if Counter(actual) != Counter(expected):
         raise RuntimeError(
             "hosted ingest response did not match the submitted source messages"
         )
@@ -265,7 +265,9 @@ def _add_setup_credential_args(parser: argparse.ArgumentParser) -> None:
 
 def _load_config(path: Path) -> _RecorderIngestConfigFile:
     try:
-        return _RecorderIngestConfigFile.model_validate_json(path.read_text(encoding="utf-8"))
+        return _RecorderIngestConfigFile.model_validate_json(
+            path.read_text(encoding="utf-8")
+        )
     except ValidationError as exc:
         raise ValueError(f"invalid recorder config: {exc}") from exc
 
@@ -347,7 +349,10 @@ def _try_write_cursor(
     try:
         write_cursor(cursor_dir, transcript, cursor)
     except Exception as exc:
-        print(f"warning: recorder cursor write failed: {type(exc).__name__}", file=sys.stderr)
+        print(
+            f"warning: recorder cursor write failed: {type(exc).__name__}",
+            file=sys.stderr,
+        )
 
 
 def _ingest(args: argparse.Namespace) -> int:
@@ -737,7 +742,9 @@ def main(argv: list[str] | None = None) -> int:
                 operation=args.command,
                 source_session_id=getattr(args, "source_session_id", None),
                 transcript_path=getattr(args, "transcript_path", None),
-                error="argument parsing failed" if isinstance(exc, MissingIngestOption) else str(exc),
+                error="argument parsing failed"
+                if isinstance(exc, MissingIngestOption)
+                else str(exc),
             ),
         )
         print(f"error: {exc}", file=sys.stderr)
