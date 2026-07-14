@@ -289,6 +289,31 @@ def test_storage_target_deadline_overrides_default(monkeypatch, gate) -> None:
         connect(target)
 
 
+def test_hung_probe_fails_after_a_single_deadline_window(monkeypatch, gate) -> None:
+    # A hung remote is not fixed by an immediate rebuild, so the probe must
+    # not retry QueryDeadlineExceeded: the caller waits one deadline window,
+    # not two.
+    connect_calls = []
+
+    def fake_driver_connect(target, **kwargs):
+        connect_calls.append(target)
+        return HangingLibsqlConn(gate)
+
+    stub = types.ModuleType("libsql")
+    stub.connect = fake_driver_connect
+    monkeypatch.setitem(sys.modules, "libsql", stub)
+
+    target = StorageTarget(
+        "libsql://example.turso.io",
+        auth_token="tok",
+        query_deadline_seconds=_TEST_DEADLINE,
+    )
+    with pytest.raises(QueryDeadlineExceeded):
+        connect(target)
+
+    assert len(connect_calls) == 1
+
+
 class _ProbeFaultLibsqlConn:
     """Driver-level fake whose every execute raises a given fault."""
 

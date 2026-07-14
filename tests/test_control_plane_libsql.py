@@ -1361,3 +1361,61 @@ def test_connect_control_db_second_transient_fault_propagates(monkeypatch):
     assert len(handed_out) == 2
     assert conns[0].closed is True
     assert conns[1].closed is True
+
+
+def test_connect_control_db_through_real_connect_seam_absorbs_probe_fault(monkeypatch):
+    # Integration across both retry seams with only the `libsql` driver module
+    # stubbed: the readiness probe inside `storage.connection.connect` absorbs
+    # the transient fault on a fresh driver handle, and `_connect_control_db`'s
+    # setup PRAGMA then runs on the ready connection.
+    import sys
+    import types
+
+    from vexic import hosted_local
+
+    class _FaultingDriverConn:
+        def __init__(self, fault):
+            self._fault = fault
+            self.closed = False
+            self.executed = []
+
+        def execute(self, sql, parameters=(), /):
+            self.executed.append(sql)
+            if self._fault is not None:
+                raise self._fault
+
+            class _Cursor:
+                def fetchone(self):
+                    return (1,)
+
+            return _Cursor()
+
+        def close(self):
+            self.closed = True
+
+    first = _FaultingDriverConn(
+        ValueError(
+            "Hrana: `api error: `status=502 Bad Gateway, "
+            'body={"error":"connect to upstream failed"}``'
+        )
+    )
+    second = _FaultingDriverConn(None)
+    driver_conns = [first, second]
+    handed_out = []
+
+    def fake_driver_connect(url, **kwargs):
+        handed_out.append(driver_conns[len(handed_out)])
+        return handed_out[-1]
+
+    stub = types.ModuleType("libsql")
+    stub.connect = fake_driver_connect
+    monkeypatch.setitem(sys.modules, "libsql", stub)
+
+    conn = hosted_local._connect_control_db(
+        StorageTarget("libsql://control.example.turso.io", auth_token="t")
+    )
+
+    assert len(handed_out) == 2
+    assert first.closed is True
+    assert second.executed == ["SELECT 1", "PRAGMA foreign_keys = ON"]
+    conn.close()

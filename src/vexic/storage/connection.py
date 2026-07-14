@@ -426,7 +426,14 @@ def connect(
             except Exception as exc:
                 with contextlib.suppress(Exception):
                     conn.close()
-                if attempt == 0 and is_retryable_operational_error(exc):
+                # A hung remote (QueryDeadlineExceeded) is not fixed by an
+                # immediate rebuild; retrying would double the caller's wait
+                # for the same outcome. Rebuild only on fast-fail faults.
+                if (
+                    attempt == 0
+                    and not isinstance(exc, QueryDeadlineExceeded)
+                    and is_retryable_operational_error(exc)
+                ):
                     continue
                 raise
             return conn
