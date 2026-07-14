@@ -41,6 +41,7 @@ from vexic.embeddings import EMBEDDING_DIM
 from vexic.models import FactCandidate
 from vexic.ports import DreamPhasePorts, HostPortNotConfigured
 from vexic.storage import commit_dream_cycle, record_session_summary, single_message_adapter
+from vexic.storage.errors import QueryDeadlineExceeded
 from vexic.hosted_http import create_app
 from vexic.hosted_local import (
     _CONTROL_PLANE_AGENT_CAPABILITIES,
@@ -360,6 +361,23 @@ class HostedHttpTests(unittest.TestCase):
         self.assertIn("correlation_id=req-locked", log_text)
         self.assertNotIn("database is locked", log_text)
         self.assertNotIn("secret", log_text)
+
+        with patch.object(
+            self.catalog,
+            "list_control_projects",
+            side_effect=QueryDeadlineExceeded(
+                "remote libSQL call exceeded the 30.0s query deadline"
+            ),
+        ):
+            response = client.get(
+                "/control/v1/clerk-orgs/org_123/projects",
+                headers=self._control_auth(),
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "storage_unavailable")
+        self.assertNotIn("deadline", response.text)
+        self.assertNotIn("Retry-After", response.headers)
 
         with patch.object(
             self.catalog,
@@ -2167,6 +2185,29 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json()["error"]["code"], "storage_unavailable")
         self.assertNotIn("SQLITE_BUSY", response.text)
+
+    def test_hosted_ingest_maps_query_deadline_timeout_to_503_without_retry_after(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE})
+
+        with patch.object(
+            type(self.service),
+            "ingest_source_transcript",
+            side_effect=QueryDeadlineExceeded(
+                "remote libSQL call exceeded the 30.0s query deadline"
+            ),
+        ):
+            response = self.client.post(
+                "/v1/ingest_source_transcript",
+                headers=self._write_headers(api_key),
+                json=self._ingest_body(),
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "storage_unavailable")
+        self.assertNotIn("deadline", response.text)
+        # Decision (ADR 0019 Addendum 7): the retryable 503 does NOT advertise Retry-After;
+        # only the 429 rate-limit responses carry it.
+        self.assertNotIn("Retry-After", response.headers)
 
     def test_hosted_ingest_maps_nonretryable_storage_valueerror_to_500(self) -> None:
         api_key = self._api_key(capabilities={MemoryCapability.WRITE})

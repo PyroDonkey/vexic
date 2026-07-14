@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
+
+from vexic.storage.errors import QueryDeadlineExceeded
 
 @dataclass(frozen=True)
 class StorageTarget:
@@ -12,6 +15,9 @@ class StorageTarget:
     never be logged: it is excluded from repr/eq/hash."""
     target: str
     auth_token: str | None = field(default=None, repr=False, compare=False, hash=False)
+    # Wall-clock bound on each remote driver call (ADR 0019 Addendum 7). ``None`` means the
+    # module default; ignored for local SQLite targets.
+    query_deadline_seconds: float | None = None
 
     def __repr__(self) -> str:
         tok = "***" if self.auth_token else None
@@ -25,6 +31,11 @@ class StorageTarget:
 # ":memory:" is the local SQLite backend. ``str.startswith`` accepts the tuple.
 _LIBSQL_SCHEMES = ("libsql://", "https://", "http://", "wss://", "ws://")
 _PLAINTEXT_LIBSQL_SCHEMES = ("http://", "ws://")
+
+# Wall-clock bound on each remote libSQL driver call (ADR 0019 Addendum 7). Well above
+# observed Turso latencies and the ~10s idle-stream reap; well below "hangs
+# forever". Local SQLite is never bounded.
+DEFAULT_QUERY_DEADLINE_SECONDS = 30.0
 
 
 class StorageConnection(Protocol):
@@ -58,6 +69,131 @@ class StorageConnection(Protocol):
     def __exit__(self, *exc: Any) -> Any: ...
 
 
+class DeadlineConnection:
+    """Bound every remote libSQL driver call with a wall-clock deadline (ADR 0019 Addendum 7).
+
+    The driver's ``timeout=`` kwarg is not a network deadline and ``connect()``
+    does no I/O (ADR 0019 Addendum 6), so a degraded remote can hang any query
+    round-trip indefinitely. Each call runs on a daemon worker thread; if it
+    outruns ``deadline_seconds`` the caller gets :class:`QueryDeadlineExceeded`
+    -- a retryable storage fault -- and the hung call is abandoned (the daemon
+    thread dies with the process rather than blocking interpreter shutdown,
+    which a ``ThreadPoolExecutor``'s non-daemon threads would).
+    """
+
+    def __init__(self, conn: Any, *, deadline_seconds: float) -> None:
+        self._conn = conn
+        self._deadline_seconds = deadline_seconds
+        self._poisoned = False
+
+    def _run(self, call: Callable[[], Any]) -> Any:
+        if self._poisoned:
+            raise QueryDeadlineExceeded(
+                "remote libSQL connection was abandoned after a query deadline "
+                "timeout; open a fresh connection"
+            )
+        outcome: dict[str, Any] = {}
+        done = threading.Event()
+
+        def worker() -> None:
+            try:
+                outcome["result"] = call()
+            except BaseException as exc:  # noqa: BLE001 - re-raised in caller
+                outcome["error"] = exc
+            finally:
+                done.set()
+
+        threading.Thread(target=worker, daemon=True).start()
+        if not done.wait(self._deadline_seconds):
+            self._poisoned = True
+            raise QueryDeadlineExceeded(
+                f"remote libSQL call exceeded the {self._deadline_seconds}s "
+                "query deadline; abandoning the connection"
+            )
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["result"]
+
+    def execute(self, sql: str, parameters: Any = (), /) -> "DeadlineCursor":
+        # Wrap the returned cursor: ``conn.execute(...).fetchall()`` is the
+        # dominant call-site pattern, and remote work deferred until fetch
+        # must run under the same deadline.
+        return DeadlineCursor(
+            self._run(lambda: self._conn.execute(sql, parameters)), self
+        )
+
+    def executemany(self, sql: str, parameters: Any, /) -> "DeadlineCursor":
+        return DeadlineCursor(
+            self._run(lambda: self._conn.executemany(sql, parameters)), self
+        )
+
+    def cursor(self) -> "DeadlineCursor":
+        # Cursors execute independently and share the connection's stream, so
+        # they run under the same deadline and poison the whole connection.
+        return DeadlineCursor(self._run(self._conn.cursor), self)
+
+    def commit(self) -> None:
+        self._run(self._conn.commit)
+
+    def rollback(self) -> None:
+        self._run(self._conn.rollback)
+
+    def close(self) -> None:
+        # A poisoned connection's underlying close() could hang on the same
+        # dead remote; drop the reference instead. Callers universally use
+        # ``with closing(connect(...))``, so close() must never raise or block.
+        if self._poisoned:
+            return
+        self._run(self._conn.close)
+
+    def __enter__(self) -> Any:
+        self._run(self._conn.__enter__)
+        return self
+
+    def __exit__(self, *exc: Any) -> Any:
+        # After a timeout the rollback-on-exit round-trip would hang on the
+        # same dead remote; skip it and let the timeout itself propagate.
+        if self._poisoned:
+            return False
+        return self._run(lambda: self._conn.__exit__(*exc))
+
+
+class DeadlineCursor:
+    """Cursor companion to :class:`DeadlineConnection`.
+
+    Round-trip methods run under the parent connection's deadline via its
+    shared runner, so a hung cursor call poisons the whole connection (the
+    dead stream is common to both). Non-round-trip attributes (``description``,
+    ``lastrowid``, ...) pass through.
+    """
+
+    def __init__(self, cursor: Any, parent: DeadlineConnection) -> None:
+        self._cursor = cursor
+        self._parent = parent
+
+    def execute(self, sql: str, parameters: Any = (), /) -> Any:
+        self._parent._run(lambda: self._cursor.execute(sql, parameters))
+        return self
+
+    def executemany(self, sql: str, parameters: Any, /) -> Any:
+        self._parent._run(lambda: self._cursor.executemany(sql, parameters))
+        return self
+
+    def fetchone(self) -> Any:
+        return self._parent._run(self._cursor.fetchone)
+
+    def fetchmany(self, size: int | None = None) -> Any:
+        if size is None:
+            return self._parent._run(self._cursor.fetchmany)
+        return self._parent._run(lambda: self._cursor.fetchmany(size))
+
+    def fetchall(self) -> Any:
+        return self._parent._run(self._cursor.fetchall)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._cursor, name)
+
+
 def _is_libsql_target(target: str | Path) -> bool:
     """True when ``target`` names a hosted libSQL database rather than a local
     SQLite file or ``:memory:``."""
@@ -85,9 +221,12 @@ def connect(
     from the environment (ADR 0019). The ``libsql`` client is an optional
     ``hosted`` extra, imported lazily so the local path needs no extra dependency.
     """
+    deadline_seconds = DEFAULT_QUERY_DEADLINE_SECONDS
     if isinstance(target, StorageTarget):
         if auth_token is not None:
             raise ValueError("Pass auth_token via StorageTarget or the kwarg, not both.")
+        if target.query_deadline_seconds is not None:
+            deadline_seconds = target.query_deadline_seconds
         target, auth_token = target.as_connect_args()
 
     if _is_libsql_target(target):
@@ -105,8 +244,10 @@ def connect(
             ) from exc
 
         if auth_token is None:
-            return libsql.connect(target)
-        return libsql.connect(target, auth_token=auth_token)
+            raw = libsql.connect(target)
+        else:
+            raw = libsql.connect(target, auth_token=auth_token)
+        return DeadlineConnection(raw, deadline_seconds=deadline_seconds)
     return sqlite3.connect(target, **kwargs)
 
 

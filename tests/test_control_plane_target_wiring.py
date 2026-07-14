@@ -141,7 +141,7 @@ class _FullFakeProvisioning:
     def build_token_cache(self, port):
         return object()
 
-    def build_resolver(self, token_cache, *, org):
+    def build_resolver(self, token_cache, *, org, env=None):
         self.resolver_calls += 1
         return lambda tenant: None
 

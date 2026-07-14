@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 import urllib.error
 import urllib.request
@@ -10,7 +11,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from urllib.parse import urlencode, urlsplit
 
-from vexic.storage.connection import StorageTarget
+from vexic.storage.connection import DEFAULT_QUERY_DEADLINE_SECONDS, StorageTarget
 
 if TYPE_CHECKING:
     from vexic.hosted import HostedTenant
@@ -27,10 +28,32 @@ def _require(env: Mapping[str, str], name: str) -> str:
     return v
 
 
+def query_deadline_from_env(env: Mapping[str, str]) -> float:
+    """Wall-clock query deadline for remote libSQL calls (ADR 0019 Addendum 7).
+
+    Reads ``VEXIC_REMOTE_QUERY_DEADLINE_SECONDS``; absent or malformed falls
+    back to the module default. Parsed here in ``adapters/`` so ``src/vexic``
+    stays free of ambient environment reads.
+    """
+    raw = env.get("VEXIC_REMOTE_QUERY_DEADLINE_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_QUERY_DEADLINE_SECONDS
+    try:
+        deadline = float(raw)
+    except ValueError:
+        return DEFAULT_QUERY_DEADLINE_SECONDS
+    # 0/negative would time out every query instantly and poison its
+    # connection; nan/inf break the wait bound. Fall back rather than fail.
+    if not math.isfinite(deadline) or deadline <= 0:
+        return DEFAULT_QUERY_DEADLINE_SECONDS
+    return deadline
+
+
 def control_plane_target(env: Mapping[str, str]) -> StorageTarget:
     return StorageTarget(
         _require(env, "TURSO_DATABASE_URL"),
         auth_token=_require(env, "TURSO_AUTH_TOKEN"),
+        query_deadline_seconds=query_deadline_from_env(env),
     )
 
 
@@ -371,7 +394,10 @@ def _db_name_from_dsn(customer_target: str, org: str) -> str:
 
 
 def make_customer_target_resolver(
-    token_cache: TenantTokenCache, *, org: str
+    token_cache: TenantTokenCache,
+    *,
+    org: str,
+    query_deadline_seconds: float | None = None,
 ) -> "Callable[[HostedTenant], StorageTarget | None]":
     """Build the per-tenant customer-memory resolver.
 
@@ -393,6 +419,10 @@ def make_customer_target_resolver(
         if not customer_target:
             return None
         db_name = _db_name_from_dsn(customer_target, org)
-        return StorageTarget(customer_target, token_cache.get_token(db_name))
+        return StorageTarget(
+            customer_target,
+            token_cache.get_token(db_name),
+            query_deadline_seconds=query_deadline_seconds,
+        )
 
     return resolve

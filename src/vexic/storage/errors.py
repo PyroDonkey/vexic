@@ -67,6 +67,16 @@ _RETRYABLE_MARKERS = (
 )
 
 
+class QueryDeadlineExceeded(ValueError):
+    """A remote libSQL driver call outran its wall-clock deadline (ADR 0019 Addendum 7).
+
+    Subclasses :class:`ValueError` so the hosted HTTP boundaries' existing
+    ``except ValueError`` -> classifier -> 503 ``storage_unavailable`` path
+    handles it without edits. The classifiers below recognize it by type, not
+    message. The message must never embed SQL text or parameters.
+    """
+
+
 def _is_reaped_stream_error(message: str) -> bool:
     """True for the Hrana ``api error`` 404 raised when Turso reaps an idle
     stream (~10s) before the next round-trip -- typically ``commit()``. The
@@ -76,6 +86,17 @@ def _is_reaped_stream_error(message: str) -> bool:
     is not reclassified as a storage fault. ``message`` is lowercased.
     """
     return "hrana" in message and "stream not found" in message
+
+
+def _is_remote_connect_error(message: str) -> bool:
+    """True for the Hrana ``http error`` raised when the driver cannot reach
+    the remote at all (DNS failure, refused, or black-holed TCP connect --
+    observed live 2026-07-13). The remote being unreachable is transient from
+    the caller's viewpoint, so it classifies as retryable. Requires the Hrana
+    payload context so a domain ``ValueError`` that merely mentions connecting
+    is not reclassified. ``message`` is lowercased.
+    """
+    return "hrana" in message and "error trying to connect" in message
 
 
 def _message(exc: BaseException) -> str:
@@ -117,11 +138,15 @@ def is_operational_error(exc: BaseException) -> bool:
     """
     if isinstance(exc, sqlite3.OperationalError):
         return True
+    if isinstance(exc, QueryDeadlineExceeded):
+        return True
     if isinstance(exc, ValueError):
         message = _message(exc).lower()
-        return any(
-            marker.lower() in message for marker in _OPERATIONAL_MARKERS
-        ) or _is_reaped_stream_error(message)
+        return (
+            any(marker.lower() in message for marker in _OPERATIONAL_MARKERS)
+            or _is_reaped_stream_error(message)
+            or _is_remote_connect_error(message)
+        )
     return False
 
 
@@ -134,11 +159,15 @@ def is_retryable_operational_error(exc: BaseException) -> bool:
     form. A non-retryable operational error (e.g. a syntax error) returns
     ``False``; non-storage exceptions return ``False``.
     """
+    if isinstance(exc, QueryDeadlineExceeded):
+        return True
     if isinstance(exc, sqlite3.OperationalError) or (
         isinstance(exc, ValueError) and is_operational_error(exc)
     ):
         message = _message(exc).lower()
-        return any(
-            marker in message for marker in _RETRYABLE_MARKERS
-        ) or _is_reaped_stream_error(message)
+        return (
+            any(marker in message for marker in _RETRYABLE_MARKERS)
+            or _is_reaped_stream_error(message)
+            or _is_remote_connect_error(message)
+        )
     return False

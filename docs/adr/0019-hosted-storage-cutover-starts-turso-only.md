@@ -437,3 +437,59 @@ Note that the 503 carries no `Retry-After` header today -- that header is
 attached only to the 429 rate-limit responses. Whether a client-retryable 503
 should advertise one is an open question for COA-377, not a settled contract
 this addendum can lean on.
+
+## Addendum 7 -- 2026-07-13: remote query deadline (COA-377)
+
+Closes the gap Addendum 6 left open: a degraded or black-holed remote could
+hang any query round-trip indefinitely, because the driver's `timeout`
+argument is not a network deadline and `connect()` does no I/O.
+
+**Mechanism.** `connect()` in `src/vexic/storage/connection.py` wraps the
+libSQL branch's raw driver connection in a `DeadlineConnection` (cursors in a
+companion `DeadlineCursor`). Every round-trip method -- `execute`,
+`executemany`, `commit`, `rollback`, `close`, cursor execute/fetch -- runs on
+a daemon worker thread bounded by a wall-clock deadline. The local SQLite
+branch returns the raw `sqlite3.Connection` untouched; a deadline there is
+meaningless and would tax every local call site and the test suite.
+
+Daemon threads rather than a `ThreadPoolExecutor`: the executor's non-daemon
+workers are joined at interpreter exit, so a hung driver call would block
+process shutdown -- the exact hang being eliminated. An abandoned worker dies
+with the process. Per-call thread cost is negligible against a network
+round-trip.
+
+**Fault shape.** A timeout raises `QueryDeadlineExceeded`
+(`src/vexic/storage/errors.py`), a `ValueError` subclass recognized by type in
+`is_operational_error` and `is_retryable_operational_error`. Subclassing
+`ValueError` means the existing HTTP boundaries route it to the 503
+`storage_unavailable` with zero edits; the classifiers match the type, never a
+fabricated Hrana message. The message carries no SQL text or parameters.
+
+**Poisoning.** A timed-out connection is poisoned: the hung Hrana stream is
+never reused, every subsequent method fails fast with
+`QueryDeadlineExceeded`, and `close()`/`__exit__` skip the underlying driver
+call entirely (a rollback or close round-trip would hang on the same dead
+remote). Callers recover by opening a fresh connection, which is what every
+`with closing(connect(...))` call site already does per operation.
+
+**Configuration.** The deadline defaults to
+`DEFAULT_QUERY_DEADLINE_SECONDS = 30.0` -- above observed Turso latencies and
+the ~10s idle-stream reap, far below "hangs forever". Operators tune it with
+`VEXIC_REMOTE_QUERY_DEADLINE_SECONDS`, parsed only in
+`adapters/turso_adapter.py` (`query_deadline_from_env`) and threaded through
+`StorageTarget.query_deadline_seconds`; `src/vexic` stays free of ambient
+environment reads.
+
+**Retry-After: resolved as omitted.** The open question from Addendum 6 is
+settled: the retryable 503 does not advertise `Retry-After`. The 429's header
+is computed from real limiter state; a 503 from a black-holed remote has no
+principled retry horizon, and inventing one would be speculative contract. A
+test pins the header's absence.
+
+**Connect-phase faults classify retryable too.** The live verification of the
+deadline surfaced an adjacent gap: the driver's Hrana ``http error: error
+trying to connect`` payload (DNS failure, refused, black-holed TCP connect)
+previously matched no classifier and fell through to a 500. An unreachable
+remote is transient from the caller's viewpoint, so
+`_is_remote_connect_error` now classifies it as a retryable operational
+error, joining the reaped-stream case in the 503 `storage_unavailable` path.

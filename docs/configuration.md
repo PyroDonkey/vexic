@@ -60,6 +60,12 @@ same target regardless of `VEXIC_STORAGE_BACKEND`.
 | `TURSO_DATABASE_URL` | `adapters/turso_adapter.py` | -- (required) | libSQL DSN of the control-plane database (tenant catalog, API keys, telemetry). |
 | `TURSO_AUTH_TOKEN` | `adapters/turso_adapter.py` | -- (required) | Auth token for `TURSO_DATABASE_URL`. |
 
+### Remote query deadline -- read when either Turso flag is `turso`
+
+| Variable | Component | Default | Notes |
+| --- | --- | --- | --- |
+| `VEXIC_REMOTE_QUERY_DEADLINE_SECONDS` | `adapters/turso_adapter.py` | `30.0` | Wall-clock deadline on each remote libSQL driver call (ADR 0019 Addendum 7). A hang past the deadline surfaces as a retryable 503 `storage_unavailable`. Absent or malformed falls back to the default. Local SQLite is never bounded. |
+
 ## OpenRouter live adapter (operator-only)
 
 Read by `adapters/openrouter_live_adapter.py` when it is configured as the
