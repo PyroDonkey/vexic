@@ -422,7 +422,7 @@ def connect(
                 raw = libsql.connect(target, auth_token=auth_token)
             conn = DeadlineConnection(raw, deadline_seconds=deadline_seconds)
             try:
-                conn.execute("SELECT 1")
+                conn.execute("SELECT 1").fetchone()
             except Exception as exc:
                 with contextlib.suppress(Exception):
                     conn.close()
