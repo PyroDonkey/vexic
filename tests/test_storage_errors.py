@@ -226,6 +226,33 @@ def test_retryable_ignores_domain_connect_phrase_value_error() -> None:
     assert is_retryable_operational_error(exc) is False
 
 
+def _hrana_upstream_connect_error() -> ValueError:
+    """The Hrana ``api error`` 502 raised when the Turso edge cannot reach the
+    database primary (observed live 2026-07-13; killed a Deep dream phase and
+    rejected a customer write)."""
+    return ValueError(
+        "Hrana: `api error: `status=502 Bad Gateway, "
+        'body={"error":"connect to upstream failed"}``'
+    )
+
+
+def test_operational_error_libsql_upstream_connect_failure() -> None:
+    assert is_operational_error(_hrana_upstream_connect_error()) is True
+
+
+def test_retryable_libsql_upstream_connect_failure() -> None:
+    # The edge failing to reach the primary is transient from the caller's
+    # viewpoint: it must surface as the retryable 503, not a 400/500.
+    assert is_retryable_operational_error(_hrana_upstream_connect_error()) is True
+
+
+def test_retryable_ignores_domain_upstream_phrase_value_error() -> None:
+    # The phrase without the Hrana payload context must not classify.
+    exc = ValueError("connect to upstream failed for widget proxy")
+    assert is_operational_error(exc) is False
+    assert is_retryable_operational_error(exc) is False
+
+
 def test_retryable_ignores_unrelated_value_error() -> None:
     assert is_retryable_operational_error(ValueError("nope")) is False
 

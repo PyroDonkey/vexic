@@ -123,6 +123,17 @@ def _is_remote_connect_error(message: str) -> bool:
     return "hrana" in message and "error trying to connect" in message
 
 
+def _is_upstream_connect_error(message: str) -> bool:
+    """True for the Hrana ``api error`` 502 raised when the Turso edge cannot
+    reach the database primary (``connect to upstream failed`` -- observed live
+    2026-07-13). The edge losing its upstream is transient from the caller's
+    viewpoint, so it classifies as retryable. Requires the Hrana payload
+    context so a domain ``ValueError`` that merely mentions an upstream is not
+    reclassified. ``message`` is lowercased.
+    """
+    return "hrana" in message and "connect to upstream failed" in message
+
+
 def _message(exc: BaseException) -> str:
     """Best-effort message text for both ``sqlite3.*`` and the libSQL ``ValueError``.
 
@@ -170,6 +181,7 @@ def is_operational_error(exc: BaseException) -> bool:
             any(marker.lower() in message for marker in _OPERATIONAL_MARKERS)
             or _is_reaped_stream_error(message)
             or _is_remote_connect_error(message)
+            or _is_upstream_connect_error(message)
         )
     return False
 
@@ -195,6 +207,7 @@ def is_retryable_operational_error(exc: BaseException) -> bool:
             any(marker in message for marker in _RETRYABLE_MARKERS)
             or _is_reaped_stream_error(message)
             or _is_remote_connect_error(message)
+            or _is_upstream_connect_error(message)
         )
     return False
 
