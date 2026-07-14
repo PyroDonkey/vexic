@@ -276,15 +276,94 @@ def test_remote_libsql_target_returns_deadline_wrapped_connection(monkeypatch) -
 
 
 def test_storage_target_deadline_overrides_default(monkeypatch, gate) -> None:
+    # The readiness probe runs under the overridden deadline, so a
+    # hung remote surfaces QueryDeadlineExceeded at connect() itself instead of
+    # hanging the caller's first business statement.
     _patch_libsql_module(monkeypatch, HangingLibsqlConn(gate))
     target = StorageTarget(
         "libsql://example.turso.io",
         auth_token="tok",
         query_deadline_seconds=_TEST_DEADLINE,
     )
-    conn = connect(target)
     with pytest.raises(QueryDeadlineExceeded):
-        conn.execute("SELECT 1")
+        connect(target)
+
+
+class _ProbeFaultLibsqlConn:
+    """Driver-level fake whose every execute raises a given fault."""
+
+    def __init__(self, fault: BaseException) -> None:
+        self._fault = fault
+        self.closed = False
+
+    def execute(self, sql, parameters=(), /):
+        raise self._fault
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _upstream_502() -> ValueError:
+    return ValueError(
+        "Hrana: `api error: `status=502 Bad Gateway, "
+        'body={"error":"connect to upstream failed"}``'
+    )
+
+
+def _patch_libsql_sequence(monkeypatch, driver_conns) -> list:
+    """Stub ``libsql`` handing out ``driver_conns`` in order; returns the log."""
+    handed_out: list = []
+
+    def fake_connect(target, **kwargs):
+        handed_out.append(driver_conns[len(handed_out)])
+        return handed_out[-1]
+
+    stub = types.ModuleType("libsql")
+    stub.connect = fake_connect
+    monkeypatch.setitem(sys.modules, "libsql", stub)
+    return handed_out
+
+
+def test_remote_connect_probe_retries_once_on_transient_fault(monkeypatch) -> None:
+    # The readiness probe absorbs one transient edge fault (e.g. the
+    # Hrana 502 upstream-connect failure) by rebuilding on a fresh handle.
+    first = _ProbeFaultLibsqlConn(_upstream_502())
+    second = FakeLibsqlConn()
+    handed_out = _patch_libsql_sequence(monkeypatch, [first, second])
+
+    conn = connect("libsql://example.turso.io", auth_token="tok")
+
+    assert len(handed_out) == 2
+    assert first.closed is True
+    assert isinstance(conn, DeadlineConnection)
+    conn.execute("CREATE TABLE t (v TEXT)")
+
+
+def test_remote_connect_probe_second_transient_fault_propagates(monkeypatch) -> None:
+    first = _ProbeFaultLibsqlConn(_upstream_502())
+    second = _ProbeFaultLibsqlConn(_upstream_502())
+    handed_out = _patch_libsql_sequence(monkeypatch, [first, second])
+
+    with pytest.raises(ValueError, match="connect to upstream failed"):
+        connect("libsql://example.turso.io", auth_token="tok")
+
+    assert len(handed_out) == 2
+    assert first.closed is True
+    assert second.closed is True
+
+
+def test_remote_connect_probe_does_not_retry_nonretryable_fault(monkeypatch) -> None:
+    fault = ValueError(
+        'Hrana: `api error: `status=404 Not Found, body={"error":"database not found"}``'
+    )
+    first = _ProbeFaultLibsqlConn(fault)
+    handed_out = _patch_libsql_sequence(monkeypatch, [first, FakeLibsqlConn()])
+
+    with pytest.raises(ValueError, match="database not found"):
+        connect("libsql://example.turso.io", auth_token="tok")
+
+    assert len(handed_out) == 1
+    assert first.closed is True
 
 
 def test_wrapped_call_exceptions_propagate_unchanged() -> None:

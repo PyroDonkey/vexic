@@ -2261,7 +2261,7 @@ class HostedHttpTests(unittest.TestCase):
         self.assertNotIn("SQLITE_BUSY", response.text)
 
     def test_hosted_ingest_maps_upstream_connect_failure_to_503(self) -> None:
-        # The exact Turso edge fault observed live 2026-07-13 (COA-376): the
+        # The exact Turso edge fault observed live 2026-07-13: the
         # Hrana api error 502 must surface as the retryable 503, not a 500.
         api_key = self._api_key(capabilities={MemoryCapability.WRITE})
 

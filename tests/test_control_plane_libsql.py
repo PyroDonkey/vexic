@@ -1269,7 +1269,7 @@ def test_local_control_plane_authenticates_without_remote_state(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# `_connect_control_db` first-round-trip retry (COA-376). `libsql.connect()`
+# `_connect_control_db` first-round-trip retry. `libsql.connect()`
 # is lazy (no network I/O), so a transient Turso edge fault first surfaces on
 # the setup PRAGMA. The acquisition must retry once on a fresh handle for a
 # classified retryable fault, and must always close a handle whose PRAGMA
