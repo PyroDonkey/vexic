@@ -419,6 +419,15 @@ sanitized `MutationOutcomeUnknown` failure instead. At most 64 abandoned remote
 workers are retained process-wide; once that cap is occupied, new work fails
 before starting a driver call.
 
+Because `libsql.connect()` is lazy, a transient edge fault (for example the
+Hrana `api error` 502 `connect to upstream failed` observed live 2026-07-13)
+first surfaces on a new connection's first round-trip. Both connection seams
+absorb one such fault at acquisition time: `storage.connection.connect` probes
+a remote target with `SELECT 1` through the deadline wrapper and rebuilds once
+on a classified retryable fault, and the control-plane `_connect_control_db`
+does the same around its setup PRAGMA. A second consecutive fault propagates;
+business statements and mutations are never replayed.
+
 Known follow-ups, deliberately not built in this cutover:
 
 - Some adapter type annotations (e.g. around the injected HTTP transport and
