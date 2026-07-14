@@ -46,7 +46,11 @@ from vexic.hosted import (
 from vexic.mcp_http import register_mcp_routes
 from vexic.mcp_http import _scope_from_headers as _read_scope_from_headers
 from vexic.ports import HostPortNotConfigured
-from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
+from vexic.hosted_local import (
+    HostedApiKeyStore,
+    HostedTenantCatalog,
+    hosted_auth_request_context,
+)
 from vexic.storage.errors import (
     is_operational_error,
     is_retryable_operational_error,
@@ -167,21 +171,34 @@ def create_app(
         request: Request,
         call_next: Callable[[Request], Awaitable[object]],
     ) -> object:
-        if request.method in {"POST", "PUT", "PATCH"}:
-            content_length = request.headers.get("content-length")
-            if content_length is not None:
-                try:
-                    body_size = int(content_length)
-                except ValueError:
-                    return _error_response(400, "invalid_request", "Invalid Content-Length header.")
-                if body_size < 0:
-                    return _error_response(400, "invalid_request", "Invalid Content-Length header.")
-                if body_size > MAX_BODY_BYTES:
+        with hosted_auth_request_context():
+            if request.method in {"POST", "PUT", "PATCH"}:
+                content_length = request.headers.get("content-length")
+                if content_length is not None:
+                    try:
+                        body_size = int(content_length)
+                    except ValueError:
+                        return _error_response(
+                            400,
+                            "invalid_request",
+                            "Invalid Content-Length header.",
+                        )
+                    if body_size < 0:
+                        return _error_response(
+                            400,
+                            "invalid_request",
+                            "Invalid Content-Length header.",
+                        )
+                    if body_size > MAX_BODY_BYTES:
+                        return _error_response(
+                            413,
+                            "request_too_large",
+                            "Request body is too large.",
+                        )
+                body = await request.body()
+                if len(body) > MAX_BODY_BYTES:
                     return _error_response(413, "request_too_large", "Request body is too large.")
-            body = await request.body()
-            if len(body) > MAX_BODY_BYTES:
-                return _error_response(413, "request_too_large", "Request body is too large.")
-        return await call_next(request)
+            return await call_next(request)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_: Request, __: RequestValidationError) -> JSONResponse:
@@ -246,7 +263,10 @@ def create_app(
             exchange = service.api_keys.exchange_setup_token(token.strip())
         except PermissionError:
             return _error_response(401, "unauthorized", "Invalid setup token.")
-        except Exception:
+        except Exception as exc:
+            storage_error = _storage_error_response(exc)
+            if storage_error is not None:
+                return storage_error
             return _error_response(500, "internal_error", "Setup token exchange failed.")
         agent_scope = exchange.agent_scope
         return JSONResponse(
@@ -447,7 +467,10 @@ async def _handle_search(
         return _error_response(403, "permission_denied", str(exc))
     except ValueError as exc:
         return _value_error_response(exc)
-    except Exception:
+    except Exception as exc:
+        storage_error = _storage_error_response(exc)
+        if storage_error is not None:
+            return storage_error
         return _error_response(500, "internal_error", "Hosted memory request failed.")
     return await _handle_payload(api_key, payload, call)
 
@@ -483,7 +506,10 @@ async def _handle_fresh_context(
         return _error_response(403, "permission_denied", str(exc))
     except ValueError as exc:
         return _value_error_response(exc)
-    except Exception:
+    except Exception as exc:
+        storage_error = _storage_error_response(exc)
+        if storage_error is not None:
+            return storage_error
         return _error_response(500, "internal_error", "Hosted memory request failed.")
     return await _handle_payload(api_key, payload, service.fresh_context)
 
@@ -524,7 +550,10 @@ async def _handle_expand_history(
         return _error_response(403, "permission_denied", str(exc))
     except ValueError as exc:
         return _value_error_response(exc)
-    except Exception:
+    except Exception as exc:
+        storage_error = _storage_error_response(exc)
+        if storage_error is not None:
+            return storage_error
         return _error_response(500, "internal_error", "Hosted memory request failed.")
     return await _handle_payload(
         api_key,
@@ -569,7 +598,10 @@ async def _handle_load_active_context(
         return _error_response(403, "permission_denied", str(exc))
     except ValueError as exc:
         return _value_error_response(exc)
-    except Exception:
+    except Exception as exc:
+        storage_error = _storage_error_response(exc)
+        if storage_error is not None:
+            return storage_error
         return _error_response(500, "internal_error", "Hosted memory request failed.")
     return await _handle_payload(api_key, payload, service.load_active_context)
 
@@ -634,7 +666,12 @@ async def _handle_trigger_dream_phase(
         if str(exc) == "Invalid hosted API key.":
             return _error_response(401, "unauthorized", "Invalid hosted API key.")
         return _error_response(403, "permission_denied", str(exc))
-    except Exception:
+    except ValueError as exc:
+        return _value_error_response(exc)
+    except Exception as exc:
+        storage_error = _storage_error_response(exc)
+        if storage_error is not None:
+            return storage_error
         return _error_response(500, "internal_error", "Hosted memory request failed.")
 
     try:
@@ -673,7 +710,10 @@ async def _handle_trigger_dream_phase(
         return _error_response(403, "permission_denied", str(exc))
     except ValueError as exc:
         return _value_error_response(exc)
-    except Exception:
+    except Exception as exc:
+        storage_error = _storage_error_response(exc)
+        if storage_error is not None:
+            return storage_error
         return _error_response(500, "internal_error", "Hosted memory request failed.")
     return JSONResponse(result.model_dump(mode="json"), status_code=202)
 
@@ -716,6 +756,19 @@ def _value_error_response(exc: ValueError) -> JSONResponse:
     """
     if isinstance(exc, ValidationError):
         return _error_response(400, "invalid_request", str(exc))
+    storage_error = _storage_error_response(exc)
+    if storage_error is not None:
+        return storage_error
+    return _error_response(400, "invalid_request", str(exc))
+
+
+def _storage_error_response(exc: BaseException) -> JSONResponse | None:
+    """Return a sanitized response for a recognized storage failure.
+
+    Unlike ``_value_error_response``, this accepts typed sqlite exceptions as
+    well as libSQL's bare ``ValueError`` so early auth/setup boundaries cannot
+    accidentally downgrade a retryable backend outage to a generic 500.
+    """
     if is_retryable_operational_error(exc):
         _log_storage_value_error("retryable_operational", exc)
         return _error_response(
@@ -726,10 +779,10 @@ def _value_error_response(exc: ValueError) -> JSONResponse:
     if is_operational_error(exc) or is_unique_violation(exc) or "hrana" in str(exc).lower():
         _log_storage_value_error("operational", exc)
         return _error_response(500, "internal_error", "Hosted memory request failed.")
-    return _error_response(400, "invalid_request", str(exc))
+    return None
 
 
-def _log_storage_value_error(category: str, exc: ValueError) -> None:
+def _log_storage_value_error(category: str, exc: BaseException) -> None:
     logger.warning(
         "hosted storage error category=%s exception_type=%s",
         category,
@@ -765,7 +818,10 @@ async def _handle_payload(
         return _error_response(403, "permission_denied", str(exc))
     except ValueError as exc:
         return _value_error_response(exc)
-    except Exception:
+    except Exception as exc:
+        storage_error = _storage_error_response(exc)
+        if storage_error is not None:
+            return storage_error
         return _error_response(500, "internal_error", "Hosted memory request failed.")
     return JSONResponse(result.model_dump(mode="json"))
 
@@ -980,9 +1036,15 @@ def main(
         keys.revoke_key(args.key_id, revoked_by=args.revoked_by)
         print(json.dumps({"key_id": args.key_id, "revoked": True}, sort_keys=True))
         return 0
-    except (HostPortNotConfigured, PermissionError, ValueError) as exc:
+    except (HostPortNotConfigured, PermissionError) as exc:
         parser.exit(2, f"{exc}\n")
     except Exception as exc:
+        if is_retryable_operational_error(exc):
+            parser.exit(1, "Hosted storage is temporarily unavailable.\n")
+        if is_operational_error(exc) or is_unique_violation(exc) or "hrana" in str(exc).lower():
+            parser.exit(1, "Hosted command failed due to a storage error.\n")
+        if isinstance(exc, ValueError):
+            parser.exit(2, f"{exc}\n")
         parser.exit(1, f"hosted command failed: {type(exc).__name__}: {exc}\n")
 
 

@@ -15,7 +15,7 @@ from vexic.storage.schema import (
     init_vector_memory,
 )
 from vexic.storage.connection import connect
-from vexic.storage.errors import is_operational_error
+from vexic.storage.errors import is_malformed_fts_query_error
 from vexic.storage.vectors import select_vector_backend
 
 # Tier 3 — durable, vector-indexed facts. Owns nearest-neighbor retrieval and
@@ -116,10 +116,9 @@ def keyword_long_term_fact_ids(
                 params,
             ).fetchall()
         except (sqlite3.OperationalError, ValueError) as exc:
-            # A malformed FTS MATCH is a sqlite3.OperationalError locally and a
-            # bare ValueError on hosted libSQL (ADR 0019); both mean "no hits".
-            # Unrelated ValueErrors re-raise.
-            if not is_operational_error(exc):
+            # Only an invalid MATCH expression means "no hits". Availability,
+            # schema, deadline, and connectivity faults must propagate.
+            if not is_malformed_fts_query_error(exc):
                 raise
             return []
     return [int(row[0]) for row in rows]

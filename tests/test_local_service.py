@@ -214,6 +214,57 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "limit must be at least 1"):
             search_messages(self.db_path, "cedar", limit=0)
 
+    async def test_append_transcript_rejects_harness_envelope(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        envelope = ModelRequest(
+            parts=[
+                UserPromptPart(
+                    content=(
+                        "<command-name>/clear</command-name>\n"
+                        "<command-message>clear</command-message>"
+                    )
+                )
+            ]
+        )
+
+        with self.assertRaisesRegex(ValueError, "command envelope"):
+            await service.append_transcript(
+                AppendTranscriptRequest(
+                    scope=_scope(capabilities={MemoryCapability.WRITE}),
+                    messages_json=[
+                        single_message_adapter.dump_json(envelope).decode()
+                    ],
+                    redaction=RedactionContext(forbidden_values=()),
+                )
+            )
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 0)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0],
+                0,
+            )
+
+    def test_save_messages_preflights_entire_batch_before_connect(self) -> None:
+        messages = [
+            ModelRequest(parts=[UserPromptPart(content="clean cedar")]),
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content="<local-command-stdout>hidden</local-command-stdout>"
+                    )
+                ]
+            ),
+        ]
+
+        with patch("vexic.storage.transcript.connect") as connect_mock:
+            with self.assertRaisesRegex(ValueError, "command envelope"):
+                save_messages(self.db_path, messages)
+        connect_mock.assert_not_called()
+
     async def test_search_long_term_uses_default_embedder_for_facts(self) -> None:
         from vexic.service import LocalMemoryService
 

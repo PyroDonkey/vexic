@@ -20,7 +20,7 @@ from pydantic_ai.messages import (
 
 from vexic.contract import PRIME_CONTEXT_HEADER, harness_envelope_reason
 from vexic.ports import ContentCodec
-from vexic.storage.errors import is_operational_error, is_unique_violation
+from vexic.storage.errors import is_malformed_fts_query_error, is_unique_violation
 from vexic.storage.schema import _assert_no_forbidden_secret_values, _fts_match_query
 from vexic.text_utils import estimate_tokens
 from vexic.storage.connection import StorageTarget, connect
@@ -322,22 +322,28 @@ def save_messages(
     timestamp: str | None = None,
     content_codec: ContentCodec | None = None,
 ) -> list[int]:
+    prepared: list[tuple[str, str]] = []
+    for msg in messages:
+        reason = _polluted_transcript_reason(msg)
+        if reason is not None:
+            raise ValueError(f"message is not clean transcript text: {reason}")
+        sanitized_msg = strip_prompt_payloads(msg)
+        plain_json = single_message_adapter.dump_json(sanitized_msg).decode()
+        body = message_search_text(sanitized_msg)
+        reason = harness_envelope_reason(body)
+        if reason is not None:
+            raise ValueError(f"message is not clean transcript text: {reason}")
+        _assert_no_forbidden_secret_values(
+            forbidden_secret_values,
+            plain_json,
+            body,
+        )
+        prepared.append((_encode_stored(content_codec, plain_json), body))
+
     message_ids: list[int] = []
     with closing(connect(db_path)) as conn:
         with conn:
-            for msg in messages:
-                reason = _polluted_transcript_reason(msg)
-                if reason is not None:
-                    raise ValueError(f"message is not clean transcript text: {reason}")
-                sanitized_msg = strip_prompt_payloads(msg)
-                plain_json = single_message_adapter.dump_json(sanitized_msg).decode()
-                body = message_search_text(sanitized_msg)
-                _assert_no_forbidden_secret_values(
-                    forbidden_secret_values,
-                    plain_json,
-                    body,
-                )
-                msg_json = _encode_stored(content_codec, plain_json)
+            for msg_json, body in prepared:
                 if timestamp is None:
                     cursor = conn.execute(
                         """
@@ -694,10 +700,10 @@ def search_messages(
                 (safe_query, session_id, agent_id, agent_id, limit),
             ).fetchall()
         except (sqlite3.OperationalError, ValueError) as exc:
-            # A malformed FTS MATCH surfaces as sqlite3.OperationalError locally
-            # and as a bare ValueError on hosted libSQL (ADR 0019); both mean
-            # "no hits for this query". Unrelated ValueErrors re-raise.
-            if not is_operational_error(exc):
+            # Only an invalid MATCH expression means "no hits". Availability,
+            # schema, deadline, and connectivity faults must propagate rather
+            # than masquerade as an authoritative empty memory search.
+            if not is_malformed_fts_query_error(exc):
                 raise
             return []
 

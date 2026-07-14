@@ -1,8 +1,18 @@
+import urllib.error
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from adapters.turso_adapter import TenantTokenCache, TursoProvisioningPort
+from adapters import turso_adapter
+from adapters.turso_adapter import (
+    PLATFORM_API_TIMEOUT_SECONDS,
+    TenantTokenCache,
+    TursoProvisioningPort,
+)
+from vexic.storage.errors import (
+    QueryDeadlineExceeded,
+    is_retryable_operational_error,
+)
 
 
 PLATFORM_TOKEN = "secret-platform-token-xyz"  # noqa: S105 - test fixture only
@@ -99,6 +109,42 @@ def test_mint_token_full_access_when_not_read_only():
     _, _, query = transport.calls[0]
     assert query["authorization"] == "full-access"
     assert query["expiration"] == "1h"
+
+
+@pytest.mark.parametrize(
+    "transport_error",
+    [
+        TimeoutError("socket timed out at a sensitive host"),
+        ConnectionResetError("sensitive host reset the connection"),
+        urllib.error.URLError("sensitive host was unreachable"),
+    ],
+)
+def test_default_mint_transport_is_bounded_and_maps_unavailable_fault(
+    monkeypatch,
+    transport_error,
+):
+    seen: dict[str, object] = {}
+
+    def unavailable_urlopen(request, *, timeout):
+        seen["request"] = request
+        seen["timeout"] = timeout
+        raise transport_error
+
+    monkeypatch.setattr(turso_adapter.urllib.request, "urlopen", unavailable_urlopen)
+    port = TursoProvisioningPort(
+        "acme-org",
+        "default",
+        platform_token=PLATFORM_TOKEN,
+    )
+
+    with pytest.raises(QueryDeadlineExceeded) as excinfo:
+        port.mint_token("tenant-a")
+
+    assert seen["timeout"] == PLATFORM_API_TIMEOUT_SECONDS
+    assert str(excinfo.value) == "Turso token resolution was unavailable; retry later"
+    assert excinfo.value.__cause__ is transport_error
+    assert "sensitive" not in str(excinfo.value)
+    assert is_retryable_operational_error(excinfo.value)
 
 
 def test_destroy_database_issues_delete_to_right_url():

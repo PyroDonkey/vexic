@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import Iterator
 
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
-from vexic.contract import SourceTranscriptMessage
+from vexic.contract import (
+    IngestSourceTranscriptResult,
+    SourceTranscriptIngestItemResult,
+    SourceTranscriptMessage,
+)
 from vexic.hosted import HOSTED_WRITE_MAX_CHARS, HOSTED_WRITE_MAX_MESSAGES
 from vexic.recorders.claude_code import scan_claude_code_transcript
 from vexic.recorders.claude_setup import (
@@ -96,6 +100,40 @@ def _iter_hosted_message_batches(
 
     if batch:
         yield batch
+
+
+def _source_key(
+    item: SourceTranscriptMessage | SourceTranscriptIngestItemResult,
+) -> tuple[str, str, str]:
+    return (
+        item.source_host,
+        item.source_session_id,
+        item.source_message_id,
+    )
+
+
+def _validated_ingest_items(
+    response: object,
+    messages: list[SourceTranscriptMessage],
+) -> list[SourceTranscriptIngestItemResult]:
+    """Validate one hosted result before it can authorize cursor advancement."""
+    try:
+        result = IngestSourceTranscriptResult.model_validate(response)
+    except ValidationError as exc:
+        raise RuntimeError("hosted ingest returned an invalid response") from exc
+
+    expected = [_source_key(message) for message in messages]
+    actual = [_source_key(item) for item in result.items]
+    if (
+        len(expected) != len(set(expected))
+        or len(actual) != len(expected)
+        or len(actual) != len(set(actual))
+        or set(actual) != set(expected)
+    ):
+        raise RuntimeError(
+            "hosted ingest response did not match the submitted source messages"
+        )
+    return result.items
 
 
 def _argv_status_path(argv: list[str]) -> Path | None:
@@ -337,7 +375,7 @@ def _ingest(args: argparse.Namespace) -> int:
         agent_id=args.agent_id,
         timeout_seconds=args.timeout_seconds,
     )
-    items = []
+    items: list[SourceTranscriptIngestItemResult] = []
     batches = list(_iter_hosted_message_batches(messages))
     for batch in batches:
         result = post_source_messages(
@@ -345,12 +383,10 @@ def _ingest(args: argparse.Namespace) -> int:
             messages=batch,
             forbidden_values=tuple(args.forbidden_value),
         )
-        batch_items = result.get("items")
-        if isinstance(batch_items, list):
-            items.extend(batch_items)
-    inserted = sum(1 for item in items if isinstance(item, dict) and item.get("status") == "inserted")
-    skipped = sum(1 for item in items if isinstance(item, dict) and item.get("status") == "skipped")
-    rejected = sum(1 for item in items if isinstance(item, dict) and item.get("status") == "rejected")
+        items.extend(_validated_ingest_items(result, batch))
+    inserted = sum(item.status == "inserted" for item in items)
+    skipped = sum(item.status == "skipped" for item in items)
+    rejected = sum(item.status == "rejected" for item in items)
 
     # Only after every batch posted: a cursor written ahead of a failed POST
     # would skip those rows forever, and the cursor must never decide ingest.

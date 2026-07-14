@@ -14,6 +14,7 @@ import io
 import json
 import tempfile
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import urlsplit
@@ -26,6 +27,7 @@ from vexic.contract import (
     Principal,
     PrincipalType,
     SearchTranscriptRequest,
+    SourceTranscriptMessage,
     TrustBoundary,
 )
 from vexic.hosted import HostedMemoryService
@@ -50,6 +52,19 @@ def _write_transcript(path: Path, rows: list[str], *, trailing_newline: bool = T
     if trailing_newline and rows:
         text += "\n"
     path.write_text(text, encoding="utf-8")
+
+
+def _ingest_item(
+    message: SourceTranscriptMessage,
+    *,
+    status: str = "inserted",
+) -> dict[str, object]:
+    return {
+        "source_host": message.source_host,
+        "source_session_id": message.source_session_id,
+        "source_message_id": message.source_message_id,
+        "status": status,
+    }
 
 
 class _RecorderHarness:
@@ -92,12 +107,19 @@ class _RecorderHarness:
             return []
         return sorted(self.cursor_dir.iterdir())
 
-    def run(self, *, post_error: Exception | None = None) -> int:
+    def run(
+        self,
+        *,
+        post_error: Exception | None = None,
+        response_factory: Callable[[list[SourceTranscriptMessage]], object] | None = None,
+    ) -> int:
         def fake_post(config, *, messages, forbidden_values):
             self.posted.append([message.source_message_id for message in messages])
             if post_error is not None:
                 raise post_error
-            return {"items": [{"status": "inserted"} for _ in messages]}
+            if response_factory is not None:
+                return response_factory(messages)
+            return {"items": [_ingest_item(message) for message in messages]}
 
         with (
             patch("vexic.recorders.cli.post_source_messages", fake_post),
@@ -244,6 +266,49 @@ class RecorderTranscriptCursorTests(unittest.TestCase):
             self.assertEqual(harness.run(), 0)
             self.assertEqual(harness.posted_ids(), ["uuid-3", "uuid-4"])
 
+    def test_same_length_rewrite_before_unchanged_final_line_triggers_full_reread(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            harness = _RecorderHarness(Path(temp))
+            original = [
+                _user_row("uuid-1", "remember cedar"),
+                _user_row("uuid-2", "and orchid"),
+            ]
+            _write_transcript(harness.transcript, original)
+            self.assertEqual(harness.run(), 0)
+            original_size = harness.transcript.stat().st_size
+
+            # The last consumed line and total byte length are unchanged. Only a
+            # digest of the whole consumed prefix can detect this earlier rewrite.
+            replacement = [
+                _user_row("uuid-3", "remember cedar"),
+                original[-1],
+            ]
+            _write_transcript(harness.transcript, replacement)
+            self.assertEqual(harness.transcript.stat().st_size, original_size)
+            harness.posted.clear()
+
+            self.assertEqual(harness.run(), 0)
+            self.assertEqual(harness.posted_ids(), ["uuid-3", "uuid-2"])
+
+    def test_cursor_without_prefix_digest_forces_a_full_reread(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            harness = _RecorderHarness(Path(temp))
+            _write_transcript(
+                harness.transcript,
+                [_user_row("uuid-1", "remember cedar"), _user_row("uuid-2", "and orchid")],
+            )
+            self.assertEqual(harness.run(), 0)
+            (cursor_file,) = harness.cursor_files()
+            old_cursor = json.loads(cursor_file.read_text(encoding="utf-8"))
+            old_cursor.pop("prefix_sha256", None)
+            cursor_file.write_text(json.dumps(old_cursor), encoding="utf-8")
+            harness.posted.clear()
+
+            self.assertEqual(harness.run(), 0)
+            self.assertEqual(harness.posted_ids(), ["uuid-1", "uuid-2"])
+
     def test_new_source_session_at_the_same_path_triggers_a_full_reread(self) -> None:
         # The cursor is keyed by transcript path *and* source session. A hook that
         # reports a different session for the same path cannot be resumed, even
@@ -300,6 +365,49 @@ class RecorderTranscriptCursorTests(unittest.TestCase):
 
             self.assertEqual(harness.run(), 0)
             self.assertEqual(harness.posted_ids(), ["uuid-1", "uuid-2"])
+
+    def test_invalid_hosted_result_does_not_advance_an_existing_cursor(self) -> None:
+        cases: dict[
+            str,
+            Callable[[list[SourceTranscriptMessage]], object],
+        ] = {
+            "missing_items": lambda _messages: {},
+            "malformed_item": lambda messages: {
+                "items": [_ingest_item(messages[0], status="unknown")]
+            },
+            "truncated_items": lambda _messages: {"items": []},
+            "duplicate_items": lambda messages: {
+                "items": [_ingest_item(messages[0]), _ingest_item(messages[0])]
+            },
+            "mismatched_item": lambda messages: {
+                "items": [
+                    {
+                        **_ingest_item(messages[0]),
+                        "source_message_id": "different-source-message",
+                    }
+                ]
+            },
+        }
+        for name, response_factory in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                harness = _RecorderHarness(Path(temp))
+                _write_transcript(
+                    harness.transcript,
+                    [_user_row("uuid-1", "remember cedar")],
+                )
+                self.assertEqual(harness.run(), 0)
+                (cursor_file,) = harness.cursor_files()
+                cursor_before = cursor_file.read_bytes()
+
+                with harness.transcript.open("a", encoding="utf-8") as handle:
+                    handle.write(_user_row("uuid-2", "and orchid") + "\n")
+                harness.posted.clear()
+
+                self.assertEqual(harness.run(response_factory=response_factory), 2)
+                self.assertEqual(cursor_file.read_bytes(), cursor_before)
+
+                self.assertEqual(harness.run(), 0)
+                self.assertEqual(harness.posted_ids(), ["uuid-2", "uuid-2"])
 
     def test_unterminated_final_row_is_ingested_and_reread_until_it_is_complete(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

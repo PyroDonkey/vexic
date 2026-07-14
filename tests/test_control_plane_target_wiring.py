@@ -13,6 +13,7 @@ from vexic.contract import MemoryCapability
 from vexic.hosted import resolve_control_plane_target
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 from vexic.storage import StorageTarget
+from vexic.storage.errors import QueryDeadlineExceeded
 
 
 def test_resolve_control_plane_target_defaults_local():
@@ -212,6 +213,9 @@ def test_cli_revoke_key_honors_turso_control_plane_target(
         project_ids=set(),
         agent_ids=set(),
     )
+    # Warm the serving store before a separate CLI-created store revokes the
+    # key. Authentication must still observe that out-of-process change.
+    assert seed_keys.authenticate(api_key.raw_key).key_id == api_key.key_id
 
     provisioning = _ControlTargetProvisioning(turso_control_plane)
     rc = main(
@@ -224,9 +228,32 @@ def test_cli_revoke_key_honors_turso_control_plane_target(
         "revoked": True,
     }
 
-    verifier = HostedApiKeyStore(control_target=turso_control_plane)
     with pytest.raises(PermissionError):
-        verifier.authenticate(api_key.raw_key)
+        seed_keys.authenticate(api_key.raw_key)
+
+
+def test_cli_storage_deadline_is_retryable_and_sanitized(tmp_path, monkeypatch, capsys):
+    """Operator storage outages are not mislabeled as caller configuration."""
+    from vexic.hosted_http import main
+
+    class _DeadlineProvisioning:
+        def build_control_plane_target(self, env):
+            raise QueryDeadlineExceeded(
+                "remote libSQL call exceeded the 30.0s query deadline: secret"
+            )
+
+    monkeypatch.setenv("VEXIC_CONTROL_PLANE_TARGET", "turso")
+    with pytest.raises(SystemExit) as raised:
+        main(
+            ["revoke-key", "--root", str(tmp_path), "--key-id", "key-a"],
+            turso_provisioning=_DeadlineProvisioning(),
+        )
+
+    assert raised.value.code == 1
+    error = capsys.readouterr().err
+    assert error == "Hosted storage is temporarily unavailable.\n"
+    assert "deadline" not in error
+    assert "secret" not in error
 
 
 def test_cli_revoke_key_needs_no_customer_provisioning_vars(

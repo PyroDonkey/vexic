@@ -23,17 +23,19 @@ from pydantic import BaseModel, ConfigDict, NonNegativeInt
 class TranscriptCursor(BaseModel):
     """Where a previous recorder run stopped in one transcript file.
 
-    `byte_offset` is the first unread byte. `last_line_offset`/`last_line_sha256`
-    fingerprint the last consumed line so a rewritten or rotated transcript that
-    happens to be long enough is still detected as stale. Offsets are validated
-    as non-negative, so a hand-mangled cursor file fails to load (full reread)
-    instead of driving a nonsense seek.
+    `byte_offset` is the first unread byte. `prefix_sha256` fingerprints every
+    consumed byte, while `last_line_offset`/`last_line_sha256` also pin the final
+    consumed line. The prefix digest catches an earlier same-length rewrite even
+    when the final line is untouched. It is required so pre-digest cursor files
+    fail closed to a full reread. Offsets are validated as non-negative, so a
+    hand-mangled cursor file cannot drive a nonsense seek.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     source_session_id: str | None = None
     byte_offset: NonNegativeInt
+    prefix_sha256: str
     last_line_offset: NonNegativeInt
     last_line_sha256: str
 

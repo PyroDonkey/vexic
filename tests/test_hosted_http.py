@@ -18,7 +18,6 @@ from vexic import hosted_http
 from vexic.contract import (
     AppendTranscriptRequest,
     ExpandHistoryRequest,
-    FreshContextRequest,
     MemoryCapability,
     MemoryScope,
     Principal,
@@ -139,6 +138,7 @@ class HostedHttpTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         root = Path(self.temp_dir.name)
+        self.root = root
         self.catalog = HostedTenantCatalog(root)
         self.keys = HostedApiKeyStore(root)
         self.service = HostedMemoryService(self.catalog, self.keys, telemetry=self.catalog)
@@ -1343,24 +1343,33 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(response.json()["error"]["code"], "storage_unavailable")
         self.assertNotIn("SQLITE_BUSY", response.text)
 
-    def test_setup_token_exchange_storage_failure_returns_json_500(self) -> None:
+    def test_setup_token_exchange_retryable_storage_failure_returns_503(self) -> None:
         client = TestClient(
             create_control_plane_app(self.service, control_plane_tokens=("console-secret",))
         )
         with patch.object(
             type(self.keys),
             "exchange_setup_token",
-            side_effect=sqlite3.OperationalError("database is locked"),
+            side_effect=QueryDeadlineExceeded(
+                "remote libSQL call exceeded the 30.0s query deadline: cedar-secret"
+            ),
         ):
             response = client.post(
                 "/v1/setup/exchange", json={"token": "vxsetup_aa_bb"}
             )
 
-        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.status_code, 503)
         self.assertEqual(
             response.json(),
-            {"error": {"code": "internal_error", "message": "Setup token exchange failed."}},
+            {
+                "error": {
+                    "code": "storage_unavailable",
+                    "message": "Hosted storage is temporarily unavailable.",
+                }
+            },
         )
+        self.assertNotIn("deadline", response.text)
+        self.assertNotIn("cedar-secret", response.text)
 
     def test_setup_token_exchanged_key_is_revocable_and_listed_with_setup_provenance(self) -> None:
         client = TestClient(
@@ -1819,6 +1828,50 @@ class HostedHttpTests(unittest.TestCase):
             ["User: header scoped cedar"],
         )
 
+    def test_header_bound_search_reads_api_key_once_per_request(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.SEARCH})
+
+        with patch.object(self.keys, "_load_key", wraps=self.keys._load_key) as load_key:
+            first = self.client.post(
+                "/v1/search_transcript",
+                headers=self._write_headers(api_key),
+                json={"query": "cedar", "limit": 5},
+            )
+            self.assertEqual(first.status_code, 200)
+            self.assertEqual(load_key.call_count, 1)
+
+            second = self.client.post(
+                "/v1/search_transcript",
+                headers=self._write_headers(api_key),
+                json={"query": "cedar", "limit": 5},
+            )
+            self.assertEqual(second.status_code, 200)
+            self.assertEqual(load_key.call_count, 2)
+
+    def test_header_bound_auth_rechecks_cross_process_revoke_next_request(self) -> None:
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        provisioned = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.SEARCH},
+            project_ids={"project-a"},
+        )
+        request = {
+            "headers": self._write_headers(provisioned.raw_key),
+            "json": {"query": "cedar", "limit": 5},
+        }
+
+        allowed = self.client.post("/v1/search_transcript", **request)
+        HostedApiKeyStore(self.root).revoke_key(
+            provisioned.key_id,
+            revoked_by="separate-process",
+        )
+        denied = self.client.post("/v1/search_transcript", **request)
+
+        self.assertEqual(allowed.status_code, 200)
+        self.assertEqual(denied.status_code, 401)
+        self.assertEqual(denied.json()["error"]["code"], "unauthorized")
+
     def test_hosted_search_long_term_header_bound_body_accepts_as_of(self) -> None:
         """The header-bound `_HeaderBoundSearchBody` used by
         `/v1/search_long_term` must accept `as_of` (not reject it as an
@@ -2069,6 +2122,27 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(audit_events[-1].error_type, "RuntimeError")
         self.assertEqual(usage_events[-1].operation, "append_transcript")
         self.assertEqual(usage_events[-1].status, "error")
+
+    def test_hosted_write_auth_deadline_returns_sanitized_503(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE})
+
+        with patch.object(
+            type(self.keys),
+            "authenticate",
+            side_effect=QueryDeadlineExceeded(
+                "remote libSQL call exceeded the 30.0s query deadline: cedar-secret"
+            ),
+        ):
+            response = self.client.post(
+                "/v1/append_transcript",
+                headers=self._write_headers(api_key),
+                json=self._append_body("preflight cedar"),
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "storage_unavailable")
+        self.assertNotIn("deadline", response.text)
+        self.assertNotIn("cedar-secret", response.text)
 
     def test_hosted_ingest_rejects_polluted_rows_per_row(self) -> None:
         api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
@@ -2324,6 +2398,27 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(response.json()["error"]["code"], "storage_unavailable")
         self.assertNotIn("SQLITE_BUSY", response.text)
 
+    def test_trigger_dream_phase_auth_deadline_returns_sanitized_503(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.DREAM_TRIGGER})
+
+        with patch.object(
+            type(self.keys),
+            "authenticate",
+            side_effect=QueryDeadlineExceeded(
+                "remote libSQL call exceeded the 30.0s query deadline: cedar-secret"
+            ),
+        ):
+            response = self.client.post(
+                "/v1/trigger_dream_phase",
+                headers=self._write_headers(api_key),
+                json={"phase": "summarize"},
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "storage_unavailable")
+        self.assertNotIn("deadline", response.text)
+        self.assertNotIn("cedar-secret", response.text)
+
     def test_trigger_dream_phase_maps_nonretryable_storage_valueerror_to_500(self) -> None:
         api_key = self._api_key(capabilities={MemoryCapability.DREAM_TRIGGER})
 
@@ -2365,6 +2460,102 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json()["error"]["code"], "storage_unavailable")
         self.assertNotIn("SQLITE_BUSY", response.text)
+
+    def test_header_bound_routes_map_typed_auth_storage_errors_to_503(self) -> None:
+        api_key = self._api_key(
+            capabilities={
+                MemoryCapability.SEARCH,
+                MemoryCapability.FRESH_CONTEXT,
+                MemoryCapability.EXPAND_HISTORY,
+            }
+        )
+        requests = (
+            ("/v1/search_transcript", {"query": "cedar", "limit": 5}),
+            ("/v1/fresh_context", {}),
+            (
+                "/v1/expand_history",
+                {"first_message_id": 1, "last_message_id": 1},
+            ),
+            ("/v1/load_active_context", {}),
+        )
+
+        for path, body in requests:
+            with self.subTest(path=path):
+                with patch.object(
+                    type(self.keys),
+                    "authenticate",
+                    side_effect=sqlite3.OperationalError(
+                        "database is locked: cedar-secret"
+                    ),
+                ):
+                    response = self.client.post(
+                        path,
+                        headers=self._write_headers(api_key),
+                        json=body,
+                    )
+
+                self.assertEqual(response.status_code, 503)
+                self.assertEqual(
+                    response.json()["error"]["code"],
+                    "storage_unavailable",
+                )
+                self.assertNotIn("cedar-secret", response.text)
+
+    def test_common_v1_handler_maps_typed_storage_error_to_503(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.SEARCH})
+
+        with patch.object(
+            type(self.service),
+            "search_transcript",
+            side_effect=sqlite3.OperationalError(
+                "database is locked: cedar-secret"
+            ),
+        ):
+            response = self.client.post(
+                "/v1/search_transcript",
+                headers=self._auth(api_key),
+                json=SearchTranscriptRequest(
+                    scope=_scope(capabilities={MemoryCapability.SEARCH}),
+                    query="cedar",
+                ).model_dump(mode="json"),
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "storage_unavailable")
+        self.assertNotIn("cedar-secret", response.text)
+
+    def test_failed_storage_auth_survives_failed_telemetry(self) -> None:
+        api_key = self._api_key(capabilities={MemoryCapability.SEARCH})
+        request = SearchTranscriptRequest(
+            scope=_scope(capabilities={MemoryCapability.SEARCH}),
+            query="cedar",
+        ).model_dump(mode="json")
+
+        with (
+            patch.object(
+                self.keys,
+                "_load_key",
+                side_effect=QueryDeadlineExceeded("primary cedar-secret"),
+            ),
+            patch.object(
+                self.catalog,
+                "record_audit_event",
+                side_effect=RuntimeError("telemetry oak-secret"),
+            ),
+            self.assertLogs("vexic.hosted", level="WARNING") as logs,
+        ):
+            response = self.client.post(
+                "/v1/search_transcript",
+                headers=self._auth(api_key),
+                json=request,
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "storage_unavailable")
+        log_text = "\n".join(logs.output)
+        self.assertIn("exception_type=RuntimeError", log_text)
+        self.assertNotIn("cedar-secret", response.text + log_text)
+        self.assertNotIn("oak-secret", response.text + log_text)
 
     def test_header_bound_search_missing_session_header_still_returns_400(self) -> None:
         api_key = self._api_key(capabilities={MemoryCapability.SEARCH})

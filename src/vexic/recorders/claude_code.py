@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -146,7 +147,18 @@ def scan_claude_code_transcript(
     messages: list[SourceTranscriptMessage] = []
     ignored = 0
     with path.open("rb") as handle:
-        start = _resume_offset(handle, cursor, source_session_id)
+        prefix_hasher = hashlib.sha256()
+        start = _resume_offset(
+            handle,
+            cursor,
+            source_session_id,
+            prefix_hasher=prefix_hasher,
+        )
+        if start == 0:
+            # A failed resume may have hashed or sought through an untrusted
+            # prefix. Discard that state before the correctness-first reread.
+            prefix_hasher = hashlib.sha256()
+            handle.seek(0)
         resumed = start > 0
         last_line_offset = cursor.last_line_offset if resumed and cursor else 0
         last_line_sha256 = cursor.last_line_sha256 if resumed and cursor else ""
@@ -165,6 +177,7 @@ def scan_claude_code_transcript(
                 else:
                     messages.append(message)
             if complete:
+                prefix_hasher.update(raw_line)
                 last_line_offset = offset
                 last_line_sha256 = line_sha256(raw_line)
                 committed = offset + len(raw_line)
@@ -174,6 +187,7 @@ def scan_claude_code_transcript(
         TranscriptCursor(
             source_session_id=source_session_id,
             byte_offset=committed,
+            prefix_sha256=prefix_hasher.hexdigest(),
             last_line_offset=last_line_offset,
             last_line_sha256=last_line_sha256,
         )
@@ -192,6 +206,8 @@ def _resume_offset(
     handle: Any,
     cursor: TranscriptCursor | None,
     source_session_id: str | None,
+    *,
+    prefix_hasher: Any,
 ) -> int:
     """Byte offset to resume from, or 0 when the cursor cannot be trusted."""
     if cursor is None or cursor.byte_offset <= 0:
@@ -206,10 +222,27 @@ def _resume_offset(
     length = cursor.byte_offset - cursor.last_line_offset
     if length <= 0:
         return 0
+
+    # Verify every consumed byte, not only the last line. Claude Code may
+    # rewrite an earlier row in place while leaving both the final line and the
+    # file length unchanged; resuming in that case would permanently skip the
+    # replacement row. Hash in chunks so verification stays memory-bounded.
+    remaining = cursor.byte_offset
+    handle.seek(0)
+    while remaining:
+        chunk = handle.read(min(1024 * 1024, remaining))
+        if not chunk:
+            return 0
+        prefix_hasher.update(chunk)
+        remaining -= len(chunk)
+    if prefix_hasher.hexdigest() != cursor.prefix_sha256:
+        return 0
+
     handle.seek(cursor.last_line_offset)
     raw_line = handle.read(length)
     if len(raw_line) != length or line_sha256(raw_line) != cursor.last_line_sha256:
         # The row the cursor stopped after is gone or no longer matches: the
         # transcript was truncated, rotated, or rewritten. Reread all of it.
         return 0
+    handle.seek(cursor.byte_offset)
     return cursor.byte_offset

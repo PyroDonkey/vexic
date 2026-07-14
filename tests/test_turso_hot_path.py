@@ -7,15 +7,24 @@ so a process that sees a long tail of tenants retains an entry per tenant
 forever. TTL governs freshness; the bound governs size. These tests pin both,
 and pin that neither cannibalizes the other.
 
-Hermetic: the provisioning port and the clock are fakes, so nothing here touches
-the network, mints a real token, or reads a wall clock.
+Hermetic: the provisioning port and TTL clock are fakes, so nothing here touches
+the network or mints a real token. Contention tests use short real monotonic waits
+to verify the synchronization deadline itself.
 """
 
 from __future__ import annotations
 
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 from adapters.turso_adapter import TenantTokenCache
+from vexic.storage.errors import (
+    QueryDeadlineExceeded,
+    is_retryable_operational_error,
+)
 
 
 class FakeClock:
@@ -98,3 +107,127 @@ def test_expired_entry_is_never_served_even_while_within_the_size_bound():
 def test_max_entries_must_be_at_least_one():
     with pytest.raises(ValueError):
         TenantTokenCache(FakePort(), max_entries=0)
+
+
+@pytest.mark.parametrize("wait_timeout", [0.0, -1.0, float("inf"), float("nan")])
+def test_mint_wait_timeout_must_be_finite_and_positive(wait_timeout):
+    with pytest.raises(ValueError, match="finite and positive"):
+        TenantTokenCache(FakePort(), mint_wait_timeout_seconds=wait_timeout)
+
+
+def test_cache_hit_and_concurrent_eviction_are_atomic():
+    """A hit cannot be evicted between lookup and its LRU promotion."""
+
+    class BlockingClock:
+        def __init__(self) -> None:
+            self.block = False
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def __call__(self) -> float:
+            if self.block:
+                self.entered.set()
+                assert self.release.wait(timeout=2)
+            return 0.0
+
+    clock = BlockingClock()
+    cache = TenantTokenCache(FakePort(), clock=clock, max_entries=1)
+    hot = cache.get_token("hot")
+    clock.block = True
+    insert_started = threading.Event()
+
+    def insert_cold() -> str:
+        insert_started.set()
+        return cache.get_token("cold")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        hit = executor.submit(cache.get_token, "hot")
+        assert clock.entered.wait(timeout=2)
+        insert = executor.submit(insert_cold)
+        assert insert_started.wait(timeout=2)
+        # The eviction waits for the in-progress hit's atomic LRU promotion.
+        assert not insert.done()
+        clock.block = False
+        clock.release.set()
+        assert hit.result(timeout=2) == hot
+        assert insert.result(timeout=2).startswith("jwt-cold-")
+
+    assert len(cache) == 1
+
+
+def test_same_key_follower_wait_is_bounded_and_retryable():
+    class BlockingPort(FakePort):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def mint_token(
+            self,
+            db_name: str,
+            *,
+            expiration: str = "5m",
+            read_only: bool = True,
+        ) -> str:
+            self.entered.set()
+            assert self.release.wait(timeout=2)
+            return super().mint_token(
+                db_name,
+                expiration=expiration,
+                read_only=read_only,
+            )
+
+    port = BlockingPort()
+    cache = TenantTokenCache(port, mint_wait_timeout_seconds=0.05)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        owner = executor.submit(cache.get_token, "tenant-a")
+        assert port.entered.wait(timeout=2)
+        started_at = time.monotonic()
+        try:
+            with pytest.raises(QueryDeadlineExceeded) as excinfo:
+                cache.get_token("tenant-a")
+        finally:
+            port.release.set()
+
+        assert time.monotonic() - started_at < 0.5
+        assert is_retryable_operational_error(excinfo.value)
+        assert owner.result(timeout=2) == "jwt-tenant-a-1"
+
+
+def test_invalidate_during_mint_discards_result_and_remints():
+    class InvalidatablePort(FakePort):
+        def __init__(self) -> None:
+            super().__init__()
+            self.first_mint_started = threading.Event()
+            self.release_first_mint = threading.Event()
+
+        def mint_token(
+            self,
+            db_name: str,
+            *,
+            expiration: str = "5m",
+            read_only: bool = True,
+        ) -> str:
+            if self._counter == 0:
+                self.first_mint_started.set()
+                assert self.release_first_mint.wait(timeout=2)
+            return super().mint_token(
+                db_name,
+                expiration=expiration,
+                read_only=read_only,
+            )
+
+    port = InvalidatablePort()
+    cache = TenantTokenCache(port)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        token_future = executor.submit(cache.get_token, "tenant-a")
+        assert port.first_mint_started.wait(timeout=2)
+        cache.invalidate("tenant-a")
+        port.release_first_mint.set()
+        assert token_future.result(timeout=2) == "jwt-tenant-a-2"
+
+    assert port.calls == ["tenant-a", "tenant-a"]
+    assert cache.get_token("tenant-a") == "jwt-tenant-a-2"
+    assert port.calls == ["tenant-a", "tenant-a"]

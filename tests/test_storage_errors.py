@@ -16,6 +16,9 @@ from __future__ import annotations
 import sqlite3
 
 from vexic.storage.errors import (
+    MutationOutcomeUnknown,
+    QueryDeadlineExceeded,
+    is_malformed_fts_query_error,
     is_operational_error,
     is_retryable_operational_error,
     is_unique_violation,
@@ -229,3 +232,44 @@ def test_retryable_ignores_unrelated_value_error() -> None:
 
 def test_retryable_ignores_non_storage_exceptions() -> None:
     assert is_retryable_operational_error(RuntimeError("database is locked")) is False
+
+
+# --- is_malformed_fts_query_error ----------------------------------------
+
+
+def test_malformed_fts_query_error_accepts_native_and_hrana_forms() -> None:
+    assert is_malformed_fts_query_error(
+        sqlite3.OperationalError('fts5: syntax error near "."')
+    )
+    assert is_malformed_fts_query_error(
+        _hrana("malformed MATCH expression", "SQLITE_ERROR")
+    )
+    assert is_malformed_fts_query_error(
+        _hrana("no such column: nonexistent MATCH clause", "SQLITE_ERROR")
+    )
+
+
+def test_malformed_fts_query_error_rejects_availability_and_schema_faults() -> None:
+    assert not is_malformed_fts_query_error(
+        QueryDeadlineExceeded("remote query deadline")
+    )
+    assert not is_malformed_fts_query_error(_hrana_connect_error())
+    assert not is_malformed_fts_query_error(
+        sqlite3.OperationalError("no such table: messages_fts")
+    )
+    assert not is_malformed_fts_query_error(
+        ValueError("unterminated string in application parser")
+    )
+    assert not is_malformed_fts_query_error(
+        ValueError('fts5: syntax error near "."')
+    )
+    assert not is_malformed_fts_query_error(
+        ValueError("application hrana parser saw an unterminated string")
+    )
+
+
+def test_mutation_outcome_unknown_is_operational_but_not_retryable() -> None:
+    exc = MutationOutcomeUnknown("remote mutation outcome is unknown")
+    assert is_operational_error(exc)
+    assert not is_retryable_operational_error(exc)
+    assert not is_malformed_fts_query_error(exc)

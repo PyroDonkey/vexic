@@ -1,10 +1,10 @@
-import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
+from pydantic import BaseModel, ValidationError
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 from vexic.contract import (
@@ -21,6 +21,7 @@ from vexic.mcp_presentation import server_instructions
 from vexic.mcp_stdio import MCP_PROTOCOL_VERSION
 from vexic.models import FactCandidate
 from vexic.storage import commit_dream_cycle, single_message_adapter
+from vexic.storage.errors import QueryDeadlineExceeded
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 
 
@@ -28,6 +29,7 @@ class McpHttpTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         root = Path(self.temp_dir.name)
+        self.root = root
         self.catalog = HostedTenantCatalog(root)
         self.keys = HostedApiKeyStore(root)
         self.service = HostedMemoryService(self.catalog, self.keys, telemetry=self.catalog)
@@ -537,6 +539,75 @@ class McpHttpTests(unittest.TestCase):
         self.assertTrue(result["isError"])
         self.assertIn("unexpected argument", result["content"][0]["text"])
 
+    def test_client_storage_markers_cannot_spoof_mcp_storage_fault(self) -> None:
+        api_key = self._api_key()
+
+        for marker in (
+            "hrana-marker",
+            "database is locked",
+            "UNIQUE constraint failed: hosted_api_keys.key_id",
+        ):
+            with self.subTest(marker=marker):
+                response = self.client.post(
+                    "/mcp",
+                    headers=self._mcp_headers(api_key, session_id="session-a"),
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 14,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "recall_conversation_history",
+                            "arguments": {"query": "cedar", marker: True},
+                        },
+                    },
+                )
+
+                self.assertEqual(response.status_code, 200)
+                result = response.json()["result"]
+                self.assertTrue(result["isError"])
+                self.assertIn("unexpected argument", result["content"][0]["text"])
+
+    def test_domain_and_validation_markers_cannot_spoof_mcp_storage_fault(self) -> None:
+        class _MarkerModel(BaseModel):
+            limit: int
+
+        with self.assertRaises(ValidationError) as caught:
+            _MarkerModel.model_validate(
+                {"limit": "Hrana: UNIQUE constraint failed: secret"}
+            )
+
+        api_key = self._api_key()
+        failures = (
+            ValueError(
+                "domain rejection containing hrana, database is locked, and "
+                "UNIQUE constraint failed: secret"
+            ),
+            caught.exception,
+        )
+        for failure in failures:
+            with self.subTest(exception_type=type(failure).__name__):
+                with patch.object(
+                    type(self.service),
+                    "search_transcript",
+                    side_effect=failure,
+                ):
+                    response = self.client.post(
+                        "/mcp",
+                        headers=self._mcp_headers(api_key, session_id="session-a"),
+                        json={
+                            "jsonrpc": "2.0",
+                            "id": 15,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "recall_conversation_history",
+                                "arguments": {"query": "cedar"},
+                            },
+                        },
+                    )
+
+                self.assertEqual(response.status_code, 200)
+                self.assertTrue(response.json()["result"]["isError"])
+
     def test_search_transcript_hostile_query_stays_scoped(self) -> None:
         api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
         self._append(api_key, session_id="session-a", text="cedar OR 1 1 visible")
@@ -701,6 +772,137 @@ class McpHttpTests(unittest.TestCase):
         self.assertEqual(response.headers["content-type"], "application/json")
         self.assertEqual(response.json()["error"]["code"], "internal_error")
         self.assertNotIn("key store unavailable", response.text)
+
+    def test_auth_deadline_returns_sanitized_503(self) -> None:
+        api_key = self._api_key()
+
+        with patch.object(
+            type(self.keys),
+            "authenticate",
+            side_effect=QueryDeadlineExceeded(
+                "remote libSQL call exceeded the 30.0s query deadline: cedar-secret"
+            ),
+        ):
+            response = self.client.post(
+                "/mcp",
+                headers=self._mcp_headers(api_key),
+                json={"jsonrpc": "2.0", "id": 20, "method": "ping"},
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "storage_unavailable")
+        self.assertNotIn("deadline", response.text)
+        self.assertNotIn("cedar-secret", response.text)
+
+    def test_tool_deadline_returns_sanitized_http_503(self) -> None:
+        api_key = self._api_key()
+
+        with patch.object(
+            type(self.service),
+            "search_transcript",
+            side_effect=QueryDeadlineExceeded(
+                "remote libSQL call exceeded the 30.0s query deadline: cedar-secret"
+            ),
+        ):
+            response = self.client.post(
+                "/mcp",
+                headers=self._mcp_headers(api_key, session_id="session-a"),
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 21,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "recall_conversation_history",
+                        "arguments": {"query": "cedar"},
+                    },
+                },
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "storage_unavailable")
+        self.assertNotIn("deadline", response.text)
+        self.assertNotIn("cedar-secret", response.text)
+
+    def test_mcp_tool_reads_api_key_once_per_request(self) -> None:
+        api_key = self._api_key()
+        request = {
+            "headers": self._mcp_headers(api_key, session_id="session-a"),
+            "json": {
+                "jsonrpc": "2.0",
+                "id": 22,
+                "method": "tools/call",
+                "params": {
+                    "name": "recall_conversation_history",
+                    "arguments": {"query": "cedar"},
+                },
+            },
+        }
+
+        with patch.object(self.keys, "_load_key", wraps=self.keys._load_key) as load_key:
+            first = self.client.post("/mcp", **request)
+            self.assertEqual(first.status_code, 200)
+            self.assertEqual(load_key.call_count, 1)
+
+            second = self.client.post("/mcp", **request)
+            self.assertEqual(second.status_code, 200)
+            self.assertEqual(load_key.call_count, 2)
+
+    def test_tool_hrana_storage_valueerror_returns_sanitized_http_503(self) -> None:
+        api_key = self._api_key()
+
+        with patch.object(
+            type(self.service),
+            "search_transcript",
+            side_effect=ValueError(
+                'Hrana: `stream error: `Error { message: "SQLite error: '
+                'database is locked", code: "SQLITE_BUSY" }``'
+            ),
+        ):
+            response = self.client.post(
+                "/mcp",
+                headers=self._mcp_headers(api_key, session_id="session-a"),
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 23,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "recall_conversation_history",
+                        "arguments": {"query": "cedar"},
+                    },
+                },
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "storage_unavailable")
+        self.assertNotIn("SQLITE_BUSY", response.text)
+
+    def test_unknown_hrana_storage_valueerror_is_sanitized_not_echoed(self) -> None:
+        api_key = self._api_key()
+
+        with patch.object(
+            type(self.service),
+            "search_transcript",
+            side_effect=ValueError(
+                "Hrana: `unrecognized storage failure: cedar-secret`"
+            ),
+        ):
+            response = self.client.post(
+                "/mcp",
+                headers=self._mcp_headers(api_key, session_id="session-a"),
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 24,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "recall_conversation_history",
+                        "arguments": {"query": "cedar"},
+                    },
+                },
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["error"]["code"], "internal_error")
+        self.assertNotIn("cedar-secret", response.text)
 
     def test_payload_egress_guard_covers_non_text_fields(self) -> None:
         from vexic.redaction import assert_no_forbidden_secret_values_in_payload

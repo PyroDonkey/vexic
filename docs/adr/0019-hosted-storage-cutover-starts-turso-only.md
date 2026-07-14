@@ -17,12 +17,12 @@ Status: accepted
 
 ## Context
 
-ADR audit AUDIT-002 (COA-264) found the deployed hosted alpha runs plain
-SQLite files on a Railway volume for both customer memory databases and the
-control-plane catalog, rather than the managed Turso (customer memory) and Neon
-Postgres (control plane) posture that ADR 0005 and ADR 0008 name as readiness
-targets. COA-232 ran only the Railway-volume drill and recorded Turso PITR and
-Neon recovery as blocked follow-ups.
+ADR audit AUDIT-002 (COA-264) recorded that the initial hosted-alpha
+implementation used plain SQLite files on a Railway volume for both customer
+memory databases and the control-plane catalog, rather than the managed Turso
+(customer memory) and Neon Postgres (control plane) posture that ADR 0005 and
+ADR 0008 name as readiness targets. COA-232 ran only the Railway-volume drill
+and recorded Turso PITR and Neon recovery as blocked follow-ups.
 
 ADR 0008 frames Turso/Neon as readiness targets, not day-one bootstrap, and its
 Consequences say the encryption/backup decision closes "without adding provider
@@ -132,13 +132,11 @@ explicitly deferred with the Neon promotion below. Restore preserves the ADR
 projections, atomically repoint the catalog, quarantine the stale handle, and
 hold the one-customer-to-one-active-database invariant.
 
-> Amended by Addendum 5 below. Turso PITR is not the recovery mechanism in the
-> deployed alpha: the deployment sits on Turso's free tier, which has no
-> point-in-time recovery. Real DR today is scheduled `turso db dump` exports of
-> the control-plane and per-tenant databases
-> (`.github/workflows/turso-backup.yml`), plus the retained local
-> `control-plane.db` as a rollback handle. PITR remains the intended mechanism
-> only if the deployment moves to a paid tier.
+> Amended by Addendum 5 below. Turso's free tier has no point-in-time recovery.
+> A deployment using that tier must use the scheduled `turso db dump` export
+> recipe in `.github/workflows/turso-backup.yml`; PITR is available only on a
+> tier that provides it. Inspect the deployment and its backup evidence rather
+> than inferring either from this repository.
 
 ## Deferred
 
@@ -302,9 +300,9 @@ reliance, not an oversight:
 ## Addendum 4 -- 2026-07-10: the control-plane catalog stayed local (COA-359)
 
 Correction of record. The Decision above (and Addendum 2's "All items in the
-Decision ... are implemented" summary) is inaccurate about *one* store: the
-control-plane catalog did **not** move to managed Turso/libSQL. What actually
-shipped, and what the deployed Railway alpha runs today, is a split:
+Decision ... are implemented" summary) was inaccurate about *one* store: the
+control-plane catalog did **not** move to managed Turso/libSQL in that
+implementation slice. Addendum 2 shipped this split:
 
 - **Customer memory** -- one isolated Turso/libSQL database per tenant,
   addressed by the catalog's `tenants.customer_target` DSN. This half of the
@@ -350,10 +348,10 @@ place to actually move `control-plane.db` off the Railway volume.
 
 ## Addendum 5 -- 2026-07-10: control-plane cutover executed (COA-360)
 
-Addendum 4 recorded that the control-plane catalog had stayed local. That is no
-longer true: the catalog was moved to managed Turso/libSQL and the deployed
-Railway alpha now runs on it. This addendum supersedes Addendum 4's
-"stayed local" status and the Decision's original narrowing.
+Addendum 4 recorded that the control-plane catalog had stayed local. The next
+implementation slice added the managed Turso/libSQL control-plane path. This
+addendum supersedes Addendum 4's "stayed local" implementation record and the
+Decision's original narrowing.
 
 What shipped and was executed:
 
@@ -364,24 +362,25 @@ What shipped and was executed:
   helper is no longer dead code -- it is the wired runtime path. Setting the
   flag to `turso` is reversible: unset it and the service reads the local
   `control-plane.db` again.
-- **Auth cache.** With the catalog remote, each API-key check is a network
-  round-trip, so `HostedApiKeyStore` gained a short-TTL in-process auth cache
-  (active only against a `StorageTarget`), evicted on revoke. Its bounded
-  multi-replica stale-revocation window is documented in code as an accepted
-  risk that is zero on the current single instance and must be revisited before
-  a second replica.
+- **Auth reads.** An initial short-TTL in-process record cache was removed after
+  the operator CLI became an out-of-process control-plane writer: process-local
+  eviction could not make revocation immediate even with one serving replica.
+  Authentication now reads the control-plane record on every request. Repeated
+  binding checks inside that same HTTP request reuse its decision, but the
+  request context is cleared at the response boundary; no credential decision
+  survives into the next request. Only the non-security-sensitive `last_used`
+  write remains throttled.
 - **Migration.** `vexic.migrate_control_plane` copies every control-plane table
   from the local `control-plane.db` into an empty Turso target, parents-first
   (foreign-key-safe), with plain `INSERT` and exact row-count verification, and
   emits counts only (never key hashes). The dogfood catalog (3 tenants, their
   API keys, and operational telemetry) was migrated this way and verified.
 
-Consequently the tenant registry, API keys, operational telemetry, and
-`dream_sweep_state` now live in the managed Turso control-plane database, not in
-the Railway-volume `control-plane.db`. That local file is retained, unwritten,
-as the instant rollback target. This realizes clean frontend / backend /
-database tier separation: the database tier (customer memory and control plane
-both on Turso) no longer lives inside the backend's compute volume.
+Consequently, selecting the Turso control-plane target routes the tenant
+registry, API keys, operational telemetry, and `dream_sweep_state` to the
+managed control-plane database rather than the local `control-plane.db`. This
+supports clean frontend / backend / database tier separation without recording
+which target any live deployment currently selects.
 
 Direction change: the eventual managed control-plane store is now **Turso**, the
 same provider as customer memory, decided in favor of provider consolidation and
@@ -389,13 +388,11 @@ the already-built libSQL seam over ADR 0008's deferred Neon Postgres target.
 Neon is no longer the planned control-plane home; the "libSQL catalog to Neon"
 second cutover named in the Consequences is retired.
 
-Backup posture (current tier reality): the deployment is on Turso's free tier,
-which has no point-in-time recovery, so the Turso PITR recovery mechanism named
-in "Backup, restore, and readiness" above is not available here. DR is instead
-scripted `turso db dump` exports of the control-plane and per-tenant databases
-(a scheduled GitHub Actions workflow), plus the retained local `control-plane.db`
-as a rollback handle. Turso PITR remains the intended mechanism if the
-deployment moves to a paid tier.
+Backup posture is tier-dependent. Turso's free tier has no point-in-time
+recovery, so a deployment using it must rely on the scripted `turso db dump`
+exports of the control-plane and per-tenant databases. A deployment on a tier
+with PITR may use the recovery mechanism named in "Backup, restore, and
+readiness" above. The repository does not record which tier is deployed.
 
 ## Addendum 6 -- 2026-07-13: hot-path follow-ups resolved (COA-335)
 
@@ -455,21 +452,32 @@ meaningless and would tax every local call site and the test suite.
 Daemon threads rather than a `ThreadPoolExecutor`: the executor's non-daemon
 workers are joined at interpreter exit, so a hung driver call would block
 process shutdown -- the exact hang being eliminated. An abandoned worker dies
-with the process. Per-call thread cost is negligible against a network
-round-trip.
+with the process. A process-wide 64-slot semaphore bounds retained connections
+and daemon workers when calls never return. Capacity exhaustion fails before a
+driver call starts, and cleanup does not wait through a second deadline merely
+to acquire a slot.
 
-**Fault shape.** A timeout raises `QueryDeadlineExceeded`
-(`src/vexic/storage/errors.py`), a `ValueError` subclass recognized by type in
-`is_operational_error` and `is_retryable_operational_error`. Subclassing
-`ValueError` means the existing HTTP boundaries route it to the 503
-`storage_unavailable` with zero edits; the classifiers match the type, never a
-fabricated Hrana message. The message carries no SQL text or parameters.
+**Fault shape.** A read-only timeout, or capacity exhaustion before any driver
+call starts, raises `QueryDeadlineExceeded`
+(`src/vexic/storage/errors.py`). It is recognized by type as a retryable
+operational error and the hosted boundaries route it to a sanitized 503
+`storage_unavailable`. A timed-out mutation, commit, or successful transaction
+exit instead raises `MutationOutcomeUnknown`: the driver has no safe
+cancellation primitive, so the write may land after the caller receives the
+error and automatic retry could duplicate an append-only row. That exception is
+operational but deliberately non-retryable and is returned only as a sanitized
+500. SQL mutability is inferred conservatively from the statement class; known
+DML/DDL, mutating PRAGMAs, and DML-prefixed CTEs use the unknown-outcome path.
+Both exception messages omit SQL text and parameters, and classifiers match
+their types rather than fabricated Hrana messages.
 
 **Poisoning.** A timed-out connection is poisoned: the hung Hrana stream is
 never reused, every subsequent method fails fast with
 `QueryDeadlineExceeded`, and `close()`/`__exit__` skip the underlying driver
 call entirely (a rollback or close round-trip would hang on the same dead
-remote). Callers recover by opening a fresh connection, which is what every
+remote). The original timed-out mutation still reports
+`MutationOutcomeUnknown`; poisoning must not erase that ambiguity. Callers
+recover by opening a fresh connection, which is what every
 `with closing(connect(...))` call site already does per operation.
 
 **Configuration.** The deadline defaults to

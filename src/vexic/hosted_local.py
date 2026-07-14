@@ -6,8 +6,10 @@ import json
 import os
 import secrets
 import sqlite3
-import time
-from contextlib import closing, suppress
+import threading
+from collections.abc import Iterator
+from contextlib import closing, contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -283,17 +285,39 @@ class _HostedApiKey:
     last_used_at: str | None = None
 
 
-@dataclass
-class _CachedAuthKey:
-    """A `HostedApiKeyStore` auth-cache entry. `expires_at` and
-    `touched_at` are `time.monotonic()` deadlines: the first bounds how long
-    the cached key is served without re-reading the remote control plane, the
-    second throttles the best-effort `last_used` write so a cache hit does no
-    network I/O at all within the interval."""
+class _RequestAuthState:
+    """Successful API-key lookups shared only within one HTTP request."""
 
-    key: _HostedApiKey
-    expires_at: float
-    touched_at: float
+    def __init__(self) -> None:
+        self.active = True
+        self.values: dict[tuple[int, str], HostedAuthContext] = {}
+        self.lock = threading.RLock()
+
+
+_REQUEST_AUTH_STATE: ContextVar[_RequestAuthState | None] = ContextVar(
+    "vexic_hosted_auth_request_state",
+    default=None,
+)
+
+
+@contextmanager
+def hosted_auth_request_context() -> Iterator[None]:
+    """Deduplicate authoritative key reads inside one logical HTTP request.
+
+    The state is deliberately created and destroyed per request. Marking the
+    shared object inactive before resetting the ContextVar also prevents a
+    child task that inherited the context from retaining a credential decision
+    after the response boundary.
+    """
+    state = _RequestAuthState()
+    token = _REQUEST_AUTH_STATE.set(state)
+    try:
+        yield
+    finally:
+        with state.lock:
+            state.active = False
+            state.values.clear()
+        _REQUEST_AUTH_STATE.reset(token)
 
 
 @dataclass(frozen=True)
@@ -1516,21 +1540,6 @@ class HostedApiKeyStore:
         self._keys: dict[str, _HostedApiKey] = {}
         self._control_metadata: dict[str, HostedApiKeyRecord] = {}
         self._setup_tokens: dict[str, _HostedSetupToken] = {}
-        # In-process auth cache, active only against a remote (StorageTarget)
-        # control plane where each `_load_key` is a network round-trip. Local
-        # file / in-memory paths read straight from disk/dict and are not
-        # cached.
-        #
-        # Revocation is evicted in-process (`_invalidate_auth_cache`), so on the
-        # single serving instance the current hosted deployment runs the
-        # stale-revocation window is ZERO. ACCEPTED, BOUNDED RISK: with two or
-        # more replicas a revoke on one replica is not seen by the others until
-        # their cached entry expires, so a revoked key can still authenticate on
-        # a peer for up to `_AUTH_CACHE_TTL_SECONDS`. This is safe only while the
-        # service is single-instance. REVISIT BEFORE ENABLING A SECOND REPLICA:
-        # add cross-replica invalidation (shared cache / pub-sub) or a
-        # per-request revocation check, or drop the TTL to the tolerable window.
-        self._auth_cache: dict[str, _CachedAuthKey] = {}
         self.root_path = Path(root_path) if root_path is not None else None
         self._control_target: str | Path | StorageTarget | None = None
         if control_target is not None:
@@ -1588,18 +1597,37 @@ class HostedApiKeyStore:
                 conn.commit()
         return ProvisionedApiKey(key_id=key_id, raw_key=raw_key)
 
-    # Auth cache tuning, applied only against a remote control plane.
-    _AUTH_CACHE_TTL_SECONDS = 60.0
-    _LAST_USED_MIN_INTERVAL_SECONDS = 60.0
-
     def authenticate(self, raw_key: str) -> HostedAuthContext:
         key_id = self._parse_key_id(raw_key)
         key_hash = self._hash(raw_key)
-        stored = self._load_key_cached(key_id)
-        # Always verify the hash and active flag, even on a cache hit -- the
-        # cache stores the key record, never a decision to admit.
+        state = _REQUEST_AUTH_STATE.get()
+        if state is None or not state.active:
+            return self._authenticate_authoritatively(key_id, key_hash)
+
+        # FastAPI may copy a request ContextVar into a child task or worker
+        # thread. Serialize the synchronous lookup so those consumers still
+        # share exactly one authoritative decision for this request.
+        cache_key = (id(self), key_hash)
+        with state.lock:
+            cached = state.values.get(cache_key)
+            if cached is not None:
+                return cached
+            auth = self._authenticate_authoritatively(key_id, key_hash)
+            if state.active:
+                state.values[cache_key] = auth
+            return auth
+
+    def _authenticate_authoritatively(
+        self,
+        key_id: str,
+        key_hash: str,
+    ) -> HostedAuthContext:
+        # Every request re-reads even a remote control plane. A raw API key can
+        # be revoked by a different CLI process or serving replica; no
+        # credential decision is retained after the request context exits.
+        stored = self._load_key(key_id)
         if hmac.compare_digest(stored.key_hash, key_hash) and stored.active:
-            self._touch_last_used_throttled(key_id, stored)
+            self._touch_last_used(stored)
             return HostedAuthContext(
                 key_id=stored.key_id,
                 tenant_id=stored.tenant_id,
@@ -1613,51 +1641,16 @@ class HostedApiKeyStore:
             )
         raise PermissionError("Invalid hosted API key.")
 
-    def _load_key_cached(self, key_id: str) -> _HostedApiKey:
-        """`_load_key` with a short-TTL in-process cache in front of the remote
-        control plane. Local file / in-memory stores read directly (no network
-        to amortize). A missing key is not negatively cached -- it raises
-        straight through `_load_key`."""
-        if not isinstance(self._control_target, StorageTarget):
-            return self._load_key(key_id)
-        now = time.monotonic()
-        entry = self._auth_cache.get(key_id)
-        if entry is not None and entry.expires_at > now:
-            return entry.key
-        key = self._load_key(key_id)
-        self._auth_cache[key_id] = _CachedAuthKey(
-            key=key,
-            expires_at=now + self._AUTH_CACHE_TTL_SECONDS,
-            touched_at=float("-inf"),
-        )
-        return key
-
-    def _touch_last_used_throttled(self, key_id: str, stored: _HostedApiKey) -> None:
-        """Record `last_used`, but skip the write entirely on a cache hit within
-        the throttle window so a cached auth costs zero network I/O. Falls back
-        to the unconditional `_touch_last_used` for the non-cached (local)
-        path."""
-        if not isinstance(self._control_target, StorageTarget):
-            self._touch_last_used(stored)
-            return
-        entry = self._auth_cache.get(key_id)
-        now = time.monotonic()
-        if entry is not None and (now - entry.touched_at) < self._LAST_USED_MIN_INTERVAL_SECONDS:
-            return
-        self._touch_last_used(stored)
-        if entry is not None:
-            entry.touched_at = now
-
-    def _invalidate_auth_cache(self, key_id: str) -> None:
-        self._auth_cache.pop(key_id, None)
-
     _LAST_USED_MIN_INTERVAL_DAYS = 60.0 / 86400.0  # one minute, in julianday units
 
     def _touch_last_used(self, stored: _HostedApiKey) -> None:
         now = _now()
+        # `_load_key` returns the authoritative timestamp on every auth, so
+        # this avoids a second remote round-trip during the throttle window
+        # without caching the revocable key record itself.
+        if _last_used_is_fresh(stored.last_used_at, now):
+            return
         if self._control_target is None:
-            if _last_used_is_fresh(stored.last_used_at, now):
-                return
             self._keys[stored.key_id] = replace(stored, last_used_at=now)
             return
         try:
@@ -1703,7 +1696,6 @@ class HostedApiKeyStore:
                         key_id=key_id,
                     )
                 )
-            self._invalidate_auth_cache(key_id)
             return
         with closing(self._connect_control()) as conn:
             row = conn.execute(
@@ -1743,7 +1735,6 @@ class HostedApiKeyStore:
                     ),
                 )
             conn.commit()
-        self._invalidate_auth_cache(key_id)
 
     def create_control_plane_key(
         self,
@@ -2421,7 +2412,10 @@ def _to_z(value: datetime) -> str:
 def _last_used_is_fresh(previous: str | None, now: str) -> bool:
     if previous is None:
         return False
-    parse = lambda value: datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+    def parse(value: str) -> datetime:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
     try:
         return (parse(now) - parse(previous)).total_seconds() < 60
     except ValueError:

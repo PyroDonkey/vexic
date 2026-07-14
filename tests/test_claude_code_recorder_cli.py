@@ -41,6 +41,26 @@ from vexic.recorders.hosted_prime import (
 from vexic.recorders.status import RecorderStatus, write_status
 
 
+def _ingest_result(
+    messages: list[SourceTranscriptMessage],
+    statuses: list[str] | None = None,
+) -> dict[str, object]:
+    resolved_statuses = statuses or ["inserted"] * len(messages)
+    if len(resolved_statuses) != len(messages):
+        raise AssertionError("test result statuses must match messages")
+    return {
+        "items": [
+            {
+                "source_host": message.source_host,
+                "source_session_id": message.source_session_id,
+                "source_message_id": message.source_message_id,
+                "status": status,
+            }
+            for message, status in zip(messages, resolved_statuses, strict=True)
+        ]
+    }
+
+
 class ClaudeCodeRecorderCliTests(unittest.TestCase):
     def test_post_source_messages_sends_scope_headers_without_agent_id(self) -> None:
         calls = []
@@ -444,7 +464,7 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
                     return self._data.decode("cp1252", "surrogateescape")
 
             def fake_post(config, *, messages, forbidden_values):
-                return {"items": [{"status": "inserted"} for _ in messages]}
+                return _ingest_result(messages)
 
             with (
                 patch("vexic.recorders.cli.sys.stdin", _WindowsLikeStdin(payload_bytes)),
@@ -496,13 +516,13 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
             def fake_post(config, *, messages, forbidden_values):
                 calls.append(messages)
                 if len(calls) == 1:
-                    return {"items": [{"status": "inserted"} for _ in messages]}
+                    return _ingest_result(messages)
                 if len(calls) == 2:
-                    return {
-                        "items": [{"status": "skipped"} for _ in messages[:-1]]
-                        + [{"status": "rejected"}]
-                    }
-                return {"items": [{"status": "inserted"} for _ in messages]}
+                    return _ingest_result(
+                        messages,
+                        ["skipped"] * (len(messages) - 1) + ["rejected"],
+                    )
+                return _ingest_result(messages)
 
             stdout = io.StringIO()
             with (
@@ -578,7 +598,7 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
 
             def fake_post(config, *, messages, forbidden_values):
                 calls.append(messages)
-                return {"items": [{"status": "inserted"} for _ in messages]}
+                return _ingest_result(messages)
 
             with (
                 patch(
@@ -1570,7 +1590,7 @@ class ClaudeCodeSetupTests(unittest.TestCase):
 
             def fake_post(config, *, messages, forbidden_values):
                 calls.append((config, messages, forbidden_values))
-                return {"items": [{"status": "inserted"}]}
+                return _ingest_result(messages)
 
             with patch("vexic.recorders.cli.post_source_messages", fake_post):
                 code = recorder_main(
@@ -1671,7 +1691,9 @@ class ClaudeCodeRecorderIngestCommandMoreTests(unittest.TestCase):
             with (
                 patch(
                     "vexic.recorders.cli.post_source_messages",
-                    return_value={"items": [{"status": "inserted"}]},
+                    side_effect=lambda _config, *, messages, forbidden_values: (
+                        _ingest_result(messages)
+                    ),
                 ),
                 patch("vexic.recorders.cli.write_status", side_effect=OSError("disk full")),
             ):
@@ -1833,7 +1855,9 @@ class ClaudeCodeRecorderIngestCommandMoreTests(unittest.TestCase):
 
             with patch(
                 "vexic.recorders.cli.post_source_messages",
-                return_value={"items": [{"status": "inserted"}]},
+                side_effect=lambda _config, *, messages, forbidden_values: (
+                    _ingest_result(messages)
+                ),
             ):
                 code = vexic_main(
                     [

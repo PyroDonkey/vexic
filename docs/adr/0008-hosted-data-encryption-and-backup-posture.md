@@ -18,13 +18,14 @@ adapter ships in a later phase per that ADR's rollout plan.
 > managed Turso/libSQL and recorded that Neon is no longer the planned
 > control-plane home. Read every Neon mention below -- including the "Control
 > plane | Neon Postgres" row in the surfaces table -- as historical. The
-> control plane runs on Turso today (`src/vexic/hosted_http.py`,
+> code routes the control plane to Turso when
+> `VEXIC_CONTROL_PLANE_TARGET=turso` (`src/vexic/hosted_http.py`,
 > `control_plane_target` in `adapters/turso_adapter.py`); Neon appears nowhere
 > in `src/`, `adapters/`, or `pyproject.toml`. The data-protection *posture*
 > this ADR decides -- provider encryption, PITR, drilled independent exports as
 > readiness targets -- is unchanged; only the named provider is. On PITR
-> specifically, see ADR 0019's Addendum 5: the current free-tier deployment has
-> no point-in-time recovery, so the readiness target is not yet met.
+> specifically, see ADR 0019's Addendum 5: a deployment using Turso's free tier
+> has no point-in-time recovery and therefore does not meet the readiness target.
 
 ## Context
 

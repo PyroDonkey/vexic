@@ -132,7 +132,7 @@ class LiveRetrievalBaselineTests(unittest.TestCase):
         self.assertIn("max-rows", stderr.getvalue())
         self.assertFalse(marker.exists())
 
-    def test_extraction_task_transcript_fixture_pins_coa_358_shape(self) -> None:
+    def test_extraction_task_transcript_fixture_pins_assistant_heavy_shape(self) -> None:
         # Light extraction once returned zero candidates on assistant-heavy
         # working-session transcripts while stated-preference transcripts
         # extracted fine. This fixture pins both shapes for the live smoke
