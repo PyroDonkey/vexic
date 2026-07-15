@@ -36,7 +36,8 @@ def test_fake_rejects_named_params_and_row_factory():
 # ---------------------------------------------------------------------------
 # Control-plane connection routed through
 # `connect(target, auth_token)`, with the filesystem-only permission guard
-# (`os.open`/`os.chmod`) skipped for a `StorageTarget` control-plane target.
+# (`os.open`/`os.chmod`) skipped for a remote libSQL-DSN control-plane target
+# (a local-file `StorageTarget` still gets owner-only enforcement).
 #
 # Both the catalog and the key store share a single fake libSQL connection
 # instance for the duration of a test (a real Turso/libSQL connection is a
@@ -227,8 +228,6 @@ def test_drop_recreate_conflict_loser_retries_and_preserves_rival_row_on_libsql(
     # this container's BEGIN fails busy; the backoff retry must re-check the
     # rebuilt shape, skip the DROP, and preserve the rival's row -- and the
     # local-only BEGIN IMMEDIATE must never reach the remote.
-    import sqlite3
-
     fake_conn = FakeLibsqlConn()
     fake_conn.execute(
         """

@@ -2388,8 +2388,11 @@ def _nullable_strings_json(values: frozenset[str | None]) -> str:
     )
 
 
-_SCHEMA_INIT_ATTEMPTS = 3
-_SCHEMA_INIT_BACKOFF_SECONDS = 0.1
+# Five attempts at 0.25s * attempt give ~2.5s of total backoff -- enough to
+# outlast a rolling-deploy winner still executing the migration block at
+# remote round-trip latency, while keeping a genuinely stuck boot bounded.
+_SCHEMA_INIT_ATTEMPTS = 5
+_SCHEMA_INIT_BACKOFF_SECONDS = 0.25
 
 
 def _run_schema_init_with_backoff(init_schema: Callable[[], None]) -> None:
@@ -2515,6 +2518,10 @@ def _ensure_control_db_permissions(target: str | Path | StorageTarget) -> None:
         db_path: str | Path = target.target
     else:
         db_path = target
+    if str(db_path) == ":memory:":
+        # A local SQLite non-file target: there is no file to protect, and
+        # chmod-creating a literal ":memory:" file would corrupt the CWD.
+        return
     try:
         fd = os.open(db_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, _CONTROL_DB_MODE)
     except FileExistsError:

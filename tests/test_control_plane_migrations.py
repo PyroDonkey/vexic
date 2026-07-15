@@ -327,6 +327,30 @@ def test_local_storage_target_control_db_gets_full_busy_timeout(
     assert recorded and all(kwargs.get("timeout") == 30 for kwargs in recorded)
 
 
+@pytest.mark.parametrize(
+    "target_form", ["storage-target", "bare"], ids=["storage-target", "bare"]
+)
+def test_memory_control_target_gets_no_filesystem_enforcement(
+    tmp_path, monkeypatch, target_form
+) -> None:
+    """``:memory:`` is a local SQLite non-file target; never create a file for it.
+
+    Filesystem permission enforcement unwrapping a local StorageTarget (or
+    taking a bare string) must not turn ``:memory:`` into a literal
+    ``:memory:`` file in the working directory.
+    """
+    from vexic.hosted_local import _ensure_control_db_permissions
+
+    monkeypatch.chdir(tmp_path)
+    target = (
+        StorageTarget(":memory:") if target_form == "storage-target" else ":memory:"
+    )
+
+    _ensure_control_db_permissions(target)
+
+    assert not (tmp_path / ":memory:").exists()
+
+
 def test_init_does_not_retry_a_hung_remote(tmp_path, monkeypatch) -> None:
     """A remote deadline is not lock contention; retrying doubles the wait.
 
@@ -423,21 +447,43 @@ def test_init_outlasts_rival_holding_the_write_lock_across_retries(
     a single immediate retry is not enough. Two consecutive faults model a
     winner still holding the lock across the loser's first retry.
     """
+    from vexic.hosted_local import _SCHEMA_INIT_ATTEMPTS
+
     real_connect = cls._connect_control
     attempts = {"count": 0}
 
-    def locked_twice(self):
+    def locked_until_last_attempt(self):
         attempts["count"] += 1
-        if attempts["count"] <= 2:
+        if attempts["count"] < _SCHEMA_INIT_ATTEMPTS:
             raise type(fault)(str(fault))
         return real_connect(self)
 
-    monkeypatch.setattr(cls, "_connect_control", locked_twice)
+    monkeypatch.setattr(cls, "_connect_control", locked_until_last_attempt)
     monkeypatch.setattr("vexic.hosted_local.time.sleep", lambda _seconds: None)
 
     cls(tmp_path)
 
-    assert attempts["count"] == 3
+    assert attempts["count"] == _SCHEMA_INIT_ATTEMPTS
+
+
+def test_schema_init_retry_horizon_outlasts_a_slow_migration_winner() -> None:
+    """The loser's total backoff must cover a winner still running migrations.
+
+    A Turso winner executing the full migration block (tens of statements at
+    remote round-trip latency) can hold contention for a couple of seconds; a
+    few hundred milliseconds of total backoff readily loses that race and
+    fails the boot.
+    """
+    from vexic.hosted_local import (
+        _SCHEMA_INIT_ATTEMPTS,
+        _SCHEMA_INIT_BACKOFF_SECONDS,
+    )
+
+    total_backoff = sum(
+        _SCHEMA_INIT_BACKOFF_SECONDS * attempt
+        for attempt in range(1, _SCHEMA_INIT_ATTEMPTS)
+    )
+    assert total_backoff >= 2.0
 
 
 def test_key_store_init_survives_rival_migrating_between_check_and_alter(
