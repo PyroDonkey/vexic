@@ -7,6 +7,7 @@ import os
 import secrets
 import sqlite3
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import closing, contextmanager, suppress
 from contextvars import ContextVar
@@ -28,6 +29,7 @@ from vexic.service import LocalMemoryService
 from vexic.storage.connection import StorageTarget, _is_libsql_target, connect
 from vexic.storage.errors import (
     QueryDeadlineExceeded,
+    is_duplicate_column_error,
     is_operational_error,
     is_retryable_operational_error,
 )
@@ -439,7 +441,7 @@ class HostedTenantCatalog:
             if control_target is not None
             else self.root_path / "control-plane.db"
         )
-        self._init_control_plane_schema()
+        _run_schema_init_with_backoff(self._init_control_plane_schema)
 
     def provision_tenant(
         self,
@@ -1419,80 +1421,58 @@ class HostedTenantCatalog:
         with closing(self._connect_control()) as conn:
             for statement in _CONTROL_PLANE_SCHEMA_STATEMENTS:
                 conn.execute(statement)
-            columns = {
-                str(row[1])
-                for row in conn.execute("PRAGMA table_info(hosted_usage_events)").fetchall()
-            }
-            if "project_id" not in columns:
-                conn.execute("ALTER TABLE hosted_usage_events ADD COLUMN project_id TEXT")
-            if "key_id" not in columns:
-                conn.execute("ALTER TABLE hosted_usage_events ADD COLUMN key_id TEXT")
-            audit_columns = {
-                str(row[1])
-                for row in conn.execute("PRAGMA table_info(hosted_audit_events)").fetchall()
-            }
-            if "project_id" not in audit_columns:
-                conn.execute("ALTER TABLE hosted_audit_events ADD COLUMN project_id TEXT")
-            if "key_id" not in audit_columns:
-                conn.execute("ALTER TABLE hosted_audit_events ADD COLUMN key_id TEXT")
-            job_columns = {
-                str(row[1])
-                for row in conn.execute("PRAGMA table_info(hosted_job_events)").fetchall()
-            }
-            if "project_id" not in job_columns:
-                conn.execute("ALTER TABLE hosted_job_events ADD COLUMN project_id TEXT")
-            tenant_columns = {
-                str(row[1])
-                for row in conn.execute("PRAGMA table_info(tenants)").fetchall()
-            }
-            if "customer_target" not in tenant_columns:
-                conn.execute("ALTER TABLE tenants ADD COLUMN customer_target TEXT")
-            if "generation" not in tenant_columns:
-                conn.execute(
-                    "ALTER TABLE tenants ADD COLUMN generation INTEGER NOT NULL DEFAULT 1"
-                )
-            if "retired_at" not in tenant_columns:
-                conn.execute("ALTER TABLE tenants ADD COLUMN retired_at TEXT")
-            if "retired_by" not in tenant_columns:
-                conn.execute("ALTER TABLE tenants ADD COLUMN retired_by TEXT")
-            if "dream_scheduling" not in tenant_columns:
-                conn.execute(
-                    "ALTER TABLE tenants ADD COLUMN dream_scheduling INTEGER NOT NULL DEFAULT 1"
-                )
+            _add_column_if_missing(conn, "hosted_usage_events", "project_id", "TEXT")
+            _add_column_if_missing(conn, "hosted_usage_events", "key_id", "TEXT")
+            _add_column_if_missing(conn, "hosted_audit_events", "project_id", "TEXT")
+            _add_column_if_missing(conn, "hosted_audit_events", "key_id", "TEXT")
+            _add_column_if_missing(conn, "hosted_job_events", "project_id", "TEXT")
+            _add_column_if_missing(conn, "tenants", "customer_target", "TEXT")
+            _add_column_if_missing(
+                conn, "tenants", "generation", "INTEGER NOT NULL DEFAULT 1"
+            )
+            _add_column_if_missing(conn, "tenants", "retired_at", "TEXT")
+            _add_column_if_missing(conn, "tenants", "retired_by", "TEXT")
+            _add_column_if_missing(
+                conn, "tenants", "dream_scheduling", "INTEGER NOT NULL DEFAULT 1"
+            )
             # Sweep state moved from tenant-keyed to (tenant, agent)-scoped
             # before any release shipped the table. The state is disposable
             # bookkeeping (worst case: one redundant sweep), so an old-shape
-            # table is dropped and recreated rather than migrated.
-            sweep_columns = {
-                str(row[1])
-                for row in conn.execute("PRAGMA table_info(dream_sweep_state)").fetchall()
-            }
-            if sweep_columns and "agent_id" not in sweep_columns:
-                conn.execute("DROP TABLE dream_sweep_state")
-                conn.execute(
-                    next(
-                        stmt
-                        for stmt in _CONTROL_PLANE_SCHEMA_STATEMENTS
-                        if "CREATE TABLE IF NOT EXISTS dream_sweep_state" in stmt
+            # table is dropped and recreated rather than migrated. Unlike the
+            # additive ADD COLUMN sites, DROP+recreate does not converge under
+            # concurrent startup -- a racing container could drop the table a
+            # rival just rebuilt -- so take the write lock first and re-read
+            # the shape inside it; the lock's loser then sees the rebuilt
+            # table and skips the DROP.
+            _begin_control_write_txn(conn, self._control_target)
+            try:
+                sweep_columns = {
+                    str(row[1])
+                    for row in conn.execute(
+                        "PRAGMA table_info(dream_sweep_state)"
+                    ).fetchall()
+                }
+                if sweep_columns and "agent_id" not in sweep_columns:
+                    conn.execute("DROP TABLE dream_sweep_state")
+                    conn.execute(
+                        next(
+                            stmt
+                            for stmt in _CONTROL_PLANE_SCHEMA_STATEMENTS
+                            if "CREATE TABLE IF NOT EXISTS dream_sweep_state" in stmt
+                        )
                     )
-                )
-                sweep_columns = {"tenant_id", "agent_id", "last_summarize_watermark",
-                                 "last_dream_completed_at", "last_dream_failed_at"}
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
             # Withheld-stamp failure time. Additive on an
             # already-(tenant, agent)-scoped table so existing sweep state
             # (completion stamps, watermarks) survives the upgrade.
-            if sweep_columns and "last_dream_failed_at" not in sweep_columns:
-                conn.execute(
-                    "ALTER TABLE dream_sweep_state ADD COLUMN last_dream_failed_at TEXT"
-                )
-            project_columns = {
-                str(row[1])
-                for row in conn.execute("PRAGMA table_info(hosted_projects)").fetchall()
-            }
-            if "retired_at" not in project_columns:
-                conn.execute("ALTER TABLE hosted_projects ADD COLUMN retired_at TEXT")
-            if "retired_by" not in project_columns:
-                conn.execute("ALTER TABLE hosted_projects ADD COLUMN retired_by TEXT")
+            _add_column_if_missing(
+                conn, "dream_sweep_state", "last_dream_failed_at", "TEXT"
+            )
+            _add_column_if_missing(conn, "hosted_projects", "retired_at", "TEXT")
+            _add_column_if_missing(conn, "hosted_projects", "retired_by", "TEXT")
             conn.commit()
 
     def _allocate_db_filename(self, conn: sqlite3.Connection) -> str:
@@ -1606,11 +1586,11 @@ class HostedApiKeyStore:
         self._control_target: str | Path | StorageTarget | None = None
         if control_target is not None:
             self._control_target = control_target
-            self._init_control_plane_schema()
+            _run_schema_init_with_backoff(self._init_control_plane_schema)
         elif self.root_path is not None:
             self.root_path.mkdir(parents=True, exist_ok=True)
             self._control_target = self.root_path / "control-plane.db"
-            self._init_control_plane_schema()
+            _run_schema_init_with_backoff(self._init_control_plane_schema)
 
     def create_key(
         self,
@@ -2341,31 +2321,15 @@ class HostedApiKeyStore:
                 )
                 """
             )
-            audit_columns = {
-                str(row[1])
-                for row in conn.execute("PRAGMA table_info(hosted_audit_events)").fetchall()
-            }
-            if "project_id" not in audit_columns:
-                conn.execute("ALTER TABLE hosted_audit_events ADD COLUMN project_id TEXT")
-            if "key_id" not in audit_columns:
-                conn.execute("ALTER TABLE hosted_audit_events ADD COLUMN key_id TEXT")
-            columns = {
-                str(row[1])
-                for row in conn.execute("PRAGMA table_info(hosted_api_keys)").fetchall()
-            }
-            if "last_used_at" not in columns:
-                conn.execute("ALTER TABLE hosted_api_keys ADD COLUMN last_used_at TEXT")
-            metadata_columns = {
-                str(row[1])
-                for row in conn.execute(
-                    "PRAGMA table_info(hosted_api_key_metadata)"
-                ).fetchall()
-            }
-            if "created_via" not in metadata_columns:
-                conn.execute(
-                    "ALTER TABLE hosted_api_key_metadata "
-                    "ADD COLUMN created_via TEXT NOT NULL DEFAULT 'console'"
-                )
+            _add_column_if_missing(conn, "hosted_audit_events", "project_id", "TEXT")
+            _add_column_if_missing(conn, "hosted_audit_events", "key_id", "TEXT")
+            _add_column_if_missing(conn, "hosted_api_keys", "last_used_at", "TEXT")
+            _add_column_if_missing(
+                conn,
+                "hosted_api_key_metadata",
+                "created_via",
+                "TEXT NOT NULL DEFAULT 'console'",
+            )
             conn.commit()
 
     def _load_key(self, key_id: str) -> _HostedApiKey:
@@ -2424,6 +2388,83 @@ def _nullable_strings_json(values: frozenset[str | None]) -> str:
     )
 
 
+# Five attempts at 0.25s * attempt give ~2.5s of total backoff -- enough to
+# outlast a rolling-deploy winner still executing the migration block at
+# remote round-trip latency, while keeping a genuinely stuck boot bounded.
+_SCHEMA_INIT_ATTEMPTS = 5
+_SCHEMA_INIT_BACKOFF_SECONDS = 0.25
+
+
+def _run_schema_init_with_backoff(init_schema: Callable[[], None]) -> None:
+    """Run a control-plane schema init, backing off on retryable lock faults.
+
+    Concurrent container startups (rolling deploy) contend on the migration
+    write lock. On Turso the loser surfaces ``database is locked`` immediately
+    instead of waiting on the local 30s busy timeout, and the winner may still
+    be mid-migration when an immediate retry lands -- so back off between a
+    bounded number of attempts. Each retry reopens a fresh connection and
+    re-checks the (by then migrated) schema. Non-retryable faults propagate
+    on the first attempt.
+    """
+    for attempt in range(1, _SCHEMA_INIT_ATTEMPTS + 1):
+        try:
+            init_schema()
+            return
+        except (sqlite3.Error, ValueError) as exc:
+            # A hung remote (QueryDeadlineExceeded) is not lock contention;
+            # retrying burns another multi-second deadline for the same
+            # outcome (same policy as _connect_control_db).
+            if isinstance(exc, QueryDeadlineExceeded):
+                raise
+            if attempt == _SCHEMA_INIT_ATTEMPTS or not is_retryable_operational_error(
+                exc
+            ):
+                raise
+            time.sleep(_SCHEMA_INIT_BACKOFF_SECONDS * attempt)
+
+
+def _begin_control_write_txn(
+    conn: sqlite3.Connection, target: str | Path | StorageTarget
+) -> None:
+    """Open the migration write transaction with the ADR 0019 backend split.
+
+    Local sqlite takes ``BEGIN IMMEDIATE`` so the write lock lands before the
+    in-transaction shape read. Managed libSQL has no local pre-read write lock
+    and only opens a real multi-statement transaction on a plain ``BEGIN``;
+    serialization there relies on the Turso server rejecting the stale write
+    at commit, which surfaces to the loser as a retryable fault (see
+    ``storage.candidates._begin_write_txn`` for the same split). Dispatch is
+    on the control target's scheme, not the connection or wrapper type: a
+    ``StorageTarget`` can also name a local SQLite file, which must keep the
+    pre-read write lock.
+    """
+    is_remote = isinstance(target, StorageTarget) and _is_libsql_target(target.target)
+    conn.execute("BEGIN" if is_remote else "BEGIN IMMEDIATE")
+
+
+def _add_column_if_missing(
+    conn: sqlite3.Connection, table: str, column: str, declaration: str
+) -> None:
+    """Additive column migration that converges under concurrent startup.
+
+    Two containers booting against the same control-plane database (rolling
+    deploy) can both observe the column missing before either ALTER commits.
+    The loser's ALTER then fails with ``duplicate column name`` -- the schema
+    is already in the desired state, so that error is swallowed; anything else
+    propagates.
+    """
+    columns = {
+        str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column in columns:
+        return
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+    except (sqlite3.OperationalError, ValueError) as exc:
+        if not is_duplicate_column_error(exc):
+            raise
+
+
 def _connect_control_db(target: str | Path | StorageTarget) -> sqlite3.Connection:
     """Open a ready control-plane connection, retrying the first round-trip once.
 
@@ -2435,10 +2476,13 @@ def _connect_control_db(target: str | Path | StorageTarget) -> sqlite3.Connectio
     handle is always closed, retryable or not.
     """
     _ensure_control_db_permissions(target)
+    is_remote = isinstance(target, StorageTarget) and _is_libsql_target(target.target)
     for attempt in (0, 1):
-        if isinstance(target, StorageTarget):
+        if is_remote:
             conn = connect(target)
         else:
+            # Local SQLite either way it is spelled (bare path or a local-file
+            # StorageTarget): the 30s busy-wait absorbs startup lock races.
             conn = connect(target, timeout=30)
         try:
             conn.execute("PRAGMA foreign_keys = ON")
@@ -2462,14 +2506,22 @@ def _connect_control_db(target: str | Path | StorageTarget) -> sqlite3.Connectio
 def _ensure_control_db_permissions(target: str | Path | StorageTarget) -> None:
     """Enforce owner-only read/write on the LOCAL control-plane database file.
 
-    A `StorageTarget` (libSQL/Turso DSN) names a remote, managed database --
-    there is no local file to `os.open`/`os.chmod`, and this is a no-op for
-    that case. Filesystem permissions only apply to a local `str`/`Path`
-    target (the default, filesystem-rooted control plane).
+    A remote libSQL/Turso DSN names a managed database -- there is no local
+    file to `os.open`/`os.chmod`, and this is a no-op for that case.
+    Classification is by scheme, not wrapper type: a `StorageTarget` can also
+    name a local SQLite file, which needs the same owner-only enforcement as
+    a bare `str`/`Path` target.
     """
     if isinstance(target, StorageTarget):
+        if _is_libsql_target(target.target):
+            return
+        db_path: str | Path = target.target
+    else:
+        db_path = target
+    if str(db_path) == ":memory:":
+        # A local SQLite non-file target: there is no file to protect, and
+        # chmod-creating a literal ":memory:" file would corrupt the CWD.
         return
-    db_path = target
     try:
         fd = os.open(db_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, _CONTROL_DB_MODE)
     except FileExistsError:

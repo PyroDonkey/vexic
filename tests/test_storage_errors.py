@@ -18,6 +18,7 @@ import sqlite3
 from vexic.storage.errors import (
     MutationOutcomeUnknown,
     QueryDeadlineExceeded,
+    is_duplicate_column_error,
     is_malformed_fts_query_error,
     is_operational_error,
     is_retryable_operational_error,
@@ -70,6 +71,34 @@ def test_unique_violation_ignores_unrelated_value_error() -> None:
 def test_unique_violation_ignores_operational_libsql_value_error() -> None:
     exc = _hrana("no such table: messages", "SQLITE_ERROR")
     assert is_unique_violation(exc) is False
+
+
+# --- is_duplicate_column_error --------------------------------------------
+
+
+def test_duplicate_column_sqlite_operational_error() -> None:
+    exc = sqlite3.OperationalError("duplicate column name: project_id")
+    assert is_duplicate_column_error(exc) is True
+
+
+def test_duplicate_column_libsql_value_error() -> None:
+    exc = _hrana("duplicate column name: project_id", "SQLITE_ERROR")
+    assert is_duplicate_column_error(exc) is True
+
+
+def test_duplicate_column_ignores_locked_operational_error() -> None:
+    exc = sqlite3.OperationalError("database is locked")
+    assert is_duplicate_column_error(exc) is False
+
+
+def test_duplicate_column_ignores_unique_violation_value_error() -> None:
+    exc = _hrana("UNIQUE constraint failed: tenants.tenant_id", "SQLITE_CONSTRAINT")
+    assert is_duplicate_column_error(exc) is False
+
+
+def test_duplicate_column_ignores_unrelated_value_error() -> None:
+    exc = ValueError("token_budget must be greater than or equal to 0.")
+    assert is_duplicate_column_error(exc) is False
 
 
 # --- is_operational_error ------------------------------------------------

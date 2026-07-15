@@ -36,7 +36,8 @@ def test_fake_rejects_named_params_and_row_factory():
 # ---------------------------------------------------------------------------
 # Control-plane connection routed through
 # `connect(target, auth_token)`, with the filesystem-only permission guard
-# (`os.open`/`os.chmod`) skipped for a `StorageTarget` control-plane target.
+# (`os.open`/`os.chmod`) skipped for a remote libSQL-DSN control-plane target
+# (a local-file `StorageTarget` still gets owner-only enforcement).
 #
 # Both the catalog and the key store share a single fake libSQL connection
 # instance for the duration of a test (a real Turso/libSQL connection is a
@@ -150,6 +151,156 @@ def test_dream_lease_contends_correctly_against_fake_libsql(monkeypatch, tmp_pat
         now="2026-07-12T00:06:00+00:00",
         expires_at="2026-07-12T00:26:00+00:00",
     )
+
+
+def test_schema_init_swallows_libsql_duplicate_column_value_error(monkeypatch, tmp_path):
+    # Two containers racing the additive control-plane migrations on Turso: the
+    # loser's ALTER surfaces as the driver's bare ValueError (Hrana payload),
+    # not sqlite3.OperationalError. Pin that the init converges on that error
+    # shape end-to-end.
+    import sqlite3
+
+    fake_conn = FakeLibsqlConn()
+
+    class _StubCursor:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    # The `key_id` check is the second table_info(hosted_usage_events) read
+    # (`project_id`, present since the CREATE, is checked first).
+    state = {"fired": False, "checks": 0, "duplicate_raised": False}
+
+    class _HranaErrorHandle(_NonClosingFakeConnHandle):
+        def execute(self, sql, parameters=(), /):
+            try:
+                cursor = super().execute(sql, parameters)
+            except sqlite3.Error as exc:
+                if "duplicate column name" in str(exc):
+                    state["duplicate_raised"] = True
+                raise ValueError(
+                    'Hrana: `stream error: `Error { message: "SQLite error: '
+                    f'{exc}", code: "SQLITE_ERROR" }}`'
+                ) from exc
+            if not state["fired"] and "table_info(hosted_usage_events)" in sql:
+                state["checks"] += 1
+                if state["checks"] == 2:
+                    rows = cursor.fetchall()
+                    state["fired"] = True
+                    # Rival container migrates between this check and the ALTER.
+                    fake_conn.execute(
+                        "ALTER TABLE hosted_usage_events ADD COLUMN key_id TEXT"
+                    )
+                    fake_conn.commit()
+                    return _StubCursor(rows)
+            return cursor
+
+    import vexic.hosted_local as hosted_local
+
+    def _fake_connect(target, *, auth_token=None, **kwargs):
+        assert isinstance(target, StorageTarget)
+        return _HranaErrorHandle(fake_conn)
+
+    monkeypatch.setattr(hosted_local, "connect", _fake_connect)
+    _forbid_local_permission_ops(monkeypatch)
+    target = StorageTarget("libsql://fake-control-plane", auth_token="s3cr3t-token")
+
+    HostedTenantCatalog(tmp_path, control_target=target)
+
+    # The losing ALTER really surfaced as the ValueError form and was swallowed.
+    assert state["duplicate_raised"]
+    columns = [
+        str(row[1])
+        for row in fake_conn.execute("PRAGMA table_info(hosted_usage_events)").fetchall()
+    ]
+    assert columns.count("key_id") == 1
+
+
+def test_drop_recreate_conflict_loser_retries_and_preserves_rival_row_on_libsql(
+    monkeypatch, tmp_path
+):
+    # The libSQL leg of the dream_sweep_state rebuild: managed libSQL has no
+    # pre-read write lock, so the migration opens a plain BEGIN and the loser
+    # of a concurrent rebuild surfaces a retryable fault instead of waiting.
+    # Simulate the loser: a rival finishes the rebuild and records a row while
+    # this container's BEGIN fails busy; the backoff retry must re-check the
+    # rebuilt shape, skip the DROP, and preserve the rival's row -- and the
+    # local-only BEGIN IMMEDIATE must never reach the remote.
+    fake_conn = FakeLibsqlConn()
+    fake_conn.execute(
+        """
+        CREATE TABLE dream_sweep_state (
+            tenant_id TEXT PRIMARY KEY,
+            last_summarize_watermark INTEGER NOT NULL DEFAULT 0,
+            last_dream_completed_at TEXT
+        )
+        """
+    )
+    fake_conn.commit()
+
+    state = {"begin_calls": 0, "begin_immediate_calls": 0}
+
+    def _rival_wins() -> None:
+        fake_conn.execute("DROP TABLE dream_sweep_state")
+        fake_conn.execute(
+            """
+            CREATE TABLE dream_sweep_state (
+                tenant_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL DEFAULT '',
+                last_summarize_watermark INTEGER NOT NULL DEFAULT 0,
+                last_dream_completed_at TEXT,
+                last_dream_failed_at TEXT,
+                PRIMARY KEY (tenant_id, agent_id)
+            )
+            """
+        )
+        fake_conn.execute(
+            "INSERT INTO dream_sweep_state "
+            "(tenant_id, agent_id, last_summarize_watermark) VALUES (?, ?, ?)",
+            ("tenant-x", "", 7),
+        )
+        fake_conn.commit()
+
+    class _ConflictOnFirstBeginHandle(_NonClosingFakeConnHandle):
+        def execute(self, sql, parameters=(), /):
+            if "BEGIN IMMEDIATE" in sql:
+                state["begin_immediate_calls"] += 1
+            elif sql.strip().upper().startswith("BEGIN"):
+                state["begin_calls"] += 1
+                if state["begin_calls"] == 1:
+                    _rival_wins()
+                    raise ValueError(
+                        'Hrana: `stream error: `Error { message: "SQLite error: '
+                        'database is locked", code: "SQLITE_BUSY" }}`'
+                    )
+            return super().execute(sql, parameters)
+
+    import vexic.hosted_local as hosted_local
+
+    def _fake_connect(target, *, auth_token=None, **kwargs):
+        assert isinstance(target, StorageTarget)
+        return _ConflictOnFirstBeginHandle(fake_conn)
+
+    monkeypatch.setattr(hosted_local, "connect", _fake_connect)
+    monkeypatch.setattr("vexic.hosted_local.time.sleep", lambda _seconds: None)
+    _forbid_local_permission_ops(monkeypatch)
+    target = StorageTarget("libsql://fake-control-plane", auth_token="s3cr3t-token")
+
+    HostedTenantCatalog(tmp_path, control_target=target)
+
+    assert state["begin_immediate_calls"] == 0
+    assert state["begin_calls"] >= 2
+    rows = fake_conn.execute(
+        "SELECT tenant_id, last_summarize_watermark FROM dream_sweep_state"
+    ).fetchall()
+    assert rows == [("tenant-x", 7)]
+    columns = {
+        str(row[1])
+        for row in fake_conn.execute("PRAGMA table_info(dream_sweep_state)").fetchall()
+    }
+    assert "agent_id" in columns and "last_dream_failed_at" in columns
 
 
 def test_catalog_provisions_tenant_against_fake_libsql_control_plane(monkeypatch, tmp_path):
