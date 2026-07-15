@@ -253,6 +253,7 @@ class DreamSweeper:
                     tenant_id,
                     agent_id=agent_id,
                     phases=phases,
+                    clock=self._clock,
                 )
             except HostPortNotConfigured:
                 # Fail closed and content-free; other scopes/tenants still
@@ -312,8 +313,11 @@ class DreamSweeper:
         # Most recent of {completed, failed} governs. A withheld-stamp failure
         # newer than the last completion re-arms on the short backoff, so a
         # stale `completed_at` cannot re-open the every-tick hammer; otherwise
-        # the 24h success clock applies. Neither present => never run.
-        if failed is not None and (completed is None or failed > completed):
+        # the 24h success clock applies. Neither present => never run. A tie
+        # favors the failure backoff: its worst case is one bounded early
+        # retry, while favoring completion suppresses a real failure's retry
+        # for up to 24h (ADR 0030 amendment).
+        if failed is not None and (completed is None or failed >= completed):
             return (now - failed).total_seconds() >= (
                 self._config.dream_failure_backoff_seconds
             )
@@ -343,10 +347,13 @@ class DreamSweeper:
         fails too). The anti-spend guard still holds: a recorded failure waits
         the full interval, and advancing is now only reached once the failure
         is queryable. A CANCELLED job did not finish running, so state is left
-        untouched and the next tick retries. The dream stamp records actual
-        completion time, not tick-start time, so the next dream is due a
-        full interval after the chain finished. Catalog writes are monotonic,
-        so a stale recorder can never rewind a newer watermark or stamp.
+        untouched and the next tick retries. The dream stamp records the job's
+        terminal time minted under the durable lease (``finished_at``), not
+        tick-start or recorder-run time: the next dream is due a full interval
+        after the chain finished, and a stalled recorder persists a value that
+        correctly loses to another container's newer stamp (ADR 0030
+        amendment). Catalog writes are monotonic, so a stale recorder can
+        never rewind a newer watermark or stamp.
         The watermark write and the dream stamp are recorded independently
         and retried once on retryable storage faults (reaped Turso Hrana
         stream), so one failed write cannot strand the other.
@@ -367,6 +374,12 @@ class DreamSweeper:
             if isinstance(result, DreamJobOutcome):
                 durably_recorded = result.durably_recorded
                 summarize_ran = result.summarize_ran
+                # The job minted its terminal time while it still held the
+                # durable lease; persist that, not recorder-run time, so a
+                # stalled recorder cannot outrank another container's newer
+                # stamp (ADR 0030 amendment). Only the raised-without-outcome
+                # anomaly in the else branch falls back to the recorder clock.
+                finished_at = result.finished_at
             else:
                 self._record_failures += 1
                 logger.error(
@@ -375,6 +388,8 @@ class DreamSweeper:
                 )
                 durably_recorded = False
                 summarize_ran = False
+                finished_at = self._clock()
+            stamp = finished_at.isoformat()
             # The two writes are independent and retried: a failed watermark
             # write must not skip the dream stamp, or the dream re-fires
             # every tick. The watermark advances only when SUMMARIZE actually
@@ -406,7 +421,7 @@ class DreamSweeper:
                         catalog.record_dream_completed,
                         tenant_id,
                         agent_id,
-                        self._clock().isoformat(),
+                        stamp,
                     )
                 except Exception:
                     self._record_failures += 1
@@ -423,7 +438,7 @@ class DreamSweeper:
                         catalog.record_dream_failed,
                         tenant_id,
                         agent_id,
-                        self._clock().isoformat(),
+                        stamp,
                     )
                 except Exception:
                     self._record_failures += 1

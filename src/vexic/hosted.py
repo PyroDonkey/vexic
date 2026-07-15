@@ -86,10 +86,18 @@ class DreamJobOutcome(NamedTuple):
     durably recorded yet never have summarized (a failure before SUMMARIZE).
 
     ``durably_recorded`` gates the 24h dream stamp; ``summarize_ran`` gates the
-    summarize watermark. See `HostedMemoryService._run_system_dream_job`."""
+    summarize watermark. ``finished_at`` is the job's terminal time, minted
+    while the durable lease is still held, so a stalled recorder persists
+    job-completion time rather than a fresher recorder-run time that could
+    outrank another container's newer stamp (ADR 0030 amendment). See
+    `HostedMemoryService._run_system_dream_job`."""
 
     durably_recorded: bool
     summarize_ran: bool
+    # No default: every construction site must mint this under the lease, or
+    # the recorder would silently fall back to recorder-run time and reopen
+    # the rolling-deploy stamp race (ADR 0030 amendment).
+    finished_at: datetime
 
 
 _RequestT = TypeVar("_RequestT", bound=MemoryRequest)
@@ -1057,9 +1065,12 @@ class HostedMemoryService:
         *,
         agent_id: str | None,
         phases: tuple[DreamPhase, ...],
+        clock: Callable[[], datetime] | None = None,
     ) -> "asyncio.Task[DreamJobOutcome] | None":
         """In-server sweeper seam (ADR 0030): schedule pre-bound dream phases
         for one tenant+agent scope under a system principal — no API key.
+        ``clock`` mints the job's terminal `finished_at` stamp; the sweeper
+        passes its own injected clock so tests stay deterministic.
 
         Mirrors the trigger endpoint's containment exactly: the minted
         `RunDreamPhaseRequest`s never re-enter `_call`/`_bind_request`, the
@@ -1108,7 +1119,13 @@ class HostedMemoryService:
                 for phase in phases
             )
             task = asyncio.create_task(
-                self._run_system_dream_job(minted_requests, tenant, auth, lock_key)
+                self._run_system_dream_job(
+                    minted_requests,
+                    tenant,
+                    auth,
+                    lock_key,
+                    clock=clock or (lambda: datetime.now(UTC)),
+                )
             )
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
@@ -1127,6 +1144,8 @@ class HostedMemoryService:
         tenant: HostedTenant,
         auth: HostedAuthContext,
         lock_key: tuple[str, str | None],
+        *,
+        clock: Callable[[], datetime],
     ) -> DreamJobOutcome:
         """Run the sweeper's minted phases sequentially on a worker-thread
         event loop (same isolation rationale as `_run_dream_trigger_job`).
@@ -1207,6 +1226,7 @@ class HostedMemoryService:
                     return DreamJobOutcome(
                         durably_recorded=dream_failure_recorded(exc),
                         summarize_ran=summarize_ran,
+                        finished_at=clock(),
                     )
                 if request.phase is DreamPhase.SUMMARIZE:
                     summarize_ran = True
@@ -1221,7 +1241,9 @@ class HostedMemoryService:
                     key_id=auth.key_id,
                 )
             return DreamJobOutcome(
-                durably_recorded=True, summarize_ran=summarize_ran
+                durably_recorded=True,
+                summarize_ran=summarize_ran,
+                finished_at=clock(),
             )
         except asyncio.CancelledError:
             # The worker thread cannot be interrupted, so a phase may still be
