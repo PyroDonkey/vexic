@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import time
 from contextlib import closing
 from pathlib import Path
 
@@ -182,13 +183,29 @@ def test_dream_sweep_state_drop_recreate_is_serialized_against_rival(
 
     reached = threading.Event()
     release = threading.Event()
+    rival_at_lock = threading.Event()
+    rival_recorded = threading.Event()
     state = {"fired": False, "wrapped": False}
     real_connect = HostedTenantCatalog._connect_control
+
+    class _SignalOnLockConnection:
+        """Rival-side wrapper: signals just before contending for the write lock."""
+
+        def __init__(self, conn) -> None:
+            self._conn = conn
+
+        def execute(self, sql: str, *args):
+            if "BEGIN IMMEDIATE" in sql:
+                rival_at_lock.set()
+            return self._conn.execute(sql, *args)
+
+        def __getattr__(self, name: str):
+            return getattr(self._conn, name)
 
     def connect_with_pause(self):
         conn = real_connect(self)
         if state["wrapped"]:
-            return conn
+            return _SignalOnLockConnection(conn)
         state["wrapped"] = True
         return _PauseOnCheckConnection(
             conn, "dream_sweep_state", reached, release, state
@@ -218,14 +235,27 @@ def test_dream_sweep_state_drop_recreate_is_serialized_against_rival(
                     ("tenant-x", "", 7),
                 )
                 conn.commit()
+            rival_recorded.set()
         except BaseException as exc:  # noqa: BLE001 - surfaced via assertion
             errors.append(exc)
 
     rival = threading.Thread(target=run_rival_then_record)
     rival.start()
-    # Give the rival time to finish (pre-fix) or block on the write lock
-    # (post-fix) before the victim resumes its DROP decision.
-    rival.join(timeout=1.0)
+    # Release the victim only once the rival has demonstrably reached one of
+    # its two possible states: blocked contending for the write lock (the
+    # serialized/fixed path), or fully finished migrating and recording its
+    # row (the unserialized path this test exists to catch). Waiting on
+    # explicit events instead of a fixed sleep leaves no starvation window in
+    # which a regressed, unserialized victim could look correct.
+    deadline = time.monotonic() + 30
+    while (
+        not rival_at_lock.is_set()
+        and not rival_recorded.is_set()
+        and not errors
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.01)
+    assert rival_at_lock.is_set() or rival_recorded.is_set() or errors
     release.set()
     victim.join(timeout=30)
     rival.join(timeout=30)
@@ -291,30 +321,44 @@ def test_concurrent_catalog_and_key_store_inits_all_converge(tmp_path) -> None:
     assert _column_names(control_db, "hosted_api_keys").count("last_used_at") == 1
 
 
+@pytest.mark.parametrize(
+    "fault",
+    [
+        sqlite3.OperationalError("database is locked"),
+        ValueError(
+            'Hrana: `stream error: `Error { message: "SQLite error: '
+            'database is locked", code: "SQLITE_BUSY" }}`'
+        ),
+    ],
+    ids=["sqlite", "libsql"],
+)
 @pytest.mark.parametrize("cls", [HostedTenantCatalog, HostedApiKeyStore])
-def test_init_retries_once_when_rival_holds_the_write_lock(
-    tmp_path, monkeypatch, cls
+def test_init_outlasts_rival_holding_the_write_lock_across_retries(
+    tmp_path, monkeypatch, cls, fault
 ) -> None:
-    """A boot that loses the write lock re-runs its init instead of dying.
+    """A boot that loses the write lock keeps re-running its init with backoff.
 
-    On Turso the lock's loser surfaces ``database is locked`` instead of
-    waiting on the local 30s busy timeout; one retry re-checks the (by then
-    migrated) schema on a fresh connection.
+    On Turso the lock's loser surfaces ``database is locked`` (as the driver's
+    bare ValueError) instead of waiting on the local 30s busy timeout, and the
+    winner may still be mid-migration when the loser's first retry lands -- so
+    a single immediate retry is not enough. Two consecutive faults model a
+    winner still holding the lock across the loser's first retry.
     """
     real_connect = cls._connect_control
     attempts = {"count": 0}
 
-    def locked_once(self):
+    def locked_twice(self):
         attempts["count"] += 1
-        if attempts["count"] == 1:
-            raise sqlite3.OperationalError("database is locked")
+        if attempts["count"] <= 2:
+            raise type(fault)(str(fault))
         return real_connect(self)
 
-    monkeypatch.setattr(cls, "_connect_control", locked_once)
+    monkeypatch.setattr(cls, "_connect_control", locked_twice)
+    monkeypatch.setattr("vexic.hosted_local.time.sleep", lambda _seconds: None)
 
     cls(tmp_path)
 
-    assert attempts["count"] == 2
+    assert attempts["count"] == 3
 
 
 def test_key_store_init_survives_rival_migrating_between_check_and_alter(

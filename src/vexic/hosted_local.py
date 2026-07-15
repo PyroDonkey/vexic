@@ -7,6 +7,7 @@ import os
 import secrets
 import sqlite3
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import closing, contextmanager, suppress
 from contextvars import ContextVar
@@ -31,7 +32,6 @@ from vexic.storage.errors import (
     is_duplicate_column_error,
     is_operational_error,
     is_retryable_operational_error,
-    retry_once_if_retryable,
 )
 
 
@@ -441,10 +441,7 @@ class HostedTenantCatalog:
             if control_target is not None
             else self.root_path / "control-plane.db"
         )
-        # A rival container's serialized migration can surface a retryable
-        # locked/busy fault on Turso; the re-run re-checks the migrated schema
-        # on a fresh connection.
-        retry_once_if_retryable(self._init_control_plane_schema)
+        _run_schema_init_with_backoff(self._init_control_plane_schema)
 
     def provision_tenant(
         self,
@@ -1447,7 +1444,7 @@ class HostedTenantCatalog:
             # rival just rebuilt -- so take the write lock first and re-read
             # the shape inside it; the lock's loser then sees the rebuilt
             # table and skips the DROP.
-            conn.execute("BEGIN IMMEDIATE")
+            _begin_control_write_txn(conn, self._control_target)
             try:
                 sweep_columns = {
                     str(row[1])
@@ -1589,11 +1586,11 @@ class HostedApiKeyStore:
         self._control_target: str | Path | StorageTarget | None = None
         if control_target is not None:
             self._control_target = control_target
-            retry_once_if_retryable(self._init_control_plane_schema)
+            _run_schema_init_with_backoff(self._init_control_plane_schema)
         elif self.root_path is not None:
             self.root_path.mkdir(parents=True, exist_ok=True)
             self._control_target = self.root_path / "control-plane.db"
-            retry_once_if_retryable(self._init_control_plane_schema)
+            _run_schema_init_with_backoff(self._init_control_plane_schema)
 
     def create_key(
         self,
@@ -2388,6 +2385,52 @@ def _strings_json(values: frozenset[str]) -> str:
 def _nullable_strings_json(values: frozenset[str | None]) -> str:
     return json.dumps(
         sorted(values, key=lambda value: (0, "") if value is None else (1, value))
+    )
+
+
+_SCHEMA_INIT_ATTEMPTS = 3
+_SCHEMA_INIT_BACKOFF_SECONDS = 0.1
+
+
+def _run_schema_init_with_backoff(init_schema: Callable[[], None]) -> None:
+    """Run a control-plane schema init, backing off on retryable lock faults.
+
+    Concurrent container startups (rolling deploy) contend on the migration
+    write lock. On Turso the loser surfaces ``database is locked`` immediately
+    instead of waiting on the local 30s busy timeout, and the winner may still
+    be mid-migration when an immediate retry lands -- so back off between a
+    bounded number of attempts. Each retry reopens a fresh connection and
+    re-checks the (by then migrated) schema. Non-retryable faults propagate
+    on the first attempt.
+    """
+    for attempt in range(1, _SCHEMA_INIT_ATTEMPTS + 1):
+        try:
+            init_schema()
+            return
+        except (sqlite3.Error, ValueError) as exc:
+            if attempt == _SCHEMA_INIT_ATTEMPTS or not is_retryable_operational_error(
+                exc
+            ):
+                raise
+            time.sleep(_SCHEMA_INIT_BACKOFF_SECONDS * attempt)
+
+
+def _begin_control_write_txn(
+    conn: sqlite3.Connection, target: str | Path | StorageTarget
+) -> None:
+    """Open the migration write transaction with the ADR 0019 backend split.
+
+    Local sqlite takes ``BEGIN IMMEDIATE`` so the write lock lands before the
+    in-transaction shape read. Managed libSQL has no local pre-read write lock
+    and only opens a real multi-statement transaction on a plain ``BEGIN``;
+    serialization there relies on the Turso server rejecting the stale write
+    at commit, which surfaces to the loser as a retryable fault (see
+    ``storage.candidates._begin_write_txn`` for the same split). Dispatch is
+    on the control target, not the connection type, so wrapped test
+    connections keep the local behavior.
+    """
+    conn.execute(
+        "BEGIN" if isinstance(target, StorageTarget) else "BEGIN IMMEDIATE"
     )
 
 
