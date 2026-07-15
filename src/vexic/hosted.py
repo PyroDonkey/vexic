@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Awaitable, Callable, Protocol, TypeVar
+from typing import Any, Awaitable, Callable, NamedTuple, Protocol, TypeVar
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 from vexic.contract import (
@@ -78,6 +78,19 @@ from vexic.usage import UsageSummary
 
 
 logger = logging.getLogger(__name__)
+
+
+class DreamJobOutcome(NamedTuple):
+    """Result of a system dream chain, read by the sweeper to decide which
+    sweep-state writes are safe. The two bits are independent: a chain can be
+    durably recorded yet never have summarized (a failure before SUMMARIZE).
+
+    ``durably_recorded`` gates the 24h dream stamp; ``summarize_ran`` gates the
+    summarize watermark. See `HostedMemoryService._run_system_dream_job`."""
+
+    durably_recorded: bool
+    summarize_ran: bool
+
 
 _RequestT = TypeVar("_RequestT", bound=MemoryRequest)
 _ResultT = TypeVar("_ResultT", bound=MemoryResult)
@@ -1044,7 +1057,7 @@ class HostedMemoryService:
         *,
         agent_id: str | None,
         phases: tuple[DreamPhase, ...],
-    ) -> "asyncio.Task[bool] | None":
+    ) -> "asyncio.Task[DreamJobOutcome] | None":
         """In-server sweeper seam (ADR 0030): schedule pre-bound dream phases
         for one tenant+agent scope under a system principal — no API key.
 
@@ -1114,19 +1127,31 @@ class HostedMemoryService:
         tenant: HostedTenant,
         auth: HostedAuthContext,
         lock_key: tuple[str, str | None],
-    ) -> bool:
+    ) -> DreamJobOutcome:
         """Run the sweeper's minted phases sequentially on a worker-thread
         event loop (same isolation rationale as `_run_dream_trigger_job`).
         A failing phase records its error and stops the chain — a Deep run
         over a failed Light extraction would promote from stale candidates.
 
-        Returns whether advancing the sweep clock is safe: ``True`` when every
-        phase succeeded or a failing phase durably recorded its terminal
+        Returns a `DreamJobOutcome` the sweeper reads for two independent
+        writes. ``durably_recorded`` gates the 24h dream stamp: ``True`` when
+        every phase succeeded or a failing phase durably recorded its terminal
         ``dream_runs`` error row, ``False`` when a failure went unrecorded so
-        the sweeper must retry next tick instead of hiding it."""
+        the sweeper must retry next tick instead of hiding it. ``summarize_ran``
+        gates the summarize watermark: ``True`` only when the SUMMARIZE phase
+        actually executed (success or ran-and-failed), so a chain that fails
+        before SUMMARIZE never advances the watermark over rows it never
+        summarized."""
         cancelled = False
+        summarize_ran = False
         try:
             for request in requests:
+                if request.phase is DreamPhase.SUMMARIZE:
+                    # "ran" includes ran-and-failed: mark before executing so a
+                    # SUMMARIZE that starts then raises still advances the
+                    # watermark (deliberate anti-spend posture), while a chain
+                    # that never reaches SUMMARIZE leaves this False.
+                    summarize_ran = True
                 job_id = secrets.token_hex(8)
                 self._record_dream_trigger_job(job_id, request, auth, status="running")
 
@@ -1171,7 +1196,10 @@ class HostedMemoryService:
                     # recorded its terminal dream_runs row. The sweeper advances
                     # the 24h retry clock only when it did: advancing
                     # over a silent failure is what stalled Tier 3 live.
-                    return dream_failure_recorded(exc)
+                    return DreamJobOutcome(
+                        durably_recorded=dream_failure_recorded(exc),
+                        summarize_ran=summarize_ran,
+                    )
                 self._record_dream_trigger_job(job_id, request, auth, status="ok")
                 self.record_job_usage(
                     operation="run_dream_phase",
@@ -1182,7 +1210,9 @@ class HostedMemoryService:
                     project_id=request.scope.project_id,
                     key_id=auth.key_id,
                 )
-            return True
+            return DreamJobOutcome(
+                durably_recorded=True, summarize_ran=summarize_ran
+            )
         except asyncio.CancelledError:
             # The worker thread cannot be interrupted, so a phase may still be
             # writing this scope. Hold the lease and let it lapse on its TTL

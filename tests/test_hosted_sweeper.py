@@ -738,6 +738,38 @@ class DreamSweeperTickTests(unittest.IsolatedAsyncioTestCase):
             state.last_summarize_watermark, self._scope_watermark(tenant.db_path)
         )
 
+    async def test_never_run_summarize_holds_watermark(self) -> None:
+        """A dream chain that fails before SUMMARIZE never summarized those
+        rows, so the watermark must NOT advance over them. Distinct
+        from a summarize that ran-and-failed (advances, anti-spend): here Light
+        fails first and the chain returns before SUMMARIZE executes. Advancing
+        would make the next tick see no new messages and strand the span
+        unsummarized until a fresh message arrives.
+        """
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _FakeAgent("a fake summary"),
+            extraction_agent_factory=lambda *_a, **_k: _FailingAgent(),
+        )
+        service = self._service(ports)
+        sweeper = self._sweeper(service)
+
+        report = await sweeper.tick(now=NOW)
+        await self._drain_background(service)
+
+        # Light failed first: the chain returned before SUMMARIZE ever ran.
+        self.assertEqual(report.dreams_scheduled, 1)
+        self.assertEqual(_summary_row_count(tenant.db_path), 0)
+        state = self.catalog.dream_sweep_state("tenant-a", None)
+        # The dream stamp still advances — the failure is durably recorded —
+        # but the summarize watermark is withheld: those rows were never
+        # summarized, so the next tick must still see them as new.
+        self.assertEqual(state.last_dream_completed_at, NOW.isoformat())
+        self.assertEqual(state.last_summarize_watermark, 0)
+
     async def test_failed_dream_chain_still_records_completion(self) -> None:
         """Pins the deliberate stamp-on-failure posture for dream chains
         (see `_record_sweep_state_after`): a failing chain must not re-dream
