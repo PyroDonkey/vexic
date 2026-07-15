@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from math import log
 from typing import Any
 
-from vexic.error_reporting import format_error_detail
+from vexic.error_reporting import format_error_detail, mark_dream_recorded
 from vexic.ports import AgentFactory, missing_host_port
 from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage import (
@@ -27,6 +27,7 @@ from vexic.storage import (
     load_promotion_candidates,
     nearest_long_term_facts,
 )
+from vexic.storage.errors import retry_once_if_retryable
 from vexic.timeutil import utc_now_iso
 from vexic.usage import UsageSummary, summarize_agent_usage
 
@@ -336,26 +337,33 @@ async def run_deep_phase(
         return usage
 
     except Exception as exc:
-        # Best-effort audit. A failure writing the error row must not mask the
-        # original exception that actually broke the cycle.
+        # Best-effort audit, retried once on a retryable storage fault. A
+        # failure writing the error row must not mask the original exception,
+        # but the sweeper must learn whether it landed: advancing the 24h retry
+        # clock over an unrecorded failure is what stalled Tier 3 in a live
+        # dreaming incident.
+        recorded = False
         try:
-            commit_deep_cycle(
-                db_path,
-                [],
-                agent_id=agent_id,
-                started_at=started_at,
-                finished_at=utc_now_iso(),
-                status="error",
-                error_detail=format_error_detail(exc),
-                forbidden_secret_values=forbidden,
+            retry_once_if_retryable(
+                lambda: commit_deep_cycle(
+                    db_path,
+                    [],
+                    agent_id=agent_id,
+                    started_at=started_at,
+                    finished_at=utc_now_iso(),
+                    status="error",
+                    error_detail=format_error_detail(exc),
+                    forbidden_secret_values=forbidden,
+                )
             )
+            recorded = True
         except Exception:
             # Best-effort status write; the original error is re-raised below.
-            pass
+            recorded = False
         print(
             f"Deep phase: ERROR -- {type(exc).__name__}. Tier 3 unchanged; will retry."
         )
-        raise
+        raise mark_dream_recorded(exc, recorded)
 
 
 def _main() -> None:

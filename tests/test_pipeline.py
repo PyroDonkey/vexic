@@ -14,6 +14,7 @@ from unittest.mock import patch
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 from vexic.embeddings import EMBEDDING_DIM
+from vexic.error_reporting import dream_failure_recorded
 from vexic.deep import run_deep_phase
 from vexic.models import ContradictionJudgment, FactCandidate
 from vexic.pipeline import _main, run_light_phase
@@ -35,6 +36,16 @@ from vexic.storage import (
 from vexic.storage.candidates import claim_candidate_for_promotion
 from vexic.storage.connection import connect
 from vexic.storage.schema import _load_vec_extension
+
+
+def _UPSTREAM_502() -> ValueError:
+    # The libSQL/Hrana bare ValueError raised when the Turso edge cannot reach
+    # its upstream primary (observed live 2026-07-13 as 502 Bad Gateway).
+    # Classified retryable by vexic.storage.errors.is_retryable_operational_error.
+    return ValueError(
+        "Hrana: `api error: `status=502 Bad Gateway, "
+        'body={"error":"connect to upstream failed"}``'
+    )
 
 
 def _unit_vector(first: float) -> list[float]:
@@ -1353,6 +1364,215 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(category, "preference")
         self.assertIsNone(occurred_at)
         self.assertEqual(count, 1)
+
+
+class DreamPhaseFailureRecordedTests(unittest.IsolatedAsyncioTestCase):
+    """A failed dream phase must surface whether its terminal
+    ``dream_runs`` error row was durably persisted, so the sweeper can refuse
+    to advance the 24h retry clock over a silent failure."""
+
+    def _seed_candidate(self, db_path: str) -> None:
+        commit_dream_cycle(
+            db_path,
+            [
+                FactCandidate(
+                    fact_text="Ryan cedar recorded-bit candidate.",
+                    subject="Ryan",
+                    category="fact",
+                    importance=5,
+                    confidence=0.8,
+                    source_message_ids=[1],
+                )
+            ],
+            candidate_embeddings=[_unit_vector(1.0)],
+            agent_id=None,
+            status="ok",
+            started_at="2026-01-01T00:00:00Z",
+            finished_at="2026-01-01T00:00:01Z",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+
+    async def test_rem_failure_marks_recorded_when_error_row_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            self._seed_candidate(db_path)
+            with patch(
+                "vexic.rem.compute_centrality_boosts",
+                side_effect=RuntimeError("boom"),
+            ):
+                with self.assertRaises(RuntimeError) as cm:
+                    await run_rem_phase(db_path)
+
+            self.assertTrue(dream_failure_recorded(cm.exception))
+            with closing(sqlite3.connect(db_path)) as conn:
+                status = conn.execute(
+                    "SELECT status FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()[0]
+            self.assertEqual(status, "error")
+
+    async def test_deep_failure_marks_recorded_when_error_row_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            self._seed_candidate(db_path)
+            with patch(
+                "vexic.deep.load_promotion_candidates",
+                side_effect=RuntimeError("boom"),
+            ):
+                with self.assertRaises(RuntimeError) as cm:
+                    await run_deep_phase(
+                        db_path,
+                        "glm",
+                        contradiction_agent_factory=lambda *_a, **_k: SimpleNamespace(),
+                    )
+
+            self.assertTrue(dream_failure_recorded(cm.exception))
+            with closing(sqlite3.connect(db_path)) as conn:
+                status = conn.execute(
+                    "SELECT status FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()[0]
+            self.assertEqual(status, "error")
+
+    async def test_light_failure_marks_recorded_when_error_row_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            save_messages(
+                db_path,
+                [ModelRequest(parts=[UserPromptPart(content="hello there")])],
+            )
+
+            class FailingExtractionAgent:
+                async def run(self, transcript: str) -> object:
+                    raise RuntimeError("boom")
+
+            with self.assertRaises(RuntimeError) as cm:
+                await run_light_phase(
+                    db_path,
+                    "glm",
+                    extraction_agent_factory=lambda *_a, **_k: FailingExtractionAgent(),
+                    embed=lambda texts: [_unit_vector(1.0) for _ in texts],
+                )
+
+            self.assertTrue(dream_failure_recorded(cm.exception))
+            with closing(sqlite3.connect(db_path)) as conn:
+                status = conn.execute(
+                    "SELECT status FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()[0]
+            self.assertEqual(status, "error")
+
+    async def test_error_row_retries_once_on_retryable_fault_then_records(
+        self,
+    ) -> None:
+        # The terminal error-row write itself faults with a retryable Turso
+        # 502, then succeeds on a fresh connection: recorded True, retried once.
+        from vexic.storage import commit_rem_cycle as real_commit
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            self._seed_candidate(db_path)
+
+            calls = {"n": 0}
+
+            def flaky(*args: object, **kwargs: object) -> object:
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise _UPSTREAM_502()
+                return real_commit(*args, **kwargs)
+
+            with patch(
+                "vexic.rem.compute_centrality_boosts",
+                side_effect=RuntimeError("boom"),
+            ):
+                with patch("vexic.rem.commit_rem_cycle", side_effect=flaky):
+                    with self.assertRaises(RuntimeError) as cm:
+                        await run_rem_phase(db_path)
+
+            self.assertTrue(dream_failure_recorded(cm.exception))
+            self.assertEqual(calls["n"], 2)
+            with closing(sqlite3.connect(db_path)) as conn:
+                status = conn.execute(
+                    "SELECT status FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()[0]
+            self.assertEqual(status, "error")
+
+    async def test_unrecorded_when_retryable_fault_persists(self) -> None:
+        # The error-row write keeps faulting: the original error still surfaces
+        # (never masked), no error row lands, and the failure is marked
+        # unrecorded so the sweeper will not advance the retry clock over it.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            self._seed_candidate(db_path)
+
+            def always_502(*args: object, **kwargs: object) -> object:
+                raise _UPSTREAM_502()
+
+            with patch(
+                "vexic.rem.compute_centrality_boosts",
+                side_effect=RuntimeError("boom"),
+            ):
+                with patch("vexic.rem.commit_rem_cycle", side_effect=always_502):
+                    with self.assertRaises(RuntimeError) as cm:
+                        await run_rem_phase(db_path)
+
+            self.assertFalse(dream_failure_recorded(cm.exception))
+            with closing(sqlite3.connect(db_path)) as conn:
+                error_rows = conn.execute(
+                    "SELECT COUNT(*) FROM dream_runs WHERE status = 'error'"
+                ).fetchone()[0]
+            self.assertEqual(error_rows, 0)
+
+    async def test_non_retryable_write_fault_is_not_retried(self) -> None:
+        # A non-retryable fault in the error-row write fails fast (one attempt),
+        # marks unrecorded, and never masks the original error.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            self._seed_candidate(db_path)
+
+            calls = {"n": 0}
+
+            def non_retryable(*args: object, **kwargs: object) -> object:
+                calls["n"] += 1
+                raise ValueError("plain domain error, not a storage fault")
+
+            with patch(
+                "vexic.rem.compute_centrality_boosts",
+                side_effect=RuntimeError("boom"),
+            ):
+                with patch("vexic.rem.commit_rem_cycle", side_effect=non_retryable):
+                    with self.assertRaises(RuntimeError) as cm:
+                        await run_rem_phase(db_path)
+
+            self.assertFalse(dream_failure_recorded(cm.exception))
+            self.assertEqual(calls["n"], 1)
+
+    async def test_recorded_error_detail_is_content_free(self) -> None:
+        # The persisted error_detail carries only the exception type + stack
+        # shape (format_error_detail), never the exception message text.
+        sentinel = "cedar-secret-message-sentinel"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            self._seed_candidate(db_path)
+            with patch(
+                "vexic.rem.compute_centrality_boosts",
+                side_effect=RuntimeError(sentinel),
+            ):
+                with self.assertRaises(RuntimeError):
+                    await run_rem_phase(db_path)
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                error_detail = conn.execute(
+                    "SELECT error_detail FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()[0]
+            self.assertIsNotNone(error_detail)
+            self.assertNotIn(sentinel, error_detail)
+            self.assertIn("RuntimeError", error_detail)
 
 
 class RemCentralityBoostTests(unittest.TestCase):

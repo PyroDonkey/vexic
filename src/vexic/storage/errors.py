@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from collections.abc import Callable
 
 # libSQL/Hrana ``code:`` fragments and message substrings that mark an
 # operational (as opposed to constraint) SQL error. ``SQLITE_ERROR`` covers the
@@ -216,6 +217,28 @@ def is_retryable_operational_error(exc: BaseException) -> bool:
             or _is_upstream_connect_error(message)
         )
     return False
+
+
+def retry_once_if_retryable(fn: Callable[[], object]) -> None:
+    """Invoke a storage write, retrying it exactly once on a retryable fault.
+
+    Retryable here means :func:`is_retryable_operational_error` -- a reaped
+    Turso Hrana stream or an edge/upstream connect blip -- where re-invoking the
+    whole thunk opens a fresh connection, the actual fix for a write lost on a
+    reaped stream. For the dream error-row writers this guards a retry is safe
+    but not strictly idempotent: the common retryable cases (reaped stream,
+    pre-commit connect fault) lose the write and must re-run, while the rarer
+    commit-then-lost-ack case re-runs to a *second* append-only ``status='error'``
+    row -- harmless here, since the sweeper reads a boolean outcome, not row
+    counts, and error rows carry no facts. Non-retryable operational faults and
+    unrelated exceptions propagate on the first attempt.
+    """
+    try:
+        fn()
+    except (sqlite3.Error, ValueError) as exc:
+        if not is_retryable_operational_error(exc):
+            raise
+        fn()
 
 
 def is_malformed_fts_query_error(exc: BaseException) -> bool:

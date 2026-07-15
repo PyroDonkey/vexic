@@ -299,11 +299,15 @@ class DreamSweeper:
     ) -> None:
         """Advance one scope's sweep state once its job finishes running.
 
-        Deliberate posture (test-pinned): a chain that RAN but failed a phase
-        in-band still advances state -- the failure detail is durable in the
-        per-phase job events, and re-running every tick on a persistently
-        failing tenant would burn model spend without an operator in the
-        loop. A CANCELLED job did not finish running, so state is left
+        Posture: a failed chain advances the dream stamp only when
+        the job reports the failure was durably recorded -- success, or a phase
+        whose terminal ``dream_runs`` error row landed. An UNRECORDED failure
+        withholds the stamp so the next tick retries, rather than advancing the
+        24h clock over a silent stall (the failure detail is not always durable
+        in the control-plane job events -- when storage is the fault, that write
+        fails too). The anti-spend guard still holds: a recorded failure waits
+        the full interval, and advancing is now only reached once the failure
+        is queryable. A CANCELLED job did not finish running, so state is left
         untouched and the next tick retries. The dream stamp records actual
         completion time, not tick-start time, so the next dream is due a
         full interval after the chain finished. Catalog writes are monotonic,
@@ -316,8 +320,22 @@ class DreamSweeper:
 
         async def _await_and_record() -> None:
             results = await asyncio.gather(task, return_exceptions=True)
-            if any(isinstance(result, asyncio.CancelledError) for result in results):
+            result = results[0]
+            if isinstance(result, asyncio.CancelledError):
                 return
+            # The job reports whether advancing the clock is safe: True on
+            # success or a durably-recorded failure, False on an unrecorded
+            # failure. It only ever surfaces CancelledError; any other raised
+            # exception means it failed without reporting an outcome, so treat
+            # it as unrecorded (withhold the stamp) and count the anomaly.
+            durably_recorded = result is True
+            if not isinstance(result, bool):
+                self._record_failures += 1
+                logger.error(
+                    "Dream job raised without reporting an outcome.",
+                    exc_info=result,
+                )
+                durably_recorded = False
             # The two writes are independent and retried: a failed watermark
             # write must not skip the dream stamp, or the dream re-fires
             # every tick.
@@ -333,7 +351,7 @@ class DreamSweeper:
                 except Exception:
                     self._record_failures += 1
                     logger.exception("Recording summarize watermark failed.")
-            if dream_completed:
+            if dream_completed and durably_recorded:
                 try:
                     await asyncio.to_thread(
                         _record_with_retry,

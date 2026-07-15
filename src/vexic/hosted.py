@@ -62,6 +62,7 @@ from vexic.contract import (
     SourceTranscriptMessage,
     TrustBoundary,
 )
+from vexic.error_reporting import dream_failure_recorded
 from vexic.ports import DreamPhasePorts, missing_host_port
 from vexic.service import (
     LocalMemoryService,
@@ -893,7 +894,7 @@ class HostedMemoryService:
     def _start_dream_lease_heartbeat(
         self,
         key: tuple[str, str | None],
-        job: "asyncio.Task[None]",
+        job: "asyncio.Task[bool]",
     ) -> None:
         """Keep this holder's lease fresh for as long as `job` runs.
 
@@ -1043,7 +1044,7 @@ class HostedMemoryService:
         *,
         agent_id: str | None,
         phases: tuple[DreamPhase, ...],
-    ) -> "asyncio.Task[None] | None":
+    ) -> "asyncio.Task[bool] | None":
         """In-server sweeper seam (ADR 0030): schedule pre-bound dream phases
         for one tenant+agent scope under a system principal — no API key.
 
@@ -1113,11 +1114,16 @@ class HostedMemoryService:
         tenant: HostedTenant,
         auth: HostedAuthContext,
         lock_key: tuple[str, str | None],
-    ) -> None:
+    ) -> bool:
         """Run the sweeper's minted phases sequentially on a worker-thread
         event loop (same isolation rationale as `_run_dream_trigger_job`).
         A failing phase records its error and stops the chain — a Deep run
-        over a failed Light extraction would promote from stale candidates."""
+        over a failed Light extraction would promote from stale candidates.
+
+        Returns whether advancing the sweep clock is safe: ``True`` when every
+        phase succeeded or a failing phase durably recorded its terminal
+        ``dream_runs`` error row, ``False`` when a failure went unrecorded so
+        the sweeper must retry next tick instead of hiding it."""
         cancelled = False
         try:
             for request in requests:
@@ -1161,7 +1167,11 @@ class HostedMemoryService:
                         project_id=request.scope.project_id,
                         key_id=auth.key_id,
                     )
-                    return
+                    # Surface to the sweeper whether the failing phase durably
+                    # recorded its terminal dream_runs row. The sweeper advances
+                    # the 24h retry clock only when it did: advancing
+                    # over a silent failure is what stalled Tier 3 live.
+                    return dream_failure_recorded(exc)
                 self._record_dream_trigger_job(job_id, request, auth, status="ok")
                 self.record_job_usage(
                     operation="run_dream_phase",
@@ -1172,6 +1182,7 @@ class HostedMemoryService:
                     project_id=request.scope.project_id,
                     key_id=auth.key_id,
                 )
+            return True
         except asyncio.CancelledError:
             # The worker thread cannot be interrupted, so a phase may still be
             # writing this scope. Hold the lease and let it lapse on its TTL
