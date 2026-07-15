@@ -152,6 +152,71 @@ def test_dream_lease_contends_correctly_against_fake_libsql(monkeypatch, tmp_pat
     )
 
 
+def test_schema_init_swallows_libsql_duplicate_column_value_error(monkeypatch, tmp_path):
+    # Two containers racing the additive control-plane migrations on Turso: the
+    # loser's ALTER surfaces as the driver's bare ValueError (Hrana payload),
+    # not sqlite3.OperationalError. Pin that the init converges on that error
+    # shape end-to-end (COA-386).
+    import sqlite3
+
+    fake_conn = FakeLibsqlConn()
+
+    class _StubCursor:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    # The `key_id` check is the second table_info(hosted_usage_events) read
+    # (`project_id`, present since the CREATE, is checked first).
+    state = {"fired": False, "checks": 0, "duplicate_raised": False}
+
+    class _HranaErrorHandle(_NonClosingFakeConnHandle):
+        def execute(self, sql, parameters=(), /):
+            try:
+                cursor = super().execute(sql, parameters)
+            except sqlite3.Error as exc:
+                if "duplicate column name" in str(exc):
+                    state["duplicate_raised"] = True
+                raise ValueError(
+                    'Hrana: `stream error: `Error { message: "SQLite error: '
+                    f'{exc}", code: "SQLITE_ERROR" }}`'
+                ) from exc
+            if not state["fired"] and "table_info(hosted_usage_events)" in sql:
+                state["checks"] += 1
+                if state["checks"] == 2:
+                    rows = cursor.fetchall()
+                    state["fired"] = True
+                    # Rival container migrates between this check and the ALTER.
+                    fake_conn.execute(
+                        "ALTER TABLE hosted_usage_events ADD COLUMN key_id TEXT"
+                    )
+                    fake_conn.commit()
+                    return _StubCursor(rows)
+            return cursor
+
+    import vexic.hosted_local as hosted_local
+
+    def _fake_connect(target, *, auth_token=None, **kwargs):
+        assert isinstance(target, StorageTarget)
+        return _HranaErrorHandle(fake_conn)
+
+    monkeypatch.setattr(hosted_local, "connect", _fake_connect)
+    _forbid_local_permission_ops(monkeypatch)
+    target = StorageTarget("libsql://fake-control-plane", auth_token="s3cr3t-token")
+
+    HostedTenantCatalog(tmp_path, control_target=target)
+
+    # The losing ALTER really surfaced as the ValueError form and was swallowed.
+    assert state["duplicate_raised"]
+    columns = [
+        str(row[1])
+        for row in fake_conn.execute("PRAGMA table_info(hosted_usage_events)").fetchall()
+    ]
+    assert columns.count("key_id") == 1
+
+
 def test_catalog_provisions_tenant_against_fake_libsql_control_plane(monkeypatch, tmp_path):
     fake_conn = FakeLibsqlConn()
     _patch_connect_to_fake(monkeypatch, fake_conn)

@@ -34,45 +34,56 @@ class _StubCursor:
 class _RivalOnCheckConnection:
     """Delegate to a real control connection, injecting a rival at the race window.
 
-    The first time the victim reads ``PRAGMA table_info(<watch_table>)``, the
-    pre-rival rows are captured, the rival initializer runs to completion on its
-    own connections, and the stale rows are handed back -- exactly the
-    interleaving where both containers observed the column missing.
+    When the victim reads ``PRAGMA table_info(<watch_table>)`` for the
+    ``fire_on_occurrence``-th time -- the read guarding the racing column --
+    the pre-rival rows are captured, the rival initializer runs to completion
+    on its own connections, and the stale rows are handed back: exactly the
+    interleaving where both containers observed the column missing. Executed
+    SQL is recorded in ``state["sqls"]`` so tests can assert the victim really
+    attempted the losing ALTER.
     """
 
-    def __init__(self, conn, watch_table: str, rival, state: dict) -> None:
+    def __init__(
+        self, conn, watch_table: str, rival, state: dict, fire_on_occurrence: int
+    ) -> None:
         self._conn = conn
         self._watch_table = watch_table
         self._rival = rival
         self._state = state
+        self._fire_on_occurrence = fire_on_occurrence
 
     def execute(self, sql: str, *args):
+        self._state["sqls"].append(sql)
         cursor = self._conn.execute(sql, *args)
-        if (
-            not self._state["fired"]
-            and f"table_info({self._watch_table})" in sql
-        ):
-            rows = cursor.fetchall()
-            self._state["fired"] = True
-            self._rival()
-            return _StubCursor(rows)
+        if not self._state["fired"] and f"table_info({self._watch_table})" in sql:
+            self._state["checks"] += 1
+            if self._state["checks"] == self._fire_on_occurrence:
+                rows = cursor.fetchall()
+                self._state["fired"] = True
+                self._rival()
+                return _StubCursor(rows)
         return cursor
 
     def __getattr__(self, name: str):
         return getattr(self._conn, name)
 
 
-def _patch_victim_connections(monkeypatch, cls, watch_table: str, rival) -> None:
-    state = {"fired": False}
+def _patch_victim_connections(
+    monkeypatch, cls, watch_table: str, rival, fire_on_occurrence: int = 1
+) -> dict:
+    state: dict = {"fired": False, "checks": 0, "sqls": []}
     real_connect = cls._connect_control
 
     def connect_with_rival(self):
         conn = real_connect(self)
         if state["fired"]:
             return conn
-        return _RivalOnCheckConnection(conn, watch_table, rival, state)
+        return _RivalOnCheckConnection(
+            conn, watch_table, rival, state, fire_on_occurrence
+        )
 
     monkeypatch.setattr(cls, "_connect_control", connect_with_rival)
+    return state
 
 
 def _column_names(control_db: Path, table: str) -> list[str]:
@@ -90,17 +101,26 @@ def test_catalog_init_survives_rival_migrating_between_check_and_alter(
 
     ``hosted_usage_events`` is created without ``key_id``, so the additive
     ALTER fires on every fresh database -- the rival adds it between the
-    victim's column check and its own ALTER.
+    victim's column check and its own ALTER. The ``key_id`` check is the
+    second ``table_info(hosted_usage_events)`` read (``project_id`` is
+    checked first).
     """
-    _patch_victim_connections(
+    state = _patch_victim_connections(
         monkeypatch,
         HostedTenantCatalog,
         "hosted_usage_events",
         lambda: HostedTenantCatalog(tmp_path),
+        fire_on_occurrence=2,
     )
 
     HostedTenantCatalog(tmp_path)
 
+    # The victim must have lost the race for real: it attempted the ALTER a
+    # rival had already applied, and converged by swallowing the duplicate.
+    assert any(
+        "ALTER TABLE hosted_usage_events ADD COLUMN key_id" in sql
+        for sql in state["sqls"]
+    )
     columns = _column_names(tmp_path / "control-plane.db", "hosted_usage_events")
     assert columns.count("key_id") == 1
 
@@ -301,7 +321,7 @@ def test_key_store_init_survives_rival_migrating_between_check_and_alter(
     tmp_path, monkeypatch
 ) -> None:
     """Same race through HostedApiKeyStore's own migration body (last_used_at)."""
-    _patch_victim_connections(
+    state = _patch_victim_connections(
         monkeypatch,
         HostedApiKeyStore,
         "hosted_api_keys",
@@ -310,5 +330,9 @@ def test_key_store_init_survives_rival_migrating_between_check_and_alter(
 
     HostedApiKeyStore(tmp_path)
 
+    assert any(
+        "ALTER TABLE hosted_api_keys ADD COLUMN last_used_at" in sql
+        for sql in state["sqls"]
+    )
     columns = _column_names(tmp_path / "control-plane.db", "hosted_api_keys")
     assert columns.count("last_used_at") == 1
