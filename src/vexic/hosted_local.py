@@ -31,6 +31,7 @@ from vexic.storage.errors import (
     is_duplicate_column_error,
     is_operational_error,
     is_retryable_operational_error,
+    retry_once_if_retryable,
 )
 
 
@@ -440,7 +441,10 @@ class HostedTenantCatalog:
             if control_target is not None
             else self.root_path / "control-plane.db"
         )
-        self._init_control_plane_schema()
+        # A rival container's serialized migration can surface a retryable
+        # locked/busy fault on Turso; the re-run re-checks the migrated schema
+        # on a fresh connection (COA-386).
+        retry_once_if_retryable(self._init_control_plane_schema)
 
     def provision_tenant(
         self,
@@ -1585,11 +1589,11 @@ class HostedApiKeyStore:
         self._control_target: str | Path | StorageTarget | None = None
         if control_target is not None:
             self._control_target = control_target
-            self._init_control_plane_schema()
+            retry_once_if_retryable(self._init_control_plane_schema)
         elif self.root_path is not None:
             self.root_path.mkdir(parents=True, exist_ok=True)
             self._control_target = self.root_path / "control-plane.db"
-            self._init_control_plane_schema()
+            retry_once_if_retryable(self._init_control_plane_schema)
 
     def create_key(
         self,

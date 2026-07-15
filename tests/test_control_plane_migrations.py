@@ -222,6 +222,81 @@ def test_dream_sweep_state_drop_recreate_is_serialized_against_rival(
     assert rows == [("tenant-x", 7)]
 
 
+def test_concurrent_catalog_and_key_store_inits_all_converge(tmp_path) -> None:
+    """Barrier-released initializers against one control DB all boot cleanly.
+
+    The rolling-deploy regression net: several containers (catalog and key
+    store alike) start simultaneously against the same pre-existing old-shape
+    database and every one must converge without raising.
+    """
+    control_db = tmp_path / "control-plane.db"
+    with closing(sqlite3.connect(control_db)) as conn:
+        conn.execute(
+            """
+            CREATE TABLE dream_sweep_state (
+                tenant_id TEXT PRIMARY KEY,
+                last_summarize_watermark INTEGER NOT NULL DEFAULT 0,
+                last_dream_completed_at TEXT
+            )
+            """
+        )
+        conn.commit()
+
+    factories = [
+        lambda: HostedTenantCatalog(tmp_path),
+        lambda: HostedTenantCatalog(tmp_path),
+        lambda: HostedApiKeyStore(tmp_path),
+        lambda: HostedApiKeyStore(tmp_path),
+    ]
+    barrier = threading.Barrier(len(factories))
+    errors: list[BaseException] = []
+
+    def run(factory) -> None:
+        barrier.wait(timeout=30)
+        try:
+            factory()
+        except BaseException as exc:  # noqa: BLE001 - surfaced via assertion
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run, args=(factory,)) for factory in factories]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+    assert all(not thread.is_alive() for thread in threads)
+
+    assert errors == []
+    assert "last_dream_failed_at" in _column_names(control_db, "dream_sweep_state")
+    assert _column_names(control_db, "hosted_usage_events").count("key_id") == 1
+    assert _column_names(control_db, "hosted_api_keys").count("last_used_at") == 1
+
+
+@pytest.mark.parametrize("cls", [HostedTenantCatalog, HostedApiKeyStore])
+def test_init_retries_once_when_rival_holds_the_write_lock(
+    tmp_path, monkeypatch, cls
+) -> None:
+    """A boot that loses the write lock re-runs its init instead of dying.
+
+    On Turso the lock's loser surfaces ``database is locked`` instead of
+    waiting on the local 30s busy timeout; one retry re-checks the (by then
+    migrated) schema on a fresh connection.
+    """
+    real_connect = cls._connect_control
+    attempts = {"count": 0}
+
+    def locked_once(self):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real_connect(self)
+
+    monkeypatch.setattr(cls, "_connect_control", locked_once)
+
+    cls(tmp_path)
+
+    assert attempts["count"] == 2
+
+
 def test_key_store_init_survives_rival_migrating_between_check_and_alter(
     tmp_path, monkeypatch
 ) -> None:
