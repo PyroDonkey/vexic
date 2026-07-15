@@ -333,7 +333,7 @@ class DreamSweeper:
                 self._record_failures += 1
                 logger.error(
                     "Dream job raised without reporting an outcome.",
-                    exc_info=result,
+                    exc_info=(type(result), result, result.__traceback__),
                 )
                 durably_recorded = False
             # The two writes are independent and retried: a failed watermark
