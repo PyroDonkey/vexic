@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from vexic.contract import DreamPhase
-from vexic.hosted import HostedMemoryService
+from vexic.hosted import DreamJobOutcome, HostedMemoryService
 from vexic.ports import HostPortNotConfigured
 from vexic.storage import agent_watermarks
 from vexic.storage.errors import is_retryable_operational_error
@@ -292,7 +292,7 @@ class DreamSweeper:
         self,
         tenant_id: str,
         agent_id: str | None,
-        task: "asyncio.Task[None]",
+        task: "asyncio.Task[DreamJobOutcome]",
         *,
         watermark: int | None,
         dream_completed: bool,
@@ -323,23 +323,29 @@ class DreamSweeper:
             result = results[0]
             if isinstance(result, asyncio.CancelledError):
                 return
-            # The job reports whether advancing the clock is safe: True on
-            # success or a durably-recorded failure, False on an unrecorded
-            # failure. It only ever surfaces CancelledError; any other raised
-            # exception means it failed without reporting an outcome, so treat
-            # it as unrecorded (withhold the stamp) and count the anomaly.
-            durably_recorded = result is True
-            if not isinstance(result, bool):
+            # The job reports two independent bits via DreamJobOutcome:
+            # `durably_recorded` (safe to advance the 24h dream stamp) and
+            # `summarize_ran` (SUMMARIZE actually executed, so the watermark
+            # may advance). It only ever surfaces CancelledError; any other
+            # raised exception means it failed without reporting an outcome, so
+            # fail closed on both writes and count the anomaly.
+            if isinstance(result, DreamJobOutcome):
+                durably_recorded = result.durably_recorded
+                summarize_ran = result.summarize_ran
+            else:
                 self._record_failures += 1
                 logger.error(
                     "Dream job raised without reporting an outcome.",
                     exc_info=(type(result), result, result.__traceback__),
                 )
                 durably_recorded = False
+                summarize_ran = False
             # The two writes are independent and retried: a failed watermark
             # write must not skip the dream stamp, or the dream re-fires
-            # every tick.
-            if watermark is not None:
+            # every tick. The watermark advances only when SUMMARIZE actually
+            # ran -- a chain that failed before SUMMARIZE never summarized these
+            # rows, so advancing would strand them.
+            if watermark is not None and summarize_ran:
                 try:
                     await asyncio.to_thread(
                         _record_with_retry,
