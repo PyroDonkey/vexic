@@ -2473,10 +2473,13 @@ def _connect_control_db(target: str | Path | StorageTarget) -> sqlite3.Connectio
     handle is always closed, retryable or not.
     """
     _ensure_control_db_permissions(target)
+    is_remote = isinstance(target, StorageTarget) and _is_libsql_target(target.target)
     for attempt in (0, 1):
-        if isinstance(target, StorageTarget):
+        if is_remote:
             conn = connect(target)
         else:
+            # Local SQLite either way it is spelled (bare path or a local-file
+            # StorageTarget): the 30s busy-wait absorbs startup lock races.
             conn = connect(target, timeout=30)
         try:
             conn.execute("PRAGMA foreign_keys = ON")
@@ -2500,14 +2503,18 @@ def _connect_control_db(target: str | Path | StorageTarget) -> sqlite3.Connectio
 def _ensure_control_db_permissions(target: str | Path | StorageTarget) -> None:
     """Enforce owner-only read/write on the LOCAL control-plane database file.
 
-    A `StorageTarget` (libSQL/Turso DSN) names a remote, managed database --
-    there is no local file to `os.open`/`os.chmod`, and this is a no-op for
-    that case. Filesystem permissions only apply to a local `str`/`Path`
-    target (the default, filesystem-rooted control plane).
+    A remote libSQL/Turso DSN names a managed database -- there is no local
+    file to `os.open`/`os.chmod`, and this is a no-op for that case.
+    Classification is by scheme, not wrapper type: a `StorageTarget` can also
+    name a local SQLite file, which needs the same owner-only enforcement as
+    a bare `str`/`Path` target.
     """
     if isinstance(target, StorageTarget):
-        return
-    db_path = target
+        if _is_libsql_target(target.target):
+            return
+        db_path: str | Path = target.target
+    else:
+        db_path = target
     try:
         fd = os.open(db_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, _CONTROL_DB_MODE)
     except FileExistsError:

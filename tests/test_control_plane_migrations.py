@@ -284,6 +284,49 @@ def test_dream_sweep_state_drop_recreate_is_serialized_against_rival(
     assert rows == [("tenant-x", 7)]
 
 
+def test_local_storage_target_control_db_gets_owner_only_permissions(
+    tmp_path,
+) -> None:
+    """A local file named via StorageTarget is still a local control DB.
+
+    The owner-only mode enforcement classifies targets by scheme, not by
+    wrapper type: only a remote libSQL DSN has no local file to protect.
+    """
+    import stat
+
+    control_db = tmp_path / "control-plane.db"
+
+    HostedTenantCatalog(tmp_path, control_target=StorageTarget(str(control_db)))
+
+    assert stat.S_IMODE(control_db.stat().st_mode) == 0o600
+
+
+def test_local_storage_target_control_db_gets_full_busy_timeout(
+    tmp_path, monkeypatch
+) -> None:
+    """A local file named via StorageTarget keeps the 30s lock busy-wait.
+
+    SQLite's default 5s timeout weakens lock-race convergence during
+    concurrent startup; the local control-plane connection always opens with
+    the 30s busy-wait regardless of how the local target is spelled.
+    """
+    import vexic.hosted_local as hosted_local
+
+    recorded: list[dict] = []
+    real_connect = hosted_local.connect
+
+    def recording_connect(target, **kwargs):
+        recorded.append(kwargs)
+        return real_connect(target, **kwargs)
+
+    monkeypatch.setattr(hosted_local, "connect", recording_connect)
+
+    control_db = tmp_path / "control-plane.db"
+    HostedTenantCatalog(tmp_path, control_target=StorageTarget(str(control_db)))
+
+    assert recorded and all(kwargs.get("timeout") == 30 for kwargs in recorded)
+
+
 def test_init_does_not_retry_a_hung_remote(tmp_path, monkeypatch) -> None:
     """A remote deadline is not lock contention; retrying doubles the wait.
 
