@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
+from vexic.storage import StorageTarget
 
 
 class _StubCursor:
@@ -158,8 +159,9 @@ class _PauseOnCheckConnection:
         return getattr(self._conn, name)
 
 
+@pytest.mark.parametrize("wrap_target", [False, True], ids=["path", "storage-target"])
 def test_dream_sweep_state_drop_recreate_is_serialized_against_rival(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, wrap_target
 ) -> None:
     """A racing boot must not drop the sweep-state table a rival just rebuilt.
 
@@ -167,6 +169,9 @@ def test_dream_sweep_state_drop_recreate_is_serialized_against_rival(
     DROP+recreate migration. The victim pauses between its column check and the
     DROP while a rival initializer runs to completion and records sweep state;
     the victim's resumed DROP must not destroy the rival's table or its row.
+
+    A ``StorageTarget`` can also name a local SQLite file, so the write-lock
+    serialization must hold for that form too, not only a bare path.
     """
     control_db = tmp_path / "control-plane.db"
     with closing(sqlite3.connect(control_db)) as conn:
@@ -215,9 +220,16 @@ def test_dream_sweep_state_drop_recreate_is_serialized_against_rival(
 
     errors: list[BaseException] = []
 
+    def make_catalog() -> HostedTenantCatalog:
+        if wrap_target:
+            return HostedTenantCatalog(
+                tmp_path, control_target=StorageTarget(str(control_db))
+            )
+        return HostedTenantCatalog(tmp_path)
+
     def run_catalog_init() -> None:
         try:
-            HostedTenantCatalog(tmp_path)
+            make_catalog()
         except BaseException as exc:  # noqa: BLE001 - surfaced via assertion
             errors.append(exc)
 
@@ -227,7 +239,7 @@ def test_dream_sweep_state_drop_recreate_is_serialized_against_rival(
 
     def run_rival_then_record() -> None:
         try:
-            HostedTenantCatalog(tmp_path)
+            make_catalog()
             with closing(sqlite3.connect(control_db, timeout=30)) as conn:
                 conn.execute(
                     "INSERT INTO dream_sweep_state "
@@ -270,6 +282,30 @@ def test_dream_sweep_state_drop_recreate_is_serialized_against_rival(
             "SELECT tenant_id, last_summarize_watermark FROM dream_sweep_state"
         ).fetchall()
     assert rows == [("tenant-x", 7)]
+
+
+def test_init_does_not_retry_a_hung_remote(tmp_path, monkeypatch) -> None:
+    """A remote deadline is not lock contention; retrying doubles the wait.
+
+    Mirrors the no-retry-on-deadline policy of ``_connect_control_db``: a
+    ``QueryDeadlineExceeded`` propagates on the first schema-init attempt
+    instead of burning further multi-second deadlines behind a boot.
+    """
+    from vexic.storage.errors import QueryDeadlineExceeded
+
+    attempts = {"count": 0}
+
+    def hung_remote(self):
+        attempts["count"] += 1
+        raise QueryDeadlineExceeded("libsql call exceeded query deadline (30.0s)")
+
+    monkeypatch.setattr(HostedTenantCatalog, "_connect_control", hung_remote)
+    monkeypatch.setattr("vexic.hosted_local.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(QueryDeadlineExceeded):
+        HostedTenantCatalog(tmp_path)
+
+    assert attempts["count"] == 1
 
 
 def test_concurrent_catalog_and_key_store_inits_all_converge(tmp_path) -> None:

@@ -2408,6 +2408,11 @@ def _run_schema_init_with_backoff(init_schema: Callable[[], None]) -> None:
             init_schema()
             return
         except (sqlite3.Error, ValueError) as exc:
+            # A hung remote (QueryDeadlineExceeded) is not lock contention;
+            # retrying burns another multi-second deadline for the same
+            # outcome (same policy as _connect_control_db).
+            if isinstance(exc, QueryDeadlineExceeded):
+                raise
             if attempt == _SCHEMA_INIT_ATTEMPTS or not is_retryable_operational_error(
                 exc
             ):
@@ -2426,12 +2431,12 @@ def _begin_control_write_txn(
     serialization there relies on the Turso server rejecting the stale write
     at commit, which surfaces to the loser as a retryable fault (see
     ``storage.candidates._begin_write_txn`` for the same split). Dispatch is
-    on the control target, not the connection type, so wrapped test
-    connections keep the local behavior.
+    on the control target's scheme, not the connection or wrapper type: a
+    ``StorageTarget`` can also name a local SQLite file, which must keep the
+    pre-read write lock.
     """
-    conn.execute(
-        "BEGIN" if isinstance(target, StorageTarget) else "BEGIN IMMEDIATE"
-    )
+    is_remote = isinstance(target, StorageTarget) and _is_libsql_target(target.target)
+    conn.execute("BEGIN" if is_remote else "BEGIN IMMEDIATE")
 
 
 def _add_column_if_missing(
