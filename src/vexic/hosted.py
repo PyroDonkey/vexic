@@ -94,7 +94,10 @@ class DreamJobOutcome(NamedTuple):
 
     durably_recorded: bool
     summarize_ran: bool
-    finished_at: datetime | None = None
+    # No default: every construction site must mint this under the lease, or
+    # the recorder would silently fall back to recorder-run time and reopen
+    # the rolling-deploy stamp race (ADR 0030 amendment).
+    finished_at: datetime
 
 
 _RequestT = TypeVar("_RequestT", bound=MemoryRequest)

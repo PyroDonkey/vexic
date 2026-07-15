@@ -377,9 +377,9 @@ class DreamSweeper:
                 # The job minted its terminal time while it still held the
                 # durable lease; persist that, not recorder-run time, so a
                 # stalled recorder cannot outrank another container's newer
-                # stamp (ADR 0030 amendment). The clock fallback below covers only the
-                # raised-without-outcome anomaly.
-                finished_at = result.finished_at or self._clock()
+                # stamp (ADR 0030 amendment). Only the raised-without-outcome
+                # anomaly in the else branch falls back to the recorder clock.
+                finished_at = result.finished_at
             else:
                 self._record_failures += 1
                 logger.error(
