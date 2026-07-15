@@ -12,6 +12,7 @@ the victim's column check and its ALTER -- so no thread timing is involved.
 from __future__ import annotations
 
 import sqlite3
+import threading
 from contextlib import closing
 from pathlib import Path
 
@@ -102,6 +103,123 @@ def test_catalog_init_survives_rival_migrating_between_check_and_alter(
 
     columns = _column_names(tmp_path / "control-plane.db", "hosted_usage_events")
     assert columns.count("key_id") == 1
+
+
+class _PauseOnCheckConnection:
+    """Delegate to a real control connection, pausing at the race window.
+
+    The first ``PRAGMA table_info(<watch_table>)`` read signals ``reached`` and
+    blocks until ``release`` is set, holding the victim initializer open so a
+    rival container's initializer can run (or contend) meanwhile.
+    """
+
+    def __init__(self, conn, watch_table: str, reached, release, state: dict) -> None:
+        self._conn = conn
+        self._watch_table = watch_table
+        self._reached = reached
+        self._release = release
+        self._state = state
+
+    def execute(self, sql: str, *args):
+        cursor = self._conn.execute(sql, *args)
+        if (
+            not self._state["fired"]
+            and f"table_info({self._watch_table})" in sql
+        ):
+            rows = cursor.fetchall()
+            self._state["fired"] = True
+            self._reached.set()
+            assert self._release.wait(timeout=30)
+            return _StubCursor(rows)
+        return cursor
+
+    def __getattr__(self, name: str):
+        return getattr(self._conn, name)
+
+
+def test_dream_sweep_state_drop_recreate_is_serialized_against_rival(
+    tmp_path, monkeypatch
+) -> None:
+    """A racing boot must not drop the sweep-state table a rival just rebuilt.
+
+    Old-shape ``dream_sweep_state`` (pre-``agent_id``) triggers the
+    DROP+recreate migration. The victim pauses between its column check and the
+    DROP while a rival initializer runs to completion and records sweep state;
+    the victim's resumed DROP must not destroy the rival's table or its row.
+    """
+    control_db = tmp_path / "control-plane.db"
+    with closing(sqlite3.connect(control_db)) as conn:
+        conn.execute(
+            """
+            CREATE TABLE dream_sweep_state (
+                tenant_id TEXT PRIMARY KEY,
+                last_summarize_watermark INTEGER NOT NULL DEFAULT 0,
+                last_dream_completed_at TEXT
+            )
+            """
+        )
+        conn.commit()
+
+    reached = threading.Event()
+    release = threading.Event()
+    state = {"fired": False, "wrapped": False}
+    real_connect = HostedTenantCatalog._connect_control
+
+    def connect_with_pause(self):
+        conn = real_connect(self)
+        if state["wrapped"]:
+            return conn
+        state["wrapped"] = True
+        return _PauseOnCheckConnection(
+            conn, "dream_sweep_state", reached, release, state
+        )
+
+    monkeypatch.setattr(HostedTenantCatalog, "_connect_control", connect_with_pause)
+
+    errors: list[BaseException] = []
+
+    def run_catalog_init() -> None:
+        try:
+            HostedTenantCatalog(tmp_path)
+        except BaseException as exc:  # noqa: BLE001 - surfaced via assertion
+            errors.append(exc)
+
+    victim = threading.Thread(target=run_catalog_init)
+    victim.start()
+    assert reached.wait(timeout=30)
+
+    def run_rival_then_record() -> None:
+        try:
+            HostedTenantCatalog(tmp_path)
+            with closing(sqlite3.connect(control_db, timeout=30)) as conn:
+                conn.execute(
+                    "INSERT INTO dream_sweep_state "
+                    "(tenant_id, agent_id, last_summarize_watermark) VALUES (?, ?, ?)",
+                    ("tenant-x", "", 7),
+                )
+                conn.commit()
+        except BaseException as exc:  # noqa: BLE001 - surfaced via assertion
+            errors.append(exc)
+
+    rival = threading.Thread(target=run_rival_then_record)
+    rival.start()
+    # Give the rival time to finish (pre-fix) or block on the write lock
+    # (post-fix) before the victim resumes its DROP decision.
+    rival.join(timeout=1.0)
+    release.set()
+    victim.join(timeout=30)
+    rival.join(timeout=30)
+    assert not victim.is_alive() and not rival.is_alive()
+
+    assert errors == []
+    columns = _column_names(control_db, "dream_sweep_state")
+    assert "agent_id" in columns
+    assert "last_dream_failed_at" in columns
+    with closing(sqlite3.connect(control_db)) as conn:
+        rows = conn.execute(
+            "SELECT tenant_id, last_summarize_watermark FROM dream_sweep_state"
+        ).fetchall()
+    assert rows == [("tenant-x", 7)]
 
 
 def test_key_store_init_survives_rival_migrating_between_check_and_alter(

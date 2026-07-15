@@ -1437,29 +1437,39 @@ class HostedTenantCatalog:
             # Sweep state moved from tenant-keyed to (tenant, agent)-scoped
             # before any release shipped the table. The state is disposable
             # bookkeeping (worst case: one redundant sweep), so an old-shape
-            # table is dropped and recreated rather than migrated.
-            sweep_columns = {
-                str(row[1])
-                for row in conn.execute("PRAGMA table_info(dream_sweep_state)").fetchall()
-            }
-            if sweep_columns and "agent_id" not in sweep_columns:
-                conn.execute("DROP TABLE dream_sweep_state")
-                conn.execute(
-                    next(
-                        stmt
-                        for stmt in _CONTROL_PLANE_SCHEMA_STATEMENTS
-                        if "CREATE TABLE IF NOT EXISTS dream_sweep_state" in stmt
+            # table is dropped and recreated rather than migrated. Unlike the
+            # additive ADD COLUMN sites, DROP+recreate does not converge under
+            # concurrent startup -- a racing container could drop the table a
+            # rival just rebuilt -- so take the write lock first and re-read
+            # the shape inside it; the lock's loser then sees the rebuilt
+            # table and skips the DROP (COA-386).
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                sweep_columns = {
+                    str(row[1])
+                    for row in conn.execute(
+                        "PRAGMA table_info(dream_sweep_state)"
+                    ).fetchall()
+                }
+                if sweep_columns and "agent_id" not in sweep_columns:
+                    conn.execute("DROP TABLE dream_sweep_state")
+                    conn.execute(
+                        next(
+                            stmt
+                            for stmt in _CONTROL_PLANE_SCHEMA_STATEMENTS
+                            if "CREATE TABLE IF NOT EXISTS dream_sweep_state" in stmt
+                        )
                     )
-                )
-                sweep_columns = {"tenant_id", "agent_id", "last_summarize_watermark",
-                                 "last_dream_completed_at", "last_dream_failed_at"}
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
             # Withheld-stamp failure time. Additive on an
             # already-(tenant, agent)-scoped table so existing sweep state
             # (completion stamps, watermarks) survives the upgrade.
-            if sweep_columns and "last_dream_failed_at" not in sweep_columns:
-                _add_column_if_missing(
-                    conn, "dream_sweep_state", "last_dream_failed_at", "TEXT"
-                )
+            _add_column_if_missing(
+                conn, "dream_sweep_state", "last_dream_failed_at", "TEXT"
+            )
             _add_column_if_missing(conn, "hosted_projects", "retired_at", "TEXT")
             _add_column_if_missing(conn, "hosted_projects", "retired_by", "TEXT")
             conn.commit()
