@@ -5,6 +5,37 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-07-14
+
+Reliability and hardening patch for the internal-alpha hosted stack. No public
+memory contract change; `CONTRACT_VERSION` stays `0.1.0`.
+
+### Added
+
+- Remote libSQL queries are bounded by a wall-clock deadline (#213).
+- Recorder keeps a local transcript cursor, so the Stop hook no longer rereads
+  the full transcript each turn (#208).
+- Per-tenant Turso token cache is bounded with LRU eviction (#207).
+
+### Changed
+
+- Transient Turso connect faults are absorbed at the connection boundary (#219).
+
+### Fixed
+
+- Light extraction drops miscited candidates instead of failing the whole
+  batch (#201), handles assistant-heavy task transcripts (#211), and filters
+  Claude Code harness envelopes out of ingested transcript (#212).
+- The dream in-flight lock is a durable control-plane lease; a cancelled dream
+  job holds its lease instead of freeing a live scope (#203).
+- Every reasoning agent gets output headroom rather than output-sized caps
+  (#199).
+- Operator CLI honors `VEXIC_CONTROL_PLANE_TARGET`, so `revoke-key` revokes on
+  production (#206).
+- Release paths from PR #214 hardened (#215).
+
+[0.1.3]: https://github.com/PyroDonkey/vexic/releases/tag/v0.1.3
+
 ## [0.1.2] - 2026-07-10
 
 Feature and hardening patch for the internal-alpha hosted stack. The public
