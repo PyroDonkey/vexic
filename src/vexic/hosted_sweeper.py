@@ -54,15 +54,16 @@ class DreamSweeperConfig:
     tick_seconds: int = 1800
     # Minimum gap between full Light -> REM -> Deep chains per scope.
     dream_interval_seconds: int = 86_400
+    # Pause between tenants within one tick so a post-3am ripeness pile-up
+    # does not become a thundering herd of model calls.
+    stagger_seconds: float = 2.0
     # Re-arm interval for a scope whose last chain failed WITHOUT durably
     # recording (withheld dream stamp). Distinct from and much shorter than the
     # 24h success interval: a transient storage-write fault recovers within ~one
     # backoff window, but a persistent unrecorded failure retries at this cadence
-    # instead of hammering the full chain every tick.
+    # instead of hammering the full chain every tick. Appended last so the
+    # existing positional field order (tick, interval, stagger) is unchanged.
     dream_failure_backoff_seconds: int = 3_600
-    # Pause between tenants within one tick so a post-3am ripeness pile-up
-    # does not become a thundering herd of model calls.
-    stagger_seconds: float = 2.0
 
     def __post_init__(self) -> None:
         if self.tick_seconds <= 0:
