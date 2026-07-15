@@ -831,6 +831,10 @@ class DreamSweeperTickTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report.dreams_scheduled, 1)
         state = self.catalog.dream_sweep_state("tenant-a", None)
         self.assertEqual(state.last_dream_completed_at, NOW.isoformat())
+        # A durably-recorded failure advances the 24h clock; it does NOT set the
+        # short-backoff failure timestamp -- the two are mutually
+        # exclusive, so the retry waits the full interval, not the backoff.
+        self.assertIsNone(state.last_dream_failed_at)
 
         # The failure that advanced the clock is durably queryable, not silent:
         # advancing is only safe because the operator can find this row.
@@ -847,8 +851,11 @@ class DreamSweeperTickTests(unittest.IsolatedAsyncioTestCase):
     async def test_dream_clock_holds_when_failure_unrecorded(self) -> None:
         """A dream phase that fails AND cannot durably record its
         terminal error row must NOT advance the 24h retry clock. Advancing over
-        a silent failure is what stalled Tier 3 ~38h live; instead the chain
-        retries on the next tick."""
+        a silent failure is what stalled Tier 3 ~38h live. Instead of the 24h
+        success interval, the withheld-stamp scope re-arms after the short
+        failure backoff: a transient fault recovers within ~one
+        backoff window, but a persistent unrecorded failure retries at
+        backoff-cadence, not every tick."""
         tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
         _seed_compactable_span(tenant.db_path)
         ports = DreamPhasePorts(
@@ -858,7 +865,7 @@ class DreamSweeperTickTests(unittest.IsolatedAsyncioTestCase):
             extraction_agent_factory=lambda *_a, **_k: _FailingAgent(),
         )
         service = self._service(ports)
-        sweeper = self._sweeper(service)
+        sweeper = self._sweeper(service, dream_failure_backoff_seconds=3600)
 
         def always_502(*_a: object, **_k: object) -> object:
             # The failing Light phase's error-row write itself hits a persistent
@@ -874,13 +881,111 @@ class DreamSweeperTickTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(report.dreams_scheduled, 1)
         state = self.catalog.dream_sweep_state("tenant-a", None)
+        # 24h success clock stays withheld; the failure timestamp records so the
+        # short backoff, not the tick cadence, governs the retry.
         self.assertIsNone(state.last_dream_completed_at)
+        self.assertEqual(state.last_dream_failed_at, NOW.isoformat())
 
-        # Clock never advanced, so the very next tick re-schedules the dream
-        # instead of waiting a full interval.
+        # Inside the backoff window: NOT re-scheduled (this is the every-tick
+        # hammer the failure backoff closes).
         report_two = await sweeper.tick(now=NOW + timedelta(minutes=30))
         await self._drain_background(service)
-        self.assertEqual(report_two.dreams_scheduled, 1)
+        self.assertEqual(report_two.dreams_scheduled, 0)
+
+        # Past the backoff window: re-armed.
+        report_three = await sweeper.tick(now=NOW + timedelta(minutes=61))
+        await self._drain_background(service)
+        self.assertEqual(report_three.dreams_scheduled, 1)
+
+    async def test_fresh_unrecorded_failure_overrides_stale_completion(self) -> None:
+        """A withheld-stamp failure newer than the last completion re-arms on
+        the short backoff, NOT the 24h success clock: a stale `completed_at`
+        must not re-open the every-tick hammer once a fresh failure has landed
+        (most-recent-failure precedence)."""
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        # A completion older than the 24h interval: on its own this scope is due.
+        stale = NOW - timedelta(hours=25)
+        self.catalog.record_dream_completed("tenant-a", None, stale.isoformat())
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _FakeAgent("a fake summary"),
+            extraction_agent_factory=lambda *_a, **_k: _FailingAgent(),
+        )
+        service = self._service(ports)
+        sweeper = self._sweeper(service, dream_failure_backoff_seconds=3600)
+
+        def always_502(*_a: object, **_k: object) -> object:
+            raise ValueError(
+                "Hrana: `api error: `status=502 Bad Gateway, "
+                'body={"error":"connect to upstream failed"}``'
+            )
+
+        with patch("vexic.pipeline.commit_dream_cycle", side_effect=always_502):
+            report = await sweeper.tick(now=NOW)
+            await self._drain_background(service)
+
+        self.assertEqual(report.dreams_scheduled, 1)
+        state = self.catalog.dream_sweep_state("tenant-a", None)
+        self.assertEqual(state.last_dream_completed_at, stale.isoformat())
+        self.assertEqual(state.last_dream_failed_at, NOW.isoformat())
+
+        # The stale completion is >24h old, but the fresh failure governs: the
+        # short backoff, not the elapsed 24h, decides due-ness.
+        report_two = await sweeper.tick(now=NOW + timedelta(minutes=30))
+        await self._drain_background(service)
+        self.assertEqual(report_two.dreams_scheduled, 0)
+
+        report_three = await sweeper.tick(now=NOW + timedelta(minutes=61))
+        await self._drain_background(service)
+        self.assertEqual(report_three.dreams_scheduled, 1)
+
+    async def test_dream_job_raising_without_outcome_records_failure(self) -> None:
+        """A dream job that raises without reporting a `DreamJobOutcome` (an
+        anomaly outside the per-phase try, e.g. the trigger-job bookkeeping
+        write itself faulting) must still stamp the failure time so the scope
+        backs off instead of re-dreaming every tick, and must count
+        the anomaly."""
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _FakeAgent("a fake summary"),
+            extraction_agent_factory=lambda *_a, **_k: _FakeAgent([]),
+        )
+        service = self._service(ports)
+        sweeper = self._sweeper(service, dream_failure_backoff_seconds=3600)
+
+        def raise_before_phase(*_a: object, **_k: object) -> None:
+            raise RuntimeError("trigger-job bookkeeping write faulted")
+
+        service._record_dream_trigger_job = raise_before_phase
+        try:
+            with self.assertLogs("vexic.hosted_sweeper", level="ERROR"):
+                report = await sweeper.tick(now=NOW)
+                # The job task raises (anomaly path); its exception is the
+                # recorder's to absorb (gather with return_exceptions), not the
+                # drainer's, so tolerate it here rather than re-raising the raw
+                # job task.
+                while service._background_tasks:
+                    await asyncio.gather(
+                        *list(service._background_tasks), return_exceptions=True
+                    )
+        finally:
+            del service._record_dream_trigger_job
+
+        self.assertEqual(report.dreams_scheduled, 1)
+        state = self.catalog.dream_sweep_state("tenant-a", None)
+        self.assertIsNone(state.last_dream_completed_at)
+        self.assertEqual(state.last_dream_failed_at, NOW.isoformat())
+        # The anomaly is counted (raised without an outcome).
+        self.assertGreaterEqual(sweeper._record_failures, 1)
+
+        report_two = await sweeper.tick(now=NOW + timedelta(minutes=30))
+        await self._drain_background(service)
+        self.assertEqual(report_two.dreams_scheduled, 0)
 
     async def test_recorded_failure_advances_even_when_error_rewrapped(self) -> None:
         """A phase failure rewrapped at the hosted boundary (NotImplementedError
@@ -1201,6 +1306,7 @@ class SweeperConfigTests(unittest.TestCase):
         self.assertIsNotNone(config)
         self.assertEqual(config.tick_seconds, 1800)
         self.assertEqual(config.dream_interval_seconds, 86_400)
+        self.assertEqual(config.dream_failure_backoff_seconds, 3_600)
 
     def test_off_switch_disables_the_sweeper(self) -> None:
         for value in ("off", "0", "false", "OFF"):
@@ -1216,6 +1322,10 @@ class SweeperConfigTests(unittest.TestCase):
             {"VEXIC_DREAM_SWEEP_TICK_SECONDS": "0"},
             {"VEXIC_DREAM_SWEEP_TICK_SECONDS": "-5"},
             {"VEXIC_DREAM_INTERVAL_SECONDS": "0"},
+            # A non-positive failure backoff would retry the unrecorded-failure
+            # chain every tick -- the every-tick hammer this closes.
+            {"VEXIC_DREAM_FAILURE_BACKOFF_SECONDS": "0"},
+            {"VEXIC_DREAM_FAILURE_BACKOFF_SECONDS": "-1"},
         ):
             with self.subTest(env=env):
                 with self.assertRaises(ValueError):
@@ -1226,11 +1336,62 @@ class SweeperConfigTests(unittest.TestCase):
             {
                 "VEXIC_DREAM_SWEEP_TICK_SECONDS": "600",
                 "VEXIC_DREAM_INTERVAL_SECONDS": "43200",
+                "VEXIC_DREAM_FAILURE_BACKOFF_SECONDS": "900",
             }
         )
 
         self.assertEqual(config.tick_seconds, 600)
         self.assertEqual(config.dream_interval_seconds, 43_200)
+        self.assertEqual(config.dream_failure_backoff_seconds, 900)
+
+
+class DreamSweepStateMigrationTests(unittest.TestCase):
+    def test_existing_sweep_state_gains_failure_column(self) -> None:
+        """An existing control DB whose `dream_sweep_state` predates the failure-backoff column
+        gains `last_dream_failed_at` on catalog init, and its prior state
+        (completion stamp, watermark) survives the additive migration."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            control_db = root / "control-plane.db"
+            # Pre-failure-backoff shape: (tenant, agent)-scoped but no failure column.
+            with closing(sqlite3.connect(control_db)) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE dream_sweep_state (
+                        tenant_id TEXT NOT NULL,
+                        agent_id TEXT NOT NULL DEFAULT '',
+                        last_summarize_watermark INTEGER NOT NULL DEFAULT 0,
+                        last_dream_completed_at TEXT,
+                        PRIMARY KEY (tenant_id, agent_id)
+                    )
+                    """
+                )
+                conn.execute(
+                    "INSERT INTO dream_sweep_state "
+                    "(tenant_id, agent_id, last_summarize_watermark, "
+                    "last_dream_completed_at) VALUES (?, ?, ?, ?)",
+                    ("tenant-x", "", 5, "2026-07-01T00:00:00+00:00"),
+                )
+                conn.commit()
+
+            # Catalog init runs _init_control_plane_schema, which migrates.
+            catalog = HostedTenantCatalog(root)
+
+            with closing(sqlite3.connect(control_db)) as conn:
+                columns = {
+                    str(row[1])
+                    for row in conn.execute(
+                        "PRAGMA table_info(dream_sweep_state)"
+                    ).fetchall()
+                }
+            self.assertIn("last_dream_failed_at", columns)
+
+            state = catalog.dream_sweep_state("tenant-x", None)
+            self.assertEqual(state.last_summarize_watermark, 5)
+            self.assertEqual(
+                state.last_dream_completed_at, "2026-07-01T00:00:00+00:00"
+            )
+            self.assertIsNone(state.last_dream_failed_at)
 
 
 if __name__ == "__main__":
