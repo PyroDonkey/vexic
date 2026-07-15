@@ -167,6 +167,18 @@ def is_unique_violation(exc: BaseException) -> bool:
     return False
 
 
+def is_duplicate_column_error(exc: BaseException) -> bool:
+    """True when ``exc`` is an ``ALTER TABLE ... ADD COLUMN`` duplicate-column error.
+
+    ``sqlite3`` raises :class:`sqlite3.OperationalError`; the hosted libSQL
+    driver raises a bare :class:`ValueError` carrying the same SQLite message.
+    An unrelated error returns ``False`` so adopting sites re-raise it.
+    """
+    if isinstance(exc, (sqlite3.OperationalError, ValueError)):
+        return "duplicate column name" in _message(exc).lower()
+    return False
+
+
 def is_operational_error(exc: BaseException) -> bool:
     """True when ``exc`` is an operational SQL error (bad SQL, contention, ...).
 
