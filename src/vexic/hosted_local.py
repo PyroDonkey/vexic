@@ -159,6 +159,7 @@ _CONTROL_PLANE_SCHEMA_STATEMENTS: tuple[str, ...] = (
         agent_id TEXT NOT NULL DEFAULT '',
         last_summarize_watermark INTEGER NOT NULL DEFAULT 0,
         last_dream_completed_at TEXT,
+        last_dream_failed_at TEXT,
         PRIMARY KEY (tenant_id, agent_id),
         FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
     )
@@ -195,11 +196,14 @@ class ProvisionedApiKey:
 class DreamSweepState:
     """Per-(tenant, agent) sweeper bookkeeping in the control database
     (ADR 0030): the highest transcript watermark whose summarize job has run
-    to completion for the scope, and when the scope's last full dream chain
-    finished running."""
+    to completion for the scope, when the scope's last full dream chain
+    finished running, and -- when the last chain failed without durably
+    recording -- when that withheld-stamp failure occurred, so the scope
+    re-arms on the short failure backoff rather than every tick."""
 
     last_summarize_watermark: int = 0
     last_dream_completed_at: str | None = None
+    last_dream_failed_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1001,7 +1005,8 @@ class HostedTenantCatalog:
         with closing(self._connect_control()) as conn:
             row = conn.execute(
                 """
-                SELECT last_summarize_watermark, last_dream_completed_at
+                SELECT last_summarize_watermark, last_dream_completed_at,
+                    last_dream_failed_at
                 FROM dream_sweep_state
                 WHERE tenant_id = ? AND agent_id = ?
                 """,
@@ -1012,6 +1017,7 @@ class HostedTenantCatalog:
         return DreamSweepState(
             last_summarize_watermark=int(row[0]),
             last_dream_completed_at=row[1],
+            last_dream_failed_at=row[2],
         )
 
     def record_summarize_watermark(
@@ -1062,6 +1068,37 @@ class HostedTenantCatalog:
                     END
                 """,
                 (tenant_id, agent_id or _SHARED_AGENT_SENTINEL, completed_at),
+            )
+            conn.commit()
+
+    def record_dream_failed(
+        self,
+        tenant_id: str,
+        agent_id: str | None,
+        failed_at: str,
+    ) -> None:
+        # Withheld-stamp failure time: a chain that failed without
+        # durably recording leaves `last_dream_completed_at` NULL, so the scope
+        # re-arms on the short failure backoff keyed off this timestamp instead
+        # of dreaming every tick. Monotonic on the ISO-8601 UTC string (same
+        # lexicographic == chronological property as the completion stamp), so a
+        # stale recorder cannot rewind a newer failure time.
+        with closing(self._connect_control()) as conn:
+            conn.execute(
+                """
+                INSERT INTO dream_sweep_state
+                    (tenant_id, agent_id, last_dream_failed_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(tenant_id, agent_id) DO UPDATE
+                    SET last_dream_failed_at = CASE
+                        WHEN dream_sweep_state.last_dream_failed_at IS NULL
+                            OR excluded.last_dream_failed_at
+                                > dream_sweep_state.last_dream_failed_at
+                        THEN excluded.last_dream_failed_at
+                        ELSE dream_sweep_state.last_dream_failed_at
+                    END
+                """,
+                (tenant_id, agent_id or _SHARED_AGENT_SENTINEL, failed_at),
             )
             conn.commit()
 
@@ -1432,7 +1469,22 @@ class HostedTenantCatalog:
             }
             if sweep_columns and "agent_id" not in sweep_columns:
                 conn.execute("DROP TABLE dream_sweep_state")
-                conn.execute(_CONTROL_PLANE_SCHEMA_STATEMENTS[-1])
+                conn.execute(
+                    next(
+                        stmt
+                        for stmt in _CONTROL_PLANE_SCHEMA_STATEMENTS
+                        if "CREATE TABLE IF NOT EXISTS dream_sweep_state" in stmt
+                    )
+                )
+                sweep_columns = {"tenant_id", "agent_id", "last_summarize_watermark",
+                                 "last_dream_completed_at", "last_dream_failed_at"}
+            # Withheld-stamp failure time. Additive on an
+            # already-(tenant, agent)-scoped table so existing sweep state
+            # (completion stamps, watermarks) survives the upgrade.
+            if sweep_columns and "last_dream_failed_at" not in sweep_columns:
+                conn.execute(
+                    "ALTER TABLE dream_sweep_state ADD COLUMN last_dream_failed_at TEXT"
+                )
             project_columns = {
                 str(row[1])
                 for row in conn.execute("PRAGMA table_info(hosted_projects)").fetchall()

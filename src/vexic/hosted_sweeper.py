@@ -57,12 +57,21 @@ class DreamSweeperConfig:
     # Pause between tenants within one tick so a post-3am ripeness pile-up
     # does not become a thundering herd of model calls.
     stagger_seconds: float = 2.0
+    # Re-arm interval for a scope whose last chain failed WITHOUT durably
+    # recording (withheld dream stamp). Distinct from and much shorter than the
+    # 24h success interval: a transient storage-write fault recovers within ~one
+    # backoff window, but a persistent unrecorded failure retries at this cadence
+    # instead of hammering the full chain every tick. Appended last so the
+    # existing positional field order (tick, interval, stagger) is unchanged.
+    dream_failure_backoff_seconds: int = 3_600
 
     def __post_init__(self) -> None:
         if self.tick_seconds <= 0:
             raise ValueError("tick_seconds must be positive.")
         if self.dream_interval_seconds <= 0:
             raise ValueError("dream_interval_seconds must be positive.")
+        if self.dream_failure_backoff_seconds <= 0:
+            raise ValueError("dream_failure_backoff_seconds must be positive.")
         if self.stagger_seconds < 0:
             raise ValueError("stagger_seconds must not be negative.")
 
@@ -71,9 +80,10 @@ def sweeper_config_from_env(env: Mapping[str, str]) -> DreamSweeperConfig | None
     """Build the sweeper config from process env; None means disabled.
 
     `VEXIC_DREAM_SWEEPER=off` is the kill switch. Cadences are tunable via
-    `VEXIC_DREAM_SWEEP_TICK_SECONDS` and `VEXIC_DREAM_INTERVAL_SECONDS`;
-    non-positive values fail loud at startup rather than producing a tight
-    scan loop or an every-tick dream.
+    `VEXIC_DREAM_SWEEP_TICK_SECONDS`, `VEXIC_DREAM_INTERVAL_SECONDS`, and
+    `VEXIC_DREAM_FAILURE_BACKOFF_SECONDS`; non-positive values fail loud at
+    startup rather than producing a tight scan loop, an every-tick dream, or an
+    every-tick failure retry.
     """
     if env.get("VEXIC_DREAM_SWEEPER", "on").strip().lower() in _OFF_VALUES:
         return None
@@ -84,6 +94,12 @@ def sweeper_config_from_env(env: Mapping[str, str]) -> DreamSweeperConfig | None
         ),
         dream_interval_seconds=int(
             env.get("VEXIC_DREAM_INTERVAL_SECONDS", defaults.dream_interval_seconds)
+        ),
+        dream_failure_backoff_seconds=int(
+            env.get(
+                "VEXIC_DREAM_FAILURE_BACKOFF_SECONDS",
+                defaults.dream_failure_backoff_seconds,
+            )
         ),
     )
 
@@ -275,18 +291,37 @@ class DreamSweeper:
         ports = self._service.dream_phase_ports
         return ports is not None and ports.summary_agent_factory is not None
 
-    def _dream_is_due(self, state: object, now: datetime) -> bool:
-        last = getattr(state, "last_dream_completed_at", None)
-        if not last:
-            return True
+    @staticmethod
+    def _parse_stamp(value: object) -> datetime | None:
+        """Parse an ISO-8601 sweep-state stamp, or None if absent/unparseable.
+        A stored value that will not parse is treated as absent so the scope
+        falls through to due, matching the completion-stamp tolerance."""
+        if not value:
+            return None
         try:
-            last_at = datetime.fromisoformat(str(last))
+            parsed = datetime.fromisoformat(str(value))
         except ValueError:
-            return True
-        if last_at.tzinfo is None:
-            last_at = last_at.replace(tzinfo=timezone.utc)
-        elapsed = (now - last_at).total_seconds()
-        return elapsed >= self._config.dream_interval_seconds
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+
+    def _dream_is_due(self, state: object, now: datetime) -> bool:
+        completed = self._parse_stamp(getattr(state, "last_dream_completed_at", None))
+        failed = self._parse_stamp(getattr(state, "last_dream_failed_at", None))
+        # Most recent of {completed, failed} governs. A withheld-stamp failure
+        # newer than the last completion re-arms on the short backoff, so a
+        # stale `completed_at` cannot re-open the every-tick hammer; otherwise
+        # the 24h success clock applies. Neither present => never run.
+        if failed is not None and (completed is None or failed > completed):
+            return (now - failed).total_seconds() >= (
+                self._config.dream_failure_backoff_seconds
+            )
+        if completed is not None:
+            return (now - completed).total_seconds() >= (
+                self._config.dream_interval_seconds
+            )
+        return True
 
     def _record_scope_state_after(
         self,
@@ -357,6 +392,13 @@ class DreamSweeper:
                 except Exception:
                     self._record_failures += 1
                     logger.exception("Recording summarize watermark failed.")
+            # A dream chain that ran needs exactly one of the two stamps: the
+            # 24h completion stamp when it durably recorded, else the short
+            # failure backoff. A completion write that itself fails is treated
+            # as a withheld stamp -- fall through to the failure backoff so a
+            # persistent control-plane write fault backs off rather than
+            # leaving both stamps NULL and re-dreaming every tick.
+            stamp_failure = dream_completed and not durably_recorded
             if dream_completed and durably_recorded:
                 try:
                     await asyncio.to_thread(
@@ -369,6 +411,23 @@ class DreamSweeper:
                 except Exception:
                     self._record_failures += 1
                     logger.exception("Recording dream completion failed.")
+                    stamp_failure = True
+            if stamp_failure:
+                # Withheld dream stamp (unrecorded failure, a job that raised
+                # without an outcome, or a completion write that failed above):
+                # record the failure time so the scope re-arms on the short
+                # failure backoff instead of every tick.
+                try:
+                    await asyncio.to_thread(
+                        _record_with_retry,
+                        catalog.record_dream_failed,
+                        tenant_id,
+                        agent_id,
+                        self._clock().isoformat(),
+                    )
+                except Exception:
+                    self._record_failures += 1
+                    logger.exception("Recording dream failure time failed.")
 
         recorder = asyncio.create_task(_await_and_record())
         self._service._background_tasks.add(recorder)

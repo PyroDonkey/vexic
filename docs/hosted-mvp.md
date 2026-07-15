@@ -701,7 +701,13 @@ active tenant in the catalog and, per recorded agent scope:
   else), and
 - schedules a full Light -> REM -> Deep -> Summarize chain when the tenant's
   dream interval (`VEXIC_DREAM_INTERVAL_SECONDS`, default 86400) has elapsed
-  since the last completed chain.
+  since the last completed chain. A chain that fails *without* durably
+  recording its terminal error row withholds the completion stamp (so the
+  failure stays visible, not advanced over) and instead re-arms after the
+  shorter failure backoff (`VEXIC_DREAM_FAILURE_BACKOFF_SECONDS`, default
+  3600): a transient storage-write fault recovers within ~one backoff window,
+  while a persistent unrecorded failure retries at that cadence rather than
+  re-running the full chain every tick.
 
 Scheduling reuses the trigger endpoint's machinery through
 `HostedMemoryService.schedule_system_dream`: pre-bound, server-minted
