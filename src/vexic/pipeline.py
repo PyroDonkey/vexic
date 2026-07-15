@@ -20,7 +20,7 @@ from pydantic_ai.messages import (
 )
 
 from vexic.embeddings import embed_texts, ensure_local_embeddings_available
-from vexic.error_reporting import format_error_detail
+from vexic.error_reporting import format_error_detail, mark_dream_recorded
 from vexic.models import FactCandidate
 from vexic.ports import (
     AgentFactory,
@@ -38,6 +38,7 @@ from vexic.storage import (
     load_candidates_missing_embeddings,
     load_messages_since,
 )
+from vexic.storage.errors import retry_once_if_retryable
 from vexic.timeutil import utc_now_iso
 from vexic.usage import UsageSummary, summarize_agent_usage
 
@@ -253,28 +254,35 @@ async def run_light_phase(
         return usage
 
     except Exception as exc:
-        # Best-effort audit. A failure writing the error row must not mask the
-        # original exception that actually broke the cycle.
+        # Best-effort audit, retried once on a retryable storage fault. A
+        # failure writing the error row must not mask the original exception,
+        # but the sweeper must learn whether it landed: advancing the 24h retry
+        # clock over an unrecorded failure is what stalled Tier 3 in a live
+        # dreaming incident.
+        recorded = False
         try:
-            commit_dream_cycle(
-                db_path,
-                [],
-                agent_id=agent_id,
-                status="error",
-                started_at=started_at,
-                finished_at=utc_now_iso(),
-                messages_processed=0,
-                last_processed_message_id=watermark,
-                error_detail=format_error_detail(exc),
-                forbidden_secret_values=forbidden,
+            retry_once_if_retryable(
+                lambda: commit_dream_cycle(
+                    db_path,
+                    [],
+                    agent_id=agent_id,
+                    status="error",
+                    started_at=started_at,
+                    finished_at=utc_now_iso(),
+                    messages_processed=0,
+                    last_processed_message_id=watermark,
+                    error_detail=format_error_detail(exc),
+                    forbidden_secret_values=forbidden,
+                )
             )
+            recorded = True
         except Exception:
             # Best-effort status write; the original error is re-raised below.
-            pass
+            recorded = False
         print(
             f"Light phase: ERROR -- {type(exc).__name__}. Watermark held; will retry."
         )
-        raise
+        raise mark_dream_recorded(exc, recorded)
 
 
 def _main() -> None:

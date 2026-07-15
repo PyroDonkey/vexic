@@ -86,6 +86,15 @@ class _FailingAgent:
         raise RuntimeError("model call failed")
 
 
+class _NotImplementedAgent:
+    """Fake agent modelling a partially-wired host port: run raises
+    NotImplementedError, which the hosted dream boundary rewraps as
+    HostPortNotConfigured (`_run_dream_phase_with_usage`)."""
+
+    async def run(self, prompt: str, **kwargs: object) -> object:
+        raise NotImplementedError("adapter not wired")
+
+
 EMBEDDING_DIM = 384
 
 
@@ -751,9 +760,83 @@ class DreamSweeperTickTests(unittest.IsolatedAsyncioTestCase):
         state = self.catalog.dream_sweep_state("tenant-a", None)
         self.assertEqual(state.last_dream_completed_at, NOW.isoformat())
 
+        # The failure that advanced the clock is durably queryable, not silent:
+        # advancing is only safe because the operator can find this row.
+        with closing(sqlite3.connect(tenant.db_path)) as conn:
+            error_rows = conn.execute(
+                "SELECT COUNT(*) FROM dream_runs WHERE status = 'error'"
+            ).fetchone()[0]
+        self.assertGreater(error_rows, 0)
+
         report_two = await sweeper.tick(now=NOW + timedelta(hours=1))
         await self._drain_background(service)
         self.assertEqual(report_two.dreams_scheduled, 0)
+
+    async def test_dream_clock_holds_when_failure_unrecorded(self) -> None:
+        """A dream phase that fails AND cannot durably record its
+        terminal error row must NOT advance the 24h retry clock. Advancing over
+        a silent failure is what stalled Tier 3 ~38h live; instead the chain
+        retries on the next tick."""
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _FakeAgent("a fake summary"),
+            extraction_agent_factory=lambda *_a, **_k: _FailingAgent(),
+        )
+        service = self._service(ports)
+        sweeper = self._sweeper(service)
+
+        def always_502(*_a: object, **_k: object) -> object:
+            # The failing Light phase's error-row write itself hits a persistent
+            # retryable Turso fault, so no dream_runs row lands: unrecorded.
+            raise ValueError(
+                "Hrana: `api error: `status=502 Bad Gateway, "
+                'body={"error":"connect to upstream failed"}``'
+            )
+
+        with patch("vexic.pipeline.commit_dream_cycle", side_effect=always_502):
+            report = await sweeper.tick(now=NOW)
+            await self._drain_background(service)
+
+        self.assertEqual(report.dreams_scheduled, 1)
+        state = self.catalog.dream_sweep_state("tenant-a", None)
+        self.assertIsNone(state.last_dream_completed_at)
+
+        # Clock never advanced, so the very next tick re-schedules the dream
+        # instead of waiting a full interval.
+        report_two = await sweeper.tick(now=NOW + timedelta(minutes=30))
+        await self._drain_background(service)
+        self.assertEqual(report_two.dreams_scheduled, 1)
+
+    async def test_recorded_failure_advances_even_when_error_rewrapped(self) -> None:
+        """A phase failure rewrapped at the hosted boundary (NotImplementedError
+        -> HostPortNotConfigured) still counts as durably recorded: the mark
+        rides the __cause__ chain, so the clock advances the full interval
+        instead of re-dreaming every tick and burning model spend."""
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _FakeAgent("a fake summary"),
+            extraction_agent_factory=lambda *_a, **_k: _NotImplementedAgent(),
+        )
+        service = self._service(ports)
+        sweeper = self._sweeper(service)
+
+        report = await sweeper.tick(now=NOW)
+        await self._drain_background(service)
+
+        self.assertEqual(report.dreams_scheduled, 1)
+        with closing(sqlite3.connect(tenant.db_path)) as conn:
+            error_rows = conn.execute(
+                "SELECT COUNT(*) FROM dream_runs WHERE status = 'error'"
+            ).fetchone()[0]
+        self.assertGreater(error_rows, 0)
+        state = self.catalog.dream_sweep_state("tenant-a", None)
+        self.assertEqual(state.last_dream_completed_at, NOW.isoformat())
 
     async def test_stale_stream_record_failure_retries_on_fresh_connection(self) -> None:
         """A reaped Hrana stream loses the state write (verified live);
