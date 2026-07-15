@@ -907,7 +907,7 @@ class HostedMemoryService:
     def _start_dream_lease_heartbeat(
         self,
         key: tuple[str, str | None],
-        job: "asyncio.Task[bool]",
+        job: "asyncio.Task[DreamJobOutcome]",
     ) -> None:
         """Keep this holder's lease fresh for as long as `job` runs.
 
@@ -1146,18 +1146,21 @@ class HostedMemoryService:
         summarize_ran = False
         try:
             for request in requests:
-                if request.phase is DreamPhase.SUMMARIZE:
-                    # "ran" includes ran-and-failed: mark before executing so a
-                    # SUMMARIZE that starts then raises still advances the
-                    # watermark (deliberate anti-spend posture), while a chain
-                    # that never reaches SUMMARIZE leaves this False.
-                    summarize_ran = True
                 job_id = secrets.token_hex(8)
                 self._record_dream_trigger_job(job_id, request, auth, status="running")
 
+                # Set at worker entry, not at dispatch: a `to_thread` submission
+                # that fails before the worker starts (executor shutdown) must
+                # leave the SUMMARIZE phase counting as never-run, so the
+                # watermark is held. "ran" still includes ran-and-failed --
+                # the worker sets this, then the phase may raise inside.
+                worker_started = threading.Event()
+
                 def _run_in_worker_thread(
                     bound: RunDreamPhaseRequest = request,
+                    started: threading.Event = worker_started,
                 ) -> tuple[RunDreamPhaseResult, UsageSummary]:
+                    started.set()
                     return asyncio.run(self._run_dream_phase_with_usage(bound, tenant))
 
                 try:
@@ -1192,6 +1195,11 @@ class HostedMemoryService:
                         project_id=request.scope.project_id,
                         key_id=auth.key_id,
                     )
+                    # A SUMMARIZE phase that started then raised is ran-and-failed
+                    # (advances, anti-spend); one whose worker never started is
+                    # never-run (held). Distinguish them by the worker signal.
+                    if request.phase is DreamPhase.SUMMARIZE and worker_started.is_set():
+                        summarize_ran = True
                     # Surface to the sweeper whether the failing phase durably
                     # recorded its terminal dream_runs row. The sweeper advances
                     # the 24h retry clock only when it did: advancing
@@ -1200,6 +1208,8 @@ class HostedMemoryService:
                         durably_recorded=dream_failure_recorded(exc),
                         summarize_ran=summarize_ran,
                     )
+                if request.phase is DreamPhase.SUMMARIZE:
+                    summarize_ran = True
                 self._record_dream_trigger_job(job_id, request, auth, status="ok")
                 self.record_job_usage(
                     operation="run_dream_phase",

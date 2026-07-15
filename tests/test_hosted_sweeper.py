@@ -770,6 +770,46 @@ class DreamSweeperTickTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.last_dream_completed_at, NOW.isoformat())
         self.assertEqual(state.last_summarize_watermark, 0)
 
+    async def test_summarize_dispatch_failure_holds_watermark(self) -> None:
+        """`summarize_ran` must reflect the SUMMARIZE phase actually beginning
+        execution, not merely being dispatched. Light/REM/Deep succeed, but the
+        SUMMARIZE worker dispatch itself fails (executor shutdown), so the phase
+        never runs. The watermark must be held: a dispatch failure is a
+        never-ran summarize, not the ran-and-failed case that advances.
+        """
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _FakeAgent("a fake summary"),
+            extraction_agent_factory=lambda *_a, **_k: _FakeAgent([]),
+        )
+        service = self._service(ports)
+        sweeper = self._sweeper(service)
+
+        real_to_thread = asyncio.to_thread
+        worker_calls = {"n": 0}
+
+        async def flaky_dispatch(func, /, *args, **kwargs):  # type: ignore[no-untyped-def]
+            # Only the dream phase worker matters; catalog reads and the
+            # recorder's own writes pass through unchanged.
+            if getattr(func, "__name__", "") == "_run_in_worker_thread":
+                worker_calls["n"] += 1
+                # LIGHT, REM, DEEP dispatch fine; the 4th (SUMMARIZE) worker
+                # never starts.
+                if worker_calls["n"] == 4:
+                    raise RuntimeError("cannot schedule new futures after shutdown")
+            return await real_to_thread(func, *args, **kwargs)
+
+        with patch("asyncio.to_thread", flaky_dispatch):
+            await sweeper.tick(now=NOW)
+            await self._drain_background(service)
+
+        self.assertEqual(worker_calls["n"], 4)
+        state = self.catalog.dream_sweep_state("tenant-a", None)
+        self.assertEqual(state.last_summarize_watermark, 0)
+
     async def test_failed_dream_chain_still_records_completion(self) -> None:
         """Pins the deliberate stamp-on-failure posture for dream chains
         (see `_record_sweep_state_after`): a failing chain must not re-dream

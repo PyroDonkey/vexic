@@ -292,7 +292,7 @@ class DreamSweeper:
         self,
         tenant_id: str,
         agent_id: str | None,
-        task: "asyncio.Task[None]",
+        task: "asyncio.Task[DreamJobOutcome]",
         *,
         watermark: int | None,
         dream_completed: bool,
