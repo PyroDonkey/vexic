@@ -1,4 +1,4 @@
-"""Concurrent-startup safety of the control-plane schema migrations (COA-386).
+"""Concurrent-startup safety of the control-plane schema migrations.
 
 Two containers booting against the same control-plane database (Railway rolling
 deploy) race the check-then-ALTER migration idiom in

@@ -443,7 +443,7 @@ class HostedTenantCatalog:
         )
         # A rival container's serialized migration can surface a retryable
         # locked/busy fault on Turso; the re-run re-checks the migrated schema
-        # on a fresh connection (COA-386).
+        # on a fresh connection.
         retry_once_if_retryable(self._init_control_plane_schema)
 
     def provision_tenant(
@@ -1446,7 +1446,7 @@ class HostedTenantCatalog:
             # concurrent startup -- a racing container could drop the table a
             # rival just rebuilt -- so take the write lock first and re-read
             # the shape inside it; the lock's loser then sees the rebuilt
-            # table and skips the DROP (COA-386).
+            # table and skips the DROP.
             conn.execute("BEGIN IMMEDIATE")
             try:
                 sweep_columns = {
@@ -2400,7 +2400,7 @@ def _add_column_if_missing(
     deploy) can both observe the column missing before either ALTER commits.
     The loser's ALTER then fails with ``duplicate column name`` -- the schema
     is already in the desired state, so that error is swallowed; anything else
-    propagates (COA-386).
+    propagates.
     """
     columns = {
         str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()

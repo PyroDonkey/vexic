@@ -156,7 +156,7 @@ def test_schema_init_swallows_libsql_duplicate_column_value_error(monkeypatch, t
     # Two containers racing the additive control-plane migrations on Turso: the
     # loser's ALTER surfaces as the driver's bare ValueError (Hrana payload),
     # not sqlite3.OperationalError. Pin that the init converges on that error
-    # shape end-to-end (COA-386).
+    # shape end-to-end.
     import sqlite3
 
     fake_conn = FakeLibsqlConn()
