@@ -28,6 +28,7 @@ from vexic.service import LocalMemoryService
 from vexic.storage.connection import StorageTarget, _is_libsql_target, connect
 from vexic.storage.errors import (
     QueryDeadlineExceeded,
+    is_duplicate_column_error,
     is_operational_error,
     is_retryable_operational_error,
 )
@@ -1419,46 +1420,20 @@ class HostedTenantCatalog:
         with closing(self._connect_control()) as conn:
             for statement in _CONTROL_PLANE_SCHEMA_STATEMENTS:
                 conn.execute(statement)
-            columns = {
-                str(row[1])
-                for row in conn.execute("PRAGMA table_info(hosted_usage_events)").fetchall()
-            }
-            if "project_id" not in columns:
-                conn.execute("ALTER TABLE hosted_usage_events ADD COLUMN project_id TEXT")
-            if "key_id" not in columns:
-                conn.execute("ALTER TABLE hosted_usage_events ADD COLUMN key_id TEXT")
-            audit_columns = {
-                str(row[1])
-                for row in conn.execute("PRAGMA table_info(hosted_audit_events)").fetchall()
-            }
-            if "project_id" not in audit_columns:
-                conn.execute("ALTER TABLE hosted_audit_events ADD COLUMN project_id TEXT")
-            if "key_id" not in audit_columns:
-                conn.execute("ALTER TABLE hosted_audit_events ADD COLUMN key_id TEXT")
-            job_columns = {
-                str(row[1])
-                for row in conn.execute("PRAGMA table_info(hosted_job_events)").fetchall()
-            }
-            if "project_id" not in job_columns:
-                conn.execute("ALTER TABLE hosted_job_events ADD COLUMN project_id TEXT")
-            tenant_columns = {
-                str(row[1])
-                for row in conn.execute("PRAGMA table_info(tenants)").fetchall()
-            }
-            if "customer_target" not in tenant_columns:
-                conn.execute("ALTER TABLE tenants ADD COLUMN customer_target TEXT")
-            if "generation" not in tenant_columns:
-                conn.execute(
-                    "ALTER TABLE tenants ADD COLUMN generation INTEGER NOT NULL DEFAULT 1"
-                )
-            if "retired_at" not in tenant_columns:
-                conn.execute("ALTER TABLE tenants ADD COLUMN retired_at TEXT")
-            if "retired_by" not in tenant_columns:
-                conn.execute("ALTER TABLE tenants ADD COLUMN retired_by TEXT")
-            if "dream_scheduling" not in tenant_columns:
-                conn.execute(
-                    "ALTER TABLE tenants ADD COLUMN dream_scheduling INTEGER NOT NULL DEFAULT 1"
-                )
+            _add_column_if_missing(conn, "hosted_usage_events", "project_id", "TEXT")
+            _add_column_if_missing(conn, "hosted_usage_events", "key_id", "TEXT")
+            _add_column_if_missing(conn, "hosted_audit_events", "project_id", "TEXT")
+            _add_column_if_missing(conn, "hosted_audit_events", "key_id", "TEXT")
+            _add_column_if_missing(conn, "hosted_job_events", "project_id", "TEXT")
+            _add_column_if_missing(conn, "tenants", "customer_target", "TEXT")
+            _add_column_if_missing(
+                conn, "tenants", "generation", "INTEGER NOT NULL DEFAULT 1"
+            )
+            _add_column_if_missing(conn, "tenants", "retired_at", "TEXT")
+            _add_column_if_missing(conn, "tenants", "retired_by", "TEXT")
+            _add_column_if_missing(
+                conn, "tenants", "dream_scheduling", "INTEGER NOT NULL DEFAULT 1"
+            )
             # Sweep state moved from tenant-keyed to (tenant, agent)-scoped
             # before any release shipped the table. The state is disposable
             # bookkeeping (worst case: one redundant sweep), so an old-shape
@@ -1482,17 +1457,11 @@ class HostedTenantCatalog:
             # already-(tenant, agent)-scoped table so existing sweep state
             # (completion stamps, watermarks) survives the upgrade.
             if sweep_columns and "last_dream_failed_at" not in sweep_columns:
-                conn.execute(
-                    "ALTER TABLE dream_sweep_state ADD COLUMN last_dream_failed_at TEXT"
+                _add_column_if_missing(
+                    conn, "dream_sweep_state", "last_dream_failed_at", "TEXT"
                 )
-            project_columns = {
-                str(row[1])
-                for row in conn.execute("PRAGMA table_info(hosted_projects)").fetchall()
-            }
-            if "retired_at" not in project_columns:
-                conn.execute("ALTER TABLE hosted_projects ADD COLUMN retired_at TEXT")
-            if "retired_by" not in project_columns:
-                conn.execute("ALTER TABLE hosted_projects ADD COLUMN retired_by TEXT")
+            _add_column_if_missing(conn, "hosted_projects", "retired_at", "TEXT")
+            _add_column_if_missing(conn, "hosted_projects", "retired_by", "TEXT")
             conn.commit()
 
     def _allocate_db_filename(self, conn: sqlite3.Connection) -> str:
@@ -2341,31 +2310,15 @@ class HostedApiKeyStore:
                 )
                 """
             )
-            audit_columns = {
-                str(row[1])
-                for row in conn.execute("PRAGMA table_info(hosted_audit_events)").fetchall()
-            }
-            if "project_id" not in audit_columns:
-                conn.execute("ALTER TABLE hosted_audit_events ADD COLUMN project_id TEXT")
-            if "key_id" not in audit_columns:
-                conn.execute("ALTER TABLE hosted_audit_events ADD COLUMN key_id TEXT")
-            columns = {
-                str(row[1])
-                for row in conn.execute("PRAGMA table_info(hosted_api_keys)").fetchall()
-            }
-            if "last_used_at" not in columns:
-                conn.execute("ALTER TABLE hosted_api_keys ADD COLUMN last_used_at TEXT")
-            metadata_columns = {
-                str(row[1])
-                for row in conn.execute(
-                    "PRAGMA table_info(hosted_api_key_metadata)"
-                ).fetchall()
-            }
-            if "created_via" not in metadata_columns:
-                conn.execute(
-                    "ALTER TABLE hosted_api_key_metadata "
-                    "ADD COLUMN created_via TEXT NOT NULL DEFAULT 'console'"
-                )
+            _add_column_if_missing(conn, "hosted_audit_events", "project_id", "TEXT")
+            _add_column_if_missing(conn, "hosted_audit_events", "key_id", "TEXT")
+            _add_column_if_missing(conn, "hosted_api_keys", "last_used_at", "TEXT")
+            _add_column_if_missing(
+                conn,
+                "hosted_api_key_metadata",
+                "created_via",
+                "TEXT NOT NULL DEFAULT 'console'",
+            )
             conn.commit()
 
     def _load_key(self, key_id: str) -> _HostedApiKey:
@@ -2422,6 +2375,29 @@ def _nullable_strings_json(values: frozenset[str | None]) -> str:
     return json.dumps(
         sorted(values, key=lambda value: (0, "") if value is None else (1, value))
     )
+
+
+def _add_column_if_missing(
+    conn: sqlite3.Connection, table: str, column: str, declaration: str
+) -> None:
+    """Additive column migration that converges under concurrent startup.
+
+    Two containers booting against the same control-plane database (rolling
+    deploy) can both observe the column missing before either ALTER commits.
+    The loser's ALTER then fails with ``duplicate column name`` -- the schema
+    is already in the desired state, so that error is swallowed; anything else
+    propagates (COA-386).
+    """
+    columns = {
+        str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column in columns:
+        return
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+    except (sqlite3.OperationalError, ValueError) as exc:
+        if not is_duplicate_column_error(exc):
+            raise
 
 
 def _connect_control_db(target: str | Path | StorageTarget) -> sqlite3.Connection:
