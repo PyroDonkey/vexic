@@ -987,6 +987,46 @@ class DreamSweeperTickTests(unittest.IsolatedAsyncioTestCase):
         await self._drain_background(service)
         self.assertEqual(report_two.dreams_scheduled, 0)
 
+    async def test_completion_write_failure_falls_back_to_failure_backoff(self) -> None:
+        """A chain that succeeds but whose completion-stamp write fails must not
+        leave both stamps NULL -- that is the every-tick hammer this feature
+        exists to close. The failed completion write falls through to the short
+        failure backoff instead, so the scope re-arms once per backoff, not
+        once per tick."""
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _FakeAgent("a fake summary"),
+            extraction_agent_factory=lambda *_a, **_k: _FakeAgent([]),
+        )
+        service = self._service(ports)
+        sweeper = self._sweeper(service, dream_failure_backoff_seconds=3600)
+
+        def broken_completion(*_a: object, **_k: object) -> None:
+            raise RuntimeError("control-plane completion write failed")
+
+        self.catalog.record_dream_completed = broken_completion
+        try:
+            with self.assertLogs("vexic.hosted_sweeper", level="ERROR"):
+                report = await sweeper.tick(now=NOW)
+                await self._drain_background(service)
+        finally:
+            del self.catalog.record_dream_completed
+
+        self.assertEqual(report.dreams_scheduled, 1)
+        state = self.catalog.dream_sweep_state("tenant-a", None)
+        # Completion never landed, but the failure backoff did: no stamp NULL
+        # hole that would make the scope due every tick.
+        self.assertIsNone(state.last_dream_completed_at)
+        self.assertEqual(state.last_dream_failed_at, NOW.isoformat())
+
+        # Within the backoff window: NOT re-scheduled.
+        report_two = await sweeper.tick(now=NOW + timedelta(minutes=30))
+        await self._drain_background(service)
+        self.assertEqual(report_two.dreams_scheduled, 0)
+
     async def test_recorded_failure_advances_even_when_error_rewrapped(self) -> None:
         """A phase failure rewrapped at the hosted boundary (NotImplementedError
         -> HostPortNotConfigured) still counts as durably recorded: the mark

@@ -392,6 +392,13 @@ class DreamSweeper:
                 except Exception:
                     self._record_failures += 1
                     logger.exception("Recording summarize watermark failed.")
+            # A dream chain that ran needs exactly one of the two stamps: the
+            # 24h completion stamp when it durably recorded, else the short
+            # failure backoff. A completion write that itself fails is treated
+            # as a withheld stamp -- fall through to the failure backoff so a
+            # persistent control-plane write fault backs off rather than
+            # leaving both stamps NULL and re-dreaming every tick.
+            stamp_failure = dream_completed and not durably_recorded
             if dream_completed and durably_recorded:
                 try:
                     await asyncio.to_thread(
@@ -404,12 +411,12 @@ class DreamSweeper:
                 except Exception:
                     self._record_failures += 1
                     logger.exception("Recording dream completion failed.")
-            elif dream_completed:
-                # Withheld dream stamp (unrecorded failure, or a job that raised
-                # without an outcome): record the failure time so the scope
-                # re-arms on the short failure backoff instead of every tick.
-                # This is mutually exclusive with the completion stamp above --
-                # a durably-recorded failure already advanced the 24h clock.
+                    stamp_failure = True
+            if stamp_failure:
+                # Withheld dream stamp (unrecorded failure, a job that raised
+                # without an outcome, or a completion write that failed above):
+                # record the failure time so the scope re-arms on the short
+                # failure backoff instead of every tick.
                 try:
                     await asyncio.to_thread(
                         _record_with_retry,
