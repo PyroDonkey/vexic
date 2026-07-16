@@ -23,6 +23,7 @@ phase moves on to the next session rather than aborting the whole run.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from vexic.ports import AgentFactory, ContentCodec, missing_host_port
@@ -44,8 +45,19 @@ CONDENSE_MAX_FRONTIER_LEAVES = 8
 
 __all__ = [
     "CONDENSE_MAX_FRONTIER_LEAVES",
+    "SummarizePhaseOutcome",
     "run_summarize_phase",
 ]
+
+
+@dataclass(frozen=True)
+class SummarizePhaseOutcome:
+    """Result of a summarize run: aggregate usage plus per-session error
+    accounting, so a swallowed session failure never reads as a clean run."""
+
+    usage: UsageSummary
+    sessions_considered: int
+    sessions_failed: int
 
 
 def _forbidden_secret_values(
@@ -235,7 +247,7 @@ async def run_summarize_phase(
     forbidden_secret_values: tuple[str, ...] = (),
     content_codec: ContentCodec | None = None,
     daily_span_budget: int | None = None,
-) -> UsageSummary:
+) -> SummarizePhaseOutcome:
     if summary_agent_factory is None:
         raise missing_host_port(
             "Session summarization",
@@ -297,4 +309,8 @@ async def run_summarize_phase(
         f"Summarize phase: {len(session_ids)} sessions considered, "
         f"{error_count} failed."
     )
-    return usage
+    return SummarizePhaseOutcome(
+        usage=usage,
+        sessions_considered=len(session_ids),
+        sessions_failed=error_count,
+    )

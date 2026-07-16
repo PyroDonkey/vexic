@@ -1799,6 +1799,81 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job_usage[-1].model_requests, 1)
         self.assertEqual(job_usage[-1].total_tokens, 10)
 
+    async def test_hosted_summarize_partial_session_failure_reports_partial_status(
+        self,
+    ) -> None:
+        """A session that fails to summarize must surface as a 'partial' job,
+        not an 'ok' one -- swallowed per-session errors are how a SUMMARIZE
+        run silently under-reports usage."""
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.ADMIN_REBUILD},
+            project_ids={"project-a"},
+        )
+
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        save_messages(
+            tenant.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="healthy summarize span")])],
+            session_id="good-session",
+            timestamp=start.isoformat(),
+        )
+        save_messages(
+            tenant.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="poison marker span")])],
+            session_id="bad-session",
+            timestamp=start.isoformat(),
+        )
+
+        class SummaryAgent:
+            async def run(self, prompt: str) -> object:
+                if "poison marker" in prompt:
+                    raise RuntimeError("boom")
+                return SimpleNamespace(
+                    output="a fake summary",
+                    usage=lambda: SimpleNamespace(
+                        requests=1,
+                        input_tokens=6,
+                        output_tokens=4,
+                        total_tokens=10,
+                    ),
+                )
+
+        service = HostedMemoryService(
+            self.catalog,
+            self.keys,
+            telemetry=self.catalog,
+            dream_phase_ports=DreamPhasePorts(
+                model_group="fake",
+                summary_agent_factory=lambda *_args, **_kwargs: SummaryAgent(),
+            ),
+        )
+        jobs = HostedBackgroundJobRunner(service)
+
+        result = await jobs.run_dream_phase(
+            api_key.raw_key,
+            RunDreamPhaseRequest(
+                scope=_scope(capabilities={MemoryCapability.ADMIN_REBUILD}),
+                phase=DreamPhase.SUMMARIZE,
+                redaction=RedactionContext(forbidden_values=()),
+            ),
+        )
+
+        self.assertEqual(result.status, "partial")
+        self.assertEqual(
+            [event.status for event in jobs.job_events], ["running", "partial"]
+        )
+        job_usage = [
+            event
+            for event in self.catalog.usage_events("tenant-a")
+            if event.kind == "job"
+        ]
+        self.assertEqual(job_usage[-1].status, "partial")
+        # Usage from the session that did summarize is still recorded.
+        self.assertEqual(job_usage[-1].total_tokens, 10)
+
     async def test_hosted_dream_worker_redaction_failure_does_not_call_model(
         self,
     ) -> None:

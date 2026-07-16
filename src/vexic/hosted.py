@@ -1023,12 +1023,16 @@ class HostedMemoryService:
                 key_id=auth.key_id,
             )
         else:
-            self._record_dream_trigger_job(job_id, request, auth, status="ok")
+            # Record the phase-reported status: SUMMARIZE can complete with
+            # swallowed per-session failures ("partial"/"error").
+            self._record_dream_trigger_job(
+                job_id, request, auth, status=result.status
+            )
             self.record_job_usage(
                 operation="run_dream_phase",
                 tenant_id=auth.tenant_id,
                 principal_id=auth.principal.principal_id,
-                status="ok",
+                status=result.status,
                 usage=usage,
                 project_id=request.scope.project_id,
                 key_id=auth.key_id,
@@ -1243,12 +1247,17 @@ class HostedMemoryService:
                     )
                 if request.phase is DreamPhase.SUMMARIZE:
                     summarize_ran = True
-                self._record_dream_trigger_job(job_id, request, auth, status="ok")
+                # A phase can complete with swallowed per-session failures
+                # (SUMMARIZE reports "partial"/"error"); record what the
+                # phase said, not an unconditional "ok".
+                self._record_dream_trigger_job(
+                    job_id, request, auth, status=_result.status
+                )
                 self.record_job_usage(
                     operation="run_dream_phase",
                     tenant_id=auth.tenant_id,
                     principal_id=auth.principal.principal_id,
-                    status="ok",
+                    status=_result.status,
                     usage=usage,
                     project_id=request.scope.project_id,
                     key_id=auth.key_id,
@@ -1633,12 +1642,14 @@ class HostedBackgroundJobRunner:
                 key_id=auth.key_id,
             )
             raise
-        self._record_job(job_id, request, auth, status="ok")
+        # Record the phase-reported status: SUMMARIZE can complete with
+        # swallowed per-session failures ("partial"/"error").
+        self._record_job(job_id, request, auth, status=result.status)
         self.service.record_job_usage(
             operation="run_dream_phase",
             tenant_id=auth.tenant_id,
             principal_id=auth.principal.principal_id,
-            status="ok",
+            status=result.status,
             usage=usage,
             project_id=request.scope.project_id,
             key_id=auth.key_id,
