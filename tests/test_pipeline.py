@@ -60,6 +60,12 @@ def _rem_candidate(candidate_id: int, embedding: list[float] | None) -> RemCandi
     return RemCandidate(candidate_id=candidate_id, embedding=embedding)
 
 
+def _fake_usage() -> SimpleNamespace:
+    # Property-form usage (pydantic-ai >=1.102); summarize_agent_usage fails
+    # loud on results that expose no usage, so every fake must carry one.
+    return SimpleNamespace(requests=1, input_tokens=1, output_tokens=1, total_tokens=2)
+
+
 class LightPhaseProvenanceTests(unittest.IsolatedAsyncioTestCase):
     """Invariant 5 (every fact carries real provenance) is enforced per
     candidate, not per batch: a candidate citing message ids outside the
@@ -99,7 +105,8 @@ class LightPhaseProvenanceTests(unittest.IsolatedAsyncioTestCase):
                                 confidence=0.8,
                                 source_message_ids=[outside_window_id],
                             ),
-                        ]
+                        ],
+                        usage=_fake_usage(),
                     )
 
             def agent_factory(model_group: str, secrets: object = None) -> object:
@@ -158,7 +165,8 @@ class LightPhaseProvenanceTests(unittest.IsolatedAsyncioTestCase):
                                 confidence=0.8,
                                 source_message_ids=[],
                             ),
-                        ]
+                        ],
+                        usage=_fake_usage(),
                     )
 
             def agent_factory(model_group: str, secrets: object = None) -> object:
@@ -211,7 +219,8 @@ class LightPhaseProvenanceTests(unittest.IsolatedAsyncioTestCase):
                                 confidence=0.8,
                                 source_message_ids=[message_id + 999],
                             )
-                        ]
+                        ],
+                        usage=_fake_usage(),
                     )
 
             def agent_factory(model_group: str, secrets: object = None) -> object:
@@ -349,7 +358,8 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                                 confidence=0.9,
                                 source_message_ids=[1],
                             )
-                        ]
+                        ],
+                        usage=_fake_usage(),
                     )
 
             def agent_factory(model_group: str, secrets: object = None) -> object:
@@ -404,7 +414,8 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                                 confidence=0.9,
                                 source_message_ids=[1],
                             )
-                        ]
+                        ],
+                        usage=_fake_usage(),
                     )
 
             def blocked_import(name: str, *args: object, **kwargs: object) -> object:
@@ -449,7 +460,8 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                                 confidence=0.9,
                                 source_message_ids=[1],
                             )
-                        ]
+                        ],
+                        usage=_fake_usage(),
                     )
 
             def embed(texts: list[str]) -> list[list[float]]:

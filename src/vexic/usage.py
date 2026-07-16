@@ -20,10 +20,14 @@ class UsageSummary:
 
 
 def summarize_agent_usage(result: object) -> UsageSummary:
-    usage_fn = getattr(result, "usage", None)
-    if not callable(usage_fn):
-        return UsageSummary()
-    usage = usage_fn()
+    raw = getattr(result, "usage", None)
+    # pydantic-ai >=1.102 deprecates the method form; the callable branch
+    # covers the transitional shim, the plain branch the property form.
+    usage = raw() if callable(raw) else raw
+    if usage is None:
+        raise ValueError(
+            "agent result exposes no usage; refusing to record zero token telemetry"
+        )
     return UsageSummary(
         model_requests=int(getattr(usage, "requests", 0) or 0),
         input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
