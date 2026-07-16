@@ -144,6 +144,51 @@ class ClaudeCodeRecorderSharedTests(unittest.TestCase):
         assert isinstance(model_message, ModelRequest)
         self.assertEqual(model_message.parts[0].content, "remember cedar")
 
+    def test_source_message_from_row_strips_task_notification_keeps_user_text(
+        self,
+    ) -> None:
+        message = source_message_from_claude_code_row(
+            {
+                "type": "user",
+                "sessionId": "session-1",
+                "uuid": "mixed-notification",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "remember cedar\n"
+                        "<task-notification>\nTask abc123 completed.\n"
+                        "Full subagent report payload.\n"
+                        "</task-notification>"
+                    ),
+                },
+            }
+        )
+
+        self.assertIsNotNone(message)
+        assert message is not None
+        model_message = single_message_adapter.validate_json(message.message_json)
+        assert isinstance(model_message, ModelRequest)
+        self.assertEqual(model_message.parts[0].content, "remember cedar")
+
+    def test_source_message_from_row_drops_pure_task_notification(self) -> None:
+        message = source_message_from_claude_code_row(
+            {
+                "type": "user",
+                "sessionId": "session-1",
+                "uuid": "pure-notification",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "<task-notification>\nTask abc123 completed.\n"
+                        "Verbatim subagent report only.\n"
+                        "</task-notification>"
+                    ),
+                },
+            }
+        )
+
+        self.assertIsNone(message)
+
     def test_source_message_from_row_drops_pure_system_reminder(self) -> None:
         message = source_message_from_claude_code_row(
             {
@@ -183,6 +228,148 @@ class ClaudeCodeRecorderSharedTests(unittest.TestCase):
                 )
                 self.assertIsNone(message)
 
+    def test_source_message_from_row_strips_multiple_task_notification_blocks(
+        self,
+    ) -> None:
+        message = source_message_from_claude_code_row(
+            {
+                "type": "user",
+                "sessionId": "session-1",
+                "uuid": "multi-notification",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "<task-notification>\nTask one done.\n</task-notification>\n"
+                        "remember cedar\n"
+                        "<task-notification>\nTask two done.\n</task-notification>"
+                    ),
+                },
+            }
+        )
+
+        self.assertIsNotNone(message)
+        assert message is not None
+        model_message = single_message_adapter.validate_json(message.message_json)
+        assert isinstance(model_message, ModelRequest)
+        self.assertEqual(model_message.parts[0].content, "remember cedar")
+
+    def test_source_message_from_row_drops_unbalanced_nested_task_notification(
+        self,
+    ) -> None:
+        # A dangling nested open tag must not let inner payload survive the
+        # non-greedy strip as apparent user text (fail closed on imbalance).
+        message = source_message_from_claude_code_row(
+            {
+                "type": "user",
+                "sessionId": "session-1",
+                "uuid": "nested-dangling-open",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "<task-notification>outer "
+                        "<task-notification>inner</task-notification>"
+                        " leaked report"
+                    ),
+                },
+            }
+        )
+
+        self.assertIsNone(message)
+
+    def test_source_message_from_row_drops_balanced_nested_task_notification(
+        self,
+    ) -> None:
+        # Balanced nesting leaves a dangling close tag after the non-greedy
+        # strip; the surviving tag must fail closed.
+        message = source_message_from_claude_code_row(
+            {
+                "type": "user",
+                "sessionId": "session-1",
+                "uuid": "nested-balanced",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "<task-notification>outer "
+                        "<task-notification>inner</task-notification>"
+                        " trailing</task-notification>"
+                    ),
+                },
+            }
+        )
+
+        self.assertIsNone(message)
+
+    def test_source_message_from_row_drops_marker_created_by_stripping(
+        self,
+    ) -> None:
+        # Stripping an inner task-notification block must not let a
+        # manufactured system-reminder block (or vice versa) slip past the
+        # final harness_envelope_reason check.
+        interleaved_contents = [
+            (
+                "<system-remin<task-notification>x</task-notification>der>"
+                "hidden</system-reminder>"
+            ),
+            (
+                "<task-notif<system-reminder>x</system-reminder>ication>"
+                "hidden</task-notification>"
+            ),
+        ]
+
+        for content in interleaved_contents:
+            with self.subTest(content=content):
+                message = source_message_from_claude_code_row(
+                    {
+                        "type": "user",
+                        "sessionId": "session-1",
+                        "uuid": "interleaved-markers",
+                        "message": {"role": "user", "content": content},
+                    }
+                )
+                self.assertIsNone(message)
+
+    def test_source_message_from_row_drops_task_notification_tag_variants(
+        self,
+    ) -> None:
+        # Attribute or whitespace variants of the tag must still fail closed.
+        variant_contents = [
+            '<task-notification id="t1">payload</task-notification >',
+            "<task-notification >payload</task-notification>",
+        ]
+
+        for content in variant_contents:
+            with self.subTest(content=content):
+                message = source_message_from_claude_code_row(
+                    {
+                        "type": "user",
+                        "sessionId": "session-1",
+                        "uuid": "variant-notification",
+                        "message": {"role": "user", "content": content},
+                    }
+                )
+                self.assertIsNone(message)
+
+    def test_source_message_from_row_drops_unpaired_task_notification_tag(
+        self,
+    ) -> None:
+        unpaired_contents = [
+            "<task-notification>\ndangling open tag, no close",
+            "dangling close tag only\n</task-notification>",
+            "remember cedar\n<task-notification>\nunterminated block",
+        ]
+
+        for content in unpaired_contents:
+            with self.subTest(content=content):
+                message = source_message_from_claude_code_row(
+                    {
+                        "type": "user",
+                        "sessionId": "session-1",
+                        "uuid": "unpaired-notification",
+                        "message": {"role": "user", "content": content},
+                    }
+                )
+                self.assertIsNone(message)
+
     def test_scan_drops_envelopes_and_strips_reminders(self) -> None:
         rows = [
             {
@@ -209,6 +396,29 @@ class ClaudeCodeRecorderSharedTests(unittest.TestCase):
             {
                 "type": "user",
                 "sessionId": "session-1",
+                "uuid": "pure-notification",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "<task-notification>subagent report</task-notification>"
+                    ),
+                },
+            },
+            {
+                "type": "user",
+                "sessionId": "session-1",
+                "uuid": "mixed-notification",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "remember birch\n"
+                        "<task-notification>report</task-notification>"
+                    ),
+                },
+            },
+            {
+                "type": "user",
+                "sessionId": "session-1",
                 "uuid": "clean",
                 "message": {"role": "user", "content": "clean maple"},
             },
@@ -222,12 +432,12 @@ class ClaudeCodeRecorderSharedTests(unittest.TestCase):
             )
             scan = scan_claude_code_transcript(path)
 
-        self.assertEqual(scan.ignored, 1)
+        self.assertEqual(scan.ignored, 2)
         texts = [
             single_message_adapter.validate_json(message.message_json).parts[0].content
             for message in scan.messages
         ]
-        self.assertEqual(texts, ["remember cedar", "clean maple"])
+        self.assertEqual(texts, ["remember cedar", "remember birch", "clean maple"])
 
     def test_iter_claude_code_source_messages_yields_none_for_bad_lines(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

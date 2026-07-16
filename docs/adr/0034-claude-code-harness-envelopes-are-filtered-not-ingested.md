@@ -8,9 +8,11 @@ Raw Claude Code slash-command envelopes (`<command-name>`,
 `<command-message>`, `<command-args>`, `<local-command-stdout>`) and
 `<system-reminder>` blocks were reaching Tier 1 `messages` through the
 recorder -> hosted ingest path (COA-378, found while diagnosing COA-358).
-These payloads arrive as plain-string content inside ordinary user turns in
-the Claude Code JSONL transcript, so the existing structural gates -- the
-recorder's text-part extraction and the ingest-side
+The same path later admitted `<task-notification>` blocks -- harness-injected
+background-task completion payloads carrying verbatim subagent reports inside
+user turns (COA-392). These payloads arrive as plain-string content inside
+ordinary user turns in the Claude Code JSONL transcript, so the existing
+structural gates -- the recorder's text-part extraction and the ingest-side
 `_polluted_transcript_reason` check -- passed them through untouched: neither
 inspected the string body.
 
@@ -38,6 +40,18 @@ Harness envelopes are filtered with a dual guard, mirroring the
      the surrounding genuine user text is kept, because reminder blocks can
      share a turn with real user speech. A row that is empty after stripping,
      or that carries an unpaired reminder tag, is dropped (fail closed).
+   - Paired `<task-notification>...</task-notification>` blocks get the same
+     strip-and-keep treatment (COA-392): a notification can share a turn with
+     real user speech, so the block is stripped, the rest kept, and a row
+     that is empty after stripping or carries an unpaired tag is dropped
+     (fail closed). Two hardenings beyond the reminder treatment, both from
+     adversarial review: stripping applies only when open and close tags are
+     balanced -- nested or malformed blocks would let a non-greedy strip
+     surface inner payload as apparent user text, so unbalanced text is left
+     untouched and the surviving tags are rejected downstream; and detection
+     matches the tag prefixes (`<task-notification`, `</task-notification`)
+     rather than the exact closed form, so attribute or whitespace tag
+     variants also fail closed.
 2. **Ingest rejects, never mutates.** `ingest_source_messages` runs the same
    marker check beside the existing prime-context backstop and rejects the
    row per-row (`status="rejected"` with a reason). The boundary never
@@ -47,10 +61,11 @@ Harness envelopes are filtered with a dual guard, mirroring the
    well-formed pair -- means a recorder guard was bypassed, and the row is
    rejected.
 
-The marker constants and the two pure helpers
-(`strip_system_reminder_blocks`, `harness_envelope_reason`) live in
-`vexic.contract` beside `PRIME_CONTEXT_HEADER`, because the dependency
-lattice is `contract <- storage <- recorders` and both layers consume them.
+The marker constants and the pure helpers
+(`strip_system_reminder_blocks`, `strip_task_notification_blocks`,
+`harness_envelope_reason`) live in `vexic.contract` beside
+`PRIME_CONTEXT_HEADER`, because the dependency lattice is
+`contract <- storage <- recorders` and both layers consume them.
 
 ## Consequences
 

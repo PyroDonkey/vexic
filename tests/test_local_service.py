@@ -248,6 +248,40 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                 0,
             )
 
+    async def test_append_transcript_rejects_task_notification(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        notification = ModelRequest(
+            parts=[
+                UserPromptPart(
+                    content=(
+                        "<task-notification>\nTask abc123 completed.\n"
+                        "</task-notification>"
+                    )
+                )
+            ]
+        )
+
+        with self.assertRaisesRegex(ValueError, "task-notification"):
+            await service.append_transcript(
+                AppendTranscriptRequest(
+                    scope=_scope(capabilities={MemoryCapability.WRITE}),
+                    messages_json=[
+                        single_message_adapter.dump_json(notification).decode()
+                    ],
+                    redaction=RedactionContext(forbidden_values=()),
+                )
+            )
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 0)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0],
+                0,
+            )
+
     def test_save_messages_preflights_entire_batch_before_connect(self) -> None:
         messages = [
             ModelRequest(parts=[UserPromptPart(content="clean cedar")]),
@@ -2071,6 +2105,17 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                         "unpaired-reminder",
                         "real text\n<system-reminder>\nunterminated",
                     ),
+                    source_message(
+                        "paired-notification",
+                        # A well-formed task-notification block at the boundary
+                        # means the recorder guard was bypassed: reject, never
+                        # strip.
+                        "real text\n<task-notification>report</task-notification>",
+                    ),
+                    source_message(
+                        "unpaired-notification",
+                        "real text\n<task-notification>\nunterminated",
+                    ),
                     source_message("clean", "clean cedar"),
                 ],
                 redaction=RedactionContext(forbidden_values=()),
@@ -2079,15 +2124,17 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [row.status for row in result.items],
-            ["rejected", "rejected", "rejected", "rejected", "inserted"],
+            ["rejected"] * 6 + ["inserted"],
         )
         self.assertEqual(
-            [row.reason for row in result.items[:4]],
+            [row.reason for row in result.items[:6]],
             [
                 "claude-code command envelope is not transcript text",
                 "claude-code command envelope is not transcript text",
                 "system-reminder block is not transcript text",
                 "system-reminder block is not transcript text",
+                "task-notification block is not transcript text",
+                "task-notification block is not transcript text",
             ],
         )
         with closing(sqlite3.connect(self.db_path)) as conn:
