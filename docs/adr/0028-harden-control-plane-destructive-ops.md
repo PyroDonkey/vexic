@@ -97,13 +97,13 @@ The deferred removal/off-boarding path now exists. Three decisions:
 - **Filter, not delete, routing membership.** `tenant_projects` rows survive
   retirement; `HostedTenant.project_ids` assembly anti-joins
   `hosted_projects.retired_at` (LEFT JOIN, so provision-only memberships with
-  no `hosted_projects` row keep routing). Retirement stays recoverable — no
+  no `hosted_projects` row keep routing). Retirement stays recoverable -- no
   canonical row is deleted and no key is revoked, so un-retiring restores
   access.
 - **Binding-level enforcement.** Every data-plane route passes through
   `HostedMemoryService._bind_request`, which authorizes the request project
   against the retirement-filtered `project_ids` and resolves the tenant via
-  `get_tenant`'s `active = 1` gate — so `retire_control_project` and
+  `get_tenant`'s `active = 1` gate -- so `retire_control_project` and
   `retire_tenant` both cut access at binding time. The credential layer
   (`HostedApiKeyStore`) deliberately stays retirement-unaware: adding a
   tenants/projects join to per-request key auth would add a hot-path read for
