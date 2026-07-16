@@ -2,11 +2,13 @@ import contextlib
 import io
 import json
 import os
+import ssl
 import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+from http.client import IncompleteRead, RemoteDisconnected
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
@@ -33,6 +35,7 @@ from vexic.recorders.claude_setup import (
     uninstall_claude_code_setup,
 )
 from vexic.recorders.hosted_ingest import HostedIngestConfig, post_source_messages
+from vexic.recorders import hosted_prime
 from vexic.recorders.hosted_prime import (
     HostedPrimeConfig,
     build_prime_context,
@@ -2282,6 +2285,149 @@ class ClaudeCodeRecorderPrimeCommandTests(unittest.TestCase):
             self.assertNotIn("Prior conversation recap:", context)
             self.assertIn("remember timeout-fallback cedar", context)
 
+    def test_prime_read_phase_timeout_on_fresh_context_falls_back_to_search_only(
+        self,
+    ) -> None:
+        # Read-phase timeout: urlopen succeeds, response.read() raises a bare
+        # builtin TimeoutError (not wrapped in URLError). Prime must still
+        # emit every section that succeeded.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+
+            class _Response:
+                def __init__(self, payload: dict[str, object] | None) -> None:
+                    self._payload = payload
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc):
+                    return False
+
+                def read(self) -> bytes:
+                    if self._payload is None:
+                        raise TimeoutError("The read operation timed out")
+                    return json.dumps(self._payload).encode("utf-8")
+
+            def fake_urlopen(request, timeout):
+                if request.full_url.endswith("/v1/fresh_context"):
+                    return _Response(None)
+                if request.full_url.endswith("/v1/search_long_term"):
+                    return _Response(
+                        {"facts": [{"fact_id": 1, "fact_text": "prefers cedar decks"}]}
+                    )
+                return _Response(
+                    {
+                        "hits": [
+                            {
+                                "message_id": 1,
+                                "session_id": "session-a",
+                                "body": "User: remember read-timeout cedar",
+                            }
+                        ]
+                    }
+                )
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            context = json.loads(stdout.getvalue())["hookSpecificOutput"]["additionalContext"]
+            self.assertNotIn("Prior conversation recap:", context)
+            self.assertIn("prefers cedar decks", context)
+            self.assertIn("remember read-timeout cedar", context)
+
+    def test_prime_read_phase_timeout_on_search_long_term_keeps_other_sections(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+
+            class _Response:
+                def __init__(self, payload: dict[str, object] | None) -> None:
+                    self._payload = payload
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc):
+                    return False
+
+                def read(self) -> bytes:
+                    if self._payload is None:
+                        raise TimeoutError("The read operation timed out")
+                    return json.dumps(self._payload).encode("utf-8")
+
+            def fake_urlopen(request, timeout):
+                if request.full_url.endswith("/v1/fresh_context"):
+                    return _Response({"text": "Recap: discussed cedar roadmap"})
+                if request.full_url.endswith("/v1/search_long_term"):
+                    return _Response(None)
+                return _Response(
+                    {
+                        "hits": [
+                            {
+                                "message_id": 1,
+                                "session_id": "session-a",
+                                "body": "User: remember partial-prime cedar",
+                            }
+                        ]
+                    }
+                )
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+            self.assertEqual(code, 0)
+            context = json.loads(stdout.getvalue())["hookSpecificOutput"]["additionalContext"]
+            self.assertIn("Recap: discussed cedar roadmap", context)
+            self.assertIn("remember partial-prime cedar", context)
+            self.assertNotIn("Long-term memory:", context)
+
     def test_prime_max_chars_cap_enforced_with_recap_present(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -2641,6 +2787,81 @@ class ClaudeCodeRecorderPrimeCommandTests(unittest.TestCase):
         urlopen_mock.assert_not_called()
 
 
+class HostedPrimePostSearchNormalizationTests(unittest.TestCase):
+    """_post_search must raise only RuntimeError for transport/decode failures.
+
+    Downstream degradation (_safe_post_search, fetch_fresh_context) filters on
+    RuntimeError; any other exception type escapes to the prime fail-open
+    catch-all and discards the whole context.
+    """
+
+    def _config(self) -> HostedPrimeConfig:
+        return HostedPrimeConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+    def _run_post_search(self, body: bytes | None, exc: Exception | None):
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self) -> bytes:
+                if exc is not None:
+                    raise exc
+                assert body is not None
+                return body
+
+        def fake_urlopen(request, timeout):
+            return _Response()
+
+        with patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen):
+            return hosted_prime._post_search(
+                self._config(), "search_transcript", {"query": "q", "limit": 1}
+            )
+
+    def test_read_phase_failures_normalize_to_runtime_error(self) -> None:
+        cases: list[tuple[str, Exception]] = [
+            ("TimeoutError", TimeoutError("The read operation timed out")),
+            ("SSLError", ssl.SSLError("bad record mac")),
+            ("IncompleteRead", IncompleteRead(b"partial")),
+            ("RemoteDisconnected", RemoteDisconnected("closed connection")),
+        ]
+        for name, exc in cases:
+            with self.subTest(name):
+                with self.assertRaises(RuntimeError) as ctx:
+                    self._run_post_search(None, exc)
+                self.assertIn("hosted prime failed:", str(ctx.exception))
+                self.assertIn(name, str(ctx.exception))
+
+    def test_malformed_body_normalizes_to_runtime_error(self) -> None:
+        for name, body in [
+            ("JSONDecodeError", b"not json"),
+            ("UnicodeDecodeError", b"\xff\xfe\xfa"),
+        ]:
+            with self.subTest(name):
+                with self.assertRaises(RuntimeError) as ctx:
+                    self._run_post_search(body, None)
+                self.assertIn("hosted prime failed:", str(ctx.exception))
+
+    def test_connect_phase_url_error_message_unchanged(self) -> None:
+        def fake_urlopen(request, timeout):
+            raise URLError(TimeoutError("timed out"))
+
+        with patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen):
+            with self.assertRaises(RuntimeError) as ctx:
+                hosted_prime._post_search(
+                    self._config(), "search_transcript", {"query": "q", "limit": 1}
+                )
+        self.assertEqual(str(ctx.exception), "hosted prime failed: TimeoutError")
+
+
 def _write_trigger_config(root: Path, **overrides: object) -> Path:
     config_path = root / "config.json"
     payload = {
@@ -2736,6 +2957,36 @@ class ClaudeCodeRecorderTriggerDreamCommandTests(unittest.TestCase):
                 code = recorder_main(["trigger-dream", "--config", str(config_path)])
 
             self.assertEqual(code, 0)
+
+    def test_trigger_dream_exits_zero_on_read_phase_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = _write_trigger_config(root)
+
+            class _Response:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc):
+                    return False
+
+                def read(self) -> bytes:
+                    raise TimeoutError("The read operation timed out")
+
+            def fake_urlopen(request, timeout):
+                return _Response()
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = recorder_main(["trigger-dream", "--config", str(config_path)])
+
+            self.assertEqual(code, 0)
+            self.assertIn("hosted prime failed: TimeoutError", stderr.getvalue())
 
     def test_trigger_dream_exits_zero_on_connection_refused(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

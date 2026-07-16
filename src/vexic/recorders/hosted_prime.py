@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from dataclasses import dataclass
+from http.client import HTTPException
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
@@ -143,6 +144,13 @@ def _post_search(
         raise RuntimeError(f"hosted prime failed: HTTP {exc.code}") from exc
     except URLError as exc:
         raise RuntimeError(f"hosted prime failed: {type(exc.reason).__name__}") from exc
+    except (OSError, HTTPException, ValueError) as exc:
+        # urllib wraps connect-phase failures in URLError, but read-phase
+        # failures escape raw: response.read() raises bare TimeoutError /
+        # ssl.SSLError / IncompleteRead, and json/decode raise ValueError
+        # subclasses. Downstream degradation filters on RuntimeError only,
+        # so anything else here would discard the entire prime.
+        raise RuntimeError(f"hosted prime failed: {type(exc).__name__}") from exc
     if not isinstance(body, dict):
         raise RuntimeError("hosted prime failed: invalid response")
     return body
