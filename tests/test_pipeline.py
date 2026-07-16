@@ -130,11 +130,13 @@ class LightPhaseProvenanceTests(unittest.IsolatedAsyncioTestCase):
                     ).fetchall()
                 ]
                 run_status = conn.execute(
-                    "SELECT status, last_processed_message_id FROM dream_runs ORDER BY id DESC LIMIT 1"
+                    "SELECT status, last_processed_message_id, candidates_dropped"
+                    " FROM dream_runs ORDER BY id DESC LIMIT 1"
                 ).fetchone()
 
         self.assertEqual(persisted, ["Ryan prefers compact reports."])
-        self.assertEqual(run_status, ("ok", message_id))
+        # A run that kept candidates stays 'ok'; the drop is still counted.
+        self.assertEqual(run_status, ("ok", message_id, 1))
 
     async def test_light_phase_drops_candidate_with_no_source_message_ids(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -243,12 +245,114 @@ class LightPhaseProvenanceTests(unittest.IsolatedAsyncioTestCase):
                 candidate_count = conn.execute(
                     "SELECT COUNT(*) FROM memory_candidates"
                 ).fetchone()[0]
+                run_row = conn.execute(
+                    "SELECT status, candidates_dropped, error_detail"
+                    " FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()
 
         self.assertEqual(candidate_count, 0)
+        # ADR 0031 amendment: a run that extracted candidates and kept none is
+        # durably 'partial' with the drop count, queryable without logs.
+        self.assertEqual(run_row, ("partial", 1, None))
         # Content-free: the operator learns that provenance dropped candidates
         # and how many, never which facts or which message ids.
         self.assertIn("1 dropped", output.getvalue())
         self.assertNotIn("Mars", output.getvalue())
+
+    async def test_error_after_filtering_still_records_known_drop_count(self) -> None:
+        # A failure between provenance filtering and commit must not zero the
+        # already-known drop count on the error audit row: the failed cycle's
+        # drop telemetry is the ADR 0031 miscitation signal either way.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            message_id = save_messages(
+                db_path,
+                [ModelRequest(parts=[UserPromptPart(content="I prefer compact reports.")])],
+            )[0]
+
+            class ExtractionAgent:
+                async def run(self, transcript: str) -> object:
+                    return SimpleNamespace(
+                        output=[
+                            FactCandidate(
+                                fact_text="Ryan prefers compact reports.",
+                                subject="Ryan",
+                                category="preference",
+                                importance=7,
+                                confidence=0.9,
+                                source_message_ids=[message_id],
+                            ),
+                            FactCandidate(
+                                fact_text="Ryan lives on Mars.",
+                                subject="Ryan",
+                                category="fact",
+                                importance=5,
+                                confidence=0.8,
+                                source_message_ids=[message_id + 999],
+                            ),
+                        ],
+                        usage=_fake_usage(),
+                    )
+
+            def failing_embed(texts: list[str]) -> list[list[float]]:
+                raise RuntimeError("embedding backend down")
+
+            output = StringIO()
+            with redirect_stdout(output):
+                with self.assertRaises(RuntimeError):
+                    await run_light_phase(
+                        db_path,
+                        "glm",
+                        extraction_agent_factory=lambda group, secrets=None: ExtractionAgent(),
+                        embed=failing_embed,
+                    )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                status, dropped = conn.execute(
+                    "SELECT status, candidates_dropped FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+
+        self.assertEqual(status, "error")
+        self.assertEqual(dropped, 1)
+
+    def test_dream_runs_schema_has_durable_drop_count(self) -> None:
+        # ADR 0031's mitigation for silent systematic miscitation is the drop
+        # count; stdout is not durable, so the count lives in dream_runs.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            with closing(sqlite3.connect(db_path)) as conn:
+                columns = {
+                    row[1]: row for row in conn.execute("PRAGMA table_info(dream_runs)")
+                }
+
+        self.assertIn("candidates_dropped", columns)
+        _, _, _, not_null, default, _ = columns["candidates_dropped"]
+        self.assertEqual(not_null, 1)
+        self.assertEqual(default, "0")
+
+    def test_commit_dream_cycle_persists_drop_count(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            commit_dream_cycle(
+                db_path,
+                [],
+                agent_id=None,
+                status="partial",
+                started_at="2026-01-01T00:00:00Z",
+                finished_at="2026-01-01T00:00:01Z",
+                messages_processed=3,
+                last_processed_message_id=3,
+                candidates_dropped=3,
+            )
+            with closing(sqlite3.connect(db_path)) as conn:
+                row = conn.execute(
+                    "SELECT status, candidates_dropped FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+
+        self.assertEqual(row, ("partial", 3))
 
 
 class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
@@ -1797,7 +1901,8 @@ class LightPhaseErrorDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         # dream_runs.error_detail and the operator print are diagnostics; a
         # candidate dropped for bad provenance must not copy user memory text
         # into either. The drop replaces the old fail-the-batch ValueError, so
-        # the run now lands 'ok' with the miscited candidate simply absent.
+        # a run that kept nothing lands 'partial' with the miscited candidate
+        # simply absent -- content-free either way.
         sentinel = "secret-medical-fact-sentinel"
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = str(Path(temp_dir) / "memory.db")
@@ -1847,7 +1952,7 @@ class LightPhaseErrorDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
                     "SELECT COUNT(*) FROM memory_candidates"
                 ).fetchone()[0]
 
-        self.assertEqual(status, "ok")
+        self.assertEqual(status, "partial")
         self.assertIsNone(error_detail)
         self.assertEqual(persisted, 0)
         self.assertNotIn(sentinel, stdout.getvalue())
@@ -1885,6 +1990,58 @@ class PipelineCorrectnessRegressionTests(unittest.TestCase):
             last_processed_message_id=last_processed_message_id,
             observed_watermark=observed_watermark,
         )
+
+    def test_superseded_partial_commit_keeps_partial_status(self) -> None:
+        # A superseded all-dropped run must persist the status the run actually
+        # had ('partial'), not a hardcoded 'ok': the durable row and the
+        # contract result must agree, or status-based telemetry misses the
+        # all-dropped run. The audit row's last_processed_message_id stays 0,
+        # so a 'partial' audit row still cannot lift the watermark.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+
+            # A first run advances the watermark to 5.
+            self._commit(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="Ryan cedar window one.",
+                        subject="Ryan",
+                        category="fact",
+                        importance=5,
+                        confidence=0.8,
+                        source_message_ids=[5],
+                    )
+                ],
+                [_unit_vector(1.0)],
+                last_processed_message_id=5,
+            )
+
+            # A stale all-dropped run (observed watermark 0) commits 'partial'.
+            commit_dream_cycle(
+                db_path,
+                [],
+                agent_id=None,
+                status="partial",
+                started_at="2026-01-01T00:01:00Z",
+                finished_at="2026-01-01T00:01:01Z",
+                messages_processed=1,
+                last_processed_message_id=5,
+                observed_watermark=0,
+                candidates_dropped=2,
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                status, dropped, watermark_claim = conn.execute(
+                    "SELECT status, candidates_dropped, last_processed_message_id"
+                    " FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+
+            self.assertEqual(status, "partial")
+            self.assertEqual(dropped, 2)
+            self.assertEqual(watermark_claim, 0)
+            self.assertEqual(get_watermark(db_path, agent_id=None), 5)
 
     def test_superseded_watermark_commit_does_not_double_write(self) -> None:
         # Finding 1: two Light runs reading the same watermark must not both

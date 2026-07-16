@@ -985,6 +985,78 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
+    async def test_light_dream_phase_reports_partial_when_every_candidate_dropped(
+        self,
+    ) -> None:
+        # ADR 0031 amendment: a Light run that extracted candidates
+        # and kept none surfaces status='partial' through the contract result,
+        # not a silent 'ok'; a run that kept some stays 'ok'.
+        from types import SimpleNamespace
+
+        from vexic.ports import DreamPhasePorts
+        from vexic.service import LocalMemoryService
+
+        init_db(self.db_path)
+        message_id = save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="I prefer compact reports.")])],
+        )[0]
+
+        def _candidate(fact_text: str, source_ids: list[int]) -> FactCandidate:
+            return FactCandidate(
+                fact_text=fact_text,
+                subject="Ryan",
+                category="preference",
+                importance=6,
+                confidence=0.8,
+                source_message_ids=source_ids,
+            )
+
+        outputs: list[list[FactCandidate]] = [
+            [_candidate("Ryan lives on Mars.", [message_id + 999])],
+        ]
+
+        class ExtractionAgent:
+            async def run(self, transcript: str) -> object:
+                return SimpleNamespace(
+                    output=outputs.pop(0),
+                    usage=SimpleNamespace(
+                        requests=1, input_tokens=1, output_tokens=1, total_tokens=2
+                    ),
+                )
+
+        service = LocalMemoryService(
+            db_path=self.db_path,
+            tenant_id="tenant-a",
+            dream_phase_ports=DreamPhasePorts(
+                model_group="glm",
+                extraction_agent_factory=lambda group, secrets=None: ExtractionAgent(),
+                embed=lambda texts: [_unit_vector(1.0) for _ in texts],
+            ),
+        )
+        service.init_schema()
+        request = RunDreamPhaseRequest(
+            scope=_scope(capabilities={MemoryCapability.ADMIN_REBUILD}),
+            phase=DreamPhase.LIGHT,
+            redaction=RedactionContext(forbidden_values=()),
+        )
+
+        all_dropped = await service.run_dream_phase(request)
+        self.assertEqual(all_dropped.status, "partial")
+
+        second_id = save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="I prefer compact reports.")])],
+        )[0]
+        outputs.append(
+            [
+                _candidate("Ryan prefers compact reports.", [second_id]),
+                _candidate("Ryan lives on Mars.", [second_id + 999]),
+            ]
+        )
+        some_kept = await service.run_dream_phase(request)
+        self.assertEqual(some_kept.status, "ok")
+
     async def test_lifecycle_export_replay_and_rebuild_are_agent_scoped(self) -> None:
         from vexic.service import LocalMemoryService
 
