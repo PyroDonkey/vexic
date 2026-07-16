@@ -409,6 +409,12 @@ directory does that, per ADR 0008/0013 precedent.
   snapshot against production data remains a manual/operator-run step (the
   hosted-migration runbook is maintained in the private hosted-ops repository);
   only the automated decision logic above is exercised in CI.
+  `import_canonical_migration` writes all canonical rows in one explicit
+  `BEGIN`/`COMMIT` transaction on both backends, so a failed drill import
+  leaves zero canonical rows in the replacement (projection init and repair
+  run outside that transaction and are re-runnable). v1 artifacts exported at
+  older schemas remain importable: the importer fills columns added by later
+  additive schema migrations from schema defaults (ADR 0011 addendum).
 
 Remote libSQL round trips use the wall-clock deadline from ADR 0019 Addendum 7.
 A read-only timeout, or worker-capacity exhaustion before a call starts, is a

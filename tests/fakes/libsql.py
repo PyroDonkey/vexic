@@ -92,6 +92,20 @@ class FakeLibsqlConn:
         )
 
 
+class AutocommitFakeLibsqlConn(FakeLibsqlConn):
+    """``FakeLibsqlConn`` variant that also emulates libSQL/Hrana transaction
+    semantics: each statement auto-commits its own micro-transaction unless an
+    explicit ``BEGIN`` opened a transaction (``sqlite3`` autocommit mode gives
+    exactly that). Use it to pin code paths that must issue an explicit
+    ``BEGIN`` because a bare ``with conn:`` opens no transaction on libSQL.
+    """
+
+    def __init__(self) -> None:
+        self._conn = sqlite3.connect(
+            ":memory:", check_same_thread=False, isolation_level=None
+        )
+
+
 class _HangingCursor:
     """Cursor whose round-trips block on the shared gate."""
 

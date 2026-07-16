@@ -144,8 +144,15 @@ def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     return row is not None
 
 
-def _target_columns(conn: sqlite3.Connection, table_name: str) -> list[str]:
-    return [str(row[1]) for row in conn.execute(f'PRAGMA table_info("{table_name}")').fetchall()]
+def _target_column_info(
+    conn: sqlite3.Connection,
+    table_name: str,
+) -> list[tuple[str, bool, object]]:
+    # PRAGMA table_info rows: (cid, name, type, notnull, dflt_value, pk).
+    return [
+        (str(row[1]), bool(row[3]), row[4])
+        for row in conn.execute(f'PRAGMA table_info("{table_name}")').fetchall()
+    ]
 
 
 def _assert_no_host_owned_tables(conn: sqlite3.Connection) -> None:
@@ -230,11 +237,28 @@ def _insert_rows(
     if not rows:
         _assert_no_extra_rows(conn, table_name, set())
         return 0
-    columns = _target_columns(conn, table_name)
-    expected = set(columns)
+    column_info = _target_column_info(conn, table_name)
+    target_columns = {name for name, _, _ in column_info}
+    artifact_columns = set(rows[0])
     for row in rows:
-        if set(row) != expected:
-            raise ValueError(f"canonical migration artifact row in {table_name} has invalid columns.")
+        if set(row) != artifact_columns:
+            raise ValueError(
+                f"canonical migration artifact rows in {table_name} have mixed column sets."
+            )
+    if artifact_columns - target_columns:
+        raise ValueError(f"canonical migration artifact row in {table_name} has invalid columns.")
+    # Additive tolerance (ADR 0011 addendum): a v1 artifact exported
+    # before an additive schema migration lacks the newer columns. Omitting
+    # them from the INSERT lets the backend fill the schema DEFAULT (or NULL),
+    # but a missing NOT NULL column without a default has no safe fill and
+    # must fail closed.
+    for name, notnull, default in column_info:
+        if name not in artifact_columns and notnull and default is None:
+            raise ValueError(
+                f"canonical migration artifact rows in {table_name} are missing "
+                f"required column {name!r} (NOT NULL, no default)."
+            )
+    columns = [name for name, _, _ in column_info if name in artifact_columns]
     column_sql = ", ".join(f'"{column}"' for column in columns)
     placeholders = ", ".join("?" for _ in columns)
     imported = 0
@@ -351,9 +375,19 @@ def import_canonical_migration(
     init_vector_memory(target_db_path)
     rows_imported = 0
     with closing(connect(target_db_path)) as conn:
-        with conn:
+        # Explicit BEGIN, not a bare `with conn:`: on libSQL/Hrana each
+        # statement auto-commits its own micro-transaction unless a
+        # transaction is opened explicitly (see StorageConnection and the
+        # ingest_source_messages precedent), so only an explicit transaction
+        # makes the multi-table insert loop atomic on both backends.
+        conn.execute("BEGIN")
+        try:
             for table_name in CANONICAL_TABLES:
                 rows_imported += _insert_rows(conn, table_name, artifact.tables[table_name])
+        except BaseException:
+            conn.rollback()
+            raise
+        conn.commit()
 
     repair_report = repair_memory_projections(
         target_db_path,

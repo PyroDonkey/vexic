@@ -78,7 +78,8 @@ Notes:
   view, defines the accepted scope semantics.
 - 0011 corresponds to the local/self-host to hosted migration-path decision for
   COA-202. The operator runbook and drill, not a public import API, are the
-  readiness owner for that path.
+  readiness owner for that path. Its COA-387 addendum makes v1 artifacts
+  additive-tolerant across schema migrations.
 - 0012 corresponds to the COA-190 website and account dashboard implementation
   path. Vexic Console is a separate Next.js control-plane app; it does not move
   dashboard concerns into `src/vexic`.

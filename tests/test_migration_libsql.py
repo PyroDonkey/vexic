@@ -13,7 +13,11 @@ from pathlib import Path
 
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
-from tests.fakes.libsql import FakeLibsqlConn
+import json
+
+import pytest
+
+from tests.fakes.libsql import AutocommitFakeLibsqlConn, FakeLibsqlConn
 from vexic.migration import export_canonical_migration, import_canonical_migration
 from vexic.storage import SourceTranscriptInput, ingest_source_messages, init_db
 from vexic.storage import single_message_adapter
@@ -151,3 +155,48 @@ def test_import_canonical_migration_accepts_libsql_storage_target(monkeypatch, t
         "SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'cedar'"
     ).fetchall()
     assert len(fts_rows) == 1
+
+
+def test_failed_import_rolls_back_on_libsql_target(monkeypatch, tmp_path):
+    """The canonical-row insert loop must be one explicit transaction on a
+    libSQL target. `AutocommitFakeLibsqlConn` emulates libSQL/Hrana
+    per-statement autocommit, so under a bare `with conn:` the earlier-table
+    inserts would already be committed when a later table fails validation;
+    only an explicit BEGIN/rollback leaves zero canonical rows behind."""
+    source_db = tmp_path / "source.db"
+    artifact = tmp_path / "canonical-migration.json"
+
+    init_db(str(source_db))
+    ingest_source_messages(
+        str(source_db),
+        [_source_message("cedar migration transcript")],
+        session_id="session-a",
+        agent_id="agent-a",
+    )
+    export_canonical_migration(
+        str(source_db),
+        artifact,
+        tenant_id="tenant-a",
+        project_id="project-a",
+    )
+    payload = json.loads(artifact.read_text())
+    # messages imports first; a later canonical table then fails validation.
+    payload["tables"]["long_term_memory"] = [{"id": 1, "bogus_column": 1}]
+    artifact.write_text(json.dumps(payload))
+
+    fake_conn = AutocommitFakeLibsqlConn()
+    _patch_connect_to_fake(monkeypatch, fake_conn)
+    # Distinct DSN: the schema init-once memo is keyed by DSN and persists
+    # across tests in the process, and this fake target starts schema-less.
+    target = StorageTarget("libsql://fake-migration-rollback-target", auth_token="s3cr3t-token")
+
+    with pytest.raises(ValueError, match="columns"):
+        import_canonical_migration(
+            artifact,
+            target,
+            tenant_id="tenant-a",
+            project_id="project-a",
+        )
+
+    count = fake_conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    assert count == 0
