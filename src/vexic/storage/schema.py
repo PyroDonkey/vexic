@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 # secret guard from here under the old private name.
 from vexic.redaction import assert_no_forbidden_secret_values as _assert_no_forbidden_secret_values
 from vexic.storage.connection import connect
+from vexic.storage.errors import is_duplicate_column_error
 
 # Process-level init-once memo: DDL against a hosted libSQL/Turso
 # target incurs per-request remote round-trips, so re-running the full
@@ -75,8 +76,19 @@ def _ensure_column(
     column_name: str,
     column_definition: str,
 ) -> None:
-    if column_name not in _table_columns(conn, table_name):
+    # Two hosted containers migrating the same tenant database (rolling deploy
+    # overlap) can both observe the column missing before either ALTER commits.
+    # The loser's ALTER then fails with ``duplicate column name`` -- the schema
+    # is already in the desired state, so that error is swallowed; anything
+    # else propagates. The hosted libSQL driver reports it as a bare ValueError
+    # rather than sqlite3.OperationalError (ADR 0019).
+    if column_name in _table_columns(conn, table_name):
+        return
+    try:
         conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_definition}")
+    except (sqlite3.OperationalError, ValueError) as exc:
+        if not is_duplicate_column_error(exc):
+            raise
 
 
 def _load_vec_extension(conn: sqlite3.Connection) -> None:

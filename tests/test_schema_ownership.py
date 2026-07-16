@@ -284,6 +284,82 @@ class VexicSchemaOwnershipTests(unittest.TestCase):
         self.assertIn("occurred_at", long_term_columns)
 
 
+class EnsureColumnConcurrentDuplicateTests(unittest.TestCase):
+    """Two hosted containers migrating the same tenant database (rolling
+    deploy overlap) can both observe a column missing before either ALTER
+    commits. The loser's ALTER fails with a duplicate-column error even though
+    the schema already reached the desired state, so _ensure_column must treat
+    that specific failure as success while every other error still propagates.
+    The hosted libSQL/Turso driver reports the failure as a bare ValueError
+    carrying the SQLite message (ADR 0019), not sqlite3.OperationalError."""
+
+    def _racing_conn(self, alter_error: BaseException) -> sqlite3.Connection:
+        """A connection whose ALTER loses the race: the check sees the column
+        missing, but the ALTER itself fails as if another container just added
+        it. Non-ALTER statements pass through to a real in-memory database."""
+        real = sqlite3.connect(":memory:")
+        self.addCleanup(real.close)
+        real.execute("CREATE TABLE dream_runs (id INTEGER PRIMARY KEY)")
+
+        class RacingConnection:
+            def execute(self, sql: str, *args: object) -> object:
+                if sql.lstrip().upper().startswith("ALTER TABLE"):
+                    raise alter_error
+                return real.execute(sql, *args)
+
+        return RacingConnection()  # type: ignore[return-value]
+
+    def test_duplicate_column_operational_error_is_swallowed(self) -> None:
+        from vexic.storage.schema import _ensure_column
+
+        conn = self._racing_conn(
+            sqlite3.OperationalError("duplicate column name: candidates_dropped")
+        )
+        _ensure_column(
+            conn,
+            "dream_runs",
+            "candidates_dropped",
+            "candidates_dropped INTEGER NOT NULL DEFAULT 0",
+        )
+
+    def test_duplicate_column_libsql_value_error_is_swallowed(self) -> None:
+        from vexic.storage.schema import _ensure_column
+
+        conn = self._racing_conn(
+            ValueError("SQLite failure: `duplicate column name: candidates_dropped`")
+        )
+        _ensure_column(
+            conn,
+            "dream_runs",
+            "candidates_dropped",
+            "candidates_dropped INTEGER NOT NULL DEFAULT 0",
+        )
+
+    def test_unrelated_operational_error_still_raises(self) -> None:
+        from vexic.storage.schema import _ensure_column
+
+        conn = self._racing_conn(sqlite3.OperationalError("no such table: dream_runs"))
+        with self.assertRaises(sqlite3.OperationalError):
+            _ensure_column(
+                conn,
+                "dream_runs",
+                "candidates_dropped",
+                "candidates_dropped INTEGER NOT NULL DEFAULT 0",
+            )
+
+    def test_unrelated_value_error_still_raises(self) -> None:
+        from vexic.storage.schema import _ensure_column
+
+        conn = self._racing_conn(ValueError("Hrana: `stream error: SQLITE_BUSY`"))
+        with self.assertRaises(ValueError):
+            _ensure_column(
+                conn,
+                "dream_runs",
+                "candidates_dropped",
+                "candidates_dropped INTEGER NOT NULL DEFAULT 0",
+            )
+
+
 class OccurredAtFieldDefaultTests(unittest.TestCase):
     """occurred_at is a nullable, flexible event-time string that
     defaults to None so existing callers that construct these types without
