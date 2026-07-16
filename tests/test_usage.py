@@ -1,4 +1,4 @@
-"""Behavior pins for vexic.usage.summarize_agent_usage (COA-375).
+"""Behavior pins for vexic.usage.summarize_agent_usage.
 
 pydantic-ai is migrating AgentRunResult.usage from a method to a property.
 These tests pin that both shapes yield real token telemetry and that a
@@ -69,6 +69,27 @@ class SummarizeAgentUsageTest(unittest.TestCase):
             f"unexpected AgentRunResult.usage shape: {type(attr)!r}",
         )
 
+    def test_deprecation_shim_usage_is_read_without_being_called(self) -> None:
+        """pydantic-ai 1.102 ships `usage` as a RunUsage that is also callable;
+        calling it emits PydanticAIDeprecationWarning. The token fields must be
+        read off the object directly, never by invoking it."""
+
+        class _ShimUsage:
+            requests = 2
+            input_tokens = 100
+            output_tokens = 40
+            total_tokens = 140
+
+            def __call__(self) -> "_ShimUsage":
+                raise AssertionError(
+                    "deprecated usage shim was called; read attributes instead"
+                )
+
+        summary = summarize_agent_usage(SimpleNamespace(usage=_ShimUsage()))
+
+        self.assertEqual(summary.model_requests, 2)
+        self.assertEqual(summary.total_tokens, 140)
+
     def test_result_without_usage_fails_loud(self) -> None:
         with self.assertRaises(ValueError):
             summarize_agent_usage(object())
@@ -76,6 +97,18 @@ class SummarizeAgentUsageTest(unittest.TestCase):
     def test_none_usage_fails_loud(self) -> None:
         with self.assertRaises(ValueError):
             summarize_agent_usage(SimpleNamespace(usage=None))
+
+    def test_malformed_usage_fails_loud(self) -> None:
+        """A falsy or token-field-free usage payload must never read as
+        'this run used no tokens'."""
+        for malformed in (False, 0, "", object()):
+            with self.subTest(usage=malformed):
+                with self.assertRaises(ValueError):
+                    summarize_agent_usage(SimpleNamespace(usage=malformed))
+
+    def test_callable_returning_no_usage_fails_loud(self) -> None:
+        with self.assertRaises(ValueError):
+            summarize_agent_usage(SimpleNamespace(usage=lambda: None))
 
 
 if __name__ == "__main__":
