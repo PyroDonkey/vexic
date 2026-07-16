@@ -694,7 +694,7 @@ def search_messages(
                     AND messages_fts.session_id = ?
                     AND messages_fts.agent_id IS ?
                     AND messages.agent_id IS ?
-                ORDER BY rank
+                ORDER BY rank, messages.id
                 LIMIT ?
                 """,
                 (safe_query, session_id, agent_id, agent_id, limit),

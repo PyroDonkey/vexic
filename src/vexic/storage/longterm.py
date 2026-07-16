@@ -81,7 +81,7 @@ def keyword_long_term_fact_ids(
     behave unexpectedly. This is a deliberate, documented approximation, not
     a bug.
     """
-    safe_query = _fts_match_query(query, any_token=True)
+    safe_query = _fts_match_query(query)
     if safe_query is None:
         return []
 

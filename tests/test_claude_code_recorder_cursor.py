@@ -630,9 +630,12 @@ class RecorderCursorLedgerDedupTests(unittest.TestCase):
             self.assertEqual((first["inserted"], first["skipped"]), (2, 0))
             self.assertEqual((second["inserted"], second["skipped"]), (0, 2))
             self.assertEqual(search_response.status_code, 200)
+            # OR-semantics recall (ADR 0036) also surfaces the hosted-juniper
+            # row on the shared "hosted" token; strict list equality still
+            # proves the ledger deduped -- neither body appears twice.
             self.assertEqual(
                 [hit["body"] for hit in search_response.json()["hits"]],
-                ["User: remember hosted-orchid"],
+                ["User: remember hosted-orchid", "User: and hosted-juniper"],
             )
 
 
