@@ -2848,7 +2848,7 @@ class HostedPrimePostSearchNormalizationTests(unittest.TestCase):
             with self.subTest(name):
                 with self.assertRaises(RuntimeError) as ctx:
                     self._run_post_search(body, None)
-                self.assertIn("hosted prime failed:", str(ctx.exception))
+                self.assertEqual(str(ctx.exception), f"hosted prime failed: {name}")
 
     def test_connect_phase_url_error_message_unchanged(self) -> None:
         def fake_urlopen(request, timeout):
