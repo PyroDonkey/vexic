@@ -5,6 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-07-16
+
+Reliability patch for the internal-alpha hosted stack. No public memory
+contract change; `CONTRACT_VERSION` stays `0.1.0`.
+
+### Fixed
+
+- SessionStart priming no longer discards all memory context when a hosted
+  read times out mid-response: read-phase transport and decode failures are
+  normalized into the degradation path, so prime emits a partial context
+  instead of nothing (#231).
+- Canonical migration artifacts tolerate additive schema columns and the
+  import row loop is one atomic transaction whose rollback failures preserve
+  the original import error (#230); a raw libsql DSN string import target
+  fails closed on host-owned extension tables instead of skipping the
+  pre-import guard (#233).
+- Control-plane schema migrations are concurrency-safe (#226), and
+  control-plane retirement cuts live access (#227).
+- Dream-phase failures are durably recorded and gate the retry clock (#222),
+  dream sweep state is stamped with job-completion time (#225), withheld-stamp
+  dream chains back off briefly after failures (#224), and the summarize
+  watermark holds when SUMMARIZE never ran (#223).
+- Light extraction drop counts are durable telemetry, and all-dropped runs
+  report partial instead of success (#229).
+- Usage is captured under the pydantic-ai property form, and missing usage
+  fails loud instead of silently reporting zero (#228).
+
+[0.1.4]: https://github.com/PyroDonkey/vexic/releases/tag/v0.1.4
+
 ## [0.1.3] - 2026-07-14
 
 Reliability and hardening patch for the internal-alpha hosted stack. No public
