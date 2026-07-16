@@ -108,7 +108,11 @@ The deferred removal/off-boarding path now exists. Three decisions:
   that deliberately bypasses `_bind_request` -- minted dream jobs and the
   sweeper (ADR 0025) -- re-checks retirement at execution time in
   `_run_dream_phase_with_usage`, closing the retire-between-scheduling-and-
-  execution race. The credential layer (`HostedApiKeyStore`) deliberately
+  execution race. That re-check raises `HostedScopeRetired`, which the
+  sweeper treats as never-run (the summarize watermark holds, since nothing
+  was summarized), and execution then proceeds against the freshly resolved
+  tenant so a replacement-database repoint between scheduling and execution
+  is honored rather than writing into the abandoned target. The credential layer (`HostedApiKeyStore`) deliberately
   stays retirement-unaware: adding a tenants/projects join to per-request key
   auth would add a hot-path read for no additional coverage.
 - **Active-project readers gate on tenant state.** `list_control_projects`

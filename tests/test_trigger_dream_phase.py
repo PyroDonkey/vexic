@@ -262,6 +262,53 @@ class TriggerDreamPhaseServiceTests(unittest.IsolatedAsyncioTestCase):
             ["running", "error"],
         )
 
+    async def test_queued_job_runs_on_repointed_database(self) -> None:
+        """A queued job must execute against the LIVE storage target.
+
+        `activate_replacement_database` bumps `generation` so pre-repoint
+        handles stop being authoritative; a job scheduled before the repoint
+        must not write summaries into the abandoned database.
+        """
+        from vexic.migration import (
+            export_canonical_migration,
+            import_canonical_migration,
+        )
+
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.DREAM_TRIGGER},
+            project_ids={"project-a"},
+        )
+        _seed_compactable_span(tenant.db_path)
+        artifact = self.root / "artifact.vexic"
+        replacement_db = self.root / "replacement.db"
+        export_canonical_migration(
+            str(tenant.db_path), str(artifact),
+            tenant_id="tenant-a", project_id="project-a",
+        )
+        import_canonical_migration(
+            str(artifact), str(replacement_db),
+            tenant_id="tenant-a", project_id="project-a",
+        )
+        service = self._make_service(ports=self._fake_ports())
+
+        result = await service.trigger_dream_phase(
+            api_key.raw_key,
+            TriggerDreamPhaseRequest(
+                scope=_scope(capabilities={MemoryCapability.DREAM_TRIGGER}),
+                phase=DreamPhase.SUMMARIZE,
+            ),
+        )
+        self.assertEqual(result.status, "scheduled")
+
+        self.catalog.activate_replacement_database("tenant-a", replacement_db)
+        await self._await_only_task(service)
+
+        self.assertGreater(_summary_row_count(replacement_db), 0)
+        self.assertEqual(_summary_row_count(tenant.db_path), 0)
+
     async def test_rate_bucket_consumed_exactly_once_per_trigger(self) -> None:
         tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
         api_key = self.keys.create_key(

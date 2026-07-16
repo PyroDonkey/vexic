@@ -434,6 +434,13 @@ class HostedRateLimitRule:
             raise ValueError("rate limit window_seconds must be at least 1.")
 
 
+class HostedScopeRetired(PermissionError):
+    """A minted dream job's scope was retired between scheduling and
+    execution (ADR 0028 addendum). Distinct from a phase that ran and
+    failed: the job never touched tenant memory, so the sweeper must hold
+    the summarize watermark rather than counting it as ran-and-failed."""
+
+
 class HostedRateLimitExceeded(RuntimeError):
     def __init__(self, retry_after_seconds: int) -> None:
         self.retry_after_seconds = max(1, retry_after_seconds)
@@ -1217,7 +1224,13 @@ class HostedMemoryService:
                     # A SUMMARIZE phase that started then raised is ran-and-failed
                     # (advances, anti-spend); one whose worker never started is
                     # never-run (held). Distinguish them by the worker signal.
-                    if request.phase is DreamPhase.SUMMARIZE and worker_started.is_set():
+                    # A retirement rejection raises before the phase touches
+                    # memory, so it is never-run even though the worker started.
+                    if (
+                        request.phase is DreamPhase.SUMMARIZE
+                        and worker_started.is_set()
+                        and not isinstance(exc, HostedScopeRetired)
+                    ):
                         summarize_ran = True
                     # Surface to the sweeper whether the failing phase durably
                     # recorded its terminal dream_runs row. The sweeper advances
@@ -1445,15 +1458,22 @@ class HostedMemoryService:
         # (ADR 0025), so a retirement landing between scheduling and
         # execution must be re-checked here before touching tenant memory
         # (ADR 0028 addendum).
-        live = self.catalog.get_tenant(tenant.tenant_id)
+        try:
+            live = self.catalog.get_tenant(tenant.tenant_id)
+        except PermissionError as exc:
+            raise HostedScopeRetired(str(exc)) from exc
         project_id = request.scope.project_id
         if project_id is not None and project_id not in live.project_ids:
-            raise PermissionError(
+            raise HostedScopeRetired(
                 "Memory scope project_id is not provisioned for tenant."
             )
         try:
+            # Execute against the LIVE tenant, not the captured one: a
+            # replacement-database repoint between scheduling and execution
+            # bumps `generation`, and the abandoned pre-repoint target must
+            # not receive the job's writes.
             return await _run_local_dream_phase_with_usage(
-                self._local_service(tenant),
+                self._local_service(live),
                 request,
             )
         except NotImplementedError as exc:
