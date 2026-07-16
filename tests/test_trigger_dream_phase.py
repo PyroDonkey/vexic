@@ -193,6 +193,75 @@ class TriggerDreamPhaseServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job_usage[-1].status, "ok")
         self.assertEqual(job_usage[-1].total_tokens, 10)
 
+    async def test_retire_tenant_between_trigger_and_run_blocks_worker(self) -> None:
+        """A retire landing after scheduling still cuts access (ADR 0028).
+
+        The minted dream job deliberately bypasses ``_bind_request`` at
+        execution time (ADR 0025), so the worker must re-check retirement
+        itself before touching tenant memory.
+        """
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.DREAM_TRIGGER},
+            project_ids={"project-a"},
+        )
+        _seed_compactable_span(tenant.db_path)
+        service = self._make_service(ports=self._fake_ports())
+
+        result = await service.trigger_dream_phase(
+            api_key.raw_key,
+            TriggerDreamPhaseRequest(
+                scope=_scope(capabilities={MemoryCapability.DREAM_TRIGGER}),
+                phase=DreamPhase.SUMMARIZE,
+            ),
+        )
+        self.assertEqual(result.status, "scheduled")
+
+        self.catalog.retire_tenant("tenant-a")
+        await self._await_only_task(service)
+
+        self.assertEqual(_summary_row_count(tenant.db_path), 0)
+        self.assertEqual(
+            [event.status for event in service.dream_trigger_job_events],
+            ["running", "error"],
+        )
+
+    async def test_retire_project_between_trigger_and_run_blocks_worker(self) -> None:
+        """Retiring the bound project after scheduling also blocks the worker."""
+        tenant = self.catalog.provision_tenant("tenant-a")
+        project = self.catalog.create_control_project("tenant-a", name="Alpha")
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.DREAM_TRIGGER},
+            project_ids={project.project_id},
+        )
+        _seed_compactable_span(tenant.db_path)
+        service = self._make_service(ports=self._fake_ports())
+
+        result = await service.trigger_dream_phase(
+            api_key.raw_key,
+            TriggerDreamPhaseRequest(
+                scope=_scope(
+                    project_id=project.project_id,
+                    capabilities={MemoryCapability.DREAM_TRIGGER},
+                ),
+                phase=DreamPhase.SUMMARIZE,
+            ),
+        )
+        self.assertEqual(result.status, "scheduled")
+
+        self.catalog.retire_control_project("tenant-a", project.project_id)
+        await self._await_only_task(service)
+
+        self.assertEqual(_summary_row_count(tenant.db_path), 0)
+        self.assertEqual(
+            [event.status for event in service.dream_trigger_job_events],
+            ["running", "error"],
+        )
+
     async def test_rate_bucket_consumed_exactly_once_per_trigger(self) -> None:
         tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
         api_key = self.keys.create_key(

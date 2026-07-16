@@ -1441,6 +1441,16 @@ class HostedMemoryService:
         request: RunDreamPhaseRequest,
         tenant: HostedTenant,
     ) -> tuple[RunDreamPhaseResult, UsageSummary]:
+        # Minted dream jobs bypass `_bind_request` at execution time
+        # (ADR 0025), so a retirement landing between scheduling and
+        # execution must be re-checked here before touching tenant memory
+        # (ADR 0028 addendum).
+        live = self.catalog.get_tenant(tenant.tenant_id)
+        project_id = request.scope.project_id
+        if project_id is not None and project_id not in live.project_ids:
+            raise PermissionError(
+                "Memory scope project_id is not provisioned for tenant."
+            )
         try:
             return await _run_local_dream_phase_with_usage(
                 self._local_service(tenant),

@@ -100,14 +100,17 @@ The deferred removal/off-boarding path now exists. Three decisions:
   no `hosted_projects` row keep routing). Retirement stays recoverable -- no
   canonical row is deleted and no key is revoked, so un-retiring restores
   access.
-- **Binding-level enforcement.** Every data-plane route passes through
-  `HostedMemoryService._bind_request`, which authorizes the request project
-  against the retirement-filtered `project_ids` and resolves the tenant via
-  `get_tenant`'s `active = 1` gate -- so `retire_control_project` and
-  `retire_tenant` both cut access at binding time. The credential layer
-  (`HostedApiKeyStore`) deliberately stays retirement-unaware: adding a
-  tenants/projects join to per-request key auth would add a hot-path read for
-  no additional coverage.
+- **Binding-level enforcement.** Every request-time data-plane route passes
+  through `HostedMemoryService._bind_request`, which authorizes the request
+  project against the retirement-filtered `project_ids` and resolves the
+  tenant via `get_tenant`'s `active = 1` gate -- so `retire_control_project`
+  and `retire_tenant` both cut access at binding time. The one execution path
+  that deliberately bypasses `_bind_request` -- minted dream jobs and the
+  sweeper (ADR 0025) -- re-checks retirement at execution time in
+  `_run_dream_phase_with_usage`, closing the retire-between-scheduling-and-
+  execution race. The credential layer (`HostedApiKeyStore`) deliberately
+  stays retirement-unaware: adding a tenants/projects join to per-request key
+  auth would add a hot-path read for no additional coverage.
 - **Active-project readers gate on tenant state.** `list_control_projects`
   and `get_control_project` exclude projects of inactive/retired tenants
   (`EXISTS ... tenants.active = 1`), failing closed with the existing
