@@ -385,7 +385,16 @@ def import_canonical_migration(
             for table_name in CANONICAL_TABLES:
                 rows_imported += _insert_rows(conn, table_name, artifact.tables[table_name])
         except BaseException:
-            conn.rollback()
+            # The rollback must never replace the original failure: on a
+            # deadline-poisoned remote connection the rollback round-trip
+            # itself raises, and letting that propagate would mask a
+            # non-retryable MutationOutcomeUnknown as a retryable timeout.
+            # The never-committed explicit transaction is discarded with the
+            # abandoned connection either way.
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             raise
         conn.commit()
 

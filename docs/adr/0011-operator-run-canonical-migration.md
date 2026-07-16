@@ -62,6 +62,12 @@ Decision: v1 artifacts are additive-tolerant.
   transaction. A bare `with conn:` opens no transaction on libSQL/Hrana (each
   statement auto-commits), so only the explicit transaction makes a failed
   import leave zero canonical rows behind on both backends.
+- Known limit, accepted: re-import conflict detection compares only the
+  columns present in the artifact, which is what keeps re-import of an older
+  artifact idempotent. A target row that diverges from the artifact only in a
+  column the artifact does not carry is therefore not flagged as a conflict.
+  The drill imports into a fresh replacement database, where such divergence
+  can only come from schema defaults filled by the same artifact.
 
 Cross-version behavior (export at schema N, import at schema N+1) is pinned by
 tests in `tests/test_operator_migration.py` and

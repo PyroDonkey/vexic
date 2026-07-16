@@ -200,3 +200,47 @@ def test_failed_import_rolls_back_on_libsql_target(monkeypatch, tmp_path):
 
     count = fake_conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
     assert count == 0
+
+
+def test_failed_import_propagates_original_error_when_rollback_raises(monkeypatch, tmp_path):
+    """A deadline-poisoned remote connection raises on the rollback round-trip
+    too; the import must still propagate the original failure rather than the
+    rollback's own error (which would mask a non-retryable
+    MutationOutcomeUnknown as a retryable timeout)."""
+    source_db = tmp_path / "source.db"
+    artifact = tmp_path / "canonical-migration.json"
+
+    init_db(str(source_db))
+    ingest_source_messages(
+        str(source_db),
+        [_source_message("cedar migration transcript")],
+        session_id="session-a",
+        agent_id="agent-a",
+    )
+    export_canonical_migration(
+        str(source_db),
+        artifact,
+        tenant_id="tenant-a",
+        project_id="project-a",
+    )
+    payload = json.loads(artifact.read_text())
+    payload["tables"]["long_term_memory"] = [{"id": 1, "bogus_column": 1}]
+    artifact.write_text(json.dumps(payload))
+
+    class _RollbackRaisingFakeConn(AutocommitFakeLibsqlConn):
+        def rollback(self) -> None:
+            raise RuntimeError("connection poisoned: rollback round-trip failed")
+
+    fake_conn = _RollbackRaisingFakeConn()
+    _patch_connect_to_fake(monkeypatch, fake_conn)
+    target = StorageTarget(
+        "libsql://fake-migration-rollback-raises-target", auth_token="s3cr3t-token"
+    )
+
+    with pytest.raises(ValueError, match="columns"):
+        import_canonical_migration(
+            artifact,
+            target,
+            tenant_id="tenant-a",
+            project_id="project-a",
+        )
