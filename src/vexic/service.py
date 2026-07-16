@@ -963,7 +963,7 @@ async def _run_dream_phase_with_usage(
     if request.phase is DreamPhase.LIGHT:
         from vexic.pipeline import run_light_phase
 
-        usage = await run_light_phase(
+        outcome = await run_light_phase(
             service.db_path,
             ports.model_group,
             agent_id=request.scope.agent_id,
@@ -973,6 +973,14 @@ async def _run_dream_phase_with_usage(
             forbidden_secret_values=service._redaction_values(request.redaction),
             content_codec=service.content_codec,
         )
+        # ADR 0031 amendment: a run that extracted candidates and kept none
+        # (all dropped for bad provenance) is partial, not a silent ok.
+        status = (
+            "partial"
+            if outcome.candidates_dropped and not outcome.candidates_kept
+            else "ok"
+        )
+        return RunDreamPhaseResult(phase=request.phase, status=status), outcome.usage
     elif request.phase is DreamPhase.REM:
         from vexic.rem import run_rem_phase
 
@@ -996,7 +1004,7 @@ async def _run_dream_phase_with_usage(
     elif request.phase is DreamPhase.SUMMARIZE:
         from vexic.summarize import run_summarize_phase
 
-        usage = await run_summarize_phase(
+        outcome = await run_summarize_phase(
             service.db_path,
             ports.model_group,
             agent_id=request.scope.agent_id,
@@ -1006,6 +1014,15 @@ async def _run_dream_phase_with_usage(
             content_codec=service.content_codec,
             daily_span_budget=ports.daily_span_budget,
         )
+        # Per-session isolation swallows individual session failures so the
+        # rest of the sweep proceeds; the phase outcome must still say so.
+        if outcome.sessions_failed == 0:
+            status = "ok"
+        elif outcome.sessions_failed < outcome.sessions_considered:
+            status = "partial"
+        else:
+            status = "error"
+        return RunDreamPhaseResult(phase=request.phase, status=status), outcome.usage
     else:
         raise ValueError(f"Unsupported dream phase: {request.phase!r}")
 

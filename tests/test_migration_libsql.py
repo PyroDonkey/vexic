@@ -13,7 +13,11 @@ from pathlib import Path
 
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
-from tests.fakes.libsql import FakeLibsqlConn
+import json
+
+import pytest
+
+from tests.fakes.libsql import AutocommitFakeLibsqlConn, FakeLibsqlConn
 from vexic.migration import export_canonical_migration, import_canonical_migration
 from vexic.storage import SourceTranscriptInput, ingest_source_messages, init_db
 from vexic.storage import single_message_adapter
@@ -151,3 +155,152 @@ def test_import_canonical_migration_accepts_libsql_storage_target(monkeypatch, t
         "SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'cedar'"
     ).fetchall()
     assert len(fts_rows) == 1
+
+
+def test_failed_import_rolls_back_on_libsql_target(monkeypatch, tmp_path):
+    """The canonical-row insert loop must be one explicit transaction on a
+    libSQL target. `AutocommitFakeLibsqlConn` emulates libSQL/Hrana
+    per-statement autocommit, so under a bare `with conn:` the earlier-table
+    inserts would already be committed when a later table fails validation;
+    only an explicit BEGIN/rollback leaves zero canonical rows behind."""
+    source_db = tmp_path / "source.db"
+    artifact = tmp_path / "canonical-migration.json"
+
+    init_db(str(source_db))
+    ingest_source_messages(
+        str(source_db),
+        [_source_message("cedar migration transcript")],
+        session_id="session-a",
+        agent_id="agent-a",
+    )
+    export_canonical_migration(
+        str(source_db),
+        artifact,
+        tenant_id="tenant-a",
+        project_id="project-a",
+    )
+    payload = json.loads(artifact.read_text())
+    # messages imports first; a later canonical table then fails validation.
+    payload["tables"]["long_term_memory"] = [{"id": 1, "bogus_column": 1}]
+    artifact.write_text(json.dumps(payload))
+
+    fake_conn = AutocommitFakeLibsqlConn()
+    _patch_connect_to_fake(monkeypatch, fake_conn)
+    # Distinct DSN: the schema init-once memo is keyed by DSN and persists
+    # across tests in the process, and this fake target starts schema-less.
+    target = StorageTarget("libsql://fake-migration-rollback-target", auth_token="s3cr3t-token")
+
+    with pytest.raises(ValueError, match="columns"):
+        import_canonical_migration(
+            artifact,
+            target,
+            tenant_id="tenant-a",
+            project_id="project-a",
+        )
+
+    count = fake_conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    assert count == 0
+
+
+def test_import_fails_closed_on_host_owned_table_for_raw_libsql_string_target(
+    monkeypatch, tmp_path
+):
+    """A raw ``libsql://`` DSN string (not a ``StorageTarget``) must hit the
+    same pre-import host-owned-table probe as a ``StorageTarget``.
+    ``Path(dsn).exists()`` is always False, so branching a DSN string into the
+    local-path form silently skips the fail-closed guard while ``connect()``
+    still routes the import to the remote database."""
+    source_db = tmp_path / "source.db"
+    artifact = tmp_path / "canonical-migration.json"
+
+    init_db(str(source_db))
+    ingest_source_messages(
+        str(source_db),
+        [_source_message("cedar migration transcript")],
+        session_id="session-a",
+        agent_id="agent-a",
+    )
+    export_canonical_migration(
+        str(source_db),
+        artifact,
+        tenant_id="tenant-a",
+        project_id="project-a",
+    )
+
+    import vexic.migration as migration
+    import vexic.storage.schema as storage_schema
+    import vexic.storage.operators as storage_operators
+    import vexic.storage.transcript as storage_transcript
+
+    dsn = "libsql://fake-migration-raw-string-target"
+    fake_conn = FakeLibsqlConn()
+    fake_conn.execute("CREATE TABLE background_tool_audit (id INTEGER PRIMARY KEY)")
+
+    def _fake_connect(target, *, auth_token=None, **kwargs):
+        assert target == dsn, f"expected the raw DSN string target, got {target!r}"
+        return _NonClosingFakeConnHandle(fake_conn)
+
+    for module in (migration, storage_schema, storage_operators, storage_transcript):
+        monkeypatch.setattr(module, "connect", _fake_connect)
+
+    with pytest.raises(ValueError, match="host-owned extension table"):
+        import_canonical_migration(
+            artifact,
+            dsn,
+            tenant_id="tenant-a",
+            project_id="project-a",
+        )
+
+    # Fail-closed means the guard fired before any schema init or row insert
+    # touched the remote target.
+    tables = [
+        row[0]
+        for row in fake_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    ]
+    assert "messages" not in tables
+
+
+def test_failed_import_propagates_original_error_when_rollback_raises(monkeypatch, tmp_path):
+    """A deadline-poisoned remote connection raises on the rollback round-trip
+    too; the import must still propagate the original failure rather than the
+    rollback's own error (which would mask a non-retryable
+    MutationOutcomeUnknown as a retryable timeout)."""
+    source_db = tmp_path / "source.db"
+    artifact = tmp_path / "canonical-migration.json"
+
+    init_db(str(source_db))
+    ingest_source_messages(
+        str(source_db),
+        [_source_message("cedar migration transcript")],
+        session_id="session-a",
+        agent_id="agent-a",
+    )
+    export_canonical_migration(
+        str(source_db),
+        artifact,
+        tenant_id="tenant-a",
+        project_id="project-a",
+    )
+    payload = json.loads(artifact.read_text())
+    payload["tables"]["long_term_memory"] = [{"id": 1, "bogus_column": 1}]
+    artifact.write_text(json.dumps(payload))
+
+    class _RollbackRaisingFakeConn(AutocommitFakeLibsqlConn):
+        def rollback(self) -> None:
+            raise RuntimeError("connection poisoned: rollback round-trip failed")
+
+    fake_conn = _RollbackRaisingFakeConn()
+    _patch_connect_to_fake(monkeypatch, fake_conn)
+    target = StorageTarget(
+        "libsql://fake-migration-rollback-raises-target", auth_token="s3cr3t-token"
+    )
+
+    with pytest.raises(ValueError, match="columns"):
+        import_canonical_migration(
+            artifact,
+            target,
+            tenant_id="tenant-a",
+            project_id="project-a",
+        )

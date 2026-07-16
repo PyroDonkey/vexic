@@ -38,3 +38,37 @@ ownership of extension-table semantics.
   spoofing rejection, cross-tenant isolation, redaction fail-closed behavior,
   retry/idempotency, rollback before catalog repoint, atomic one-active-database
   catalog state, projection rebuild, and schema/version mismatch handling.
+
+## Addendum - 2026-07-16: v1 artifact compatibility is additive-tolerant (COA-387)
+
+The original import required each artifact row's column set to exactly equal
+the current target schema's columns, so every additive `_ensure_column`
+schema migration silently invalidated all previously exported v1 artifacts
+while `ARTIFACT_VERSION` still claimed they were supported.
+
+Decision: v1 artifacts are additive-tolerant.
+
+- The importer accepts artifact rows that are missing columns the target
+  schema has. Missing columns are omitted from the insert so the storage
+  backend fills the schema `DEFAULT` (or `NULL` for a nullable column with no
+  default).
+- Import fails closed when a missing column is `NOT NULL` with no default
+  (no safe fill exists), when artifact rows carry columns unknown to the
+  target schema, and when rows within one table carry mixed column sets.
+- `ARTIFACT_VERSION` stays `vexic.canonical-migration.v1` across additive
+  schema changes. A version bump is reserved for column renames, removals, or
+  semantic changes that additive tolerance cannot absorb.
+- The canonical-row insert loop runs inside one explicit `BEGIN`/`COMMIT`
+  transaction. A bare `with conn:` opens no transaction on libSQL/Hrana (each
+  statement auto-commits), so only the explicit transaction makes a failed
+  import leave zero canonical rows behind on both backends.
+- Known limit, accepted: re-import conflict detection compares only the
+  columns present in the artifact, which is what keeps re-import of an older
+  artifact idempotent. A target row that diverges from the artifact only in a
+  column the artifact does not carry is therefore not flagged as a conflict.
+  The drill imports into a fresh replacement database, where such divergence
+  can only come from schema defaults filled by the same artifact.
+
+Cross-version behavior (export at schema N, import at schema N+1) is pinned by
+tests in `tests/test_operator_migration.py` and
+`tests/test_migration_libsql.py`.

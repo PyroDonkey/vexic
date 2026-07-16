@@ -591,6 +591,128 @@ class OperatorMigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(catalog.get_tenant("tenant-a").db_path, old_tenant.db_path)
         self.assertFalse(self.target_db.exists())
 
+    def _export_artifact_payload(self) -> dict:
+        from vexic.migration import export_canonical_migration
+
+        self._seed_source()
+        export_canonical_migration(
+            str(self.source_db),
+            self.artifact,
+            tenant_id="tenant-a",
+            project_id="project-a",
+        )
+        return json.loads(self.artifact.read_text())
+
+    def _strip_additive_columns(self, payload: dict) -> dict:
+        # Simulates a v1 artifact exported before the additive `_ensure_column`
+        # migrations that added dream_runs.candidates_dropped (NOT NULL
+        # DEFAULT 0) and long_term_memory.occurred_at (nullable, no default).
+        for row in payload["tables"]["dream_runs"]:
+            del row["candidates_dropped"]
+        for row in payload["tables"]["long_term_memory"]:
+            del row["occurred_at"]
+        return payload
+
+    def test_import_fills_missing_additive_columns_from_schema_defaults(self) -> None:
+        from vexic.migration import import_canonical_migration
+
+        payload = self._strip_additive_columns(self._export_artifact_payload())
+        self.assertTrue(payload["tables"]["dream_runs"])
+        self.assertTrue(payload["tables"]["long_term_memory"])
+        self.artifact.write_text(json.dumps(payload))
+
+        report = import_canonical_migration(
+            self.artifact,
+            str(self.target_db),
+            tenant_id="tenant-a",
+            project_id="project-a",
+        )
+
+        self.assertGreater(report.rows_imported, 0)
+        with closing(sqlite3.connect(self.target_db)) as conn:
+            dropped = conn.execute("SELECT candidates_dropped FROM dream_runs").fetchall()
+            occurred = conn.execute("SELECT occurred_at FROM long_term_memory").fetchall()
+        self.assertEqual({row[0] for row in dropped}, {0})
+        self.assertEqual({row[0] for row in occurred}, {None})
+
+    def test_import_of_column_stripped_artifact_is_idempotent(self) -> None:
+        from vexic.migration import import_canonical_migration
+
+        payload = self._strip_additive_columns(self._export_artifact_payload())
+        self.artifact.write_text(json.dumps(payload))
+
+        first = import_canonical_migration(
+            self.artifact,
+            str(self.target_db),
+            tenant_id="tenant-a",
+            project_id="project-a",
+        )
+        second = import_canonical_migration(
+            self.artifact,
+            str(self.target_db),
+            tenant_id="tenant-a",
+            project_id="project-a",
+        )
+
+        self.assertGreater(first.rows_imported, 0)
+        self.assertEqual(second.rows_imported, 0)
+
+    def test_import_fails_closed_on_missing_not_null_column_without_default(self) -> None:
+        from vexic.migration import import_canonical_migration
+
+        payload = self._export_artifact_payload()
+        for row in payload["tables"]["messages"]:
+            del row["message_json"]
+        self.artifact.write_text(json.dumps(payload))
+
+        with self.assertRaisesRegex(ValueError, r"messages.*message_json"):
+            import_canonical_migration(
+                self.artifact,
+                str(self.target_db),
+                tenant_id="tenant-a",
+                project_id="project-a",
+            )
+
+    def test_import_rejects_mixed_column_sets_within_table(self) -> None:
+        from vexic.migration import import_canonical_migration
+
+        payload = self._export_artifact_payload()
+        extra_row = dict(payload["tables"]["messages"][0])
+        extra_row["id"] = 999
+        del extra_row["agent_id"]
+        payload["tables"]["messages"].append(extra_row)
+        self.artifact.write_text(json.dumps(payload))
+
+        with self.assertRaisesRegex(ValueError, r"messages.*mixed column sets"):
+            import_canonical_migration(
+                self.artifact,
+                str(self.target_db),
+                tenant_id="tenant-a",
+                project_id="project-a",
+            )
+
+    def test_failed_import_rolls_back_all_canonical_rows(self) -> None:
+        from vexic.migration import import_canonical_migration
+
+        payload = self._export_artifact_payload()
+        # messages imports cleanly; long_term_memory (a later canonical table)
+        # then fails validation, which must roll back the whole import.
+        self.assertTrue(payload["tables"]["long_term_memory"])
+        payload["tables"]["long_term_memory"][0]["bogus_column"] = 1
+        self.artifact.write_text(json.dumps(payload))
+
+        with self.assertRaisesRegex(ValueError, "columns"):
+            import_canonical_migration(
+                self.artifact,
+                str(self.target_db),
+                tenant_id="tenant-a",
+                project_id="project-a",
+            )
+
+        with closing(sqlite3.connect(self.target_db)) as conn:
+            count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        self.assertEqual(count, 0)
+
     def _table_names(self, db_path: Path) -> set[str]:
         with closing(sqlite3.connect(db_path)) as conn:
             return {

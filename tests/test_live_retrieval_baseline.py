@@ -423,7 +423,16 @@ class LiveRetrievalBaselineTests(unittest.TestCase):
                     ]
 
                     def usage(self):
-                        return type("Usage", (), {"requests": 1})()
+                        return type(
+                            "Usage",
+                            (),
+                            {
+                                "requests": 1,
+                                "input_tokens": 1,
+                                "output_tokens": 1,
+                                "total_tokens": 2,
+                            },
+                        )()
 
                 class _ExtractionAgent:
                     async def run(self, transcript):
@@ -509,7 +518,16 @@ class LiveRetrievalBaselineTests(unittest.TestCase):
 
         class _Result:
             def usage(self) -> object:
-                return type("Usage", (), {"requests": 2})()
+                return type(
+                    "Usage",
+                    (),
+                    {
+                        "requests": 2,
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                )()
 
         class _Agent:
             async def run(self, *, usage_limits=None) -> _Result:

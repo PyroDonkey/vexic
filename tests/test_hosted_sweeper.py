@@ -86,6 +86,15 @@ class _FailingAgent:
         raise RuntimeError("model call failed")
 
 
+class _NotImplementedAgent:
+    """Fake agent modelling a partially-wired host port: run raises
+    NotImplementedError, which the hosted dream boundary rewraps as
+    HostPortNotConfigured (`_run_dream_phase_with_usage`)."""
+
+    async def run(self, prompt: str, **kwargs: object) -> object:
+        raise NotImplementedError("adapter not wired")
+
+
 EMBEDDING_DIM = 384
 
 
@@ -479,6 +488,99 @@ class CrossProcessDreamLeaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(after)
         await asyncio.gather(*list(incoming._background_tasks))
 
+    async def test_stalled_recorder_cannot_suppress_a_newer_failures_backoff(
+        self,
+    ) -> None:
+        """Rolling-deploy stamp-race acceptance (ADR 0030 amendment): container
+        A succeeds at T0 and releases its
+        lease, but its recorder stalls on a slow control-plane write. Container
+        B acquires the freed lease, fails unrecorded at T1 > T0, and stamps the
+        failure. When A's recorder finally lands at T2 > T1, its completion
+        stamp must carry T0 -- losing to the newer failure -- so the scope
+        re-arms on the short failure backoff instead of the 24h success clock
+        suppressing the retry."""
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        self.clock_now = NOW
+        clock = lambda: self.clock_now  # noqa: E731
+        config = DreamSweeperConfig(
+            stagger_seconds=0.0, dream_failure_backoff_seconds=3600
+        )
+        ports_ok = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _FakeAgent("a fake summary"),
+            extraction_agent_factory=lambda *_a, **_k: _FakeAgent([]),
+        )
+        ports_failing = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _FakeAgent("a fake summary"),
+            extraction_agent_factory=lambda *_a, **_k: _FailingAgent(),
+        )
+        service_a = self._service(ports_ok)
+        service_b = self._service(ports_failing)
+        sweeper_a = DreamSweeper(service_a, config, clock=clock)
+        sweeper_b = DreamSweeper(service_b, config, clock=clock)
+
+        # Stall A's recorder between job completion (lease released in the
+        # job's own finally) and the stamp write. B's failing chain stops at
+        # LIGHT, so B never reaches the watermark write and is not gated.
+        entered = threading.Event()
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        original = self.catalog.record_summarize_watermark
+
+        def gated_watermark(*args: object, **kwargs: object) -> object:
+            entered.set()
+            gate.wait()
+            return original(*args, **kwargs)
+
+        def always_502(*_a: object, **_k: object) -> object:
+            raise ValueError(
+                "Hrana: `api error: `status=502 Bad Gateway, "
+                'body={"error":"connect to upstream failed"}``'
+            )
+
+        with patch.object(
+            self.catalog, "record_summarize_watermark", gated_watermark
+        ):
+            # T0: A's chain succeeds and releases the lease; its recorder is
+            # now stalled before minting any stamp.
+            report_a = await sweeper_a.tick(now=NOW)
+            self.assertEqual(report_a.dreams_scheduled, 1)
+            for _ in range(500):
+                if entered.is_set():
+                    break
+                await asyncio.sleep(0.02)
+            else:
+                self.fail("container A's recorder never reached the stall point")
+
+            # T1: B acquires the freed lease (the accepted duplicate-run
+            # window) and fails without durably recording.
+            self.clock_now = t1 = NOW + timedelta(minutes=30)
+            with patch("vexic.pipeline.commit_dream_cycle", side_effect=always_502):
+                report_b = await sweeper_b.tick(now=t1)
+                while service_b._background_tasks:
+                    await asyncio.gather(*list(service_b._background_tasks))
+            self.assertEqual(report_b.dreams_scheduled, 1)
+            state = self.catalog.dream_sweep_state("tenant-a", None)
+            self.assertEqual(state.last_dream_failed_at, t1.isoformat())
+
+            # T2: A's stale recorder finally lands.
+            self.clock_now = NOW + timedelta(hours=2)
+            gate.set()
+            while service_a._background_tasks:
+                await asyncio.gather(*list(service_a._background_tasks))
+
+        state = self.catalog.dream_sweep_state("tenant-a", None)
+        # A's stamp carries its job-completion time T0, not recorder-run T2.
+        self.assertEqual(state.last_dream_completed_at, NOW.isoformat())
+        self.assertEqual(state.last_dream_failed_at, t1.isoformat())
+        # The newer failure governs: short backoff, not the 24h success clock.
+        self.assertFalse(sweeper_b._dream_is_due(state, t1 + timedelta(minutes=30)))
+        self.assertTrue(sweeper_b._dream_is_due(state, t1 + timedelta(minutes=61)))
+
 
 class DreamSweeperTickTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
@@ -706,6 +808,29 @@ class DreamSweeperTickTests(unittest.IsolatedAsyncioTestCase):
             state.last_summarize_watermark, self._scope_watermark(tenant.db_path)
         )
 
+    async def test_retire_tenant_between_tick_and_run_holds_watermark(self) -> None:
+        """A sweep job blocked by the execution-time retirement gate never
+        summarized anything, so the watermark must hold (ADR 0028 addendum).
+
+        Distinct from ran-and-failed (advances, anti-spend): the retirement
+        gate rejects before the phase touches memory, so re-provisioning the
+        tenant must let the next tick still see those rows as new.
+        """
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        service = self._service(_summary_ports())
+        sweeper = self._sweeper(service)
+
+        report = await sweeper.tick(now=NOW)
+        self.assertEqual(report.summarize_scheduled, 1)
+
+        self.catalog.retire_tenant("tenant-a")
+        await self._drain_background(service)
+
+        self.assertEqual(_summary_row_count(tenant.db_path), 0)
+        state = self.catalog.dream_sweep_state("tenant-a", None)
+        self.assertEqual(state.last_summarize_watermark, 0)
+
     async def test_failed_summarize_run_still_advances_watermark(self) -> None:
         """Deliberate spend posture: the job ran, its errors are in job
         events, and re-sweeping a persistently failing tenant every tick
@@ -729,6 +854,78 @@ class DreamSweeperTickTests(unittest.IsolatedAsyncioTestCase):
             state.last_summarize_watermark, self._scope_watermark(tenant.db_path)
         )
 
+    async def test_never_run_summarize_holds_watermark(self) -> None:
+        """A dream chain that fails before SUMMARIZE never summarized those
+        rows, so the watermark must NOT advance over them. Distinct
+        from a summarize that ran-and-failed (advances, anti-spend): here Light
+        fails first and the chain returns before SUMMARIZE executes. Advancing
+        would make the next tick see no new messages and strand the span
+        unsummarized until a fresh message arrives.
+        """
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _FakeAgent("a fake summary"),
+            extraction_agent_factory=lambda *_a, **_k: _FailingAgent(),
+        )
+        service = self._service(ports)
+        sweeper = self._sweeper(service)
+
+        report = await sweeper.tick(now=NOW)
+        await self._drain_background(service)
+
+        # Light failed first: the chain returned before SUMMARIZE ever ran.
+        self.assertEqual(report.dreams_scheduled, 1)
+        self.assertEqual(_summary_row_count(tenant.db_path), 0)
+        state = self.catalog.dream_sweep_state("tenant-a", None)
+        # The dream stamp still advances — the failure is durably recorded —
+        # but the summarize watermark is withheld: those rows were never
+        # summarized, so the next tick must still see them as new.
+        self.assertEqual(state.last_dream_completed_at, NOW.isoformat())
+        self.assertEqual(state.last_summarize_watermark, 0)
+
+    async def test_summarize_dispatch_failure_holds_watermark(self) -> None:
+        """`summarize_ran` must reflect the SUMMARIZE phase actually beginning
+        execution, not merely being dispatched. Light/REM/Deep succeed, but the
+        SUMMARIZE worker dispatch itself fails (executor shutdown), so the phase
+        never runs. The watermark must be held: a dispatch failure is a
+        never-ran summarize, not the ran-and-failed case that advances.
+        """
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _FakeAgent("a fake summary"),
+            extraction_agent_factory=lambda *_a, **_k: _FakeAgent([]),
+        )
+        service = self._service(ports)
+        sweeper = self._sweeper(service)
+
+        real_to_thread = asyncio.to_thread
+        worker_calls = {"n": 0}
+
+        async def flaky_dispatch(func, /, *args, **kwargs):  # type: ignore[no-untyped-def]
+            # Only the dream phase worker matters; catalog reads and the
+            # recorder's own writes pass through unchanged.
+            if getattr(func, "__name__", "") == "_run_in_worker_thread":
+                worker_calls["n"] += 1
+                # LIGHT, REM, DEEP dispatch fine; the 4th (SUMMARIZE) worker
+                # never starts.
+                if worker_calls["n"] == 4:
+                    raise RuntimeError("cannot schedule new futures after shutdown")
+            return await real_to_thread(func, *args, **kwargs)
+
+        with patch("asyncio.to_thread", flaky_dispatch):
+            await sweeper.tick(now=NOW)
+            await self._drain_background(service)
+
+        self.assertEqual(worker_calls["n"], 4)
+        state = self.catalog.dream_sweep_state("tenant-a", None)
+        self.assertEqual(state.last_summarize_watermark, 0)
+
     async def test_failed_dream_chain_still_records_completion(self) -> None:
         """Pins the deliberate stamp-on-failure posture for dream chains
         (see `_record_sweep_state_after`): a failing chain must not re-dream
@@ -750,10 +947,402 @@ class DreamSweeperTickTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report.dreams_scheduled, 1)
         state = self.catalog.dream_sweep_state("tenant-a", None)
         self.assertEqual(state.last_dream_completed_at, NOW.isoformat())
+        # A durably-recorded failure advances the 24h clock; it does NOT set the
+        # short-backoff failure timestamp -- the two are mutually
+        # exclusive, so the retry waits the full interval, not the backoff.
+        self.assertIsNone(state.last_dream_failed_at)
+
+        # The failure that advanced the clock is durably queryable, not silent:
+        # advancing is only safe because the operator can find this row.
+        with closing(sqlite3.connect(tenant.db_path)) as conn:
+            error_rows = conn.execute(
+                "SELECT COUNT(*) FROM dream_runs WHERE status = 'error'"
+            ).fetchone()[0]
+        self.assertGreater(error_rows, 0)
 
         report_two = await sweeper.tick(now=NOW + timedelta(hours=1))
         await self._drain_background(service)
         self.assertEqual(report_two.dreams_scheduled, 0)
+
+    async def test_dream_clock_holds_when_failure_unrecorded(self) -> None:
+        """A dream phase that fails AND cannot durably record its
+        terminal error row must NOT advance the 24h retry clock. Advancing over
+        a silent failure is what stalled Tier 3 ~38h live. Instead of the 24h
+        success interval, the withheld-stamp scope re-arms after the short
+        failure backoff: a transient fault recovers within ~one
+        backoff window, but a persistent unrecorded failure retries at
+        backoff-cadence, not every tick."""
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _FakeAgent("a fake summary"),
+            extraction_agent_factory=lambda *_a, **_k: _FailingAgent(),
+        )
+        service = self._service(ports)
+        sweeper = self._sweeper(service, dream_failure_backoff_seconds=3600)
+
+        def always_502(*_a: object, **_k: object) -> object:
+            # The failing Light phase's error-row write itself hits a persistent
+            # retryable Turso fault, so no dream_runs row lands: unrecorded.
+            raise ValueError(
+                "Hrana: `api error: `status=502 Bad Gateway, "
+                'body={"error":"connect to upstream failed"}``'
+            )
+
+        with patch("vexic.pipeline.commit_dream_cycle", side_effect=always_502):
+            report = await sweeper.tick(now=NOW)
+            await self._drain_background(service)
+
+        self.assertEqual(report.dreams_scheduled, 1)
+        state = self.catalog.dream_sweep_state("tenant-a", None)
+        # 24h success clock stays withheld; the failure timestamp records so the
+        # short backoff, not the tick cadence, governs the retry.
+        self.assertIsNone(state.last_dream_completed_at)
+        self.assertEqual(state.last_dream_failed_at, NOW.isoformat())
+
+        # Inside the backoff window: NOT re-scheduled (this is the every-tick
+        # hammer the failure backoff closes).
+        report_two = await sweeper.tick(now=NOW + timedelta(minutes=30))
+        await self._drain_background(service)
+        self.assertEqual(report_two.dreams_scheduled, 0)
+
+        # Past the backoff window: re-armed.
+        report_three = await sweeper.tick(now=NOW + timedelta(minutes=61))
+        await self._drain_background(service)
+        self.assertEqual(report_three.dreams_scheduled, 1)
+
+    async def test_fresh_unrecorded_failure_overrides_stale_completion(self) -> None:
+        """A withheld-stamp failure newer than the last completion re-arms on
+        the short backoff, NOT the 24h success clock: a stale `completed_at`
+        must not re-open the every-tick hammer once a fresh failure has landed
+        (most-recent-failure precedence)."""
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        # A completion older than the 24h interval: on its own this scope is due.
+        stale = NOW - timedelta(hours=25)
+        self.catalog.record_dream_completed("tenant-a", None, stale.isoformat())
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _FakeAgent("a fake summary"),
+            extraction_agent_factory=lambda *_a, **_k: _FailingAgent(),
+        )
+        service = self._service(ports)
+        sweeper = self._sweeper(service, dream_failure_backoff_seconds=3600)
+
+        def always_502(*_a: object, **_k: object) -> object:
+            raise ValueError(
+                "Hrana: `api error: `status=502 Bad Gateway, "
+                'body={"error":"connect to upstream failed"}``'
+            )
+
+        with patch("vexic.pipeline.commit_dream_cycle", side_effect=always_502):
+            report = await sweeper.tick(now=NOW)
+            await self._drain_background(service)
+
+        self.assertEqual(report.dreams_scheduled, 1)
+        state = self.catalog.dream_sweep_state("tenant-a", None)
+        self.assertEqual(state.last_dream_completed_at, stale.isoformat())
+        self.assertEqual(state.last_dream_failed_at, NOW.isoformat())
+
+        # The stale completion is >24h old, but the fresh failure governs: the
+        # short backoff, not the elapsed 24h, decides due-ness.
+        report_two = await sweeper.tick(now=NOW + timedelta(minutes=30))
+        await self._drain_background(service)
+        self.assertEqual(report_two.dreams_scheduled, 0)
+
+        report_three = await sweeper.tick(now=NOW + timedelta(minutes=61))
+        await self._drain_background(service)
+        self.assertEqual(report_three.dreams_scheduled, 1)
+
+    async def test_job_outcome_carries_completion_time_captured_under_the_lease(
+        self,
+    ) -> None:
+        """The job mints its own terminal timestamp while it still holds the
+        durable lease, so a stalled recorder later persists job-completion
+        time -- not a fresher recorder-run time that could outrank another
+        container's newer failure stamp (ADR 0030 amendment)."""
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        service = self._service(_summary_ports())
+
+        task = service.schedule_system_dream(
+            "tenant-a",
+            agent_id=None,
+            phases=(DreamPhase.SUMMARIZE,),
+            clock=lambda: NOW,
+        )
+        assert task is not None
+        outcome = await task
+
+        self.assertEqual(outcome.finished_at, NOW)
+
+    async def test_failing_job_outcome_carries_failure_time_captured_under_the_lease(
+        self,
+    ) -> None:
+        """A failing chain's terminal time is also minted under the lease, so
+        the eventual failure stamp orders correctly against other containers'
+        stamps regardless of when the recorder runs."""
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _FakeAgent("a fake summary"),
+            extraction_agent_factory=lambda *_a, **_k: _FailingAgent(),
+        )
+        service = self._service(ports)
+
+        task = service.schedule_system_dream(
+            "tenant-a",
+            agent_id=None,
+            phases=(DreamPhase.LIGHT,),
+            clock=lambda: NOW,
+        )
+        assert task is not None
+        outcome = await task
+
+        self.assertEqual(outcome.finished_at, NOW)
+
+    async def test_recorder_persists_job_completion_time_not_recorder_run_time(
+        self,
+    ) -> None:
+        """The completion stamp must carry the time the chain finished under
+        the lease, not the time the recorder finally got to write it. A
+        recorder stalled past another container's failure would otherwise mint
+        a fresher completion that suppresses that failure's short backoff for
+        up to 24h (ADR 0030 amendment)."""
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _FakeAgent("a fake summary"),
+            extraction_agent_factory=lambda *_a, **_k: _FakeAgent([]),
+        )
+        service = self._service(ports)
+        sweeper = self._sweeper(service)
+
+        # Stall the recorder between the job finishing (lease released) and
+        # the stamp write: the watermark write runs first, so gating it holds
+        # the recorder in exactly the rolling-deploy stamp-race window the
+        # ADR 0030 amendment describes.
+        entered = threading.Event()
+        gate = threading.Event()
+        original = self.catalog.record_summarize_watermark
+
+        def gated_watermark(*args: object, **kwargs: object) -> object:
+            entered.set()
+            gate.wait()
+            return original(*args, **kwargs)
+
+        with patch.object(
+            self.catalog, "record_summarize_watermark", gated_watermark
+        ):
+            await sweeper.tick(now=NOW)
+            for _ in range(200):
+                if entered.is_set():
+                    break
+                await asyncio.sleep(0.02)
+            else:
+                self.fail("recorder never reached the watermark write")
+            # Recorder-run time diverges from job-completion time.
+            self.clock_now = NOW + timedelta(hours=2)
+            gate.set()
+            await self._drain_background(service)
+
+        state = self.catalog.dream_sweep_state("tenant-a", None)
+        self.assertEqual(state.last_dream_completed_at, NOW.isoformat())
+
+    async def test_escalated_failure_stamp_uses_job_time_not_recorder_run_time(
+        self,
+    ) -> None:
+        """A completion write that fails escalates to the failure-backoff
+        stamp; that stamp must also carry the job's lease-held terminal time,
+        not the recorder's later wall clock."""
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _FakeAgent("a fake summary"),
+            extraction_agent_factory=lambda *_a, **_k: _FakeAgent([]),
+        )
+        service = self._service(ports)
+        sweeper = self._sweeper(service, dream_failure_backoff_seconds=3600)
+
+        entered = threading.Event()
+        gate = threading.Event()
+        original = self.catalog.record_summarize_watermark
+
+        def gated_watermark(*args: object, **kwargs: object) -> object:
+            entered.set()
+            gate.wait()
+            return original(*args, **kwargs)
+
+        def broken_completion(*_a: object, **_k: object) -> None:
+            raise RuntimeError("control-plane completion write failed")
+
+        self.catalog.record_dream_completed = broken_completion
+        try:
+            with (
+                patch.object(
+                    self.catalog, "record_summarize_watermark", gated_watermark
+                ),
+                self.assertLogs("vexic.hosted_sweeper", level="ERROR"),
+            ):
+                await sweeper.tick(now=NOW)
+                for _ in range(200):
+                    if entered.is_set():
+                        break
+                    await asyncio.sleep(0.02)
+                else:
+                    self.fail("recorder never reached the watermark write")
+                self.clock_now = NOW + timedelta(hours=2)
+                gate.set()
+                await self._drain_background(service)
+        finally:
+            del self.catalog.record_dream_completed
+
+        state = self.catalog.dream_sweep_state("tenant-a", None)
+        self.assertIsNone(state.last_dream_completed_at)
+        self.assertEqual(state.last_dream_failed_at, NOW.isoformat())
+
+    async def test_equal_failure_and_completion_stamps_favor_the_failure_backoff(
+        self,
+    ) -> None:
+        """When the two stamps tie, the failure backoff governs: the worst case
+        of favoring failure is one bounded early retry, while favoring
+        completion suppresses a real failure's retry for up to 24h
+        (ADR 0030 amendment, cross-column precedence)."""
+        service = self._service(_summary_ports())
+        sweeper = self._sweeper(service, dream_failure_backoff_seconds=3600)
+        state = SimpleNamespace(
+            last_dream_completed_at=NOW.isoformat(),
+            last_dream_failed_at=NOW.isoformat(),
+        )
+
+        # Inside the backoff window: not due.
+        self.assertFalse(sweeper._dream_is_due(state, NOW + timedelta(minutes=30)))
+        # Past the backoff window (but far inside the 24h success interval):
+        # due, because the tied failure stamp wins.
+        self.assertTrue(sweeper._dream_is_due(state, NOW + timedelta(minutes=61)))
+
+    async def test_dream_job_raising_without_outcome_records_failure(self) -> None:
+        """A dream job that raises without reporting a `DreamJobOutcome` (an
+        anomaly outside the per-phase try, e.g. the trigger-job bookkeeping
+        write itself faulting) must still stamp the failure time so the scope
+        backs off instead of re-dreaming every tick, and must count
+        the anomaly."""
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _FakeAgent("a fake summary"),
+            extraction_agent_factory=lambda *_a, **_k: _FakeAgent([]),
+        )
+        service = self._service(ports)
+        sweeper = self._sweeper(service, dream_failure_backoff_seconds=3600)
+
+        def raise_before_phase(*_a: object, **_k: object) -> None:
+            raise RuntimeError("trigger-job bookkeeping write faulted")
+
+        service._record_dream_trigger_job = raise_before_phase
+        try:
+            with self.assertLogs("vexic.hosted_sweeper", level="ERROR"):
+                report = await sweeper.tick(now=NOW)
+                # The job task raises (anomaly path); its exception is the
+                # recorder's to absorb (gather with return_exceptions), not the
+                # drainer's, so tolerate it here rather than re-raising the raw
+                # job task.
+                while service._background_tasks:
+                    await asyncio.gather(
+                        *list(service._background_tasks), return_exceptions=True
+                    )
+        finally:
+            del service._record_dream_trigger_job
+
+        self.assertEqual(report.dreams_scheduled, 1)
+        state = self.catalog.dream_sweep_state("tenant-a", None)
+        self.assertIsNone(state.last_dream_completed_at)
+        self.assertEqual(state.last_dream_failed_at, NOW.isoformat())
+        # The anomaly is counted (raised without an outcome).
+        self.assertGreaterEqual(sweeper._record_failures, 1)
+
+        report_two = await sweeper.tick(now=NOW + timedelta(minutes=30))
+        await self._drain_background(service)
+        self.assertEqual(report_two.dreams_scheduled, 0)
+
+    async def test_completion_write_failure_falls_back_to_failure_backoff(self) -> None:
+        """A chain that succeeds but whose completion-stamp write fails must not
+        leave both stamps NULL -- that is the every-tick hammer this feature
+        exists to close. The failed completion write falls through to the short
+        failure backoff instead, so the scope re-arms once per backoff, not
+        once per tick."""
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _FakeAgent("a fake summary"),
+            extraction_agent_factory=lambda *_a, **_k: _FakeAgent([]),
+        )
+        service = self._service(ports)
+        sweeper = self._sweeper(service, dream_failure_backoff_seconds=3600)
+
+        def broken_completion(*_a: object, **_k: object) -> None:
+            raise RuntimeError("control-plane completion write failed")
+
+        self.catalog.record_dream_completed = broken_completion
+        try:
+            with self.assertLogs("vexic.hosted_sweeper", level="ERROR"):
+                report = await sweeper.tick(now=NOW)
+                await self._drain_background(service)
+        finally:
+            del self.catalog.record_dream_completed
+
+        self.assertEqual(report.dreams_scheduled, 1)
+        state = self.catalog.dream_sweep_state("tenant-a", None)
+        # Completion never landed, but the failure backoff did: no stamp NULL
+        # hole that would make the scope due every tick.
+        self.assertIsNone(state.last_dream_completed_at)
+        self.assertEqual(state.last_dream_failed_at, NOW.isoformat())
+
+        # Within the backoff window: NOT re-scheduled.
+        report_two = await sweeper.tick(now=NOW + timedelta(minutes=30))
+        await self._drain_background(service)
+        self.assertEqual(report_two.dreams_scheduled, 0)
+
+    async def test_recorded_failure_advances_even_when_error_rewrapped(self) -> None:
+        """A phase failure rewrapped at the hosted boundary (NotImplementedError
+        -> HostPortNotConfigured) still counts as durably recorded: the mark
+        rides the __cause__ chain, so the clock advances the full interval
+        instead of re-dreaming every tick and burning model spend."""
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        ports = DreamPhasePorts(
+            model_group="fake",
+            embed=_fake_embed,
+            summary_agent_factory=lambda *_a, **_k: _FakeAgent("a fake summary"),
+            extraction_agent_factory=lambda *_a, **_k: _NotImplementedAgent(),
+        )
+        service = self._service(ports)
+        sweeper = self._sweeper(service)
+
+        report = await sweeper.tick(now=NOW)
+        await self._drain_background(service)
+
+        self.assertEqual(report.dreams_scheduled, 1)
+        with closing(sqlite3.connect(tenant.db_path)) as conn:
+            error_rows = conn.execute(
+                "SELECT COUNT(*) FROM dream_runs WHERE status = 'error'"
+            ).fetchone()[0]
+        self.assertGreater(error_rows, 0)
+        state = self.catalog.dream_sweep_state("tenant-a", None)
+        self.assertEqual(state.last_dream_completed_at, NOW.isoformat())
 
     async def test_stale_stream_record_failure_retries_on_fresh_connection(self) -> None:
         """A reaped Hrana stream loses the state write (verified live);
@@ -1046,6 +1635,7 @@ class SweeperConfigTests(unittest.TestCase):
         self.assertIsNotNone(config)
         self.assertEqual(config.tick_seconds, 1800)
         self.assertEqual(config.dream_interval_seconds, 86_400)
+        self.assertEqual(config.dream_failure_backoff_seconds, 3_600)
 
     def test_off_switch_disables_the_sweeper(self) -> None:
         for value in ("off", "0", "false", "OFF"):
@@ -1061,6 +1651,10 @@ class SweeperConfigTests(unittest.TestCase):
             {"VEXIC_DREAM_SWEEP_TICK_SECONDS": "0"},
             {"VEXIC_DREAM_SWEEP_TICK_SECONDS": "-5"},
             {"VEXIC_DREAM_INTERVAL_SECONDS": "0"},
+            # A non-positive failure backoff would retry the unrecorded-failure
+            # chain every tick -- the every-tick hammer this closes.
+            {"VEXIC_DREAM_FAILURE_BACKOFF_SECONDS": "0"},
+            {"VEXIC_DREAM_FAILURE_BACKOFF_SECONDS": "-1"},
         ):
             with self.subTest(env=env):
                 with self.assertRaises(ValueError):
@@ -1071,11 +1665,62 @@ class SweeperConfigTests(unittest.TestCase):
             {
                 "VEXIC_DREAM_SWEEP_TICK_SECONDS": "600",
                 "VEXIC_DREAM_INTERVAL_SECONDS": "43200",
+                "VEXIC_DREAM_FAILURE_BACKOFF_SECONDS": "900",
             }
         )
 
         self.assertEqual(config.tick_seconds, 600)
         self.assertEqual(config.dream_interval_seconds, 43_200)
+        self.assertEqual(config.dream_failure_backoff_seconds, 900)
+
+
+class DreamSweepStateMigrationTests(unittest.TestCase):
+    def test_existing_sweep_state_gains_failure_column(self) -> None:
+        """An existing control DB whose `dream_sweep_state` predates the failure-backoff column
+        gains `last_dream_failed_at` on catalog init, and its prior state
+        (completion stamp, watermark) survives the additive migration."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            control_db = root / "control-plane.db"
+            # Pre-failure-backoff shape: (tenant, agent)-scoped but no failure column.
+            with closing(sqlite3.connect(control_db)) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE dream_sweep_state (
+                        tenant_id TEXT NOT NULL,
+                        agent_id TEXT NOT NULL DEFAULT '',
+                        last_summarize_watermark INTEGER NOT NULL DEFAULT 0,
+                        last_dream_completed_at TEXT,
+                        PRIMARY KEY (tenant_id, agent_id)
+                    )
+                    """
+                )
+                conn.execute(
+                    "INSERT INTO dream_sweep_state "
+                    "(tenant_id, agent_id, last_summarize_watermark, "
+                    "last_dream_completed_at) VALUES (?, ?, ?, ?)",
+                    ("tenant-x", "", 5, "2026-07-01T00:00:00+00:00"),
+                )
+                conn.commit()
+
+            # Catalog init runs _init_control_plane_schema, which migrates.
+            catalog = HostedTenantCatalog(root)
+
+            with closing(sqlite3.connect(control_db)) as conn:
+                columns = {
+                    str(row[1])
+                    for row in conn.execute(
+                        "PRAGMA table_info(dream_sweep_state)"
+                    ).fetchall()
+                }
+            self.assertIn("last_dream_failed_at", columns)
+
+            state = catalog.dream_sweep_state("tenant-x", None)
+            self.assertEqual(state.last_summarize_watermark, 5)
+            self.assertEqual(
+                state.last_dream_completed_at, "2026-07-01T00:00:00+00:00"
+            )
+            self.assertIsNone(state.last_dream_failed_at)
 
 
 if __name__ == "__main__":

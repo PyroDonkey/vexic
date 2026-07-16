@@ -65,6 +65,17 @@ scheduling entirely.
   (a cancelled job leaves state untouched); ripeness and budgets are still
   computed downstream per run, so lost state merely causes a cheap redundant
   sweep.
+
+  > Amended for COA-385. The dream stamps record the job's terminal time,
+  > minted inside the job while the durable lease (ADR 0032) is still held,
+  > rather than the wall-clock time at which the asynchronous recorder later
+  > persists them. The lease is still released in the job's own `finally`
+  > before the recorder runs -- the lifecycle is unchanged -- but a recorder
+  > stalled across a rolling deploy now persists a stamp that correctly loses,
+  > via the monotonic column guards, to a newer stamp another container wrote
+  > in the meantime. A `failed == completed` due-check tie favors the failure
+  > backoff: its worst case is one bounded early retry, while favoring
+  > completion suppresses a real failure's retry for up to 24h.
 - Per-tenant opt-out: `tenants.dream_scheduling` column,
   `HostedTenantCatalog.set_dream_scheduling`.
 - Kill switch: `VEXIC_DREAM_SWEEPER=off`. Tenants are staggered within a

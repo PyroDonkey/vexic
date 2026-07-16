@@ -1171,6 +1171,63 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                 ),
             )
 
+    async def test_key_bound_to_retired_project_is_rejected_at_bind(self) -> None:
+        """Retiring a control project cuts live access for its keys.
+
+        Enforcement is binding-level: every data-plane route passes through
+        ``_bind_request``, whose project check reads the retirement-filtered
+        ``HostedTenant.project_ids``. The credential layer stays untouched —
+        the key is not revoked, so un-retiring restores access.
+        """
+        self.catalog.provision_tenant("tenant-a")
+        project = self.catalog.create_control_project("tenant-a", name="Alpha")
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.SEARCH},
+            project_ids={project.project_id},
+        )
+
+        self.catalog.retire_control_project("tenant-a", project.project_id)
+
+        with self.assertRaises(PermissionError):
+            await self.service.search_transcript(
+                api_key.raw_key,
+                SearchTranscriptRequest(
+                    scope=_scope(
+                        project_id=project.project_id,
+                        capabilities={MemoryCapability.SEARCH},
+                    ),
+                    query="cedar",
+                ),
+            )
+
+    async def test_retire_tenant_cuts_data_plane_access(self) -> None:
+        """Retiring a tenant cuts live access for previously valid keys.
+
+        Pins the ``active = 1`` predicate in ``get_tenant`` as the contract
+        that makes ``retire_tenant`` an access cut (ADR 0028 addendum), not an
+        audit marker.
+        """
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.SEARCH},
+            project_ids={"project-a"},
+        )
+
+        self.catalog.retire_tenant("tenant-a")
+
+        with self.assertRaisesRegex(PermissionError, "Unknown hosted tenant"):
+            await self.service.search_transcript(
+                api_key.raw_key,
+                SearchTranscriptRequest(
+                    scope=_scope(capabilities={MemoryCapability.SEARCH}),
+                    query="cedar",
+                ),
+            )
+
     async def test_redaction_failure_records_no_payload_and_persists_nothing(self) -> None:
         self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
         api_key = self.keys.create_key(
@@ -1740,6 +1797,81 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(job_usage[-1].status, "ok")
         self.assertEqual(job_usage[-1].model_requests, 1)
+        self.assertEqual(job_usage[-1].total_tokens, 10)
+
+    async def test_hosted_summarize_partial_session_failure_reports_partial_status(
+        self,
+    ) -> None:
+        """A session that fails to summarize must surface as a 'partial' job,
+        not an 'ok' one -- swallowed per-session errors are how a SUMMARIZE
+        run silently under-reports usage."""
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.ADMIN_REBUILD},
+            project_ids={"project-a"},
+        )
+
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        save_messages(
+            tenant.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="healthy summarize span")])],
+            session_id="good-session",
+            timestamp=start.isoformat(),
+        )
+        save_messages(
+            tenant.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="poison marker span")])],
+            session_id="bad-session",
+            timestamp=start.isoformat(),
+        )
+
+        class SummaryAgent:
+            async def run(self, prompt: str) -> object:
+                if "poison marker" in prompt:
+                    raise RuntimeError("boom")
+                return SimpleNamespace(
+                    output="a fake summary",
+                    usage=lambda: SimpleNamespace(
+                        requests=1,
+                        input_tokens=6,
+                        output_tokens=4,
+                        total_tokens=10,
+                    ),
+                )
+
+        service = HostedMemoryService(
+            self.catalog,
+            self.keys,
+            telemetry=self.catalog,
+            dream_phase_ports=DreamPhasePorts(
+                model_group="fake",
+                summary_agent_factory=lambda *_args, **_kwargs: SummaryAgent(),
+            ),
+        )
+        jobs = HostedBackgroundJobRunner(service)
+
+        result = await jobs.run_dream_phase(
+            api_key.raw_key,
+            RunDreamPhaseRequest(
+                scope=_scope(capabilities={MemoryCapability.ADMIN_REBUILD}),
+                phase=DreamPhase.SUMMARIZE,
+                redaction=RedactionContext(forbidden_values=()),
+            ),
+        )
+
+        self.assertEqual(result.status, "partial")
+        self.assertEqual(
+            [event.status for event in jobs.job_events], ["running", "partial"]
+        )
+        job_usage = [
+            event
+            for event in self.catalog.usage_events("tenant-a")
+            if event.kind == "job"
+        ]
+        self.assertEqual(job_usage[-1].status, "partial")
+        # Usage from the session that did summarize is still recorded.
         self.assertEqual(job_usage[-1].total_tokens, 10)
 
     async def test_hosted_dream_worker_redaction_failure_does_not_call_model(

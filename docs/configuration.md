@@ -30,6 +30,7 @@ library and MCP server need none of these by default; variables marked
 | `VEXIC_DREAM_SWEEPER` | `vexic.hosted_sweeper` | `on` | Kill switch for the in-server dream sweeper (`off`/`0`/`false`/`no` disables; ADR 0030). |
 | `VEXIC_DREAM_SWEEP_TICK_SECONDS` | `vexic.hosted_sweeper` | `1800` | How often the sweeper walks active tenants. |
 | `VEXIC_DREAM_INTERVAL_SECONDS` | `vexic.hosted_sweeper` | `86400` | Minimum gap between full Light -> REM -> Deep chains per tenant. |
+| `VEXIC_DREAM_FAILURE_BACKOFF_SECONDS` | `vexic.hosted_sweeper` | `3600` | Re-arm interval for a scope whose last chain failed without durably recording (withheld dream stamp); shorter than the success interval so transient faults recover fast but a persistent unrecorded failure retries at this cadence, not every tick. |
 | *(names passed via `--secret-env`)* | `vexic.hosted` CLI | -- | `run-dream-phase --secret-env NAME` reads each named variable and threads it to the adapter as a forbidden secret value. |
 
 ## Turso backends (operator-only)

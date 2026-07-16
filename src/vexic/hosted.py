@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Awaitable, Callable, Protocol, TypeVar
+from typing import Any, Awaitable, Callable, NamedTuple, Protocol, TypeVar
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 from vexic.contract import (
@@ -62,6 +62,7 @@ from vexic.contract import (
     SourceTranscriptMessage,
     TrustBoundary,
 )
+from vexic.error_reporting import dream_failure_recorded
 from vexic.ports import DreamPhasePorts, missing_host_port
 from vexic.service import (
     LocalMemoryService,
@@ -77,6 +78,27 @@ from vexic.usage import UsageSummary
 
 
 logger = logging.getLogger(__name__)
+
+
+class DreamJobOutcome(NamedTuple):
+    """Result of a system dream chain, read by the sweeper to decide which
+    sweep-state writes are safe. The two bits are independent: a chain can be
+    durably recorded yet never have summarized (a failure before SUMMARIZE).
+
+    ``durably_recorded`` gates the 24h dream stamp; ``summarize_ran`` gates the
+    summarize watermark. ``finished_at`` is the job's terminal time, minted
+    while the durable lease is still held, so a stalled recorder persists
+    job-completion time rather than a fresher recorder-run time that could
+    outrank another container's newer stamp (ADR 0030 amendment). See
+    `HostedMemoryService._run_system_dream_job`."""
+
+    durably_recorded: bool
+    summarize_ran: bool
+    # No default: every construction site must mint this under the lease, or
+    # the recorder would silently fall back to recorder-run time and reopen
+    # the rolling-deploy stamp race (ADR 0030 amendment).
+    finished_at: datetime
+
 
 _RequestT = TypeVar("_RequestT", bound=MemoryRequest)
 _ResultT = TypeVar("_ResultT", bound=MemoryResult)
@@ -410,6 +432,13 @@ class HostedRateLimitRule:
             raise ValueError("rate limit must be at least 1.")
         if self.window_seconds < 1:
             raise ValueError("rate limit window_seconds must be at least 1.")
+
+
+class HostedScopeRetired(PermissionError):
+    """A minted dream job's scope was retired between scheduling and
+    execution (ADR 0028 addendum). Distinct from a phase that ran and
+    failed: the job never touched tenant memory, so the sweeper must hold
+    the summarize watermark rather than counting it as ran-and-failed."""
 
 
 class HostedRateLimitExceeded(RuntimeError):
@@ -893,7 +922,7 @@ class HostedMemoryService:
     def _start_dream_lease_heartbeat(
         self,
         key: tuple[str, str | None],
-        job: "asyncio.Task[None]",
+        job: "asyncio.Task[DreamJobOutcome]",
     ) -> None:
         """Keep this holder's lease fresh for as long as `job` runs.
 
@@ -994,12 +1023,16 @@ class HostedMemoryService:
                 key_id=auth.key_id,
             )
         else:
-            self._record_dream_trigger_job(job_id, request, auth, status="ok")
+            # Record the phase-reported status: SUMMARIZE can complete with
+            # swallowed per-session failures ("partial"/"error").
+            self._record_dream_trigger_job(
+                job_id, request, auth, status=result.status
+            )
             self.record_job_usage(
                 operation="run_dream_phase",
                 tenant_id=auth.tenant_id,
                 principal_id=auth.principal.principal_id,
-                status="ok",
+                status=result.status,
                 usage=usage,
                 project_id=request.scope.project_id,
                 key_id=auth.key_id,
@@ -1043,9 +1076,12 @@ class HostedMemoryService:
         *,
         agent_id: str | None,
         phases: tuple[DreamPhase, ...],
-    ) -> "asyncio.Task[None] | None":
+        clock: Callable[[], datetime] | None = None,
+    ) -> "asyncio.Task[DreamJobOutcome] | None":
         """In-server sweeper seam (ADR 0030): schedule pre-bound dream phases
         for one tenant+agent scope under a system principal — no API key.
+        ``clock`` mints the job's terminal `finished_at` stamp; the sweeper
+        passes its own injected clock so tests stay deterministic.
 
         Mirrors the trigger endpoint's containment exactly: the minted
         `RunDreamPhaseRequest`s never re-enter `_call`/`_bind_request`, the
@@ -1094,7 +1130,13 @@ class HostedMemoryService:
                 for phase in phases
             )
             task = asyncio.create_task(
-                self._run_system_dream_job(minted_requests, tenant, auth, lock_key)
+                self._run_system_dream_job(
+                    minted_requests,
+                    tenant,
+                    auth,
+                    lock_key,
+                    clock=clock or (lambda: datetime.now(UTC)),
+                )
             )
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
@@ -1113,20 +1155,42 @@ class HostedMemoryService:
         tenant: HostedTenant,
         auth: HostedAuthContext,
         lock_key: tuple[str, str | None],
-    ) -> None:
+        *,
+        clock: Callable[[], datetime],
+    ) -> DreamJobOutcome:
         """Run the sweeper's minted phases sequentially on a worker-thread
         event loop (same isolation rationale as `_run_dream_trigger_job`).
         A failing phase records its error and stops the chain — a Deep run
-        over a failed Light extraction would promote from stale candidates."""
+        over a failed Light extraction would promote from stale candidates.
+
+        Returns a `DreamJobOutcome` the sweeper reads for two independent
+        writes. ``durably_recorded`` gates the 24h dream stamp: ``True`` when
+        every phase succeeded or a failing phase durably recorded its terminal
+        ``dream_runs`` error row, ``False`` when a failure went unrecorded so
+        the sweeper must retry next tick instead of hiding it. ``summarize_ran``
+        gates the summarize watermark: ``True`` only when the SUMMARIZE phase
+        actually executed (success or ran-and-failed), so a chain that fails
+        before SUMMARIZE never advances the watermark over rows it never
+        summarized."""
         cancelled = False
+        summarize_ran = False
         try:
             for request in requests:
                 job_id = secrets.token_hex(8)
                 self._record_dream_trigger_job(job_id, request, auth, status="running")
 
+                # Set at worker entry, not at dispatch: a `to_thread` submission
+                # that fails before the worker starts (executor shutdown) must
+                # leave the SUMMARIZE phase counting as never-run, so the
+                # watermark is held. "ran" still includes ran-and-failed --
+                # the worker sets this, then the phase may raise inside.
+                worker_started = threading.Event()
+
                 def _run_in_worker_thread(
                     bound: RunDreamPhaseRequest = request,
+                    started: threading.Event = worker_started,
                 ) -> tuple[RunDreamPhaseResult, UsageSummary]:
+                    started.set()
                     return asyncio.run(self._run_dream_phase_with_usage(bound, tenant))
 
                 try:
@@ -1161,17 +1225,48 @@ class HostedMemoryService:
                         project_id=request.scope.project_id,
                         key_id=auth.key_id,
                     )
-                    return
-                self._record_dream_trigger_job(job_id, request, auth, status="ok")
+                    # A SUMMARIZE phase that started then raised is ran-and-failed
+                    # (advances, anti-spend); one whose worker never started is
+                    # never-run (held). Distinguish them by the worker signal.
+                    # A retirement rejection raises before the phase touches
+                    # memory, so it is never-run even though the worker started.
+                    if (
+                        request.phase is DreamPhase.SUMMARIZE
+                        and worker_started.is_set()
+                        and not isinstance(exc, HostedScopeRetired)
+                    ):
+                        summarize_ran = True
+                    # Surface to the sweeper whether the failing phase durably
+                    # recorded its terminal dream_runs row. The sweeper advances
+                    # the 24h retry clock only when it did: advancing
+                    # over a silent failure is what stalled Tier 3 live.
+                    return DreamJobOutcome(
+                        durably_recorded=dream_failure_recorded(exc),
+                        summarize_ran=summarize_ran,
+                        finished_at=clock(),
+                    )
+                if request.phase is DreamPhase.SUMMARIZE:
+                    summarize_ran = True
+                # A phase can complete with swallowed per-session failures
+                # (SUMMARIZE reports "partial"/"error"); record what the
+                # phase said, not an unconditional "ok".
+                self._record_dream_trigger_job(
+                    job_id, request, auth, status=_result.status
+                )
                 self.record_job_usage(
                     operation="run_dream_phase",
                     tenant_id=auth.tenant_id,
                     principal_id=auth.principal.principal_id,
-                    status="ok",
+                    status=_result.status,
                     usage=usage,
                     project_id=request.scope.project_id,
                     key_id=auth.key_id,
                 )
+            return DreamJobOutcome(
+                durably_recorded=True,
+                summarize_ran=summarize_ran,
+                finished_at=clock(),
+            )
         except asyncio.CancelledError:
             # The worker thread cannot be interrupted, so a phase may still be
             # writing this scope. Hold the lease and let it lapse on its TTL
@@ -1368,9 +1463,26 @@ class HostedMemoryService:
         request: RunDreamPhaseRequest,
         tenant: HostedTenant,
     ) -> tuple[RunDreamPhaseResult, UsageSummary]:
+        # Minted dream jobs bypass `_bind_request` at execution time
+        # (ADR 0025), so a retirement landing between scheduling and
+        # execution must be re-checked here before touching tenant memory
+        # (ADR 0028 addendum).
         try:
+            live = self.catalog.get_tenant(tenant.tenant_id)
+        except PermissionError as exc:
+            raise HostedScopeRetired(str(exc)) from exc
+        project_id = request.scope.project_id
+        if project_id is not None and project_id not in live.project_ids:
+            raise HostedScopeRetired(
+                "Memory scope project_id is not provisioned for tenant."
+            )
+        try:
+            # Execute against the LIVE tenant, not the captured one: a
+            # replacement-database repoint between scheduling and execution
+            # bumps `generation`, and the abandoned pre-repoint target must
+            # not receive the job's writes.
             return await _run_local_dream_phase_with_usage(
-                self._local_service(tenant),
+                self._local_service(live),
                 request,
             )
         except NotImplementedError as exc:
@@ -1530,12 +1642,14 @@ class HostedBackgroundJobRunner:
                 key_id=auth.key_id,
             )
             raise
-        self._record_job(job_id, request, auth, status="ok")
+        # Record the phase-reported status: SUMMARIZE can complete with
+        # swallowed per-session failures ("partial"/"error").
+        self._record_job(job_id, request, auth, status=result.status)
         self.service.record_job_usage(
             operation="run_dream_phase",
             tenant_id=auth.tenant_id,
             principal_id=auth.principal.principal_id,
-            status="ok",
+            status=result.status,
             usage=usage,
             project_id=request.scope.project_id,
             key_id=auth.key_id,

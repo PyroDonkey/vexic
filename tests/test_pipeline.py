@@ -14,6 +14,7 @@ from unittest.mock import patch
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 from vexic.embeddings import EMBEDDING_DIM
+from vexic.error_reporting import dream_failure_recorded
 from vexic.deep import run_deep_phase
 from vexic.models import ContradictionJudgment, FactCandidate
 from vexic.pipeline import _main, run_light_phase
@@ -37,6 +38,16 @@ from vexic.storage.connection import connect
 from vexic.storage.schema import _load_vec_extension
 
 
+def _UPSTREAM_502() -> ValueError:
+    # The libSQL/Hrana bare ValueError raised when the Turso edge cannot reach
+    # its upstream primary (observed live 2026-07-13 as 502 Bad Gateway).
+    # Classified retryable by vexic.storage.errors.is_retryable_operational_error.
+    return ValueError(
+        "Hrana: `api error: `status=502 Bad Gateway, "
+        'body={"error":"connect to upstream failed"}``'
+    )
+
+
 def _unit_vector(first: float) -> list[float]:
     return [first] + [0.0] * (EMBEDDING_DIM - 1)
 
@@ -47,6 +58,12 @@ def _padded_vector(*components: float) -> list[float]:
 
 def _rem_candidate(candidate_id: int, embedding: list[float] | None) -> RemCandidate:
     return RemCandidate(candidate_id=candidate_id, embedding=embedding)
+
+
+def _fake_usage() -> SimpleNamespace:
+    # Property-form usage (pydantic-ai >=1.102); summarize_agent_usage fails
+    # loud on results that expose no usage, so every fake must carry one.
+    return SimpleNamespace(requests=1, input_tokens=1, output_tokens=1, total_tokens=2)
 
 
 class LightPhaseProvenanceTests(unittest.IsolatedAsyncioTestCase):
@@ -88,7 +105,8 @@ class LightPhaseProvenanceTests(unittest.IsolatedAsyncioTestCase):
                                 confidence=0.8,
                                 source_message_ids=[outside_window_id],
                             ),
-                        ]
+                        ],
+                        usage=_fake_usage(),
                     )
 
             def agent_factory(model_group: str, secrets: object = None) -> object:
@@ -112,11 +130,13 @@ class LightPhaseProvenanceTests(unittest.IsolatedAsyncioTestCase):
                     ).fetchall()
                 ]
                 run_status = conn.execute(
-                    "SELECT status, last_processed_message_id FROM dream_runs ORDER BY id DESC LIMIT 1"
+                    "SELECT status, last_processed_message_id, candidates_dropped"
+                    " FROM dream_runs ORDER BY id DESC LIMIT 1"
                 ).fetchone()
 
         self.assertEqual(persisted, ["Ryan prefers compact reports."])
-        self.assertEqual(run_status, ("ok", message_id))
+        # A run that kept candidates stays 'ok'; the drop is still counted.
+        self.assertEqual(run_status, ("ok", message_id, 1))
 
     async def test_light_phase_drops_candidate_with_no_source_message_ids(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -147,7 +167,8 @@ class LightPhaseProvenanceTests(unittest.IsolatedAsyncioTestCase):
                                 confidence=0.8,
                                 source_message_ids=[],
                             ),
-                        ]
+                        ],
+                        usage=_fake_usage(),
                     )
 
             def agent_factory(model_group: str, secrets: object = None) -> object:
@@ -200,7 +221,8 @@ class LightPhaseProvenanceTests(unittest.IsolatedAsyncioTestCase):
                                 confidence=0.8,
                                 source_message_ids=[message_id + 999],
                             )
-                        ]
+                        ],
+                        usage=_fake_usage(),
                     )
 
             def agent_factory(model_group: str, secrets: object = None) -> object:
@@ -223,12 +245,114 @@ class LightPhaseProvenanceTests(unittest.IsolatedAsyncioTestCase):
                 candidate_count = conn.execute(
                     "SELECT COUNT(*) FROM memory_candidates"
                 ).fetchone()[0]
+                run_row = conn.execute(
+                    "SELECT status, candidates_dropped, error_detail"
+                    " FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()
 
         self.assertEqual(candidate_count, 0)
+        # ADR 0031 amendment: a run that extracted candidates and kept none is
+        # durably 'partial' with the drop count, queryable without logs.
+        self.assertEqual(run_row, ("partial", 1, None))
         # Content-free: the operator learns that provenance dropped candidates
         # and how many, never which facts or which message ids.
         self.assertIn("1 dropped", output.getvalue())
         self.assertNotIn("Mars", output.getvalue())
+
+    async def test_error_after_filtering_still_records_known_drop_count(self) -> None:
+        # A failure between provenance filtering and commit must not zero the
+        # already-known drop count on the error audit row: the failed cycle's
+        # drop telemetry is the ADR 0031 miscitation signal either way.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            message_id = save_messages(
+                db_path,
+                [ModelRequest(parts=[UserPromptPart(content="I prefer compact reports.")])],
+            )[0]
+
+            class ExtractionAgent:
+                async def run(self, transcript: str) -> object:
+                    return SimpleNamespace(
+                        output=[
+                            FactCandidate(
+                                fact_text="Ryan prefers compact reports.",
+                                subject="Ryan",
+                                category="preference",
+                                importance=7,
+                                confidence=0.9,
+                                source_message_ids=[message_id],
+                            ),
+                            FactCandidate(
+                                fact_text="Ryan lives on Mars.",
+                                subject="Ryan",
+                                category="fact",
+                                importance=5,
+                                confidence=0.8,
+                                source_message_ids=[message_id + 999],
+                            ),
+                        ],
+                        usage=_fake_usage(),
+                    )
+
+            def failing_embed(texts: list[str]) -> list[list[float]]:
+                raise RuntimeError("embedding backend down")
+
+            output = StringIO()
+            with redirect_stdout(output):
+                with self.assertRaises(RuntimeError):
+                    await run_light_phase(
+                        db_path,
+                        "glm",
+                        extraction_agent_factory=lambda group, secrets=None: ExtractionAgent(),
+                        embed=failing_embed,
+                    )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                status, dropped = conn.execute(
+                    "SELECT status, candidates_dropped FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+
+        self.assertEqual(status, "error")
+        self.assertEqual(dropped, 1)
+
+    def test_dream_runs_schema_has_durable_drop_count(self) -> None:
+        # ADR 0031's mitigation for silent systematic miscitation is the drop
+        # count; stdout is not durable, so the count lives in dream_runs.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            with closing(sqlite3.connect(db_path)) as conn:
+                columns = {
+                    row[1]: row for row in conn.execute("PRAGMA table_info(dream_runs)")
+                }
+
+        self.assertIn("candidates_dropped", columns)
+        _, _, _, not_null, default, _ = columns["candidates_dropped"]
+        self.assertEqual(not_null, 1)
+        self.assertEqual(default, "0")
+
+    def test_commit_dream_cycle_persists_drop_count(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            commit_dream_cycle(
+                db_path,
+                [],
+                agent_id=None,
+                status="partial",
+                started_at="2026-01-01T00:00:00Z",
+                finished_at="2026-01-01T00:00:01Z",
+                messages_processed=3,
+                last_processed_message_id=3,
+                candidates_dropped=3,
+            )
+            with closing(sqlite3.connect(db_path)) as conn:
+                row = conn.execute(
+                    "SELECT status, candidates_dropped FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+
+        self.assertEqual(row, ("partial", 3))
 
 
 class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
@@ -338,7 +462,8 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                                 confidence=0.9,
                                 source_message_ids=[1],
                             )
-                        ]
+                        ],
+                        usage=_fake_usage(),
                     )
 
             def agent_factory(model_group: str, secrets: object = None) -> object:
@@ -393,7 +518,8 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                                 confidence=0.9,
                                 source_message_ids=[1],
                             )
-                        ]
+                        ],
+                        usage=_fake_usage(),
                     )
 
             def blocked_import(name: str, *args: object, **kwargs: object) -> object:
@@ -438,7 +564,8 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                                 confidence=0.9,
                                 source_message_ids=[1],
                             )
-                        ]
+                        ],
+                        usage=_fake_usage(),
                     )
 
             def embed(texts: list[str]) -> list[list[float]]:
@@ -1355,6 +1482,215 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(count, 1)
 
 
+class DreamPhaseFailureRecordedTests(unittest.IsolatedAsyncioTestCase):
+    """A failed dream phase must surface whether its terminal
+    ``dream_runs`` error row was durably persisted, so the sweeper can refuse
+    to advance the 24h retry clock over a silent failure."""
+
+    def _seed_candidate(self, db_path: str) -> None:
+        commit_dream_cycle(
+            db_path,
+            [
+                FactCandidate(
+                    fact_text="Ryan cedar recorded-bit candidate.",
+                    subject="Ryan",
+                    category="fact",
+                    importance=5,
+                    confidence=0.8,
+                    source_message_ids=[1],
+                )
+            ],
+            candidate_embeddings=[_unit_vector(1.0)],
+            agent_id=None,
+            status="ok",
+            started_at="2026-01-01T00:00:00Z",
+            finished_at="2026-01-01T00:00:01Z",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+
+    async def test_rem_failure_marks_recorded_when_error_row_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            self._seed_candidate(db_path)
+            with patch(
+                "vexic.rem.compute_centrality_boosts",
+                side_effect=RuntimeError("boom"),
+            ):
+                with self.assertRaises(RuntimeError) as cm:
+                    await run_rem_phase(db_path)
+
+            self.assertTrue(dream_failure_recorded(cm.exception))
+            with closing(sqlite3.connect(db_path)) as conn:
+                status = conn.execute(
+                    "SELECT status FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()[0]
+            self.assertEqual(status, "error")
+
+    async def test_deep_failure_marks_recorded_when_error_row_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            self._seed_candidate(db_path)
+            with patch(
+                "vexic.deep.load_promotion_candidates",
+                side_effect=RuntimeError("boom"),
+            ):
+                with self.assertRaises(RuntimeError) as cm:
+                    await run_deep_phase(
+                        db_path,
+                        "glm",
+                        contradiction_agent_factory=lambda *_a, **_k: SimpleNamespace(),
+                    )
+
+            self.assertTrue(dream_failure_recorded(cm.exception))
+            with closing(sqlite3.connect(db_path)) as conn:
+                status = conn.execute(
+                    "SELECT status FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()[0]
+            self.assertEqual(status, "error")
+
+    async def test_light_failure_marks_recorded_when_error_row_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            save_messages(
+                db_path,
+                [ModelRequest(parts=[UserPromptPart(content="hello there")])],
+            )
+
+            class FailingExtractionAgent:
+                async def run(self, transcript: str) -> object:
+                    raise RuntimeError("boom")
+
+            with self.assertRaises(RuntimeError) as cm:
+                await run_light_phase(
+                    db_path,
+                    "glm",
+                    extraction_agent_factory=lambda *_a, **_k: FailingExtractionAgent(),
+                    embed=lambda texts: [_unit_vector(1.0) for _ in texts],
+                )
+
+            self.assertTrue(dream_failure_recorded(cm.exception))
+            with closing(sqlite3.connect(db_path)) as conn:
+                status = conn.execute(
+                    "SELECT status FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()[0]
+            self.assertEqual(status, "error")
+
+    async def test_error_row_retries_once_on_retryable_fault_then_records(
+        self,
+    ) -> None:
+        # The terminal error-row write itself faults with a retryable Turso
+        # 502, then succeeds on a fresh connection: recorded True, retried once.
+        from vexic.storage import commit_rem_cycle as real_commit
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            self._seed_candidate(db_path)
+
+            calls = {"n": 0}
+
+            def flaky(*args: object, **kwargs: object) -> object:
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise _UPSTREAM_502()
+                return real_commit(*args, **kwargs)
+
+            with patch(
+                "vexic.rem.compute_centrality_boosts",
+                side_effect=RuntimeError("boom"),
+            ):
+                with patch("vexic.rem.commit_rem_cycle", side_effect=flaky):
+                    with self.assertRaises(RuntimeError) as cm:
+                        await run_rem_phase(db_path)
+
+            self.assertTrue(dream_failure_recorded(cm.exception))
+            self.assertEqual(calls["n"], 2)
+            with closing(sqlite3.connect(db_path)) as conn:
+                status = conn.execute(
+                    "SELECT status FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()[0]
+            self.assertEqual(status, "error")
+
+    async def test_unrecorded_when_retryable_fault_persists(self) -> None:
+        # The error-row write keeps faulting: the original error still surfaces
+        # (never masked), no error row lands, and the failure is marked
+        # unrecorded so the sweeper will not advance the retry clock over it.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            self._seed_candidate(db_path)
+
+            def always_502(*args: object, **kwargs: object) -> object:
+                raise _UPSTREAM_502()
+
+            with patch(
+                "vexic.rem.compute_centrality_boosts",
+                side_effect=RuntimeError("boom"),
+            ):
+                with patch("vexic.rem.commit_rem_cycle", side_effect=always_502):
+                    with self.assertRaises(RuntimeError) as cm:
+                        await run_rem_phase(db_path)
+
+            self.assertFalse(dream_failure_recorded(cm.exception))
+            with closing(sqlite3.connect(db_path)) as conn:
+                error_rows = conn.execute(
+                    "SELECT COUNT(*) FROM dream_runs WHERE status = 'error'"
+                ).fetchone()[0]
+            self.assertEqual(error_rows, 0)
+
+    async def test_non_retryable_write_fault_is_not_retried(self) -> None:
+        # A non-retryable fault in the error-row write fails fast (one attempt),
+        # marks unrecorded, and never masks the original error.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            self._seed_candidate(db_path)
+
+            calls = {"n": 0}
+
+            def non_retryable(*args: object, **kwargs: object) -> object:
+                calls["n"] += 1
+                raise ValueError("plain domain error, not a storage fault")
+
+            with patch(
+                "vexic.rem.compute_centrality_boosts",
+                side_effect=RuntimeError("boom"),
+            ):
+                with patch("vexic.rem.commit_rem_cycle", side_effect=non_retryable):
+                    with self.assertRaises(RuntimeError) as cm:
+                        await run_rem_phase(db_path)
+
+            self.assertFalse(dream_failure_recorded(cm.exception))
+            self.assertEqual(calls["n"], 1)
+
+    async def test_recorded_error_detail_is_content_free(self) -> None:
+        # The persisted error_detail carries only the exception type + stack
+        # shape (format_error_detail), never the exception message text.
+        sentinel = "cedar-secret-message-sentinel"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            self._seed_candidate(db_path)
+            with patch(
+                "vexic.rem.compute_centrality_boosts",
+                side_effect=RuntimeError(sentinel),
+            ):
+                with self.assertRaises(RuntimeError):
+                    await run_rem_phase(db_path)
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                error_detail = conn.execute(
+                    "SELECT error_detail FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()[0]
+            self.assertIsNotNone(error_detail)
+            self.assertNotIn(sentinel, error_detail)
+            self.assertIn("RuntimeError", error_detail)
+
+
 class RemCentralityBoostTests(unittest.TestCase):
     def test_empty_candidates_return_empty_dict(self) -> None:
         self.assertEqual(compute_centrality_boosts([]), {})
@@ -1565,7 +1901,8 @@ class LightPhaseErrorDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         # dream_runs.error_detail and the operator print are diagnostics; a
         # candidate dropped for bad provenance must not copy user memory text
         # into either. The drop replaces the old fail-the-batch ValueError, so
-        # the run now lands 'ok' with the miscited candidate simply absent.
+        # a run that kept nothing lands 'partial' with the miscited candidate
+        # simply absent -- content-free either way.
         sentinel = "secret-medical-fact-sentinel"
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = str(Path(temp_dir) / "memory.db")
@@ -1615,7 +1952,7 @@ class LightPhaseErrorDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
                     "SELECT COUNT(*) FROM memory_candidates"
                 ).fetchone()[0]
 
-        self.assertEqual(status, "ok")
+        self.assertEqual(status, "partial")
         self.assertIsNone(error_detail)
         self.assertEqual(persisted, 0)
         self.assertNotIn(sentinel, stdout.getvalue())
@@ -1653,6 +1990,58 @@ class PipelineCorrectnessRegressionTests(unittest.TestCase):
             last_processed_message_id=last_processed_message_id,
             observed_watermark=observed_watermark,
         )
+
+    def test_superseded_partial_commit_keeps_partial_status(self) -> None:
+        # A superseded all-dropped run must persist the status the run actually
+        # had ('partial'), not a hardcoded 'ok': the durable row and the
+        # contract result must agree, or status-based telemetry misses the
+        # all-dropped run. The audit row's last_processed_message_id stays 0,
+        # so a 'partial' audit row still cannot lift the watermark.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+
+            # A first run advances the watermark to 5.
+            self._commit(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="Ryan cedar window one.",
+                        subject="Ryan",
+                        category="fact",
+                        importance=5,
+                        confidence=0.8,
+                        source_message_ids=[5],
+                    )
+                ],
+                [_unit_vector(1.0)],
+                last_processed_message_id=5,
+            )
+
+            # A stale all-dropped run (observed watermark 0) commits 'partial'.
+            commit_dream_cycle(
+                db_path,
+                [],
+                agent_id=None,
+                status="partial",
+                started_at="2026-01-01T00:01:00Z",
+                finished_at="2026-01-01T00:01:01Z",
+                messages_processed=1,
+                last_processed_message_id=5,
+                observed_watermark=0,
+                candidates_dropped=2,
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                status, dropped, watermark_claim = conn.execute(
+                    "SELECT status, candidates_dropped, last_processed_message_id"
+                    " FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+
+            self.assertEqual(status, "partial")
+            self.assertEqual(dropped, 2)
+            self.assertEqual(watermark_claim, 0)
+            self.assertEqual(get_watermark(db_path, agent_id=None), 5)
 
     def test_superseded_watermark_commit_does_not_double_write(self) -> None:
         # Finding 1: two Light runs reading the same watermark must not both

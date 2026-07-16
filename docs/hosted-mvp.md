@@ -409,6 +409,12 @@ directory does that, per ADR 0008/0013 precedent.
   snapshot against production data remains a manual/operator-run step (the
   hosted-migration runbook is maintained in the private hosted-ops repository);
   only the automated decision logic above is exercised in CI.
+  `import_canonical_migration` writes all canonical rows in one explicit
+  `BEGIN`/`COMMIT` transaction on both backends, so a failed drill import
+  leaves zero canonical rows in the replacement (projection init and repair
+  run outside that transaction and are re-runnable). v1 artifacts exported at
+  older schemas remain importable: the importer fills columns added by later
+  additive schema migrations from schema defaults (ADR 0011 addendum).
 
 Remote libSQL round trips use the wall-clock deadline from ADR 0019 Addendum 7.
 A read-only timeout, or worker-capacity exhaustion before a call starts, is a
@@ -701,7 +707,13 @@ active tenant in the catalog and, per recorded agent scope:
   else), and
 - schedules a full Light -> REM -> Deep -> Summarize chain when the tenant's
   dream interval (`VEXIC_DREAM_INTERVAL_SECONDS`, default 86400) has elapsed
-  since the last completed chain.
+  since the last completed chain. A chain that fails *without* durably
+  recording its terminal error row withholds the completion stamp (so the
+  failure stays visible, not advanced over) and instead re-arms after the
+  shorter failure backoff (`VEXIC_DREAM_FAILURE_BACKOFF_SECONDS`, default
+  3600): a transient storage-write fault recovers within ~one backoff window,
+  while a persistent unrecorded failure retries at that cadence rather than
+  re-running the full chain every tick.
 
 Scheduling reuses the trigger endpoint's machinery through
 `HostedMemoryService.schedule_system_dream`: pre-bound, server-minted

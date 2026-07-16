@@ -9,8 +9,12 @@ Deep phase consumes are unchanged -- a value in [0, 1] per candidate.
 
 import asyncio
 
-from vexic.error_reporting import format_error_detail
+from vexic.error_reporting import (
+    format_error_detail,
+    mark_dream_recorded,
+)
 from vexic.storage import RemCandidate, commit_rem_cycle, load_rem_candidates
+from vexic.storage.errors import retry_once_if_retryable
 from vexic.timeutil import utc_now_iso
 from vexic.usage import UsageSummary
 
@@ -105,25 +109,33 @@ async def run_rem_phase(
             )
         return UsageSummary()
     except Exception as exc:
+        # Retry a retryable storage fault once (reaped Turso stream / edge
+        # blip) so the terminal error row lands, and surface to the sweeper
+        # whether it did: advancing the retry clock over an unrecorded failure
+        # is what silently stalled Tier 3 in a live dreaming incident.
+        recorded = False
         try:
-            commit_rem_cycle(
-                db_path,
-                {},
-                agent_id=agent_id,
-                started_at=started_at,
-                finished_at=utc_now_iso(),
-                status="error",
-                error_detail=format_error_detail(exc),
-                forbidden_secret_values=forbidden_secret_values,
+            retry_once_if_retryable(
+                lambda: commit_rem_cycle(
+                    db_path,
+                    {},
+                    agent_id=agent_id,
+                    started_at=started_at,
+                    finished_at=utc_now_iso(),
+                    status="error",
+                    error_detail=format_error_detail(exc),
+                    forbidden_secret_values=forbidden_secret_values,
+                )
             )
+            recorded = True
         except Exception:
             # Best-effort status write; the original error is surfaced below.
-            pass
+            recorded = False
         print(
             f"REM phase: ERROR -- {type(exc).__name__}. "
             "Boosts unchanged; Deep phase also skipped this cycle."
         )
-        raise
+        raise mark_dream_recorded(exc, recorded)
 
 
 def _main() -> None:

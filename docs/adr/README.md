@@ -78,7 +78,8 @@ Notes:
   view, defines the accepted scope semantics.
 - 0011 corresponds to the local/self-host to hosted migration-path decision for
   COA-202. The operator runbook and drill, not a public import API, are the
-  readiness owner for that path.
+  readiness owner for that path. Its COA-387 addendum makes v1 artifacts
+  additive-tolerant across schema migrations.
 - 0012 corresponds to the COA-190 website and account dashboard implementation
   path. Vexic Console is a separate Next.js control-plane app; it does not move
   dashboard concerns into `src/vexic`.
@@ -152,7 +153,8 @@ Notes:
   control-plane ops record `hosted_audit_events` (with new `project_id`/`key_id`
   columns), a whole-scope purge (`PurgeScopeRequest` with a null session)
   requires `confirm_whole_scope=True`, and `hosted_projects`/`tenants` gain
-  inline `retired_at`/`retired_by` soft-delete. Extends ADR 0022. Infra
+  inline `retired_at`/`retired_by` soft-delete; a COA-323 addendum makes
+  retirement cut live access at binding time. Extends ADR 0022. Infra
   controls (PITR/backups, Railway SSH) and the `adapters/` credential-scoping
   work stay deferred to their own workstreams.
 - These numbers are the Vexic `docs/adr/` series and are self-contained.
