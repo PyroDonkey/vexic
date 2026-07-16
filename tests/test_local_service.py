@@ -318,6 +318,27 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result.hits), 5)
         self.assertIn("priming payload", result.hits[0].body)
 
+    async def test_search_transcript_breaks_rank_ties_by_message_id(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        save_messages(
+            self.db_path,
+            [
+                ModelRequest(parts=[UserPromptPart(content=f"cedar tie {index}")])
+                for index in range(4)
+            ],
+            session_id="default",
+        )
+
+        result = await service.search_transcript(
+            SearchTranscriptRequest(scope=_scope(), query="cedar", limit=4)
+        )
+
+        message_ids = [hit.message_id for hit in result.hits]
+        self.assertEqual(message_ids, sorted(message_ids))
+
     async def test_search_messages_rejects_non_positive_limit(self) -> None:
         from vexic.service import LocalMemoryService
 
