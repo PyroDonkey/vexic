@@ -27,9 +27,12 @@ question into per-keyword queries and unioning the hits.
 Every FTS keyword leg is recall-oriented. `_fts_match_query` always ORs the
 sanitized tokens; the `any_token` flag is removed rather than defaulted,
 because no caller wants AND semantics. Transcript search keeps its existing
-`ORDER BY rank` bm25 ordering, which surfaces messages matching more query
-tokens ahead of single-token matches, and the result `limit` bounds the
-widened candidate set.
+`ORDER BY rank` bm25 ordering. bm25 is an IDF-weighted relevance score, not a
+match-count sort: it generally favors messages matching more and rarer query
+tokens, but a short message matching one rare token can outrank a long one
+matching several common tokens. The result `limit` bounds the widened
+candidate set, and a regression test pins that a rare-token target survives
+the limit window against stopword-heavy filler.
 
 `run_evals` drops the per-keyword split-and-union workaround and issues the
 raw natural-language question as a single query -- the same shape a live MCP
@@ -53,3 +56,8 @@ decision. It is tracked as its own issue, not smuggled into this change.
 - The recorder-ledger dedup test that implicitly pinned AND behavior now
   asserts the OR-ranked hit list, which still proves dedup (no body appears
   twice).
+- Eval pass rates from `vexic.run_evals` are not comparable across this
+  change: the old runner unioned per-keyword result pages (up to
+  keywords x limit bodies), the new runner scores at most `limit` bodies from
+  one query. A pass-rate drop against a pre-0036 baseline is expected, not a
+  retrieval regression.

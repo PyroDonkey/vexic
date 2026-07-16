@@ -263,6 +263,61 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("priming payload", result.hits[0].body)
         self.assertIn("priming happens", result.hits[1].body)
 
+    async def test_search_transcript_returns_no_hits_for_unsearchable_query(
+        self,
+    ) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="cedar detail")])],
+            session_id="default",
+        )
+
+        for query in ("!!!", "   ", '"', "()"):
+            result = await service.search_transcript(
+                SearchTranscriptRequest(scope=_scope(), query=query)
+            )
+            self.assertEqual(result.hits, [], f"query {query!r} should yield no hits")
+
+    async def test_search_transcript_rare_token_target_survives_limit_crowding(
+        self,
+    ) -> None:
+        # OR semantics widen the candidate set; bm25 IDF weighting must keep a
+        # message matching the rare content token inside the limit window even
+        # when chatty messages match several common query tokens (ADR 0036).
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        filler = [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content=f"we did what we did and the time last we decide {i}"
+                    )
+                ]
+            )
+            for i in range(10)
+        ]
+        target = ModelRequest(
+            parts=[UserPromptPart(content="the priming payload arrives at startup")]
+        )
+        save_messages(self.db_path, filler + [target], session_id="default")
+
+        result = await service.search_transcript(
+            SearchTranscriptRequest(
+                scope=_scope(),
+                query="what did we decide about the priming payload last time",
+                limit=5,
+            )
+        )
+
+        self.assertEqual(len(result.hits), 5)
+        self.assertIn("priming payload", result.hits[0].body)
+
     async def test_search_messages_rejects_non_positive_limit(self) -> None:
         from vexic.service import LocalMemoryService
 

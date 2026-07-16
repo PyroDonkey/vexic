@@ -17,7 +17,9 @@ deliberately out of scope here; this runner never wires a provider.
 Retrieval note: ``search_transcript`` uses any-token OR keyword semantics with
 bm25 ranking (ADR 0036), so the raw natural-language question is issued as a
 single query -- the same shape a live MCP caller sends. No client-side keyword
-splitting or hit-unioning is needed.
+splitting or hit-unioning is needed. Pass rates are not comparable to runs
+from before ADR 0036: the old per-keyword union scored up to keywords x limit
+bodies, this runner scores at most ``limit`` bodies from one query.
 
 Exit code is always 0 (this is an eval, not a gate). The final stdout line is a
 machine-readable JSON summary.
