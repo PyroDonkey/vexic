@@ -97,7 +97,7 @@ class SummarizePhaseTests(unittest.IsolatedAsyncioTestCase):
             def factory(model_group: str, secrets=None):
                 return agent
 
-            usage = await run_summarize_phase(
+            outcome = await run_summarize_phase(
                 db_path,
                 "glm",
                 summary_agent_factory=factory,
@@ -107,8 +107,8 @@ class SummarizePhaseTests(unittest.IsolatedAsyncioTestCase):
             frontier = fetch_session_summary_frontier(db_path, session_id="default")
             self.assertTrue(len(frontier) >= 1)
             self.assertTrue(all(s.kind == "leaf" for s in frontier))
-            self.assertGreater(usage.total_tokens, 0)
-            self.assertGreaterEqual(usage.model_requests, 1)
+            self.assertGreater(outcome.usage.total_tokens, 0)
+            self.assertGreaterEqual(outcome.usage.model_requests, 1)
 
     async def test_condense_pass_triggers_on_frontier_leaf_count(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -294,7 +294,7 @@ class SummarizePhaseTests(unittest.IsolatedAsyncioTestCase):
                         )
                     return await super().run(prompt)
 
-            usage = await run_summarize_phase(
+            outcome = await run_summarize_phase(
                 db_path,
                 "glm",
                 summary_agent_factory=factory,
@@ -306,7 +306,7 @@ class SummarizePhaseTests(unittest.IsolatedAsyncioTestCase):
             clean_frontier = fetch_session_summary_frontier(db_path, session_id="clean-session")
             self.assertEqual(leaky_frontier, [])
             self.assertTrue(len(clean_frontier) >= 1)
-            self.assertGreater(usage.total_tokens, 0)
+            self.assertGreater(outcome.usage.total_tokens, 0)
 
     async def test_per_session_error_isolation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -337,7 +337,7 @@ class SummarizePhaseTests(unittest.IsolatedAsyncioTestCase):
             def factory(model_group: str, secrets=None):
                 return FailOnFirstSessionAgent()
 
-            usage = await run_summarize_phase(
+            outcome = await run_summarize_phase(
                 db_path,
                 "glm",
                 summary_agent_factory=factory,
@@ -348,7 +348,7 @@ class SummarizePhaseTests(unittest.IsolatedAsyncioTestCase):
             session_b_frontier = fetch_session_summary_frontier(db_path, session_id="session-b")
             self.assertEqual(session_a_frontier, [])
             self.assertTrue(len(session_b_frontier) >= 1)
-            self.assertGreater(usage.total_tokens, 0)
+            self.assertGreater(outcome.usage.total_tokens, 0)
 
     async def test_leaf_pass_never_invokes_agent_on_forbidden_input(self) -> None:
         # Fail-closed on the *input* side: a forbidden secret value present
@@ -387,7 +387,7 @@ class SummarizePhaseTests(unittest.IsolatedAsyncioTestCase):
             def factory(model_group: str, secrets=None):
                 return MarkerRoutingAgent()
 
-            usage = await run_summarize_phase(
+            outcome = await run_summarize_phase(
                 db_path,
                 "glm",
                 summary_agent_factory=factory,
@@ -400,7 +400,7 @@ class SummarizePhaseTests(unittest.IsolatedAsyncioTestCase):
             clean_frontier = fetch_session_summary_frontier(db_path, session_id="clean-session")
             self.assertEqual(leaky_frontier, [])
             self.assertTrue(len(clean_frontier) >= 1)
-            self.assertGreater(usage.total_tokens, 0)
+            self.assertGreater(outcome.usage.total_tokens, 0)
 
     async def test_condense_pass_never_invokes_agent_on_forbidden_input(self) -> None:
         # Same fail-closed guarantee for the condense pass: a forbidden
@@ -455,6 +455,49 @@ class SummarizePhaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(all(s.kind == "leaf" for s in frontier))
 
 
+class SessionErrorAccountingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_partial_session_failure_is_counted_not_swallowed(self) -> None:
+        """Per-session isolation still lets other sessions summarize, but the
+        outcome must say how many sessions failed -- a swallowed failure
+        otherwise reads as a clean run with lower usage."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            _save_session(db_path, "good-session", count=5, start=start)
+            _save_session(
+                db_path,
+                "bad-session",
+                count=5,
+                start=start,
+                text="poison marker payload " * 3,
+            )
+
+            def explode_on_poison(prompt: str) -> None:
+                if "poison marker" in prompt:
+                    raise RuntimeError("boom")
+
+            agent = FakeSummaryAgent(on_run=explode_on_poison)
+
+            def factory(model_group: str, secrets=None):
+                return agent
+
+            outcome = await run_summarize_phase(
+                db_path,
+                "glm",
+                summary_agent_factory=factory,
+                now_utc=start + timedelta(hours=6),
+            )
+
+            self.assertEqual(outcome.sessions_considered, 2)
+            self.assertEqual(outcome.sessions_failed, 1)
+            self.assertGreater(outcome.usage.total_tokens, 0)
+            good = fetch_session_summary_frontier(db_path, session_id="good-session")
+            self.assertTrue(len(good) >= 1)
+            bad = fetch_session_summary_frontier(db_path, session_id="bad-session")
+            self.assertEqual(bad, [])
+
+
 class DailySpanBudgetTests(unittest.IsolatedAsyncioTestCase):
     def _seed_one_span_session(
         self, db_path: str, session_id: str, *, start: datetime
@@ -482,7 +525,7 @@ class DailySpanBudgetTests(unittest.IsolatedAsyncioTestCase):
                 return agent
 
             run_day1 = start + timedelta(days=1, hours=6)
-            usage = await run_summarize_phase(
+            outcome = await run_summarize_phase(
                 db_path,
                 "glm",
                 summary_agent_factory=factory,
@@ -493,7 +536,7 @@ class DailySpanBudgetTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(fetch_session_summary_frontier(db_path, session_id="s1")), 1)
             self.assertEqual(len(fetch_session_summary_frontier(db_path, session_id="s2")), 1)
             self.assertEqual(fetch_session_summary_frontier(db_path, session_id="s3"), [])
-            self.assertGreater(usage.total_tokens, 0)
+            self.assertGreater(outcome.usage.total_tokens, 0)
 
             # Next run, same UTC day: budget already spent, third span untouched.
             usage_again = await run_summarize_phase(
@@ -504,7 +547,7 @@ class DailySpanBudgetTests(unittest.IsolatedAsyncioTestCase):
                 daily_span_budget=2,
             )
             self.assertEqual(fetch_session_summary_frontier(db_path, session_id="s3"), [])
-            self.assertEqual(usage_again.total_tokens, 0)
+            self.assertEqual(usage_again.usage.total_tokens, 0)
 
             # Next UTC day: budget resets, third span now gets summarized.
             run_day2 = start + timedelta(days=2, hours=6)
@@ -603,7 +646,7 @@ class DailySpanBudgetTests(unittest.IsolatedAsyncioTestCase):
             def factory(model_group: str, secrets=None):
                 return agent
 
-            usage = await run_summarize_phase(
+            outcome = await run_summarize_phase(
                 db_path,
                 "glm",
                 summary_agent_factory=factory,
@@ -612,7 +655,7 @@ class DailySpanBudgetTests(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertEqual(agent.calls, [])
-            self.assertEqual(usage.total_tokens, 0)
+            self.assertEqual(outcome.usage.total_tokens, 0)
             self.assertEqual(fetch_session_summary_frontier(db_path, session_id="default"), [])
 
     async def test_explicit_created_at_round_trips_through_frontier(self) -> None:

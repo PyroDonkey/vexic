@@ -996,7 +996,7 @@ async def _run_dream_phase_with_usage(
     elif request.phase is DreamPhase.SUMMARIZE:
         from vexic.summarize import run_summarize_phase
 
-        usage = await run_summarize_phase(
+        outcome = await run_summarize_phase(
             service.db_path,
             ports.model_group,
             agent_id=request.scope.agent_id,
@@ -1006,6 +1006,15 @@ async def _run_dream_phase_with_usage(
             content_codec=service.content_codec,
             daily_span_budget=ports.daily_span_budget,
         )
+        # Per-session isolation swallows individual session failures so the
+        # rest of the sweep proceeds; the phase outcome must still say so.
+        if outcome.sessions_failed == 0:
+            status = "ok"
+        elif outcome.sessions_failed < outcome.sessions_considered:
+            status = "partial"
+        else:
+            status = "error"
+        return RunDreamPhaseResult(phase=request.phase, status=status), outcome.usage
     else:
         raise ValueError(f"Unsupported dream phase: {request.phase!r}")
 
