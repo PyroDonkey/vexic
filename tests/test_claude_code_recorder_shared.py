@@ -144,6 +144,51 @@ class ClaudeCodeRecorderSharedTests(unittest.TestCase):
         assert isinstance(model_message, ModelRequest)
         self.assertEqual(model_message.parts[0].content, "remember cedar")
 
+    def test_source_message_from_row_strips_task_notification_keeps_user_text(
+        self,
+    ) -> None:
+        message = source_message_from_claude_code_row(
+            {
+                "type": "user",
+                "sessionId": "session-1",
+                "uuid": "mixed-notification",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "remember cedar\n"
+                        "<task-notification>\nTask abc123 completed.\n"
+                        "Full subagent report payload.\n"
+                        "</task-notification>"
+                    ),
+                },
+            }
+        )
+
+        self.assertIsNotNone(message)
+        assert message is not None
+        model_message = single_message_adapter.validate_json(message.message_json)
+        assert isinstance(model_message, ModelRequest)
+        self.assertEqual(model_message.parts[0].content, "remember cedar")
+
+    def test_source_message_from_row_drops_pure_task_notification(self) -> None:
+        message = source_message_from_claude_code_row(
+            {
+                "type": "user",
+                "sessionId": "session-1",
+                "uuid": "pure-notification",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "<task-notification>\nTask abc123 completed.\n"
+                        "Verbatim subagent report only.\n"
+                        "</task-notification>"
+                    ),
+                },
+            }
+        )
+
+        self.assertIsNone(message)
+
     def test_source_message_from_row_drops_pure_system_reminder(self) -> None:
         message = source_message_from_claude_code_row(
             {
@@ -178,6 +223,52 @@ class ClaudeCodeRecorderSharedTests(unittest.TestCase):
                         "type": "user",
                         "sessionId": "session-1",
                         "uuid": "unpaired-reminder",
+                        "message": {"role": "user", "content": content},
+                    }
+                )
+                self.assertIsNone(message)
+
+    def test_source_message_from_row_strips_multiple_task_notification_blocks(
+        self,
+    ) -> None:
+        message = source_message_from_claude_code_row(
+            {
+                "type": "user",
+                "sessionId": "session-1",
+                "uuid": "multi-notification",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "<task-notification>\nTask one done.\n</task-notification>\n"
+                        "remember cedar\n"
+                        "<task-notification>\nTask two done.\n</task-notification>"
+                    ),
+                },
+            }
+        )
+
+        self.assertIsNotNone(message)
+        assert message is not None
+        model_message = single_message_adapter.validate_json(message.message_json)
+        assert isinstance(model_message, ModelRequest)
+        self.assertEqual(model_message.parts[0].content, "remember cedar")
+
+    def test_source_message_from_row_drops_unpaired_task_notification_tag(
+        self,
+    ) -> None:
+        unpaired_contents = [
+            "<task-notification>\ndangling open tag, no close",
+            "dangling close tag only\n</task-notification>",
+            "remember cedar\n<task-notification>\nunterminated block",
+        ]
+
+        for content in unpaired_contents:
+            with self.subTest(content=content):
+                message = source_message_from_claude_code_row(
+                    {
+                        "type": "user",
+                        "sessionId": "session-1",
+                        "uuid": "unpaired-notification",
                         "message": {"role": "user", "content": content},
                     }
                 )
