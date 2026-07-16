@@ -205,6 +205,64 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(result.hits), 7)
 
+    async def test_search_transcript_matches_natural_language_query_with_dead_token(
+        self,
+    ) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        save_messages(
+            self.db_path,
+            [
+                ModelRequest(
+                    parts=[
+                        UserPromptPart(
+                            content=(
+                                "The priming payload arrives at startup "
+                                "via the SessionStart hook"
+                            )
+                        )
+                    ]
+                )
+            ],
+            session_id="default",
+        )
+
+        result = await service.search_transcript(
+            SearchTranscriptRequest(scope=_scope(), query="priming payload session start")
+        )
+
+        self.assertEqual(len(result.hits), 1)
+        self.assertIn("priming payload", result.hits[0].body)
+
+    async def test_search_transcript_ranks_more_matching_tokens_first(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        save_messages(
+            self.db_path,
+            [
+                ModelRequest(parts=[UserPromptPart(content="priming happens later")]),
+                ModelRequest(
+                    parts=[
+                        UserPromptPart(content="priming payload arrives during startup")
+                    ]
+                ),
+                ModelRequest(parts=[UserPromptPart(content="unrelated cedar filler")]),
+            ],
+            session_id="default",
+        )
+
+        result = await service.search_transcript(
+            SearchTranscriptRequest(scope=_scope(), query="priming payload session start")
+        )
+
+        self.assertEqual(len(result.hits), 2)
+        self.assertIn("priming payload", result.hits[0].body)
+        self.assertIn("priming happens", result.hits[1].body)
+
     async def test_search_messages_rejects_non_positive_limit(self) -> None:
         from vexic.service import LocalMemoryService
 
