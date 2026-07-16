@@ -1934,6 +1934,58 @@ class PipelineCorrectnessRegressionTests(unittest.TestCase):
             observed_watermark=observed_watermark,
         )
 
+    def test_superseded_partial_commit_keeps_partial_status(self) -> None:
+        # A superseded all-dropped run must persist the status the run actually
+        # had ('partial'), not a hardcoded 'ok': the durable row and the
+        # contract result must agree, or status-based telemetry misses the
+        # all-dropped run. The audit row's last_processed_message_id stays 0,
+        # so a 'partial' audit row still cannot lift the watermark.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+
+            # A first run advances the watermark to 5.
+            self._commit(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="Ryan cedar window one.",
+                        subject="Ryan",
+                        category="fact",
+                        importance=5,
+                        confidence=0.8,
+                        source_message_ids=[5],
+                    )
+                ],
+                [_unit_vector(1.0)],
+                last_processed_message_id=5,
+            )
+
+            # A stale all-dropped run (observed watermark 0) commits 'partial'.
+            commit_dream_cycle(
+                db_path,
+                [],
+                agent_id=None,
+                status="partial",
+                started_at="2026-01-01T00:01:00Z",
+                finished_at="2026-01-01T00:01:01Z",
+                messages_processed=1,
+                last_processed_message_id=5,
+                observed_watermark=0,
+                candidates_dropped=2,
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                status, dropped, watermark_claim = conn.execute(
+                    "SELECT status, candidates_dropped, last_processed_message_id"
+                    " FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+
+            self.assertEqual(status, "partial")
+            self.assertEqual(dropped, 2)
+            self.assertEqual(watermark_claim, 0)
+            self.assertEqual(get_watermark(db_path, agent_id=None), 5)
+
     def test_superseded_watermark_commit_does_not_double_write(self) -> None:
         # Finding 1: two Light runs reading the same watermark must not both
         # process the window. A commit whose observed watermark no longer

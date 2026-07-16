@@ -1166,7 +1166,9 @@ def commit_dream_cycle(
             if superseded:
                 # A no-op audit row: no candidates, and last_processed_message_id
                 # left at 0 so it cannot lift MAX(last_processed_message_id) past
-                # the run that already advanced the watermark.
+                # the run that already advanced the watermark. The row keeps the
+                # caller's status ('ok' or 'partial' -- the CAS condition admits
+                # no other) so durable telemetry agrees with the contract result.
                 conn.execute(
                     """
                     INSERT INTO dream_runs
@@ -1175,11 +1177,12 @@ def commit_dream_cycle(
                          last_processed_message_id, error_detail, model_requests,
                          input_tokens, output_tokens, total_tokens, estimated_cost_micros,
                          candidates_dropped)
-                    VALUES (?, ?, 'ok', ?, 0, 0, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, 0, 0, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         started_at,
                         finished_at,
+                        status,
                         agent_id,
                         "superseded: watermark advanced by a concurrent Light run",
                         model_requests,
