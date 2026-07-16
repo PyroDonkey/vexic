@@ -778,6 +778,7 @@ def init_db(
             _ensure_column(conn, "dream_runs", "output_tokens", "output_tokens INTEGER NOT NULL DEFAULT 0")
             _ensure_column(conn, "dream_runs", "total_tokens", "total_tokens INTEGER NOT NULL DEFAULT 0")
             _ensure_column(conn, "dream_runs", "estimated_cost_micros", "estimated_cost_micros INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(conn, "dream_runs", "candidates_dropped", "candidates_dropped INTEGER NOT NULL DEFAULT 0")
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_dream_runs_agent_status_watermark

@@ -9,6 +9,7 @@ extraction agent itself is a host port: callers must inject an
 
 import asyncio
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic_ai.messages import (
@@ -39,6 +40,7 @@ from vexic.storage import (
     load_messages_since,
 )
 from vexic.storage.errors import retry_once_if_retryable
+from vexic.storage.schema import DreamStatus
 from vexic.timeutil import utc_now_iso
 from vexic.usage import UsageSummary, summarize_agent_usage
 
@@ -124,6 +126,15 @@ def _forbidden_secret_values(
     return [*values, *extra_values]
 
 
+@dataclass(frozen=True)
+class LightPhaseOutcome:
+    """Count-only accounting for one Light cycle (never candidate content)."""
+
+    usage: UsageSummary
+    candidates_kept: int = 0
+    candidates_dropped: int = 0
+
+
 async def run_light_phase(
     db_path: str,
     model_group: str,
@@ -134,11 +145,11 @@ async def run_light_phase(
     embed: EmbedTexts | None = None,
     forbidden_secret_values: tuple[str, ...] = (),
     content_codec: ContentCodec | None = None,
-) -> UsageSummary:
+) -> LightPhaseOutcome:
     """Run one Light extraction cycle over messages past the watermark.
 
-    Returns a usage summary; commits candidates and the new watermark
-    atomically via ``commit_dream_cycle``.
+    Returns a count-only outcome with the usage summary; commits candidates
+    and the new watermark atomically via ``commit_dream_cycle``.
     """
     started_at = utc_now_iso()
     watermark = 0
@@ -188,7 +199,7 @@ async def run_light_phase(
                 forbidden_secret_values=forbidden,
             )
             print("Light phase: no new messages. No-op.")
-            return UsageSummary()
+            return LightPhaseOutcome(usage=UsageSummary())
 
         window_ids = [msg_id for msg_id, _ in rows]
         transcript = render_transcript(rows)
@@ -224,11 +235,14 @@ async def run_light_phase(
             *(candidate.fact_text for candidate in candidates),
         )
         candidate_embeddings = embedder([candidate.fact_text for candidate in candidates])
+        # ADR 0031 amendment: the drop count is durable, and a run that
+        # extracted candidates but kept none is 'partial', not silently 'ok'.
+        status: DreamStatus = "partial" if dropped and not candidates else "ok"
         commit_dream_cycle(
             db_path,
             candidates,
             agent_id=agent_id,
-            status="ok",
+            status=status,
             started_at=started_at,
             finished_at=utc_now_iso(),
             messages_processed=len(rows),
@@ -240,6 +254,7 @@ async def run_light_phase(
             output_tokens=usage.output_tokens,
             total_tokens=usage.total_tokens,
             estimated_cost_micros=usage.estimated_cost_micros,
+            candidates_dropped=dropped,
             forbidden_secret_values=forbidden,
         )
         dropped_note = (
@@ -251,7 +266,11 @@ async def run_light_phase(
             f"Light phase: {len(rows)} messages -> "
             f"{len(candidates)} extracted candidates{dropped_note}."
         )
-        return usage
+        return LightPhaseOutcome(
+            usage=usage,
+            candidates_kept=len(candidates),
+            candidates_dropped=dropped,
+        )
 
     except Exception as exc:
         # Best-effort audit, retried once on a retryable storage fault. A

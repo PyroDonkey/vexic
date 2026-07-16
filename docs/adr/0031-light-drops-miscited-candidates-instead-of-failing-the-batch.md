@@ -65,6 +65,16 @@ chain.
   loudly.
   The dropped count in the phase log is the signal; a persistently nonzero
   count means the extraction prompt or model needs attention.
+
+  **Amendment (2026-07-16): the drop count is durable.** A stdout-only signal
+  is not queryable and nothing can alert on it — the same silence class that
+  hid the dreaming incident behind ADR 0032. Every Light cycle now persists
+  the count in `dream_runs.candidates_dropped` (count only, still content-free),
+  and a run that extracted candidates but kept none records
+  `status = 'partial'` instead of `'ok'` and surfaces `partial` through
+  `RunDreamPhaseResult`. Watermark reads treat `'partial'` like `'ok'`
+  (`get_watermark` and the commit-time compare-and-set), so an all-dropped run
+  still advances the watermark exactly as decided above.
 - `validate_candidate_source_ids` is gone. It was module-internal to
   `vexic.pipeline` (never part of the `MemoryService` contract), so the public
   contract surface is unchanged.

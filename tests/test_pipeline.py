@@ -130,11 +130,13 @@ class LightPhaseProvenanceTests(unittest.IsolatedAsyncioTestCase):
                     ).fetchall()
                 ]
                 run_status = conn.execute(
-                    "SELECT status, last_processed_message_id FROM dream_runs ORDER BY id DESC LIMIT 1"
+                    "SELECT status, last_processed_message_id, candidates_dropped"
+                    " FROM dream_runs ORDER BY id DESC LIMIT 1"
                 ).fetchone()
 
         self.assertEqual(persisted, ["Ryan prefers compact reports."])
-        self.assertEqual(run_status, ("ok", message_id))
+        # A run that kept candidates stays 'ok'; the drop is still counted.
+        self.assertEqual(run_status, ("ok", message_id, 1))
 
     async def test_light_phase_drops_candidate_with_no_source_message_ids(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -243,12 +245,57 @@ class LightPhaseProvenanceTests(unittest.IsolatedAsyncioTestCase):
                 candidate_count = conn.execute(
                     "SELECT COUNT(*) FROM memory_candidates"
                 ).fetchone()[0]
+                run_row = conn.execute(
+                    "SELECT status, candidates_dropped, error_detail"
+                    " FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()
 
         self.assertEqual(candidate_count, 0)
+        # ADR 0031 amendment: a run that extracted candidates and kept none is
+        # durably 'partial' with the drop count, queryable without logs.
+        self.assertEqual(run_row, ("partial", 1, None))
         # Content-free: the operator learns that provenance dropped candidates
         # and how many, never which facts or which message ids.
         self.assertIn("1 dropped", output.getvalue())
         self.assertNotIn("Mars", output.getvalue())
+
+    def test_dream_runs_schema_has_durable_drop_count(self) -> None:
+        # ADR 0031's mitigation for silent systematic miscitation is the drop
+        # count; stdout is not durable, so the count lives in dream_runs.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            with closing(sqlite3.connect(db_path)) as conn:
+                columns = {
+                    row[1]: row for row in conn.execute("PRAGMA table_info(dream_runs)")
+                }
+
+        self.assertIn("candidates_dropped", columns)
+        _, _, _, not_null, default, _ = columns["candidates_dropped"]
+        self.assertEqual(not_null, 1)
+        self.assertEqual(default, "0")
+
+    def test_commit_dream_cycle_persists_drop_count(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            commit_dream_cycle(
+                db_path,
+                [],
+                agent_id=None,
+                status="partial",
+                started_at="2026-01-01T00:00:00Z",
+                finished_at="2026-01-01T00:00:01Z",
+                messages_processed=3,
+                last_processed_message_id=3,
+                candidates_dropped=3,
+            )
+            with closing(sqlite3.connect(db_path)) as conn:
+                row = conn.execute(
+                    "SELECT status, candidates_dropped FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+
+        self.assertEqual(row, ("partial", 3))
 
 
 class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
@@ -1797,7 +1844,8 @@ class LightPhaseErrorDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         # dream_runs.error_detail and the operator print are diagnostics; a
         # candidate dropped for bad provenance must not copy user memory text
         # into either. The drop replaces the old fail-the-batch ValueError, so
-        # the run now lands 'ok' with the miscited candidate simply absent.
+        # a run that kept nothing lands 'partial' with the miscited candidate
+        # simply absent -- content-free either way.
         sentinel = "secret-medical-fact-sentinel"
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = str(Path(temp_dir) / "memory.db")
@@ -1847,7 +1895,7 @@ class LightPhaseErrorDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
                     "SELECT COUNT(*) FROM memory_candidates"
                 ).fetchone()[0]
 
-        self.assertEqual(status, "ok")
+        self.assertEqual(status, "partial")
         self.assertIsNone(error_detail)
         self.assertEqual(persisted, 0)
         self.assertNotIn(sentinel, stdout.getvalue())

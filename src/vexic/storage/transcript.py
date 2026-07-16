@@ -824,7 +824,7 @@ def get_watermark(db_path: str, *, agent_id: str | None) -> int:
             SELECT MAX(last_processed_message_id)
             FROM dream_runs
             WHERE agent_id IS ?
-                AND status = 'ok'
+                AND status IN ('ok', 'partial')
             """,
             (agent_id,),
         ).fetchone()

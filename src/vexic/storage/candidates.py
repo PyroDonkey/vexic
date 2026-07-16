@@ -1084,7 +1084,8 @@ def commit_rem_cycle(
 
 def _current_ok_watermark(conn: sqlite3.Connection, agent_id: str | None) -> int:
     # Conn-scoped read of the Light watermark inside the open commit
-    # transaction, mirroring transcript.get_watermark's MAX-over-ok-runs query.
+    # transaction, mirroring transcript.get_watermark's MAX over completed
+    # ('ok' or 'partial') runs.
     # Reading through the same locked transaction is what makes the
     # compare-and-set below atomic against a concurrent Light run.
     row = conn.execute(
@@ -1092,7 +1093,7 @@ def _current_ok_watermark(conn: sqlite3.Connection, agent_id: str | None) -> int
         SELECT MAX(last_processed_message_id)
         FROM dream_runs
         WHERE agent_id IS ?
-            AND status = 'ok'
+            AND status IN ('ok', 'partial')
         """,
         (agent_id,),
     ).fetchone()
@@ -1117,6 +1118,7 @@ def commit_dream_cycle(
     output_tokens: int = 0,
     total_tokens: int = 0,
     estimated_cost_micros: int = 0,
+    candidates_dropped: int = 0,
     forbidden_secret_values: Iterable[str] = (),
 ) -> None:
     init_db(db_path)
@@ -1142,12 +1144,12 @@ def commit_dream_cycle(
             # read time but another Light run has since advanced it, this window
             # was already processed. Abort as an audit-only no-op rather than
             # re-committing the same candidates (double hit_count / duplicate
-            # staging rows) and re-advancing the watermark. Only 'ok' cycles
-            # carry a watermark to defend; error/no-op audit rows never claim
-            # to have processed the window.
+            # staging rows) and re-advancing the watermark. Only completed
+            # ('ok'/'partial') cycles carry a watermark to defend; error/no-op
+            # audit rows never claim to have processed the window.
             superseded = (
                 observed_watermark is not None
-                and status == "ok"
+                and status in ("ok", "partial")
                 and _current_ok_watermark(conn, agent_id) != observed_watermark
             )
 
@@ -1171,8 +1173,9 @@ def commit_dream_cycle(
                         (started_at, finished_at, status, agent_id, messages_processed,
                          candidates_inserted, candidates_merged, candidates_review,
                          last_processed_message_id, error_detail, model_requests,
-                         input_tokens, output_tokens, total_tokens, estimated_cost_micros)
-                    VALUES (?, ?, 'ok', ?, 0, 0, 0, 0, 0, ?, ?, ?, ?, ?, ?)
+                         input_tokens, output_tokens, total_tokens, estimated_cost_micros,
+                         candidates_dropped)
+                    VALUES (?, ?, 'ok', ?, 0, 0, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         started_at,
@@ -1184,6 +1187,7 @@ def commit_dream_cycle(
                         output_tokens,
                         total_tokens,
                         estimated_cost_micros,
+                        candidates_dropped,
                     ),
                 )
             else:
@@ -1193,8 +1197,9 @@ def commit_dream_cycle(
                         (started_at, finished_at, status, agent_id, messages_processed,
                          candidates_inserted, candidates_merged, candidates_review,
                          last_processed_message_id, error_detail, model_requests,
-                         input_tokens, output_tokens, total_tokens, estimated_cost_micros)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         input_tokens, output_tokens, total_tokens, estimated_cost_micros,
+                         candidates_dropped)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         started_at,
@@ -1212,6 +1217,7 @@ def commit_dream_cycle(
                         output_tokens,
                         total_tokens,
                         estimated_cost_micros,
+                        candidates_dropped,
                     ),
                 )
         except BaseException:
