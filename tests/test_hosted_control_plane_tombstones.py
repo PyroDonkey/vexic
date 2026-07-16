@@ -81,6 +81,39 @@ class ControlPlaneTombstoneTests(unittest.TestCase):
         with self.assertRaisesRegex(PermissionError, "already retired"):
             self.catalog.retire_control_project("tenant-a", self.project.project_id)
 
+    def test_retired_project_excluded_from_tenant_project_ids(self) -> None:
+        """Retiring a project cuts it from routing membership (ADR 0028 addendum).
+
+        ``HostedTenant.project_ids`` is what ``_bind_request`` authorizes
+        against, so a retired project must drop out — while the
+        ``tenant_projects`` row survives (filter, not delete).
+        """
+        other = self.catalog.create_control_project("tenant-a", name="Beta")
+        self.catalog.retire_control_project("tenant-a", self.project.project_id)
+
+        project_ids = self.catalog.get_tenant("tenant-a").project_ids
+        self.assertNotIn(self.project.project_id, project_ids)
+        self.assertIn(other.project_id, project_ids)
+        # Filter, not delete: routing membership rows are untouched.
+        self.assertEqual(
+            self._raw_count(
+                "SELECT COUNT(*) FROM tenant_projects WHERE tenant_id = ?",
+                "tenant-a",
+            ),
+            2,
+        )
+
+    def test_provision_only_membership_survives_filter(self) -> None:
+        """Memberships with no hosted_projects row still route.
+
+        ``provision_tenant`` seeds ``tenant_projects`` without a matching
+        ``hosted_projects`` row; the retirement filter must not drop them.
+        """
+        self.catalog.provision_tenant("tenant-b", project_ids={"legacy-project"})
+        self.assertIn(
+            "legacy-project", self.catalog.get_tenant("tenant-b").project_ids
+        )
+
     def test_retire_tenant_marks_inactive_but_row_survives_and_audits(self) -> None:
         self.catalog.retire_tenant("tenant-a", retired_by="admin")
 
@@ -112,6 +145,24 @@ class ControlPlaneTombstoneTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(row[0], 1)
         self.assertIsNone(row[1])
+
+    def test_list_control_projects_empty_for_retired_tenant(self) -> None:
+        """A retired tenant's projects drop out of active listings (ADR 0028)."""
+        self.catalog.retire_tenant("tenant-a")
+        self.assertEqual(self.catalog.list_control_projects("tenant-a"), [])
+
+    def test_get_control_project_rejects_retired_tenant(self) -> None:
+        """Reads fail closed with the existing error — no retirement leak."""
+        self.catalog.retire_tenant("tenant-a")
+        with self.assertRaisesRegex(PermissionError, "Unknown hosted project"):
+            self.catalog.get_control_project("tenant-a", self.project.project_id)
+
+    def test_reprovision_restores_project_listing(self) -> None:
+        """Retirement stays recoverable: reprovision brings listings back."""
+        self.catalog.retire_tenant("tenant-a")
+        self.catalog.provision_tenant("tenant-a")
+        active = [p.project_id for p in self.catalog.list_control_projects("tenant-a")]
+        self.assertIn(self.project.project_id, active)
 
     def test_retire_unknown_tenant_raises(self) -> None:
         with self.assertRaises(PermissionError):

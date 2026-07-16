@@ -152,7 +152,8 @@ Notes:
   control-plane ops record `hosted_audit_events` (with new `project_id`/`key_id`
   columns), a whole-scope purge (`PurgeScopeRequest` with a null session)
   requires `confirm_whole_scope=True`, and `hosted_projects`/`tenants` gain
-  inline `retired_at`/`retired_by` soft-delete. Extends ADR 0022. Infra
+  inline `retired_at`/`retired_by` soft-delete; a COA-323 addendum makes
+  retirement cut live access at binding time. Extends ADR 0022. Infra
   controls (PITR/backups, Railway SSH) and the `adapters/` credential-scoping
   work stay deferred to their own workstreams.
 - These numbers are the Vexic `docs/adr/` series and are self-contained.

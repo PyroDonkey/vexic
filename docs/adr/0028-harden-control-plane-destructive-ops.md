@@ -76,13 +76,10 @@ trail, and `hosted_projects`/`tenants` had no working soft-delete
   remains the primary control. This ADR narrows the accidental and
   single-action blast radius inside the core.
 - `retire_control_project`/`retire_tenant` are the recoverable soft-delete
-  primitive, not a full removal path. They mark the row (listing + audit +
-  `active = 0` for tenants) but deliberately do not yet cut live access:
-  `retire_control_project` leaves the `tenant_projects` routing membership and
-  existing key bindings intact, and the active-project readers filter only
-  `hosted_projects.retired_at` (not the owning tenant's state). A future
-  removal/off-boarding path builds access revocation on top of these
-  primitives; until it exists these methods have no runtime callers.
+  primitive. As first landed they marked the row (listing + audit +
+  `active = 0` for tenants) without cutting live access; the addendum below
+  (COA-323) closed that gap, so retirement now revokes access at binding time
+  while remaining non-destructive and recoverable.
 - Audit rows for the destructive ops commit in the same transaction as the
   state change, and revocation audits fire only on the `NULL -> revoked`
   transition, so a repeated (idempotent) revoke does not forge a second event
@@ -92,3 +89,29 @@ trail, and `hosted_projects`/`tenants` had no working soft-delete
 - Deferred to their own workstreams: read-only default tenant tokens and a
   `destroy_database` allow-list in `adapters/`; Turso PITR/backups, the
   restore-drill runbook, and Railway SSH-key restriction (infra/ops).
+
+## Addendum (2026-07-15): retirement cuts live access (COA-323)
+
+The deferred removal/off-boarding path now exists. Three decisions:
+
+- **Filter, not delete, routing membership.** `tenant_projects` rows survive
+  retirement; `HostedTenant.project_ids` assembly anti-joins
+  `hosted_projects.retired_at` (LEFT JOIN, so provision-only memberships with
+  no `hosted_projects` row keep routing). Retirement stays recoverable — no
+  canonical row is deleted and no key is revoked, so un-retiring restores
+  access.
+- **Binding-level enforcement.** Every data-plane route passes through
+  `HostedMemoryService._bind_request`, which authorizes the request project
+  against the retirement-filtered `project_ids` and resolves the tenant via
+  `get_tenant`'s `active = 1` gate — so `retire_control_project` and
+  `retire_tenant` both cut access at binding time. The credential layer
+  (`HostedApiKeyStore`) deliberately stays retirement-unaware: adding a
+  tenants/projects join to per-request key auth would add a hot-path read for
+  no additional coverage.
+- **Active-project readers gate on tenant state.** `list_control_projects`
+  and `get_control_project` exclude projects of inactive/retired tenants
+  (`EXISTS ... tenants.active = 1`), failing closed with the existing
+  "Unknown hosted project" error so retirement state does not leak.
+
+Out of scope, tracked separately: a project unretire primitive and
+`upsert_control_project` behavior against a retired project id.
