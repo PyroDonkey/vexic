@@ -44,7 +44,14 @@ Harness envelopes are filtered with a dual guard, mirroring the
      strip-and-keep treatment (COA-392): a notification can share a turn with
      real user speech, so the block is stripped, the rest kept, and a row
      that is empty after stripping or carries an unpaired tag is dropped
-     (fail closed).
+     (fail closed). Two hardenings beyond the reminder treatment, both from
+     adversarial review: stripping applies only when open and close tags are
+     balanced -- nested or malformed blocks would let a non-greedy strip
+     surface inner payload as apparent user text, so unbalanced text is left
+     untouched and the surviving tags are rejected downstream; and detection
+     matches the tag prefixes (`<task-notification`, `</task-notification`)
+     rather than the exact closed form, so attribute or whitespace tag
+     variants also fail closed.
 2. **Ingest rejects, never mutates.** `ingest_source_messages` runs the same
    marker check beside the existing prime-context backstop and rejects the
    row per-row (`status="rejected"` with a reason). The boundary never

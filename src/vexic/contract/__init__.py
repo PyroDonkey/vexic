@@ -63,6 +63,12 @@ def strip_system_reminder_blocks(text: str) -> str:
 TASK_NOTIFICATION_OPEN = "<task-notification>"
 TASK_NOTIFICATION_CLOSE = "</task-notification>"
 
+# Detection is prefix-based so attribute or whitespace tag variants
+# (e.g. "<task-notification id=...>") still fail closed even though only the
+# canonical exact form is ever stripped.
+_TASK_NOTIFICATION_OPEN_PREFIX = "<task-notification"
+_TASK_NOTIFICATION_CLOSE_PREFIX = "</task-notification"
+
 _TASK_NOTIFICATION_BLOCK = re.compile(
     re.escape(TASK_NOTIFICATION_OPEN) + ".*?" + re.escape(TASK_NOTIFICATION_CLOSE),
     flags=re.DOTALL,
@@ -70,7 +76,17 @@ _TASK_NOTIFICATION_BLOCK = re.compile(
 
 
 def strip_task_notification_blocks(text: str) -> str:
-    """Remove paired task-notification blocks, keeping surrounding text."""
+    """Remove paired task-notification blocks, keeping surrounding text.
+
+    Strips only when open and close tags are balanced. Nested or malformed
+    blocks would let a non-greedy strip surface inner payload as apparent
+    user text, so unbalanced text is returned untouched and the surviving
+    tags fail closed in :func:`harness_envelope_reason`.
+    """
+    opens = text.count(_TASK_NOTIFICATION_OPEN_PREFIX)
+    closes = text.count(_TASK_NOTIFICATION_CLOSE_PREFIX)
+    if opens != closes:
+        return text
     return _TASK_NOTIFICATION_BLOCK.sub("", text).strip()
 
 
@@ -81,7 +97,10 @@ def harness_envelope_reason(text: str) -> str | None:
             return "claude-code command envelope is not transcript text"
     if SYSTEM_REMINDER_OPEN in text or SYSTEM_REMINDER_CLOSE in text:
         return "system-reminder block is not transcript text"
-    if TASK_NOTIFICATION_OPEN in text or TASK_NOTIFICATION_CLOSE in text:
+    if (
+        _TASK_NOTIFICATION_OPEN_PREFIX in text
+        or _TASK_NOTIFICATION_CLOSE_PREFIX in text
+    ):
         return "task-notification block is not transcript text"
     return None
 
