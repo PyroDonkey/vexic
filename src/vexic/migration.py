@@ -12,7 +12,13 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage import init_db, init_vector_memory
 from vexic.storage.operators import MemoryProjectionRepairReport, repair_memory_projections
-from vexic.storage.connection import StorageTarget, connect, row_as_dict, rows_as_dicts
+from vexic.storage.connection import (
+    StorageTarget,
+    _is_libsql_target,
+    connect,
+    row_as_dict,
+    rows_as_dicts,
+)
 
 ARTIFACT_VERSION = "vexic.canonical-migration.v1"
 MIGRATION_METADATA_TABLE = "canonical_migration_imports"
@@ -359,12 +365,14 @@ def import_canonical_migration(
         *_iter_payload_strings(artifact.model_dump(mode="json")),
     )
 
-    # A `StorageTarget` (libSQL/Turso DSN) names a remote, managed database --
-    # there is no local file to `Path.exists()` against, so the pre-import
-    # host-owned-table check always connects for a remote target. A local
-    # path/str target keeps the existing behavior byte-identical: only probe
-    # when a file is already there (a brand-new local file has no tables yet).
-    if isinstance(target_db_path, StorageTarget):
+    # A `StorageTarget` or a raw libsql-scheme DSN string names a remote,
+    # managed database -- there is no local file to `Path.exists()` against
+    # (`Path(dsn).exists()` is always False), so the pre-import
+    # host-owned-table check must always connect for a remote target rather
+    # than fall into the local-path probe and silently skip. A local path/str
+    # target keeps the existing behavior byte-identical: only probe when a
+    # file is already there (a brand-new local file has no tables yet).
+    if isinstance(target_db_path, StorageTarget) or _is_libsql_target(target_db_path):
         with closing(connect(target_db_path)) as conn:
             _assert_no_host_owned_tables(conn)
     else:

@@ -202,6 +202,66 @@ def test_failed_import_rolls_back_on_libsql_target(monkeypatch, tmp_path):
     assert count == 0
 
 
+def test_import_fails_closed_on_host_owned_table_for_raw_libsql_string_target(
+    monkeypatch, tmp_path
+):
+    """A raw ``libsql://`` DSN string (not a ``StorageTarget``) must hit the
+    same pre-import host-owned-table probe as a ``StorageTarget``.
+    ``Path(dsn).exists()`` is always False, so branching a DSN string into the
+    local-path form silently skips the fail-closed guard while ``connect()``
+    still routes the import to the remote database."""
+    source_db = tmp_path / "source.db"
+    artifact = tmp_path / "canonical-migration.json"
+
+    init_db(str(source_db))
+    ingest_source_messages(
+        str(source_db),
+        [_source_message("cedar migration transcript")],
+        session_id="session-a",
+        agent_id="agent-a",
+    )
+    export_canonical_migration(
+        str(source_db),
+        artifact,
+        tenant_id="tenant-a",
+        project_id="project-a",
+    )
+
+    import vexic.migration as migration
+    import vexic.storage.schema as storage_schema
+    import vexic.storage.operators as storage_operators
+    import vexic.storage.transcript as storage_transcript
+
+    dsn = "libsql://fake-migration-raw-string-target"
+    fake_conn = FakeLibsqlConn()
+    fake_conn.execute("CREATE TABLE background_tool_audit (id INTEGER PRIMARY KEY)")
+
+    def _fake_connect(target, *, auth_token=None, **kwargs):
+        assert target == dsn, f"expected the raw DSN string target, got {target!r}"
+        return _NonClosingFakeConnHandle(fake_conn)
+
+    for module in (migration, storage_schema, storage_operators, storage_transcript):
+        monkeypatch.setattr(module, "connect", _fake_connect)
+
+    with pytest.raises(ValueError, match="host-owned extension table"):
+        import_canonical_migration(
+            artifact,
+            dsn,
+            tenant_id="tenant-a",
+            project_id="project-a",
+        )
+
+    # Fail-closed means the guard fired before any schema init or row insert
+    # touched the remote target.
+    tables = [
+        row[0]
+        for row in fake_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    ]
+    assert "messages" not in tables
+
+
 def test_failed_import_propagates_original_error_when_rollback_raises(monkeypatch, tmp_path):
     """A deadline-poisoned remote connection raises on the rollback round-trip
     too; the import must still propagate the original failure rather than the
