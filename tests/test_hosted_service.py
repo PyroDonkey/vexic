@@ -1171,6 +1171,63 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                 ),
             )
 
+    async def test_key_bound_to_retired_project_is_rejected_at_bind(self) -> None:
+        """Retiring a control project cuts live access for its keys.
+
+        Enforcement is binding-level: every data-plane route passes through
+        ``_bind_request``, whose project check reads the retirement-filtered
+        ``HostedTenant.project_ids``. The credential layer stays untouched —
+        the key is not revoked, so un-retiring restores access.
+        """
+        self.catalog.provision_tenant("tenant-a")
+        project = self.catalog.create_control_project("tenant-a", name="Alpha")
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.SEARCH},
+            project_ids={project.project_id},
+        )
+
+        self.catalog.retire_control_project("tenant-a", project.project_id)
+
+        with self.assertRaises(PermissionError):
+            await self.service.search_transcript(
+                api_key.raw_key,
+                SearchTranscriptRequest(
+                    scope=_scope(
+                        project_id=project.project_id,
+                        capabilities={MemoryCapability.SEARCH},
+                    ),
+                    query="cedar",
+                ),
+            )
+
+    async def test_retire_tenant_cuts_data_plane_access(self) -> None:
+        """Retiring a tenant cuts live access for previously valid keys.
+
+        Pins the ``active = 1`` predicate in ``get_tenant`` as the contract
+        that makes ``retire_tenant`` an access cut (ADR 0028 addendum), not an
+        audit marker.
+        """
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.SEARCH},
+            project_ids={"project-a"},
+        )
+
+        self.catalog.retire_tenant("tenant-a")
+
+        with self.assertRaisesRegex(PermissionError, "Unknown hosted tenant"):
+            await self.service.search_transcript(
+                api_key.raw_key,
+                SearchTranscriptRequest(
+                    scope=_scope(capabilities={MemoryCapability.SEARCH}),
+                    query="cedar",
+                ),
+            )
+
     async def test_redaction_failure_records_no_payload_and_persists_nothing(self) -> None:
         self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
         api_key = self.keys.create_key(

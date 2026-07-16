@@ -808,6 +808,29 @@ class DreamSweeperTickTests(unittest.IsolatedAsyncioTestCase):
             state.last_summarize_watermark, self._scope_watermark(tenant.db_path)
         )
 
+    async def test_retire_tenant_between_tick_and_run_holds_watermark(self) -> None:
+        """A sweep job blocked by the execution-time retirement gate never
+        summarized anything, so the watermark must hold (ADR 0028 addendum).
+
+        Distinct from ran-and-failed (advances, anti-spend): the retirement
+        gate rejects before the phase touches memory, so re-provisioning the
+        tenant must let the next tick still see those rows as new.
+        """
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        service = self._service(_summary_ports())
+        sweeper = self._sweeper(service)
+
+        report = await sweeper.tick(now=NOW)
+        self.assertEqual(report.summarize_scheduled, 1)
+
+        self.catalog.retire_tenant("tenant-a")
+        await self._drain_background(service)
+
+        self.assertEqual(_summary_row_count(tenant.db_path), 0)
+        state = self.catalog.dream_sweep_state("tenant-a", None)
+        self.assertEqual(state.last_summarize_watermark, 0)
+
     async def test_failed_summarize_run_still_advances_watermark(self) -> None:
         """Deliberate spend posture: the job ran, its errors are in job
         events, and re-sweeping a persistently failing tenant every tick

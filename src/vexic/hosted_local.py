@@ -658,6 +658,10 @@ class HostedTenantCatalog:
                 SELECT project_id, tenant_id, name, environment, created_at
                 FROM hosted_projects
                 WHERE tenant_id = ? AND retired_at IS NULL
+                  AND EXISTS (
+                    SELECT 1 FROM tenants t
+                    WHERE t.tenant_id = hosted_projects.tenant_id AND t.active = 1
+                  )
                 ORDER BY created_at, project_id
                 """,
                 (tenant_id,),
@@ -680,6 +684,10 @@ class HostedTenantCatalog:
                 SELECT project_id, tenant_id, name, environment, created_at
                 FROM hosted_projects
                 WHERE tenant_id = ? AND project_id = ? AND retired_at IS NULL
+                  AND EXISTS (
+                    SELECT 1 FROM tenants t
+                    WHERE t.tenant_id = hosted_projects.tenant_id AND t.active = 1
+                  )
                 """,
                 (tenant_id, project_id),
             ).fetchone()
@@ -1545,12 +1553,16 @@ class HostedTenantCatalog:
         tenant_id: str,
         db_filename: str,
     ) -> HostedTenant:
+        # LEFT JOIN, not INNER: provision-only memberships have no
+        # hosted_projects row and must keep routing (ADR 0028 addendum).
         project_rows = conn.execute(
             """
-            SELECT project_id
-            FROM tenant_projects
-            WHERE tenant_id = ?
-            ORDER BY project_id
+            SELECT tp.project_id
+            FROM tenant_projects tp
+            LEFT JOIN hosted_projects hp
+              ON hp.tenant_id = tp.tenant_id AND hp.project_id = tp.project_id
+            WHERE tp.tenant_id = ? AND hp.retired_at IS NULL
+            ORDER BY tp.project_id
             """,
             (tenant_id,),
         ).fetchall()
