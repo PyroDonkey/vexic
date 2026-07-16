@@ -39,7 +39,7 @@ ownership of extension-table semantics.
   retry/idempotency, rollback before catalog repoint, atomic one-active-database
   catalog state, projection rebuild, and schema/version mismatch handling.
 
-## Addendum — 2026-07-16: v1 artifact compatibility is additive-tolerant (COA-387)
+## Addendum - 2026-07-16: v1 artifact compatibility is additive-tolerant (COA-387)
 
 The original import required each artifact row's column set to exactly equal
 the current target schema's columns, so every additive `_ensure_column`
