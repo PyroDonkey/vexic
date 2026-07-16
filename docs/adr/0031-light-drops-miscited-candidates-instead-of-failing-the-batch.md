@@ -67,7 +67,7 @@ chain.
   count means the extraction prompt or model needs attention.
 
   **Amendment (2026-07-16): the drop count is durable.** A stdout-only signal
-  is not queryable and nothing can alert on it — the same silence class that
+  is not queryable and nothing can alert on it -- the same silence class that
   hid the dreaming incident behind ADR 0032. Every Light cycle now persists
   the count in `dream_runs.candidates_dropped` (count only, still content-free),
   and a run that extracted candidates but kept none records
