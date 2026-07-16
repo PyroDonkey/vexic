@@ -259,6 +259,63 @@ class LightPhaseProvenanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1 dropped", output.getvalue())
         self.assertNotIn("Mars", output.getvalue())
 
+    async def test_error_after_filtering_still_records_known_drop_count(self) -> None:
+        # A failure between provenance filtering and commit must not zero the
+        # already-known drop count on the error audit row: the failed cycle's
+        # drop telemetry is the ADR 0031 miscitation signal either way.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            message_id = save_messages(
+                db_path,
+                [ModelRequest(parts=[UserPromptPart(content="I prefer compact reports.")])],
+            )[0]
+
+            class ExtractionAgent:
+                async def run(self, transcript: str) -> object:
+                    return SimpleNamespace(
+                        output=[
+                            FactCandidate(
+                                fact_text="Ryan prefers compact reports.",
+                                subject="Ryan",
+                                category="preference",
+                                importance=7,
+                                confidence=0.9,
+                                source_message_ids=[message_id],
+                            ),
+                            FactCandidate(
+                                fact_text="Ryan lives on Mars.",
+                                subject="Ryan",
+                                category="fact",
+                                importance=5,
+                                confidence=0.8,
+                                source_message_ids=[message_id + 999],
+                            ),
+                        ],
+                        usage=_fake_usage(),
+                    )
+
+            def failing_embed(texts: list[str]) -> list[list[float]]:
+                raise RuntimeError("embedding backend down")
+
+            output = StringIO()
+            with redirect_stdout(output):
+                with self.assertRaises(RuntimeError):
+                    await run_light_phase(
+                        db_path,
+                        "glm",
+                        extraction_agent_factory=lambda group, secrets=None: ExtractionAgent(),
+                        embed=failing_embed,
+                    )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                status, dropped = conn.execute(
+                    "SELECT status, candidates_dropped FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+
+        self.assertEqual(status, "error")
+        self.assertEqual(dropped, 1)
+
     def test_dream_runs_schema_has_durable_drop_count(self) -> None:
         # ADR 0031's mitigation for silent systematic miscitation is the drop
         # count; stdout is not durable, so the count lives in dream_runs.

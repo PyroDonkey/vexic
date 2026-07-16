@@ -153,6 +153,7 @@ async def run_light_phase(
     """
     started_at = utc_now_iso()
     watermark = 0
+    dropped = 0
     forbidden = _forbidden_secret_values(secrets, forbidden_secret_values)
     agent_factory = extraction_agent_factory or build_extraction_agent
     embedder = embed or embed_texts
@@ -291,6 +292,9 @@ async def run_light_phase(
                     messages_processed=0,
                     last_processed_message_id=watermark,
                     error_detail=format_error_detail(exc),
+                    # A drop count established before the failure is still the
+                    # ADR 0031 miscitation signal; do not zero it on error.
+                    candidates_dropped=dropped,
                     forbidden_secret_values=forbidden,
                 )
             )
