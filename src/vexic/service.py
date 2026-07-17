@@ -214,9 +214,34 @@ class LocalMemoryService(MemoryService):
                 return False
         return row["target_agent_id"] == scope.agent_id
 
+    def _scope_matches_tombstone_erase_key(
+        self, scope: MemoryScope, row: Mapping[str, object]
+    ) -> bool:
+        """Match the (session, agent) erase key the physical purge uses.
+
+        ``purge_scope_rows`` deletes by ``(? IS NULL OR session_id = ?) AND
+        agent_id IS ?`` -- project/user-blind, because the physical tables
+        carry no project/user columns (ADR 0007). The write gate must mirror
+        that exactly: a tombstone whose project or user differs from the
+        writer's scope still erases the writer's rows, so those fields must
+        not exempt a write.
+        """
+        target_session = row["target_session_id"]
+        if target_session is not None and target_session != scope.session_id:
+            return False
+        return row["target_agent_id"] == scope.agent_id
+
     def _assert_not_tombstoned(self, scope: MemoryScope, operation: str) -> None:
         column_name = _TOMBSTONE_FLAG_COLUMNS[operation]
         flag_filter = "" if column_name is None else f"AND {column_name} = 1"
+        # Reads gate logical access and honor the tombstone's full scope
+        # pattern; writes gate against the physical erase key (see
+        # _scope_matches_tombstone_erase_key).
+        matches = (
+            self._scope_matches_tombstone_erase_key
+            if operation == "write"
+            else self._scope_matches_tombstone
+        )
         with closing(connect(self.db_path)) as conn:
             rows = rows_as_dicts(conn.execute(
                 f"""
@@ -226,7 +251,7 @@ class LocalMemoryService(MemoryService):
                 """,
                 (scope.tenant_id,),
             ))
-        if any(self._scope_matches_tombstone(scope, row) for row in rows):
+        if any(matches(scope, row) for row in rows):
             raise PermissionError(f"Memory scope is tombstoned for {operation}.")
 
     def _artifact_root(self) -> Path:
@@ -711,6 +736,12 @@ class LocalMemoryService(MemoryService):
             request.scope.model_copy(update={"session_id": request.event.session_id}),
             "retrieval",
         )
+        # Recording the event also writes a row, so the flag-independent write
+        # gate applies on top of the retrieval flag gate.
+        self._assert_not_tombstoned(
+            request.scope.model_copy(update={"session_id": request.event.session_id}),
+            "write",
+        )
         event_ids = record_long_term_retrieval(
             self.db_path,
             [request.event.referent_id],
@@ -738,6 +769,12 @@ class LocalMemoryService(MemoryService):
         self._assert_not_tombstoned(
             self._with_default_session(request.scope),
             "rebuild",
+        )
+        # Retiring a fact mutates a row, so the flag-independent write gate
+        # applies on top of the rebuild flag gate.
+        self._assert_not_tombstoned(
+            self._with_default_session(request.scope),
+            "write",
         )
         with closing(connect(self.db_path)) as conn:
             with conn:
@@ -964,13 +1001,11 @@ async def _run_dream_phase_with_usage(
 ) -> tuple[RunDreamPhaseResult, UsageSummary]:
     service.init_schema()
     service._authorize(request.scope, request.required_capability)
-    service._assert_not_tombstoned(
-        service._with_default_session(request.scope),
-        "rebuild",
-    )
-    # Dream phases write candidate and fact rows, so they are also gated as
-    # writes: any matching tombstone blocks them even when its lifecycle flags
-    # (including rebuild_blocked) are zero.
+    # Dream phases write candidate and fact rows, so they are gated as writes:
+    # any tombstone matching the erase key blocks them even when its lifecycle
+    # flags (including rebuild_blocked) are zero. The write gate subsumes the
+    # rebuild flag gate here, since the normalized scope carries a concrete
+    # session and the erase-key match is at least as broad.
     service._assert_not_tombstoned(
         service._with_default_session(request.scope),
         "write",

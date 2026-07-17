@@ -1531,37 +1531,23 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                     """
                 )
 
+        # Partial flags still gate matching READ operations per flag, but every
+        # mutating operation is additionally blocked by the flag-independent
+        # write gate: any tombstone marks the scope for erasure (ADR 0022), so
+        # database mutations fail closed regardless of the lifecycle flags.
         agent_a_write = _scope(agent_id="agent-a", capabilities={MemoryCapability.WRITE})
         agent_b_write = _scope(agent_id="agent-b", capabilities={MemoryCapability.WRITE})
-        with self.assertRaisesRegex(PermissionError, "tombstoned"):
-            await service.record_retrieval_event(
-                RecordRetrievalEventRequest(
-                    scope=agent_a_write,
-                    event=RetrievalEvent(
-                        event_id=0,
-                        referent_id=facts["agent-a"],
-                        session_id="default",
-                        query="cedar",
-                        retrieved_at="2026-06-20T00:00:00Z",
-                    ),
-                    redaction=RedactionContext(forbidden_values=()),
-                )
-            )
-        self.assertTrue(
-            (
-                await service.retire_fact(
-                    RetireFactRequest(scope=agent_a_write, fact_id=facts["agent-a"])
-                )
-            ).retired
-        )
-        self.assertGreater(
-            (
+        for scope, fact_id in (
+            (agent_a_write, facts["agent-a"]),
+            (agent_b_write, facts["agent-b"]),
+        ):
+            with self.assertRaisesRegex(PermissionError, "tombstoned"):
                 await service.record_retrieval_event(
                     RecordRetrievalEventRequest(
-                        scope=agent_b_write,
+                        scope=scope,
                         event=RetrievalEvent(
                             event_id=0,
-                            referent_id=facts["agent-b"],
+                            referent_id=fact_id,
                             session_id="default",
                             query="cedar",
                             retrieved_at="2026-06-20T00:00:00Z",
@@ -1569,13 +1555,23 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                         redaction=RedactionContext(forbidden_values=()),
                     )
                 )
-            ).event_id,
-            0,
-        )
+            with self.assertRaisesRegex(PermissionError, "tombstoned"):
+                await service.retire_fact(
+                    RetireFactRequest(scope=scope, fact_id=fact_id)
+                )
+
+        # Read side: the retrieval-only tombstone blocks agent-a's search while
+        # agent-b's tombstone (retrieval_blocked = 0) leaves search open.
         with self.assertRaisesRegex(PermissionError, "tombstoned"):
-            await service.retire_fact(
-                RetireFactRequest(scope=agent_b_write, fact_id=facts["agent-b"])
+            await service.search_transcript(
+                SearchTranscriptRequest(
+                    scope=_scope(agent_id="agent-a"), query="cedar"
+                )
             )
+        agent_b_search = await service.search_transcript(
+            SearchTranscriptRequest(scope=_scope(agent_id="agent-b"), query="cedar")
+        )
+        self.assertEqual(agent_b_search.hits, [])
 
     def test_session_summary_helpers_use_agent_scope(self) -> None:
         from vexic.storage import (

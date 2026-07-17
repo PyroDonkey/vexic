@@ -18,7 +18,10 @@ from vexic.contract import (
     Principal,
     PrincipalType,
     PurgeScopeRequest,
+    RecordRetrievalEventRequest,
     RedactionContext,
+    RetireFactRequest,
+    RetrievalEvent,
     RunDreamPhaseRequest,
     SourceTranscriptMessage,
     TrustBoundary,
@@ -567,10 +570,7 @@ class PurgeScopeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(append_result.message_ids), 1)
         self.assertEqual(ingest_result.items[0].status, "inserted")
 
-    async def test_dream_phase_writes_rejected_for_any_tombstone_flags(self) -> None:
-        # Candidate/fact writes fail closed on ANY matching tombstone, even one
-        # whose lifecycle flags are all zero: every tombstone marks the scope
-        # for erasure, so consolidation must not write new rows into it.
+    def _insert_zero_flag_tombstone(self, session_id: str | None) -> None:
         with closing(sqlite3.connect(self.db_path)) as conn:
             with conn:
                 conn.execute(
@@ -580,10 +580,17 @@ class PurgeScopeTests(unittest.IsolatedAsyncioTestCase):
                          created_by_principal_id, created_by_principal_type, reason,
                          retrieval_blocked, export_blocked, replay_blocked,
                          rebuild_blocked, physical_purge_deferred)
-                    VALUES ('tenant-a', 'session-1', 'operator', 'operator',
+                    VALUES ('tenant-a', ?, 'operator', 'operator',
                             'flags all zero', 0, 0, 0, 0, 1)
-                    """
+                    """,
+                    (session_id,),
                 )
+
+    async def test_dream_phase_writes_rejected_for_any_tombstone_flags(self) -> None:
+        # Candidate/fact writes fail closed on ANY matching tombstone, even one
+        # whose lifecycle flags are all zero: every tombstone marks the scope
+        # for erasure, so consolidation must not write new rows into it.
+        self._insert_zero_flag_tombstone("session-1")
 
         with self.assertRaisesRegex(PermissionError, "tombstoned for write"):
             await self.service.run_dream_phase(
@@ -591,6 +598,97 @@ class PurgeScopeTests(unittest.IsolatedAsyncioTestCase):
                     scope=_scope({MemoryCapability.ADMIN_REBUILD}),
                     phase=DreamPhase.LIGHT,
                     redaction=RedactionContext(forbidden_values=()),
+                )
+            )
+
+    async def test_write_gate_ignores_project_and_user_tombstone_fields(self) -> None:
+        # Purge erases messages by (session_id, agent_id) only -- the physical
+        # tables carry no project/user columns -- so the write gate must match
+        # that same erase key. A tombstone whose project differs from the
+        # writer's project still erases the writer's rows; the gate must not
+        # treat the project mismatch as an exemption.
+        await self.service.delete_scope(
+            DeleteScopeRequest(
+                scope=_scope({MemoryCapability.ADMIN_LIFECYCLE}),
+                target_scope=MemoryScopeSelector(
+                    tenant_id="tenant-a",
+                    project_id="project-1",
+                    session_id="session-1",
+                ),
+                reason="user requested erasure",
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+
+        with self.assertRaisesRegex(PermissionError, "tombstoned for write"):
+            await self.service.append_transcript(
+                AppendTranscriptRequest(
+                    scope=_scope({MemoryCapability.WRITE}).model_copy(
+                        update={"project_id": "project-2"}
+                    ),
+                    messages_json=[
+                        single_message_adapter.dump_json(
+                            ModelRequest(
+                                parts=[UserPromptPart(content="other-project write")]
+                            )
+                        ).decode()
+                    ],
+                    redaction=RedactionContext(forbidden_values=()),
+                )
+            )
+
+    async def test_whole_scope_tombstone_blocks_every_session_write(self) -> None:
+        # A NULL target session purges every session in the agent scope, so
+        # the write gate must block writes to every session too.
+        await self._tombstone(None)
+
+        with self.assertRaisesRegex(PermissionError, "tombstoned for write"):
+            await self._append("session-2", "write into whole-scope erasure")
+
+    async def test_record_retrieval_event_rejected_for_any_tombstone_flags(
+        self,
+    ) -> None:
+        self._insert_zero_flag_tombstone("session-1")
+
+        with self.assertRaisesRegex(PermissionError, "tombstoned for write"):
+            await self.service.record_retrieval_event(
+                RecordRetrievalEventRequest(
+                    scope=_scope({MemoryCapability.WRITE}),
+                    event=RetrievalEvent(
+                        event_id=0,
+                        referent_id=self.purged_fact_id,
+                        session_id="session-1",
+                        query="late telemetry write",
+                        retrieved_at="2026-07-01T00:00:00Z",
+                    ),
+                    redaction=RedactionContext(forbidden_values=()),
+                )
+            )
+
+    async def test_retire_fact_rejected_for_any_tombstone_flags(self) -> None:
+        self._insert_zero_flag_tombstone("session-1")
+
+        with self.assertRaisesRegex(PermissionError, "tombstoned for write"):
+            await self.service.retire_fact(
+                RetireFactRequest(
+                    scope=_scope({MemoryCapability.WRITE}),
+                    fact_id=self.purged_fact_id,
+                )
+            )
+
+    async def test_none_session_scope_write_gate_checks_default_session(self) -> None:
+        # retire_fact permits a None-session scope; the gate normalizes it to
+        # "default" before matching, so a tombstone targeting "default" blocks
+        # it even when its lifecycle flags are all zero.
+        self._insert_zero_flag_tombstone("default")
+
+        with self.assertRaisesRegex(PermissionError, "tombstoned for write"):
+            await self.service.retire_fact(
+                RetireFactRequest(
+                    scope=_scope({MemoryCapability.WRITE}).model_copy(
+                        update={"session_id": None}
+                    ),
+                    fact_id=self.purged_fact_id,
                 )
             )
 
