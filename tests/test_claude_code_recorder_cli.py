@@ -2519,7 +2519,7 @@ class ClaudeCodeRecorderPrimeCommandTests(unittest.TestCase):
                         "--hook-input",
                         str(hook_payload),
                         "--max-chars",
-                        "160",
+                        "600",
                     ]
                 )
 
@@ -2527,7 +2527,7 @@ class ClaudeCodeRecorderPrimeCommandTests(unittest.TestCase):
             output = json.loads(stdout.getvalue())
             context = output["hookSpecificOutput"]["additionalContext"]
             self.assertEqual(output["hookSpecificOutput"]["hookEventName"], "SessionStart")
-            self.assertLessEqual(len(context), 160)
+            self.assertLessEqual(len(context), 600)
             self.assertIn("Durable cedar preference", context)
             self.assertIn("recent cedar note", context)
             self.assertNotIn("vx_secret", stdout.getvalue())
@@ -2552,6 +2552,120 @@ class ClaudeCodeRecorderPrimeCommandTests(unittest.TestCase):
         self.assertIn("Durable cedar preference", context)
         self.assertIn("vexic memory search tools", context)
         self.assertIn("Use this memory silently", context)
+
+    def test_prime_framing_bridge_survives_end_truncation_at_small_budget(self) -> None:
+        context = build_prime_context(
+            {
+                "facts": [{"fact_text": "long fact " * 200}],
+                "candidate_notes": [],
+            },
+            {"hits": []},
+            max_chars=300,
+        )
+
+        self.assertLessEqual(len(context), 300)
+        self.assertTrue(context.startswith("Vexic memory priming:"))
+        self.assertIn("Memory snapshot from prior sessions", context)
+        self.assertIn("vexic recall tools reach them", context)
+
+    def test_prime_core_guidance_sentence_complete_at_pathological_budget(self) -> None:
+        context = build_prime_context(
+            {
+                "facts": [{"fact_text": "long fact " * 200}],
+                "candidate_notes": [],
+            },
+            {"hits": []},
+            max_chars=200,
+        )
+
+        self.assertLessEqual(len(context), 200)
+        self.assertIn(
+            "Memory snapshot from prior sessions — use it silently.",
+            context,
+            "core usage-guidance sentence must be complete even below the "
+            "footer-reservation threshold",
+        )
+
+    def test_prime_footer_survives_worst_case_truncation(self) -> None:
+        from vexic.recorders.hosted_prime import PRIME_FOOTER
+
+        context = build_prime_context(
+            {
+                "facts": [{"fact_text": f"fact {i} " + "x" * 300} for i in range(30)],
+                "candidate_notes": [],
+            },
+            {"hits": [{"body": f"hit {i} " + "y" * 300} for i in range(30)]},
+            recap_text="recap " * 500,
+            max_chars=6_000,
+        )
+
+        self.assertLessEqual(len(context), 6_000)
+        self.assertTrue(
+            context.endswith(PRIME_FOOTER),
+            "reserved footer must be intact at the end under worst-case truncation",
+        )
+
+    def test_prime_below_reservation_threshold_prioritizes_content_over_footer(self) -> None:
+        from vexic.recorders.hosted_prime import PRIME_FOOTER
+
+        footer_block_len = len("\n" + PRIME_FOOTER)
+        max_chars = 2 * footer_block_len - 100  # inside the dead band
+        context = build_prime_context(
+            {"facts": [{"fact_text": "long fact " * 200}], "candidate_notes": []},
+            {"hits": []},
+            max_chars=max_chars,
+        )
+
+        self.assertLessEqual(len(context), max_chars)
+        # deliberate policy: below the reservation threshold, memory content
+        # wins the budget and the footer may be truncated away
+        self.assertIn("Memory snapshot from prior sessions — use it silently.", context)
+        self.assertIn("long fact", context)
+        self.assertFalse(context.endswith(PRIME_FOOTER))
+
+    def test_prime_single_long_hit_cannot_starve_later_hits(self) -> None:
+        context = build_prime_context(
+            {"facts": [], "candidate_notes": []},
+            {
+                "hits": [
+                    {"body": "monster hit " * 500},
+                    {"body": "short survivor hit"},
+                ]
+            },
+            max_chars=6_000,
+        )
+
+        self.assertIn("short survivor hit", context)
+        self.assertIn("monster hit", context)
+        # capped body: at most PRIME_ITEM_CAP chars plus the ellipsis
+        for line in context.splitlines():
+            if line.startswith("- monster hit"):
+                self.assertLessEqual(len(line), 2 + 400 + 1)  # "- " + cap + "…"
+                self.assertTrue(line.endswith("…"))
+
+    def test_prime_recap_body_capped_per_item(self) -> None:
+        context = build_prime_context(
+            {"facts": [{"fact_text": "Durable cedar preference"}], "candidate_notes": []},
+            {"hits": []},
+            recap_text="recap words " * 400,
+            max_chars=6_000,
+        )
+
+        self.assertIn("Durable cedar preference", context)
+        lines = context.splitlines()
+        recap_body = lines[lines.index("Prior conversation recap:") + 1]
+        # capped body: at most PRIME_RECAP_CAP chars plus the ellipsis
+        self.assertLessEqual(len(recap_body), 500 + 1)
+        self.assertTrue(recap_body.endswith("…"))
+
+    def test_prime_empty_memory_still_returns_empty_despite_framing(self) -> None:
+        context = build_prime_context(
+            {"facts": [], "candidate_notes": []},
+            {"hits": []},
+            max_chars=6_000,
+        )
+
+        self.assertEqual(context, "")
 
     def test_prime_context_stays_empty_without_memory(self) -> None:
         context = build_prime_context(
@@ -2957,6 +3071,79 @@ class ClaudeCodeRecorderPrimeCommandTests(unittest.TestCase):
             self.assertEqual(code, 0)
             context = json.loads(stdout.getvalue())["hookSpecificOutput"]["additionalContext"]
             self.assertLessEqual(len(context), 200)
+
+    def test_prime_fetch_trimmed_recap_carries_truncation_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+
+            class _Response:
+                def __init__(self, payload: dict[str, object]) -> None:
+                    self._payload = payload
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc):
+                    return False
+
+                def read(self) -> bytes:
+                    return json.dumps(self._payload).encode("utf-8")
+
+            def fake_urlopen(request, timeout):
+                if request.full_url.endswith("/v1/fresh_context"):
+                    return _Response(
+                        {
+                            "summaries": [],
+                            "recent": [],
+                            "text": "Recap cedar " * 200,
+                            "truncated": False,
+                        }
+                    )
+                if request.full_url.endswith("/v1/search_long_term"):
+                    return _Response({"facts": [], "candidate_notes": []})
+                return _Response({"hits": []})
+
+            stdout = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--max-chars",
+                        "2000",
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            context = json.loads(stdout.getvalue())["hookSpecificOutput"]["additionalContext"]
+            self.assertLessEqual(len(context), 2000)
+            lines = context.splitlines()
+            recap_index = lines.index("Prior conversation recap:")
+            recap_line = lines[recap_index + 1]
+            self.assertTrue(
+                recap_line.endswith("…"),
+                f"expected truncated recap to end with an ellipsis marker, got: {recap_line!r}",
+            )
 
     def test_prime_huge_recap_does_not_starve_long_term_and_transcript_sections(
         self,

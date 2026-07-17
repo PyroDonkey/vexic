@@ -16,6 +16,27 @@ LONG_TERM_PRIME_QUERY = "preference fact goal decision project context remember"
 TRANSCRIPT_PRIME_QUERY = "remember"
 DEFAULT_PRIME_MAX_CHARS = 6_000
 
+PRIME_FRAMING = (
+    "Memory snapshot from prior sessions — use it silently.\n"
+    "More facts and conversation history exist beyond this snapshot; the "
+    "vexic recall tools reach them."
+)
+PRIME_FOOTER = (
+    "Use this memory silently, as if you simply remember it — don't mention "
+    "memory systems or where facts came from unless asked. If vexic memory "
+    "search tools are available, use them to look up more preferences, "
+    "facts, and past conversation when relevant."
+)
+
+PRIME_ITEM_CAP = 400
+PRIME_RECAP_CAP = 500
+
+
+def _cap_item(text: str, cap: int) -> str:
+    if len(text) <= cap:
+        return text
+    return text[:cap].rstrip() + "…"
+
 
 @dataclass(frozen=True)
 class HostedPrimeConfig:
@@ -83,9 +104,7 @@ def fetch_prime_context(
     if fresh_context is not None:
         recap_text = _str(fresh_context.get("text"))
         if recap_text is not None:
-            recap_cap = max_chars // 4
-            if len(recap_text) > recap_cap:
-                recap_text = recap_text[:recap_cap].rstrip()
+            recap_text = _cap_item(recap_text, max_chars // 4)
     long_term = _safe_post_search(
         config,
         "search_long_term",
@@ -163,14 +182,14 @@ def build_prime_context(
     recap_text: str | None = None,
     max_chars: int,
 ) -> str:
-    lines: list[str] = [PRIME_CONTEXT_HEADER]
+    lines: list[str] = [PRIME_CONTEXT_HEADER, PRIME_FRAMING]
     facts = _items(long_term.get("facts"))
     notes = _items(long_term.get("candidate_notes"))
     hits = _items(transcript.get("hits"))
 
     if recap_text:
         lines.append("Prior conversation recap:")
-        lines.append(recap_text)
+        lines.append(_cap_item(recap_text, PRIME_RECAP_CAP))
 
     if facts or notes:
         lines.append("Long-term memory:")
@@ -188,17 +207,19 @@ def build_prime_context(
         for hit in hits:
             body = _str(hit.get("body"))
             if body:
-                lines.append(f"- {body}")
+                lines.append(f"- {_cap_item(body, PRIME_ITEM_CAP)}")
 
-    if len(lines) == 1:
+    if len(lines) == 2:
         return ""
-    lines.append(
-        "Use this memory silently, as if you simply remember it — don't mention "
-        "memory systems or where facts came from unless asked. If vexic memory "
-        "search tools are available, use them to look up more preferences, "
-        "facts, and past conversation when relevant."
-    )
-    return _cap("\n".join(lines), max_chars)
+    content = "\n".join(lines)
+    footer_block = "\n" + PRIME_FOOTER
+    if max_chars >= 2 * len(footer_block):
+        # Reserve footer space only when the budget can hold the footer plus
+        # at least an equal share of content. Below that threshold the
+        # legacy end-cap below deliberately prioritizes memory content over
+        # the footer.
+        return _cap(content, max_chars - len(footer_block)) + footer_block
+    return _cap(content + footer_block, max_chars)
 
 
 def _items(value: object) -> list[dict[str, object]]:
