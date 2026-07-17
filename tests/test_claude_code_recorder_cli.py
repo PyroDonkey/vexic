@@ -469,6 +469,131 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         self.assertEqual(sleep_mock.call_args_list, [call(0.5), call(1.0)])
 
+    def test_post_source_messages_retries_response_read_timeout_then_succeeds(
+        self,
+    ) -> None:
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        class _Response:
+            def __init__(self, *, fail: bool) -> None:
+                self._fail = fail
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self) -> bytes:
+                if self._fail:
+                    raise TimeoutError("read timed out")
+                return b'{"items":[]}'
+
+        calls: list[int] = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(1)
+            return _Response(fail=len(calls) == 1)
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+        ):
+            result = post_source_messages(config, messages=[], forbidden_values=())
+
+        self.assertEqual(result, {"items": []})
+        self.assertEqual(len(calls), 2)
+        sleep_mock.assert_called_once_with(0.5)
+
+    def test_post_source_messages_retries_incomplete_read_then_succeeds(self) -> None:
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        class _Response:
+            def __init__(self, *, fail: bool) -> None:
+                self._fail = fail
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self) -> bytes:
+                if self._fail:
+                    raise IncompleteRead(partial=b"{")
+                return b'{"items":[]}'
+
+        calls: list[int] = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(1)
+            return _Response(fail=len(calls) == 1)
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+        ):
+            result = post_source_messages(config, messages=[], forbidden_values=())
+
+        self.assertEqual(result, {"items": []})
+        self.assertEqual(len(calls), 2)
+        sleep_mock.assert_called_once_with(0.5)
+
+    def test_post_source_messages_invalid_json_body_exhausts_to_transport_error(
+        self,
+    ) -> None:
+        from vexic.recorders.hosted_ingest import HostedIngestTransportError
+
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self) -> bytes:
+                # A proxy-truncated 200 body: parse fails on every attempt.
+                return b"<html>truncated"
+
+        calls: list[int] = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(1)
+            return _Response()
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+        ):
+            with self.assertRaises(HostedIngestTransportError) as caught:
+                post_source_messages(config, messages=[], forbidden_values=())
+
+        # The parse failure surfaces only the exception type name, never the
+        # response body, so a misbehaving proxy body cannot leak into status.
+        self.assertEqual(str(caught.exception), "hosted ingest failed: JSONDecodeError")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleep_mock.call_args_list, [call(0.5), call(1.0)])
+
     def test_write_status_does_not_leak_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             status_path = Path(temp) / "status.json"
@@ -495,6 +620,66 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
         self.assertEqual(payload["rejected"], 3)
         self.assertEqual(payload["ignored"], 4)
         self.assertNotIn("vx_secret", json.dumps(payload))
+
+    def test_write_status_is_atomic_via_temp_file_and_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            status_dir = Path(temp)
+            status_path = status_dir / "status.json"
+            captured: list[tuple[str, str]] = []
+            real_replace = os.replace
+
+            def spy_replace(src, dst):
+                captured.append((str(src), str(dst)))
+                return real_replace(src, dst)
+
+            with patch("vexic.recorders.status.os.replace", spy_replace):
+                write_status(
+                    status_path,
+                    RecorderStatus(
+                        ok=True,
+                        operation="ingest",
+                        source_session_id="session-1",
+                        transcript_path="/tmp/session.jsonl",
+                    ),
+                )
+
+            # The final write lands via a temp file renamed onto the target, so
+            # an overlapping async run can never observe a half-written status.
+            self.assertEqual(len(captured), 1)
+            self.assertEqual(captured[0][1], str(status_path))
+            self.assertNotEqual(captured[0][0], str(status_path))
+            self.assertTrue(json.loads(status_path.read_text(encoding="utf-8"))["ok"])
+            leftovers = [p.name for p in status_dir.iterdir() if p.name != "status.json"]
+            self.assertEqual(leftovers, [])
+
+    def test_write_status_failed_replace_leaves_target_intact(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            status_dir = Path(temp)
+            status_path = status_dir / "status.json"
+            status_path.write_text('{"ok": true, "prior": "value"}\n', encoding="utf-8")
+
+            with patch(
+                "vexic.recorders.status.os.replace",
+                side_effect=OSError("rename failed"),
+            ):
+                with self.assertRaises(OSError):
+                    write_status(
+                        status_path,
+                        RecorderStatus(
+                            ok=False,
+                            operation="ingest",
+                            source_session_id="session-1",
+                            transcript_path="/tmp/session.jsonl",
+                        ),
+                    )
+
+            # A failed atomic replace must not corrupt the prior status file or
+            # strand a temp file in the directory.
+            self.assertEqual(
+                status_path.read_text(encoding="utf-8"), '{"ok": true, "prior": "value"}\n'
+            )
+            leftovers = [p.name for p in status_dir.iterdir() if p.name != "status.json"]
+            self.assertEqual(leftovers, [])
 
 
 class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
