@@ -8,7 +8,10 @@ from unittest.mock import patch
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 from vexic.contract import (
+    AppendTranscriptRequest,
     DeleteScopeRequest,
+    DreamPhase,
+    IngestSourceTranscriptRequest,
     MemoryCapability,
     MemoryScope,
     MemoryScopeSelector,
@@ -16,12 +19,20 @@ from vexic.contract import (
     PrincipalType,
     PurgeScopeRequest,
     RedactionContext,
+    RunDreamPhaseRequest,
+    SourceTranscriptMessage,
     TrustBoundary,
 )
 from vexic.embeddings import EMBEDDING_DIM
 from vexic.models import FactCandidate
 from vexic.service import LocalMemoryService
-from vexic.storage import commit_deep_cycle, commit_dream_cycle, init_db, save_messages
+from vexic.storage import (
+    commit_deep_cycle,
+    commit_dream_cycle,
+    init_db,
+    save_messages,
+    single_message_adapter,
+)
 from vexic.storage.promotion import PromotionDecision
 from vexic.storage.schema import _load_vec_extension
 
@@ -477,6 +488,111 @@ class PurgeScopeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.purged["messages"], 0)
         with closing(sqlite3.connect(self.db_path)) as conn:
             self.assertEqual(self._count(conn, "SELECT COUNT(*) FROM messages"), 1)
+
+    async def _append(self, session_id: str, text: str):
+        return await self.service.append_transcript(
+            AppendTranscriptRequest(
+                scope=_scope({MemoryCapability.WRITE}).model_copy(
+                    update={"session_id": session_id}
+                ),
+                messages_json=[
+                    single_message_adapter.dump_json(
+                        ModelRequest(parts=[UserPromptPart(content=text)])
+                    ).decode()
+                ],
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+
+    async def _ingest(self, session_id: str, text: str):
+        return await self.service.ingest_source_transcript(
+            IngestSourceTranscriptRequest(
+                scope=_scope({MemoryCapability.WRITE}).model_copy(
+                    update={"session_id": session_id}
+                ),
+                messages=[
+                    SourceTranscriptMessage(
+                        source_host="claude-code",
+                        source_session_id=f"src-{session_id}",
+                        source_message_id=f"uuid-{text[:8]}",
+                        message_json=single_message_adapter.dump_json(
+                            ModelRequest(parts=[UserPromptPart(content=text)])
+                        ).decode(),
+                    )
+                ],
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+
+    async def test_append_transcript_rejected_while_tombstone_pends_purge(self) -> None:
+        await self._tombstone("session-1")
+
+        with self.assertRaisesRegex(PermissionError, "tombstoned for write"):
+            await self._append("session-1", "late write into erased scope")
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(self._count(conn, "SELECT COUNT(*) FROM messages"), 2)
+
+    async def test_ingest_source_transcript_rejected_while_tombstone_pends_purge(
+        self,
+    ) -> None:
+        await self._tombstone("session-1")
+
+        with self.assertRaisesRegex(PermissionError, "tombstoned for write"):
+            await self._ingest("session-1", "late ingest into erased scope")
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(self._count(conn, "SELECT COUNT(*) FROM messages"), 2)
+
+    async def test_writes_rejected_after_purge_completes(self) -> None:
+        # The tombstone survives the purge as the audit record, so the write
+        # block persists: re-ingesting would recreate data behind the erasure.
+        await self._tombstone("session-1")
+        await self._purge("session-1")
+
+        with self.assertRaisesRegex(PermissionError, "tombstoned for write"):
+            await self._append("session-1", "resurrection attempt")
+        with self.assertRaisesRegex(PermissionError, "tombstoned for write"):
+            await self._ingest("session-1", "resurrection attempt")
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(self._count(conn, "SELECT COUNT(*) FROM messages"), 1)
+
+    async def test_writes_to_non_tombstoned_scope_unaffected(self) -> None:
+        await self._tombstone("session-1")
+
+        append_result = await self._append("session-2", "survivor session write")
+        ingest_result = await self._ingest("session-2", "survivor session ingest")
+
+        self.assertEqual(len(append_result.message_ids), 1)
+        self.assertEqual(ingest_result.items[0].status, "inserted")
+
+    async def test_dream_phase_writes_rejected_for_any_tombstone_flags(self) -> None:
+        # Candidate/fact writes fail closed on ANY matching tombstone, even one
+        # whose lifecycle flags are all zero: every tombstone marks the scope
+        # for erasure, so consolidation must not write new rows into it.
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO scope_tombstones
+                        (target_tenant_id, target_session_id,
+                         created_by_principal_id, created_by_principal_type, reason,
+                         retrieval_blocked, export_blocked, replay_blocked,
+                         rebuild_blocked, physical_purge_deferred)
+                    VALUES ('tenant-a', 'session-1', 'operator', 'operator',
+                            'flags all zero', 0, 0, 0, 0, 1)
+                    """
+                )
+
+        with self.assertRaisesRegex(PermissionError, "tombstoned for write"):
+            await self.service.run_dream_phase(
+                RunDreamPhaseRequest(
+                    scope=_scope({MemoryCapability.ADMIN_REBUILD}),
+                    phase=DreamPhase.LIGHT,
+                    redaction=RedactionContext(forbidden_values=()),
+                )
+            )
 
     async def test_failed_purge_rolls_back_everything(self) -> None:
         await self._tombstone("session-1")

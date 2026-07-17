@@ -118,6 +118,11 @@ _TOMBSTONE_FLAG_COLUMNS = {
     "export": "export_blocked",
     "replay": "replay_blocked",
     "rebuild": "rebuild_blocked",
+    # Writes are blocked by ANY matching tombstone, regardless of which
+    # lifecycle flags it carries: every tombstone marks the scope for erasure
+    # (pending or completed purge, ADR 0022), so new content written into it
+    # would be either erased by the purge or orphaned behind the audit record.
+    "write": None,
 }
 
 
@@ -211,12 +216,13 @@ class LocalMemoryService(MemoryService):
 
     def _assert_not_tombstoned(self, scope: MemoryScope, operation: str) -> None:
         column_name = _TOMBSTONE_FLAG_COLUMNS[operation]
+        flag_filter = "" if column_name is None else f"AND {column_name} = 1"
         with closing(connect(self.db_path)) as conn:
             rows = rows_as_dicts(conn.execute(
                 f"""
                 SELECT target_project_id, target_user_id, target_session_id, target_agent_id
                 FROM scope_tombstones
-                WHERE target_tenant_id = ? AND {column_name} = 1
+                WHERE target_tenant_id = ? {flag_filter}
                 """,
                 (scope.tenant_id,),
             ))
@@ -409,6 +415,11 @@ class LocalMemoryService(MemoryService):
         request: AppendTranscriptRequest,
     ) -> AppendTranscriptResult:
         self._authorize(request.scope, request.required_capability)
+        # Messages persist under scope.session_id or "default", so the
+        # tombstone check runs against that exact session (ADR 0022 follow-up:
+        # writes into a tombstoned scope fail closed instead of being erased
+        # or orphaned by the deferred purge).
+        self._assert_not_tombstoned(self._with_default_session(request.scope), "write")
         messages = [single_message_adapter.validate_json(raw) for raw in request.messages_json]
         message_ids = save_messages(
             self.db_path,
@@ -425,6 +436,7 @@ class LocalMemoryService(MemoryService):
         request: IngestSourceTranscriptRequest,
     ) -> IngestSourceTranscriptResult:
         self._authorize(request.scope, request.required_capability)
+        self._assert_not_tombstoned(self._with_default_session(request.scope), "write")
         results = ingest_source_messages(
             self.db_path,
             [
@@ -955,6 +967,13 @@ async def _run_dream_phase_with_usage(
     service._assert_not_tombstoned(
         service._with_default_session(request.scope),
         "rebuild",
+    )
+    # Dream phases write candidate and fact rows, so they are also gated as
+    # writes: any matching tombstone blocks them even when its lifecycle flags
+    # (including rebuild_blocked) are zero.
+    service._assert_not_tombstoned(
+        service._with_default_session(request.scope),
+        "write",
     )
     ports = service.dream_phase_ports
     if ports is None:

@@ -88,9 +88,15 @@ erasure.
 - Purged message ids are never reused (AUTOINCREMENT), so dream watermarks
   stay monotonic; a watermark may reference a purged id, which is harmless.
 - Purge must not run concurrently with dream phases for the same scope;
-  operators stop recorders and pipelines for the scope first. Writes to a
-  tombstoned scope are not blocked by the tombstone; re-ingesting after purge
-  recreates data and requires a fresh delete/purge cycle.
+  operators stop recorders and pipelines for the scope first. This ADR
+  originally left writes to a tombstoned scope unblocked, so a late write
+  could slip in silently and be erased or orphaned by the deferred purge.
+  Amendment (2026-07, COA-334): that gap is closed. `append_transcript`,
+  `ingest_source_transcript`, and dream-phase candidate/fact writes fail
+  closed with a `PermissionError` when any tombstone matches the scope,
+  regardless of which lifecycle flags the tombstone carries. Because the
+  tombstone survives the purge as the audit record, the write block persists
+  after the purge completes: a purged scope cannot be silently re-populated.
 - Supersedes the "purge deferred" wording in `docs/memory-service-contract.md`
   and the "physical purge semantics" non-goal in `docs/architecture.md`; both
   are updated with this ADR. ADR 0008's backup posture is unchanged.

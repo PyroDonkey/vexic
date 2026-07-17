@@ -241,7 +241,10 @@ Memory is retained by default.
   retrieval or promotion.
 - Scope deletion is modeled as a tombstone/scope-deny contract.
 - The local SQLite adapter records tombstones in `scope_tombstones` and blocks
-  retrieval, export, replay, and rebuild for matching scopes.
+  retrieval, export, replay, and rebuild for matching scopes. Writes fail
+  closed too: transcript appends, recorder ingest, and dream-phase
+  candidate/fact writes are rejected while any matching tombstone exists,
+  including after the physical purge completes (ADR 0022).
 - Physical purge is a second deliberate step (`purge_scope`, ADR 0022): it
   requires an existing tombstone for exactly the target scope, irreversibly
   deletes the scope's canonical rows, projections, and content-bearing
