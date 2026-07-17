@@ -28,7 +28,11 @@ from vexic.recorders.hosted_prime import (
     fetch_prime_context,
     post_trigger_dream_phase,
 )
-from vexic.recorders.hosted_ingest import HostedIngestConfig, post_source_messages
+from vexic.recorders.hosted_ingest import (
+    HostedIngestConfig,
+    HostedIngestTransportError,
+    post_source_messages,
+)
 from vexic.recorders.mcp_connect import install_codex_connect, install_generic_connect
 from vexic.recorders.setup_exchange import SetupExchangeConfig, exchange_setup_token
 from vexic.recorders.status import RecorderStatus, write_status
@@ -734,6 +738,26 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "uninstall-mcp-client":
             return _uninstall_mcp_client(args)
         raise ValueError(f"unknown command: {args.command}")
+    except HostedIngestTransportError as exc:
+        # Transient hosted transport fault (5xx / connectivity): fail open so a
+        # blip does not derail the conversation. The blocking Stop-hook exit 2
+        # feeds stderr to the model and prevents the stop; this returns a
+        # non-blocking exit instead and records the failure in the status file.
+        # Exit 1 (not 0): ingest has a status consumer, so a nonzero code marks
+        # the run as degraded, unlike the always-exit-0 fire-and-forget
+        # trigger-dream subcommand.
+        _try_write_status(
+            getattr(args, "status_path", None),
+            RecorderStatus(
+                ok=False,
+                operation=args.command,
+                source_session_id=getattr(args, "source_session_id", None),
+                transcript_path=getattr(args, "transcript_path", None),
+                error=str(exc),
+            ),
+        )
+        print(f"warning: {exc}", file=sys.stderr)
+        return 1
     except Exception as exc:
         _try_write_status(
             getattr(args, "status_path", None),

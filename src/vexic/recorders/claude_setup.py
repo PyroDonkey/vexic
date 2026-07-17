@@ -232,10 +232,15 @@ def install_claude_code_setup(
             "hooks": [
                 {
                     "type": "command",
-                    "command": hook_command,
-                    "async": False,
+                    # Async so a transient hosted ingest fault (retried, then
+                    # reported as a non-blocking warning) can never derail the
+                    # conversation the way a blocking Stop hook exit 2 would.
+                    # SessionStart below stays synchronous because its stdout is
+                    # the priming context Claude Code consumes.
+                    "async": True,
                     "timeout": 120,
                     "vexicHookId": VEXIC_HOOK_ID,
+                    "command": hook_command,
                 }
             ]
         }

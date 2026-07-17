@@ -215,7 +215,10 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
             fp=body,
         )
 
-        with patch("vexic.recorders.hosted_ingest.urlopen", side_effect=error):
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", side_effect=error),
+            patch("vexic.recorders.hosted_ingest.time.sleep"),
+        ):
             with self.assertRaisesRegex(
                 RuntimeError,
                 r"hosted ingest failed: HTTP 503 \(storage_unavailable\)$",
@@ -266,7 +269,10 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
             fp=_TrackingBody(huge),
         )
 
-        with patch("vexic.recorders.hosted_ingest.urlopen", side_effect=error):
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", side_effect=error),
+            patch("vexic.recorders.hosted_ingest.time.sleep"),
+        ):
             with self.assertRaisesRegex(RuntimeError, r"hosted ingest failed: HTTP 502$"):
                 post_source_messages(config, messages=[], forbidden_values=())
 
@@ -315,6 +321,153 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
                 post_source_messages(config, messages=[], forbidden_values=())
 
         urlopen_mock.assert_not_called()
+
+    def test_post_source_messages_retries_transient_5xx_then_succeeds(self) -> None:
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self) -> bytes:
+                return b'{"items":[]}'
+
+        calls: list[int] = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(1)
+            if len(calls) == 1:
+                raise HTTPError(
+                    url="https://api.example.test/v1/ingest_source_transcript",
+                    code=503,
+                    msg="Service Unavailable",
+                    hdrs={},
+                    fp=None,
+                )
+            return _Response()
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+        ):
+            result = post_source_messages(config, messages=[], forbidden_values=())
+
+        self.assertEqual(result, {"items": []})
+        self.assertEqual(len(calls), 2)
+        sleep_mock.assert_called_once_with(0.5)
+
+    def test_post_source_messages_retries_urlerror_then_succeeds(self) -> None:
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self) -> bytes:
+                return b'{"items":[]}'
+
+        calls: list[int] = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(1)
+            if len(calls) == 1:
+                raise URLError(TimeoutError("timed out"))
+            return _Response()
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+        ):
+            result = post_source_messages(config, messages=[], forbidden_values=())
+
+        self.assertEqual(result, {"items": []})
+        self.assertEqual(len(calls), 2)
+        sleep_mock.assert_called_once_with(0.5)
+
+    def test_post_source_messages_does_not_retry_4xx(self) -> None:
+        from vexic.recorders.hosted_ingest import HostedIngestTransportError
+
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+        calls: list[int] = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(1)
+            raise HTTPError(
+                url="https://api.example.test/v1/ingest_source_transcript",
+                code=403,
+                msg="Forbidden",
+                hdrs={},
+                fp=None,
+            )
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                post_source_messages(config, messages=[], forbidden_values=())
+
+        self.assertNotIsInstance(caught.exception, HostedIngestTransportError)
+        self.assertRegex(str(caught.exception), "hosted ingest failed: HTTP 403")
+        self.assertEqual(len(calls), 1)
+        sleep_mock.assert_not_called()
+
+    def test_post_source_messages_exhausted_retries_raise_transport_error(self) -> None:
+        from vexic.recorders.hosted_ingest import HostedIngestTransportError
+
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+        calls: list[int] = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(1)
+            raise HTTPError(
+                url="https://api.example.test/v1/ingest_source_transcript",
+                code=503,
+                msg="Service Unavailable",
+                hdrs={},
+                fp=None,
+            )
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+        ):
+            with self.assertRaises(HostedIngestTransportError) as caught:
+                post_source_messages(config, messages=[], forbidden_values=())
+
+        self.assertRegex(str(caught.exception), "hosted ingest failed: HTTP 503")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleep_mock.call_count, 2)
 
     def test_write_status_does_not_leak_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1141,7 +1294,78 @@ class ClaudeCodeSetupTests(unittest.TestCase):
             self.assertIn("C:/Users/user/.local/bin/uv.exe", command)
             self.assertIn(str(result.config_path).replace("\\", "/"), command)
             self.assertNotIn("\\", command)
-            self.assertFalse(hook["async"])
+            self.assertTrue(hook["async"])
+
+    def test_setup_rerun_upgrades_sync_stop_hook_to_async(self) -> None:
+        from vexic.cli import main as vexic_main
+
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            settings_path = home / ".claude" / "settings.json"
+            settings_path.parent.mkdir(parents=True, exist_ok=True)
+            # Pre-seed an old-style synchronous vexic Stop hook, as an install
+            # made before this fix would have left behind.
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "hooks": {
+                            "Stop": [
+                                {
+                                    "hooks": [
+                                        {
+                                            "type": "command",
+                                            "command": "python -m vexic.cli recorder ingest",
+                                            "async": False,
+                                            "timeout": 120,
+                                            "vexicHookId": "vexic-claude-code-recorder",
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            code = vexic_main(
+                [
+                    "setup",
+                    "claude-code",
+                    "--home",
+                    str(home),
+                    "--base-url",
+                    "https://api.example.test",
+                    "--api-key",
+                    "vx_secret",
+                    "--project-id",
+                    "project-a",
+                    "--session-id",
+                    "session-a",
+                ]
+            )
+            self.assertEqual(code, 0)
+
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            stop_hooks = [
+                hook
+                for group in settings["hooks"]["Stop"]
+                for hook in group["hooks"]
+                if hook.get("vexicHookId") == "vexic-claude-code-recorder"
+            ]
+            self.assertEqual(len(stop_hooks), 1)
+            self.assertTrue(stop_hooks[0]["async"])
+            self.assertEqual(stop_hooks[0]["timeout"], 120)
+            self.assertNotIn("asyncRewake", stop_hooks[0])
+
+            session_start_hooks = [
+                hook
+                for group in settings["hooks"]["SessionStart"]
+                for hook in group["hooks"]
+                if hook.get("vexicHookId") == "vexic-claude-code-recorder"
+            ]
+            self.assertEqual(len(session_start_hooks), 1)
+            self.assertFalse(session_start_hooks[0]["async"])
 
     def test_setup_is_idempotent(self) -> None:
         from vexic.cli import main as vexic_main
@@ -1618,57 +1842,103 @@ class ClaudeCodeSetupTests(unittest.TestCase):
 
 
 class ClaudeCodeRecorderIngestCommandMoreTests(unittest.TestCase):
-    def test_ingest_failure_writes_status_and_returns_two(self) -> None:
+    def _run_ingest_with_failing_post(
+        self, root: Path, status_path: Path, error: Exception
+    ) -> tuple[int, str]:
+        transcript = root / "session.jsonl"
+        transcript.write_text(
+            json.dumps(
+                {
+                    "type": "user",
+                    "sessionId": "claude-session",
+                    "uuid": "uuid-1",
+                    "message": {"role": "user", "content": "remember cedar"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        hook_payload = root / "hook.json"
+        hook_payload.write_text(
+            json.dumps({"session_id": "claude-session", "transcript_path": str(transcript)}),
+            encoding="utf-8",
+        )
+        stderr = io.StringIO()
+        with (
+            patch("vexic.recorders.cli.post_source_messages", side_effect=error),
+            contextlib.redirect_stderr(stderr),
+        ):
+            code = recorder_main(
+                [
+                    "ingest",
+                    "--hook-input",
+                    str(hook_payload),
+                    "--base-url",
+                    "https://api.example.test",
+                    "--api-key",
+                    "vx_secret",
+                    "--project-id",
+                    "project-a",
+                    "--session-id",
+                    "vexic-session",
+                    "--status-path",
+                    str(status_path),
+                ]
+            )
+        return code, stderr.getvalue()
+
+    def test_ingest_transport_failure_warns_and_returns_one(self) -> None:
+        from vexic.recorders.hosted_ingest import HostedIngestTransportError
+
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            transcript = root / "session.jsonl"
-            transcript.write_text(
-                json.dumps(
-                    {
-                        "type": "user",
-                        "sessionId": "claude-session",
-                        "uuid": "uuid-1",
-                        "message": {"role": "user", "content": "remember cedar"},
-                    }
-                ),
-                encoding="utf-8",
-            )
-            hook_payload = root / "hook.json"
-            hook_payload.write_text(
-                json.dumps({"session_id": "claude-session", "transcript_path": str(transcript)}),
-                encoding="utf-8",
-            )
             status_path = root / "status.json"
+            code, stderr = self._run_ingest_with_failing_post(
+                root,
+                status_path,
+                HostedIngestTransportError("hosted ingest failed: HTTP 503"),
+            )
 
-            with patch(
-                "vexic.recorders.cli.post_source_messages",
-                side_effect=RuntimeError("hosted ingest failed: HTTP 403"),
-            ):
-                code = recorder_main(
-                    [
-                        "ingest",
-                        "--hook-input",
-                        str(hook_payload),
-                        "--base-url",
-                        "https://api.example.test",
-                        "--api-key",
-                        "vx_secret",
-                        "--project-id",
-                        "project-a",
-                        "--session-id",
-                        "vexic-session",
-                        "--status-path",
-                        str(status_path),
-                    ]
-                )
+            self.assertEqual(code, 1)
+            self.assertIn("warning: hosted ingest failed: HTTP 503", stderr)
+            self.assertNotIn("error:", stderr)
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertFalse(status["ok"])
+            self.assertEqual(status["error"], "hosted ingest failed: HTTP 503")
+            self.assertEqual(status["source_session_id"], "claude-session")
+            self.assertNotIn("vx_secret", json.dumps(status))
+
+    def test_ingest_auth_failure_still_returns_two(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            status_path = root / "status.json"
+            code, stderr = self._run_ingest_with_failing_post(
+                root,
+                status_path,
+                RuntimeError("hosted ingest failed: HTTP 403"),
+            )
 
             self.assertEqual(code, 2)
+            self.assertIn("error: hosted ingest failed: HTTP 403", stderr)
             status = json.loads(status_path.read_text(encoding="utf-8"))
             self.assertFalse(status["ok"])
             self.assertEqual(status["error"], "hosted ingest failed: HTTP 403")
             self.assertEqual(status["source_session_id"], "claude-session")
-            self.assertEqual(status["transcript_path"], str(transcript))
             self.assertNotIn("vx_secret", json.dumps(status))
+
+    def test_ingest_non_transport_failure_still_returns_two(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            status_path = root / "status.json"
+            code, _stderr = self._run_ingest_with_failing_post(
+                root,
+                status_path,
+                RuntimeError("something else broke"),
+            )
+
+            self.assertEqual(code, 2)
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertFalse(status["ok"])
+            self.assertEqual(status["error"], "something else broke")
 
     def test_ingest_status_write_failure_returns_two_without_traceback(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
