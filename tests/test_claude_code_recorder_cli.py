@@ -2605,6 +2605,41 @@ class ClaudeCodeRecorderPrimeCommandTests(unittest.TestCase):
             "reserved footer must be intact at the end under worst-case truncation",
         )
 
+    def test_prime_single_long_hit_cannot_starve_later_hits(self) -> None:
+        context = build_prime_context(
+            {"facts": [], "candidate_notes": []},
+            {
+                "hits": [
+                    {"body": "monster hit " * 500},
+                    {"body": "short survivor hit"},
+                ]
+            },
+            max_chars=6_000,
+        )
+
+        self.assertIn("short survivor hit", context)
+        self.assertIn("monster hit", context)
+        # capped body: at most PRIME_ITEM_CAP chars plus the ellipsis
+        for line in context.splitlines():
+            if line.startswith("- monster hit"):
+                self.assertLessEqual(len(line), 2 + 400 + 1)  # "- " + cap + "…"
+                self.assertTrue(line.endswith("…"))
+
+    def test_prime_recap_body_capped_per_item(self) -> None:
+        context = build_prime_context(
+            {"facts": [{"fact_text": "Durable cedar preference"}], "candidate_notes": []},
+            {"hits": []},
+            recap_text="recap words " * 400,
+            max_chars=6_000,
+        )
+
+        self.assertIn("Durable cedar preference", context)
+        lines = context.splitlines()
+        recap_body = lines[lines.index("Prior conversation recap:") + 1]
+        # capped body: at most PRIME_RECAP_CAP chars plus the ellipsis
+        self.assertLessEqual(len(recap_body), 500 + 1)
+        self.assertTrue(recap_body.endswith("…"))
+
     def test_prime_empty_memory_still_returns_empty_despite_framing(self) -> None:
         context = build_prime_context(
             {"facts": [], "candidate_notes": []},

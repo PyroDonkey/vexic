@@ -28,6 +28,15 @@ PRIME_FOOTER = (
     "facts, and past conversation when relevant."
 )
 
+PRIME_ITEM_CAP = 400
+PRIME_RECAP_CAP = 500
+
+
+def _cap_item(text: str, cap: int) -> str:
+    if len(text) <= cap:
+        return text
+    return text[:cap].rstrip() + "…"
+
 
 @dataclass(frozen=True)
 class HostedPrimeConfig:
@@ -182,7 +191,7 @@ def build_prime_context(
 
     if recap_text:
         lines.append("Prior conversation recap:")
-        lines.append(recap_text)
+        lines.append(_cap_item(recap_text, PRIME_RECAP_CAP))
 
     if facts or notes:
         lines.append("Long-term memory:")
@@ -200,7 +209,7 @@ def build_prime_context(
         for hit in hits:
             body = _str(hit.get("body"))
             if body:
-                lines.append(f"- {body}")
+                lines.append(f"- {_cap_item(body, PRIME_ITEM_CAP)}")
 
     if len(lines) == 2:
         return ""
