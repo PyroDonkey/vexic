@@ -1299,6 +1299,29 @@ class HostedTenantCatalog:
                 ).fetchall()
         return [HostedAuditEvent(*row) for row in rows]
 
+    def last_usage_event_id(self, tenant_id: str | None) -> int:
+        """Durable id of the tenant's newest usage event (0 when none exist).
+
+        Callers that need "events recorded after this point" snapshot this
+        cutoff and pass it to ``usage_events(after_id=...)``: row ids are
+        stable under concurrent writers of a shared control plane, unlike
+        list positions.
+        """
+        if tenant_id is None:
+            condition, params = "tenant_id IS NULL", ()
+        else:
+            condition, params = "tenant_id = ?", (tenant_id,)
+        with closing(self._connect_control()) as conn:
+            row = conn.execute(
+                f"""
+                SELECT COALESCE(MAX(id), 0)
+                FROM hosted_usage_events
+                WHERE {condition}
+                """,
+                params,
+            ).fetchone()
+        return int(row[0])
+
     def usage_events(
         self,
         tenant_id: str | None,
@@ -1306,6 +1329,7 @@ class HostedTenantCatalog:
         project_id: str | None = None,
         recorded_at_gte: str | None = None,
         recorded_at_lt: str | None = None,
+        after_id: int | None = None,
     ) -> list[HostedUsageEvent]:
         conditions: list[str]
         params: list[object] = []
@@ -1317,6 +1341,9 @@ class HostedTenantCatalog:
         if project_id is not None:
             conditions.append("project_id = ?")
             params.append(project_id)
+        if after_id is not None:
+            conditions.append("id > ?")
+            params.append(after_id)
         if recorded_at_gte is not None:
             conditions.append("julianday(recorded_at) >= julianday(?)")
             params.append(recorded_at_gte)

@@ -2226,3 +2226,40 @@ class HostedControlPlaneKeyCompensationTests(unittest.TestCase):
         self.assertIn("manually", message)
         self.assertIsInstance(caught.exception.__cause__, sqlite3.OperationalError)
         self.assertIn("hosted_api_key_metadata", str(caught.exception.__cause__))
+
+
+class HostedUsageEventCursorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.catalog = HostedTenantCatalog(Path(self.temp_dir.name))
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    @staticmethod
+    def _event(operation: str) -> HostedUsageEvent:
+        return HostedUsageEvent(
+            kind="request",
+            operation=operation,
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            status="ok",
+            recorded_at="2026-07-16T00:00:00Z",
+        )
+
+    def test_usage_events_after_durable_id_cutoff(self) -> None:
+        """A durable MAX(id) cutoff isolates the events recorded after it,
+        independent of list positions that concurrent writers or pruning
+        could shift."""
+        self.catalog.record_usage_event(self._event("before-1"))
+        self.catalog.record_usage_event(self._event("before-2"))
+
+        cutoff = self.catalog.last_usage_event_id("tenant-a")
+        self.catalog.record_usage_event(self._event("after-1"))
+        self.catalog.record_usage_event(self._event("after-2"))
+
+        events = self.catalog.usage_events("tenant-a", after_id=cutoff)
+        self.assertEqual([event.operation for event in events], ["after-1", "after-2"])
+
+    def test_last_usage_event_id_is_zero_for_untracked_tenant(self) -> None:
+        self.assertEqual(self.catalog.last_usage_event_id("tenant-a"), 0)
