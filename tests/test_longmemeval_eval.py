@@ -1,10 +1,11 @@
 """Conformance tests for the LongMemEval harness in vexic.longmemeval."""
 
+import io
 import json
 import sqlite3
 import tempfile
 import unittest
-from contextlib import closing
+from contextlib import closing, redirect_stderr
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -557,6 +558,99 @@ class LongMemEvalArtifactTests(unittest.IsolatedAsyncioTestCase):
                 limit=1,
                 selection="random",
             )
+
+    def _typed_rows(self) -> list[dict]:
+        rows = []
+        for question_type in ("single-session-user", "multi-session", "knowledge-update"):
+            for index in range(3):
+                rows.append(
+                    {
+                        "question_id": f"{question_type}-{index}",
+                        "question_type": question_type,
+                    }
+                )
+        return rows
+
+    def test_type_weight_defaults_preserve_equal_round_robin(self) -> None:
+        rows = self._typed_rows()
+        self.assertEqual(
+            _select_instances(rows, limit=6, selection="stratified"),
+            _select_instances(
+                rows,
+                limit=6,
+                selection="stratified",
+                type_weights=None,
+            ),
+        )
+
+    def test_stratified_selection_with_type_weights_biases_selected_types(self) -> None:
+        selected = _select_instances(
+            self._typed_rows(),
+            limit=6,
+            selection="stratified",
+            type_weights={"multi-session": 3, "knowledge-update": 2},
+        )
+        self.assertEqual(
+            [row["question_id"] for row in selected],
+            [
+                "single-session-user-0",
+                "multi-session-0",
+                "multi-session-1",
+                "multi-session-2",
+                "knowledge-update-0",
+                "knowledge-update-1",
+            ],
+        )
+
+    def test_type_weight_exhausted_group_yields_slots_to_others(self) -> None:
+        selected = _select_instances(
+            self._typed_rows(),
+            limit=9,
+            selection="stratified",
+            type_weights={"multi-session": 3, "knowledge-update": 2},
+        )
+        self.assertEqual(
+            [row["question_id"] for row in selected],
+            [
+                "single-session-user-0",
+                "multi-session-0",
+                "multi-session-1",
+                "multi-session-2",
+                "knowledge-update-0",
+                "knowledge-update-1",
+                "single-session-user-1",
+                "knowledge-update-2",
+                "single-session-user-2",
+            ],
+        )
+
+    def test_parser_accepts_repeated_type_weight_and_rejects_malformed(self) -> None:
+        parser = build_parser()
+        base_args = [
+            "--dataset",
+            "dataset.json",
+            "--split",
+            "s",
+            "--output-dir",
+            "runs",
+        ]
+        args = parser.parse_args(
+            [
+                *base_args,
+                "--type-weight",
+                "multi-session=3",
+                "--type-weight",
+                "knowledge-update=2",
+            ]
+        )
+        self.assertEqual(
+            args.type_weight,
+            [("multi-session", 3), ("knowledge-update", 2)],
+        )
+        for malformed in ("foo", "x=0", "x=-1", "=3", "x=y"):
+            with self.subTest(malformed=malformed), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    parser.parse_args([*base_args, "--type-weight", malformed])
 
     async def test_subset_can_retry_specific_question_ids(self) -> None:
         rows = [

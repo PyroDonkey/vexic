@@ -627,6 +627,7 @@ def _select_instances(
     *,
     limit: int,
     selection: LongMemEvalSelection,
+    type_weights: Mapping[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     if selection == "first":
         return list(raw_instances[:limit])
@@ -640,20 +641,22 @@ def _select_instances(
         groups.setdefault(group_name, []).append(raw)
 
     selected: list[dict[str, Any]] = []
-    group_names = list(groups)
-    index = 0
+    offsets = {group_name: 0 for group_name in groups}
     while len(selected) < limit:
         made_progress = False
-        for group_name in group_names:
-            group = groups[group_name]
-            if index < len(group):
-                selected.append(group[index])
+        for group_name, group in groups.items():
+            weight = 1 if type_weights is None else type_weights.get(group_name, 1)
+            for _ in range(weight):
+                offset = offsets[group_name]
+                if offset >= len(group):
+                    break
+                selected.append(group[offset])
+                offsets[group_name] = offset + 1
                 made_progress = True
                 if len(selected) == limit:
-                    break
+                    return selected
         if not made_progress:
             break
-        index += 1
     return selected
 
 
@@ -1214,6 +1217,7 @@ async def run_longmemeval_subset(
     max_light_cycles: int | None = None,
     skip_dream: bool = False,
     selection: LongMemEvalSelection = "first",
+    type_weights: Mapping[str, int] | None = None,
     question_ids: Sequence[str] = (),
     resume_from_run: Path | None = None,
     extraction_agent_factory: AgentFactory | None = None,
@@ -1245,6 +1249,7 @@ async def run_longmemeval_subset(
         _load_dataset(dataset_path),
         limit=limit,
         selection=selection,
+        type_weights=type_weights,
     )
     raw_instances = _filter_instances_by_question_id(raw_instances, question_ids)
     if resume_from_run is not None:
@@ -1610,6 +1615,23 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _type_weight(value: str) -> tuple[str, int]:
+    name, sep, raw_weight = value.partition("=")
+    if not sep or not name:
+        raise argparse.ArgumentTypeError(
+            "must be <question-type>=<positive-int>, e.g. multi-session=3"
+        )
+    try:
+        weight = int(raw_weight)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "must be <question-type>=<positive-int>, e.g. multi-session=3"
+        ) from exc
+    if weight < 1:
+        raise argparse.ArgumentTypeError("weight must be at least 1")
+    return name, weight
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run a native Vexic LongMemEval memory harness subset."
@@ -1643,6 +1665,18 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Select the first N rows, or round-robin rows across question_type "
             "for a stratified diagnostic subset."
+        ),
+    )
+    parser.add_argument(
+        "--type-weight",
+        action="append",
+        type=_type_weight,
+        default=[],
+        metavar="TYPE=N",
+        help=(
+            "Weight a question_type in stratified selection: take N rows from "
+            "that type per round-robin pass (others default to 1). Repeat per "
+            "type, e.g. --type-weight multi-session=3."
         ),
     )
     parser.add_argument(
@@ -1748,6 +1782,7 @@ async def _amain(args: argparse.Namespace) -> int:
         deep_top_n=args.deep_top_n,
         skip_dream=args.skip_dream,
         selection=args.selection,
+        type_weights=dict(args.type_weight) or None,
         question_ids=tuple(args.question_id),
         resume_from_run=args.resume_from_run,
         extraction_agent_factory=extraction_agent_factory,
