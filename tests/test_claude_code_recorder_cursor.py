@@ -303,6 +303,43 @@ class RecorderTranscriptCursorTests(unittest.TestCase):
             self.assertEqual(harness.run(), 0)
             self.assertEqual(harness.posted_ids(), ["uuid-3", "uuid-4"])
 
+    def test_same_length_rewrite_self_heals_on_the_following_run(self) -> None:
+        # Run 2 detects the same-length rewrite via the prefix digest and does a
+        # correct full reread, but its corrected cursor has the same byte_offset
+        # as the stale one already on disk. If that write were skipped as a
+        # "regression", the stale prefix hash would stick around forever and
+        # every following run would keep failing verification and re-reading --
+        # run 3, with the transcript untouched since run 2, must resume cleanly
+        # and post nothing.
+        with tempfile.TemporaryDirectory() as temp:
+            harness = _RecorderHarness(Path(temp))
+            _write_transcript(
+                harness.transcript,
+                [
+                    _user_row("uuid-1", "remember cedar"),
+                    _user_row("uuid-2", "and orchid"),
+                ],
+            )
+            self.assertEqual(harness.run(), 0)
+            original_size = harness.transcript.stat().st_size
+
+            _write_transcript(
+                harness.transcript,
+                [
+                    _user_row("uuid-3", "remember cedar"),
+                    _user_row("uuid-4", "and orchid"),
+                ],
+            )
+            self.assertEqual(harness.transcript.stat().st_size, original_size)
+            harness.posted.clear()
+
+            self.assertEqual(harness.run(), 0)
+            self.assertEqual(harness.posted_ids(), ["uuid-3", "uuid-4"])
+
+            harness.posted.clear()
+            self.assertEqual(harness.run(), 0)
+            self.assertEqual(harness.posted_ids(), [])
+
     def test_same_length_rewrite_before_unchanged_final_line_triggers_full_reread(
         self,
     ) -> None:
@@ -645,11 +682,11 @@ class RecorderCursorLedgerDedupTests(unittest.TestCase):
             )
 
 
-def _cursor(byte_offset: int) -> TranscriptCursor:
+def _cursor(byte_offset: int, *, prefix_sha256: str = "0" * 64) -> TranscriptCursor:
     return TranscriptCursor(
         source_session_id="claude-session",
         byte_offset=byte_offset,
-        prefix_sha256="0" * 64,
+        prefix_sha256=prefix_sha256,
         last_line_offset=0,
         last_line_sha256="0" * 64,
     )
@@ -685,7 +722,7 @@ class WriteCursorMonotonicTests(unittest.TestCase):
                 200,
             )
 
-    def test_equal_byte_offset_skips_the_rewrite(self) -> None:
+    def test_equal_byte_offset_identical_cursor_skips_the_rewrite(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             cursor_dir = Path(temp)
             transcript = cursor_dir / "session.jsonl"
@@ -697,6 +734,23 @@ class WriteCursorMonotonicTests(unittest.TestCase):
             write_cursor(cursor_dir, transcript, _cursor(100))
 
             self.assertEqual(path.read_bytes(), before)
+
+    def test_equal_byte_offset_different_hash_still_writes(self) -> None:
+        # A same-length transcript rewrite produces a corrected cursor at the
+        # same byte_offset but a different prefix digest. Skipping this write
+        # would pin the stale digest in place and force every following run
+        # to keep failing verification and fully rereading.
+        with tempfile.TemporaryDirectory() as temp:
+            cursor_dir = Path(temp)
+            transcript = cursor_dir / "session.jsonl"
+
+            write_cursor(cursor_dir, transcript, _cursor(100, prefix_sha256="a" * 64))
+            write_cursor(cursor_dir, transcript, _cursor(100, prefix_sha256="b" * 64))
+
+            self.assertEqual(
+                read_cursor(cursor_dir, transcript).prefix_sha256,  # type: ignore[union-attr]
+                "b" * 64,
+            )
 
     def test_corrupt_existing_cursor_does_not_block_the_write(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

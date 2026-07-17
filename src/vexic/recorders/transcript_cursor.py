@@ -9,12 +9,17 @@ ingest. Every read failure here therefore returns `None` (full reread) and every
 write failure is non-fatal to the caller.
 
 The Stop hook runs asynchronously, so two ingest runs over the same
-transcript can overlap. `write_cursor` is monotonic: it skips the write when an
-existing on-disk cursor already covers the new one's `byte_offset`, so a
-late-finishing older run cannot regress a cursor a newer run already advanced.
-The read-then-compare is not atomic against a concurrent writer, but that
-residual race only ever costs a redundant reread -- the ledger, not this file,
-is what keeps ingest correct.
+transcript can overlap. `write_cursor` is monotonic: it skips the write only
+when an existing on-disk cursor strictly precedes it in `byte_offset`, or is
+byte-for-byte identical, so a late-finishing older run cannot regress a cursor
+a newer run already advanced. An equal `byte_offset` with different content is
+still written -- a same-length transcript rewrite legitimately produces a
+corrected cursor at the same offset with a different prefix digest, and a
+byte_offset-only skip there would pin the stale digest in place and force
+every following run to fail verification and fully reread forever. The
+read-then-compare is not atomic against a concurrent writer, but that residual
+race only ever costs a redundant reread -- the ledger, not this file, is what
+keeps ingest correct.
 """
 
 from __future__ import annotations
@@ -72,14 +77,21 @@ def read_cursor(cursor_dir: Path, transcript_path: Path) -> TranscriptCursor | N
 def write_cursor(cursor_dir: Path, transcript_path: Path, cursor: TranscriptCursor) -> None:
     """Persist `cursor`, skipping the write if it would regress an existing one.
 
-    An existing on-disk cursor with `byte_offset >= cursor.byte_offset` wins and
-    the write is skipped; a missing or corrupt existing cursor never blocks the
-    write. See the module docstring for why the resulting compare-then-replace
-    race window is acceptable.
+    An existing on-disk cursor with a strictly greater `byte_offset` wins and
+    the write is skipped, as does an existing cursor that is byte-for-byte
+    identical to `cursor` (nothing would change). An existing cursor at the
+    same `byte_offset` but with different content -- e.g. a corrected digest
+    after a same-length transcript rewrite -- still gets written; see the
+    module docstring for why. A missing or corrupt existing cursor never
+    blocks the write. See the module docstring for why the resulting
+    compare-then-replace race window is acceptable.
     """
     existing = read_cursor(cursor_dir, transcript_path)
-    if existing is not None and existing.byte_offset >= cursor.byte_offset:
-        return
+    if existing is not None:
+        if existing.byte_offset > cursor.byte_offset:
+            return
+        if existing.byte_offset == cursor.byte_offset and existing == cursor:
+            return
 
     path = cursor_path(cursor_dir, transcript_path)
     path.parent.mkdir(parents=True, exist_ok=True)
