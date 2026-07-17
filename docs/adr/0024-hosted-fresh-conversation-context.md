@@ -157,6 +157,11 @@ HTTP error, timeout, or a key without `memory:fresh-context` (`403`) all
 result in `fetch_fresh_context` returning `None`, and priming continues with
 whatever the long-term/transcript search legs return -- unchanged from the
 ADR 0018 posture that a hosted outage must not block Claude Code startup.
+At render time, `build_prime_context` further caps the recap body to
+`PRIME_RECAP_CAP` (500 chars) and each transcript-hit body to `PRIME_ITEM_CAP`
+(400 chars). Long-term facts are not per-item capped at render time; COA-403
+scoped per-item caps to the recap and transcript hits, leaving facts bounded
+by the `search_long_term` `limit` and the overall `max_chars` block cap.
 
 ## Out Of Scope / Deferred
 
