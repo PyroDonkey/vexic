@@ -53,7 +53,7 @@ jobs:
           ls -la dumps
 
       - name: Upload dumps
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: turso-dumps-${{ github.run_id }}
           path: dumps/
