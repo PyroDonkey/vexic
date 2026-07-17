@@ -2375,6 +2375,27 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"]["code"], "invalid_request")
 
+    def test_value_error_responses_do_not_echo_validation_input(self) -> None:
+        class _MarkerModel(BaseModel):
+            limit: int
+
+        try:
+            _MarkerModel.model_validate({"limit": "sekret-marker-value"})
+        except ValidationError as exc:
+            validation_error = exc
+
+        response = hosted_http._value_error_response(validation_error)
+
+        self.assertEqual(response.status_code, 400)
+        body = json.loads(response.body)
+        self.assertEqual(body["error"]["code"], "invalid_request")
+        message = body["error"]["message"]
+        self.assertIn("Input should be a valid integer", message)
+        raw = response.body.decode()
+        self.assertNotIn("sekret-marker-value", raw)
+        self.assertNotIn("input_value", raw)
+        self.assertNotIn("errors.pydantic.dev", raw)
+
     def test_hosted_ingest_storage_valueerror_mapping_logs_sanitized_category(self) -> None:
         api_key = self._api_key(capabilities={MemoryCapability.WRITE})
 
