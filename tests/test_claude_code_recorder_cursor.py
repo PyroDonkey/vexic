@@ -34,6 +34,12 @@ from vexic.hosted import HostedMemoryService
 from vexic.hosted_http import create_app
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 from vexic.recorders.cli import main as recorder_main
+from vexic.recorders.transcript_cursor import (
+    TranscriptCursor,
+    cursor_path,
+    read_cursor,
+    write_cursor,
+)
 
 
 def _user_row(uuid: str, text: str, *, session_id: str = "claude-session") -> str:
@@ -636,6 +642,75 @@ class RecorderCursorLedgerDedupTests(unittest.TestCase):
             self.assertEqual(
                 [hit["body"] for hit in search_response.json()["hits"]],
                 ["User: remember hosted-orchid", "User: and hosted-juniper"],
+            )
+
+
+def _cursor(byte_offset: int) -> TranscriptCursor:
+    return TranscriptCursor(
+        source_session_id="claude-session",
+        byte_offset=byte_offset,
+        prefix_sha256="0" * 64,
+        last_line_offset=0,
+        last_line_sha256="0" * 64,
+    )
+
+
+class WriteCursorMonotonicTests(unittest.TestCase):
+    """`write_cursor` must not let a late-finishing older run regress a cursor
+    a newer overlapping run already advanced."""
+
+    def test_older_byte_offset_does_not_overwrite_a_newer_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            cursor_dir = Path(temp)
+            transcript = cursor_dir / "session.jsonl"
+
+            write_cursor(cursor_dir, transcript, _cursor(200))
+            write_cursor(cursor_dir, transcript, _cursor(100))
+
+            self.assertEqual(
+                read_cursor(cursor_dir, transcript).byte_offset,  # type: ignore[union-attr]
+                200,
+            )
+
+    def test_newer_byte_offset_replaces_the_existing_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            cursor_dir = Path(temp)
+            transcript = cursor_dir / "session.jsonl"
+
+            write_cursor(cursor_dir, transcript, _cursor(100))
+            write_cursor(cursor_dir, transcript, _cursor(200))
+
+            self.assertEqual(
+                read_cursor(cursor_dir, transcript).byte_offset,  # type: ignore[union-attr]
+                200,
+            )
+
+    def test_equal_byte_offset_skips_the_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            cursor_dir = Path(temp)
+            transcript = cursor_dir / "session.jsonl"
+
+            write_cursor(cursor_dir, transcript, _cursor(100))
+            path = cursor_path(cursor_dir, transcript)
+            before = path.read_bytes()
+
+            write_cursor(cursor_dir, transcript, _cursor(100))
+
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_corrupt_existing_cursor_does_not_block_the_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            cursor_dir = Path(temp)
+            transcript = cursor_dir / "session.jsonl"
+            path = cursor_path(cursor_dir, transcript)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"\xff\xfenot json garbage")
+
+            write_cursor(cursor_dir, transcript, _cursor(100))
+
+            self.assertEqual(
+                read_cursor(cursor_dir, transcript).byte_offset,  # type: ignore[union-attr]
+                100,
             )
 
 

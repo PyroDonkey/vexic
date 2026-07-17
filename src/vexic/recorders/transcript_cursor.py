@@ -7,6 +7,14 @@ the whole session. It is an optimization only: the hosted source ledger
 stale, or rotated cursor must degrade to a full reread rather than to a wrong
 ingest. Every read failure here therefore returns `None` (full reread) and every
 write failure is non-fatal to the caller.
+
+The Stop hook runs asynchronously, so two ingest runs over the same
+transcript can overlap. `write_cursor` is monotonic: it skips the write when an
+existing on-disk cursor already covers the new one's `byte_offset`, so a
+late-finishing older run cannot regress a cursor a newer run already advanced.
+The read-then-compare is not atomic against a concurrent writer, but that
+residual race only ever costs a redundant reread -- the ledger, not this file,
+is what keeps ingest correct.
 """
 
 from __future__ import annotations
@@ -62,6 +70,17 @@ def read_cursor(cursor_dir: Path, transcript_path: Path) -> TranscriptCursor | N
 
 
 def write_cursor(cursor_dir: Path, transcript_path: Path, cursor: TranscriptCursor) -> None:
+    """Persist `cursor`, skipping the write if it would regress an existing one.
+
+    An existing on-disk cursor with `byte_offset >= cursor.byte_offset` wins and
+    the write is skipped; a missing or corrupt existing cursor never blocks the
+    write. See the module docstring for why the resulting compare-then-replace
+    race window is acceptable.
+    """
+    existing = read_cursor(cursor_dir, transcript_path)
+    if existing is not None and existing.byte_offset >= cursor.byte_offset:
+        return
+
     path = cursor_path(cursor_dir, transcript_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
