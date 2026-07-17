@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import secrets
+import sqlite3
 import sys
 import threading
 import time
@@ -62,7 +63,11 @@ from vexic.contract import (
     SourceTranscriptMessage,
     TrustBoundary,
 )
-from vexic.error_reporting import dream_failure_recorded
+from vexic.error_reporting import (
+    dream_failure_recorded,
+    dream_phase_not_started,
+    mark_dream_phase_not_started,
+)
 from vexic.ports import DreamPhasePorts, missing_host_port
 from vexic.service import (
     LocalMemoryService,
@@ -78,6 +83,14 @@ from vexic.usage import UsageSummary
 
 
 logger = logging.getLogger(__name__)
+
+# Bounded in-process retry of the pre-phase dream prelude. A single
+# transient Turso operational fault at first tenant/connection touch shortly
+# after container start would otherwise fail the whole sweep until the next
+# tick. Same thin-local-loop precedent as `_run_schema_init_with_backoff`
+# (hosted_local) and the sweeper's `_record_with_retry`: no shared abstraction.
+_DREAM_PHASE_STORAGE_RETRIES = 2  # 3 attempts total
+_DREAM_PHASE_RETRY_BACKOFF_SECONDS = 0.25
 
 
 class DreamJobOutcome(NamedTuple):
@@ -1228,12 +1241,15 @@ class HostedMemoryService:
                     # A SUMMARIZE phase that started then raised is ran-and-failed
                     # (advances, anti-spend); one whose worker never started is
                     # never-run (held). Distinguish them by the worker signal.
-                    # A retirement rejection raises before the phase touches
-                    # memory, so it is never-run even though the worker started.
+                    # A retirement rejection or any other pre-phase prelude fault
+                    # raises before the phase touches memory, so it is never-run
+                    # even though the worker started -- `dream_phase_not_started`
+                    # tags those (the retirement gate stays explicit alongside).
                     if (
                         request.phase is DreamPhase.SUMMARIZE
                         and worker_started.is_set()
                         and not isinstance(exc, HostedScopeRetired)
+                        and not dream_phase_not_started(exc)
                     ):
                         summarize_ran = True
                     # Surface to the sweeper whether the failing phase durably
@@ -1463,6 +1479,71 @@ class HostedMemoryService:
         request: RunDreamPhaseRequest,
         tenant: HostedTenant,
     ) -> tuple[RunDreamPhaseResult, UsageSummary]:
+        # Retry ONLY the pre-phase prelude on retryable operational faults:
+        # a boot-blip Turso fault at the retirement re-check or live
+        # local-service construction would otherwise fail the whole sweep until
+        # the next tick. Phase execution is deliberately NOT wrapped here: each
+        # phase durably records its own `dream_runs` error row before
+        # re-raising, so retrying it would double-record and re-spend model
+        # calls. Mid-phase transient faults keep today's fail-closed behaviour.
+        try:
+            service = await self._dream_phase_prelude(request, tenant)
+        except Exception as exc:
+            # The prelude runs before the phase touches tenant memory. Tag its
+            # faults (exhausted storage retry, MutationOutcomeUnknown, a
+            # non-retryable operational fault, or the retirement gate) so a
+            # failing SUMMARIZE prelude counts as never-run and holds the
+            # summarize watermark, exactly like the retirement gate -- not as
+            # ran-and-failed, which would strand the never-summarized rows.
+            raise mark_dream_phase_not_started(exc)
+        # Only phase execution needs the NotImplementedError -> host-port
+        # conversion: live local-service construction in the prelude raises no
+        # NotImplementedError (LocalMemoryService.__init__ does not), so a
+        # partially-wired agent factory surfaces here inside the phase run.
+        try:
+            return await _run_local_dream_phase_with_usage(service, request)
+        except NotImplementedError as exc:
+            raise missing_host_port("Dream phase") from exc
+
+    async def _dream_phase_prelude(
+        self,
+        request: RunDreamPhaseRequest,
+        tenant: HostedTenant,
+    ) -> LocalMemoryService:
+        """Resolve the live local service for a minted dream job, retrying the
+        whole prelude on a retryable operational fault.
+
+        `HostedScopeRetired` is a `PermissionError`, not caught by the storage
+        gate, so a retirement landing mid-retry still aborts immediately.
+        `MutationOutcomeUnknown` returns False from the predicate and is not
+        retried (deliberate exclusion in `src/vexic/storage/errors.py`); any
+        non-retryable operational fault propagates on the first attempt.
+        """
+        for attempt in range(1, _DREAM_PHASE_STORAGE_RETRIES + 2):
+            try:
+                return self._resolve_live_dream_service(request, tenant)
+            except (sqlite3.Error, ValueError) as exc:
+                if attempt > _DREAM_PHASE_STORAGE_RETRIES or (
+                    not is_retryable_operational_error(exc)
+                ):
+                    raise
+                logger.warning(
+                    "dream phase prelude retryable fault attempt=%d/%d "
+                    "exception_type=%s",
+                    attempt,
+                    _DREAM_PHASE_STORAGE_RETRIES + 1,
+                    type(exc).__name__,
+                )
+                await asyncio.sleep(_DREAM_PHASE_RETRY_BACKOFF_SECONDS * attempt)
+        raise AssertionError(  # pragma: no cover - loop returns or raises
+            "dream phase prelude retry loop exited without a result"
+        )
+
+    def _resolve_live_dream_service(
+        self,
+        request: RunDreamPhaseRequest,
+        tenant: HostedTenant,
+    ) -> LocalMemoryService:
         # Minted dream jobs bypass `_bind_request` at execution time
         # (ADR 0025), so a retirement landing between scheduling and
         # execution must be re-checked here before touching tenant memory
@@ -1476,17 +1557,11 @@ class HostedMemoryService:
             raise HostedScopeRetired(
                 "Memory scope project_id is not provisioned for tenant."
             )
-        try:
-            # Execute against the LIVE tenant, not the captured one: a
-            # replacement-database repoint between scheduling and execution
-            # bumps `generation`, and the abandoned pre-repoint target must
-            # not receive the job's writes.
-            return await _run_local_dream_phase_with_usage(
-                self._local_service(live),
-                request,
-            )
-        except NotImplementedError as exc:
-            raise missing_host_port("Dream phase") from exc
+        # Execute against the LIVE tenant, not the captured one: a
+        # replacement-database repoint between scheduling and execution
+        # bumps `generation`, and the abandoned pre-repoint target must
+        # not receive the job's writes.
+        return self._local_service(live)
 
     def _record_request(
         self,
