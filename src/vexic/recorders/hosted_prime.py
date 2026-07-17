@@ -216,9 +216,10 @@ def build_prime_context(
     content = "\n".join(lines)
     footer_block = "\n" + PRIME_FOOTER
     if max_chars >= 2 * len(footer_block):
-        # Reserve footer space before capping so the usage guidance can
-        # never be truncated away; _cap deletes from the end, and the
-        # footer is appended after capping.
+        # Reserve footer space only when the budget can hold the footer plus
+        # at least an equal share of content. Below that threshold the
+        # legacy end-cap below deliberately prioritizes memory content over
+        # the footer.
         return _cap(content, max_chars - len(footer_block)) + footer_block
     return _cap(content + footer_block, max_chars)
 

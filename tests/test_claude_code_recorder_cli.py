@@ -2605,6 +2605,24 @@ class ClaudeCodeRecorderPrimeCommandTests(unittest.TestCase):
             "reserved footer must be intact at the end under worst-case truncation",
         )
 
+    def test_prime_below_reservation_threshold_prioritizes_content_over_footer(self) -> None:
+        from vexic.recorders.hosted_prime import PRIME_FOOTER
+
+        footer_block_len = len("\n" + PRIME_FOOTER)
+        max_chars = 2 * footer_block_len - 100  # inside the dead band
+        context = build_prime_context(
+            {"facts": [{"fact_text": "long fact " * 200}], "candidate_notes": []},
+            {"hits": []},
+            max_chars=max_chars,
+        )
+
+        self.assertLessEqual(len(context), max_chars)
+        # deliberate policy: below the reservation threshold, memory content
+        # wins the budget and the footer may be truncated away
+        self.assertIn("Memory snapshot from prior sessions — use it silently.", context)
+        self.assertIn("long fact", context)
+        self.assertFalse(context.endswith(PRIME_FOOTER))
+
     def test_prime_single_long_hit_cannot_starve_later_hits(self) -> None:
         context = build_prime_context(
             {"facts": [], "candidate_notes": []},
