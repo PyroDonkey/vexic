@@ -32,6 +32,7 @@ from vexic.storage.errors import (
     is_duplicate_column_error,
     is_operational_error,
     is_retryable_operational_error,
+    is_unique_violation,
 )
 
 
@@ -457,25 +458,42 @@ class HostedTenantCatalog:
             if not project_id.strip():
                 raise ValueError("project_id must not be blank.")
         with closing(self._connect_control()) as conn:
-            row = conn.execute(
-                """
-                SELECT db_filename, active, customer_target
-                FROM tenants
-                WHERE tenant_id = ?
-                """,
-                (tenant_id,),
-            ).fetchone()
+
+            def _read_tenant_row() -> tuple[str, int, str | None] | None:
+                return conn.execute(
+                    """
+                    SELECT db_filename, active, customer_target
+                    FROM tenants
+                    WHERE tenant_id = ?
+                    """,
+                    (tenant_id,),
+                ).fetchone()
+
+            row = _read_tenant_row()
             if row is None:
                 db_filename = self._allocate_db_filename(conn)
                 target = self._new_customer_target(tenant_id, customer_target)
-                conn.execute(
-                    """
-                    INSERT INTO tenants (tenant_id, db_filename, active, customer_target)
-                    VALUES (?, ?, 0, ?)
-                    """,
-                    (tenant_id, db_filename, target),
-                )
-                conn.commit()
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO tenants (tenant_id, db_filename, active, customer_target)
+                        VALUES (?, ?, 0, ?)
+                        """,
+                        (tenant_id, db_filename, target),
+                    )
+                    conn.commit()
+                except (sqlite3.IntegrityError, ValueError) as exc:
+                    if not is_unique_violation(exc):
+                        raise
+                    # A concurrent provisioner committed this tenant between
+                    # the existence check and the INSERT (check-then-insert
+                    # race). Converge on the winner's row instead of failing:
+                    # roll back and continue down the already-exists path.
+                    conn.rollback()
+                    row = _read_tenant_row()
+                    if row is None:
+                        raise
+            if row is None:
                 needs_customer_init = True
             else:
                 db_filename = row[0]
@@ -1484,8 +1502,9 @@ class HostedTenantCatalog:
             conn.commit()
 
     def _allocate_db_filename(self, conn: sqlite3.Connection) -> str:
-        # NOTE(alpha): local staging assumes serialized provisioning; retry INSERT on
-        # IntegrityError if concurrent tenant creation becomes a real workload.
+        # Check-then-use is a hint, not a lock: concurrent provisioning is
+        # settled by the tenants UNIQUE constraints, and `provision_tenant`
+        # converges on the winner's committed row when its INSERT loses.
         for _ in range(100):
             db_filename = f"customer-{secrets.token_hex(16)}.db"
             exists = conn.execute(

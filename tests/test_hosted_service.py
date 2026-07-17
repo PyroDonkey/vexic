@@ -2096,3 +2096,51 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(api_key.raw_key, ledger_text)
         self.assertNotIn(api_key.raw_key.encode("utf-8"), ledger_bytes)
         self.assertNotIn(b"Dream phase host port is not configured", ledger_bytes)
+
+
+class HostedProvisioningRaceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.catalog = HostedTenantCatalog(self.root)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_provision_tenant_converges_when_rival_commits_first(self) -> None:
+        """Two provisioners racing on the same tenant_id must converge onto the
+        winner's committed row instead of failing with IntegrityError."""
+        control_db = self.root / "control-plane.db"
+        real_allocate = self.catalog._allocate_db_filename
+
+        def rival_commits_then_allocate(conn: sqlite3.Connection) -> str:
+            # Simulate a concurrent provisioner winning the race between this
+            # call's existence check and its INSERT.
+            with closing(sqlite3.connect(control_db)) as rival:
+                rival.execute(
+                    """
+                    INSERT INTO tenants (tenant_id, db_filename, active)
+                    VALUES (?, ?, 0)
+                    """,
+                    ("tenant-race", "customer-rival.db"),
+                )
+                rival.commit()
+            return real_allocate(conn)
+
+        with patch.object(
+            self.catalog,
+            "_allocate_db_filename",
+            side_effect=rival_commits_then_allocate,
+        ):
+            tenant = self.catalog.provision_tenant("tenant-race")
+
+        self.assertEqual(tenant.tenant_id, "tenant-race")
+        # The loser adopted the winner's row: one tenants row, the rival's
+        # db_filename, activated and initialized.
+        with closing(sqlite3.connect(control_db)) as conn:
+            rows = conn.execute(
+                "SELECT db_filename, active FROM tenants WHERE tenant_id = ?",
+                ("tenant-race",),
+            ).fetchall()
+        self.assertEqual(rows, [("customer-rival.db", 1)])
+        self.assertTrue((self.root / "customer-rival.db").exists())
