@@ -160,6 +160,7 @@ def _answer_retrieval_arrays(
         SELECT keyword_fact_ids, vector_fact_ids, fused_fact_ids
         FROM retrieval_events
         WHERE session_id = ?
+        ORDER BY id DESC
         LIMIT 1
         """,
         (f"longmemeval:{question_id}:answer",),

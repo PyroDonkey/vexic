@@ -624,6 +624,15 @@ class LongMemEvalArtifactTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    def test_select_instances_rejects_type_weights_with_first_selection(self) -> None:
+        with self.assertRaisesRegex(ValueError, "type weights require stratified"):
+            _select_instances(
+                self._typed_rows(),
+                limit=3,
+                selection="first",
+                type_weights={"multi-session": 2},
+            )
+
     def test_select_instances_rejects_non_positive_type_weight(self) -> None:
         with self.assertRaisesRegex(ValueError, "type weight.*at least 1"):
             _select_instances(

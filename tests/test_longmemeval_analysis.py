@@ -394,6 +394,49 @@ class LongMemEvalAnalysisTests(unittest.TestCase):
         self.assertEqual(report.aggregate_histogram.distinct_subjects, 21)
         self.assertEqual(report.aggregate_histogram.median_facts_per_subject, 1)
 
+    def test_latest_retrieval_event_wins_when_session_has_multiple(self) -> None:
+        # One answer-session retrieval writes one row per returned fact, all
+        # sharing identical arrays; if a future harness ever records a second
+        # attempt, the analysis must read the latest attempt's arrays, not an
+        # unspecified row.
+        self._write_run([_diagnostics_row("q-two-events")])
+        dataset = self._write_dataset(
+            [self._dataset_row("q-two-events", "Boston Marathon")]
+        )
+        facts = [
+            (f"Filler fact number {index}.", f"filler-{index}") for index in range(1, 6)
+        ]
+        facts.append(("The user ran the Boston Marathon in 2023.", "user"))
+        db_path = self._seed_question_db(
+            "q-two-events",
+            facts,
+            # Stale first attempt: gold fact 6 nowhere in the arrays.
+            event={
+                "keyword_fact_ids": [1, 2, 3, 4, 5],
+                "vector_fact_ids": [1, 2, 3, 4, 5],
+                "fused_fact_ids": [1, 2, 3, 4, 5],
+            },
+        )
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute(
+                """
+                INSERT INTO retrieval_events (
+                    fact_id, session_id, query,
+                    keyword_fact_ids, vector_fact_ids, fused_fact_ids
+                ) VALUES (6, 'longmemeval:q-two-events:answer', 'q',
+                          '[6, 1, 2]', '[6, 1, 2]', '[6, 1, 2]')
+                """
+            )
+            conn.commit()
+
+        report = analyze_run(self.run_dir, dataset)
+
+        # Latest attempt returned the gold fact within top-5, so this routes
+        # to manual review, not to a stale outside_retrieve_k class 2.
+        miss = report.misses[0]
+        self.assertEqual(miss.sub_reason, "retrieved_but_judged_miss")
+        self.assertEqual(miss.gold_fused_rank, 1)
+
     def test_invalid_event_array_json_yields_analysis_error_not_crash(self) -> None:
         self._write_run([_diagnostics_row("q-badjson")])
         dataset = self._write_dataset([self._dataset_row("q-badjson", "Boston Marathon")])

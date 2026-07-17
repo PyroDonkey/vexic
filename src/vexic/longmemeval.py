@@ -630,6 +630,11 @@ def _select_instances(
     type_weights: Mapping[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     if selection == "first":
+        if type_weights:
+            raise ValueError(
+                "type weights require stratified selection; drop --type-weight "
+                "or use --selection stratified"
+            )
         return list(raw_instances[:limit])
     if selection != "stratified":
         raise ValueError(f"Unsupported LongMemEval selection: {selection}")
