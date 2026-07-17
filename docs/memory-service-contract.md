@@ -241,7 +241,19 @@ Memory is retained by default.
   retrieval or promotion.
 - Scope deletion is modeled as a tombstone/scope-deny contract.
 - The local SQLite adapter records tombstones in `scope_tombstones` and blocks
-  retrieval, export, replay, and rebuild for matching scopes.
+  retrieval, export, replay, and rebuild for matching scopes. Writes fail
+  closed too (ADR 0022): transcript appends, recorder ingest, retrieval-event
+  recording, and fact retirement are rejected while a tombstone matches the
+  write's session (NULL target session matches all) and exact agent -- the
+  key the purge erases messages and session-scoped telemetry by; tombstone
+  project and user fields do not narrow the physical erase and so do not
+  exempt a write, and the block persists after the purge completes. Dream
+  phases, whose sweeps read sources agent-wide and whose outputs the purge
+  erases by source intersection, are blocked for the whole agent while a
+  matching purge is pending, then per-session afterwards. The
+  `search_long_term` candidate fallback is skipped for a tombstoned scope
+  (no tentative notes served, no retrieval telemetry recorded) while the
+  search itself stays governed by the tombstone's retrieval flag.
 - Physical purge is a second deliberate step (`purge_scope`, ADR 0022): it
   requires an existing tombstone for exactly the target scope, irreversibly
   deletes the scope's canonical rows, projections, and content-bearing
