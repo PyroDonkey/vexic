@@ -19,6 +19,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install uv
+        # Exact pin required: setup-uv stopped publishing floating major tags after v7
+        # (no @v8 exists upstream; @v8 fails at workflow parse time).
         uses: astral-sh/setup-uv@v8.3.2
       - name: Set up Python
         run: uv python install 3.13
