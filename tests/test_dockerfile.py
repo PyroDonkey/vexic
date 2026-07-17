@@ -137,14 +137,10 @@ def test_hosted_entrypoint_repairs_volume_then_drops_privileges(
     )
 
 
-def test_chown_tree_skips_walk_when_root_already_owned(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """A correctly-owned volume root must not trigger the O(volume) re-chown."""
-    if os.name == "nt":
-        pytest.skip("hosted_entrypoint uses POSIX uid/gid APIs")
-
+def _chown_fixture(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[Path, Path, Path, list[Path]]:
+    """A volume tree plus a recorder replacing the real os.lchown."""
     from vexic import hosted_entrypoint
 
     root = tmp_path / "volume"
@@ -158,39 +154,89 @@ def test_chown_tree_skips_walk_when_root_already_owned(
         "lchown",
         lambda path, uid, gid: chowned.append(Path(path)),
     )
+    return root, nested, nested / "customer.db", chowned
 
+
+def test_chown_tree_skips_walk_when_sentinel_and_root_match(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A completed repair (matching sentinel + correctly-owned root) must not
+    trigger the O(volume) re-chown on later boots."""
+    if os.name == "nt":
+        pytest.skip("hosted_entrypoint uses POSIX uid/gid APIs")
+
+    from vexic import hosted_entrypoint
+
+    root, _nested, _db, chowned = _chown_fixture(monkeypatch, tmp_path)
     stat = root.lstat()
+    (root / ".chown-complete").write_text(
+        f"{stat.st_uid}:{stat.st_gid}", encoding="utf-8"
+    )
+
     hosted_entrypoint._chown_tree(root, stat.st_uid, stat.st_gid)
 
     assert chowned == []
 
 
-def test_chown_tree_repairs_bottom_up_so_root_marks_completion(
+def test_chown_tree_walks_when_root_correct_but_sentinel_absent(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """The root directory flips ownership last: a correctly-owned root then
-    proves the whole tree was repaired, and an interrupted repair leaves the
-    root mismatched so the next boot resumes the walk instead of skipping it."""
+    """A correctly-owned root alone is not proof of a completed repair: the
+    pre-sentinel entrypoint chowned the root first, so an interrupted old
+    repair (or an external writer) can leave a correct root over mis-owned
+    children. Without the completion sentinel the walk must run."""
     if os.name == "nt":
         pytest.skip("hosted_entrypoint uses POSIX uid/gid APIs")
 
     from vexic import hosted_entrypoint
 
-    root = tmp_path / "volume"
-    nested = root / "nested"
-    nested.mkdir(parents=True)
-    (nested / "customer.db").write_text("", encoding="utf-8")
+    root, nested, db, chowned = _chown_fixture(monkeypatch, tmp_path)
+    stat = root.lstat()
 
-    chowned: list[Path] = []
-    monkeypatch.setattr(
-        hosted_entrypoint.os,
-        "lchown",
-        lambda path, uid, gid: chowned.append(Path(path)),
-    )
+    hosted_entrypoint._chown_tree(root, stat.st_uid, stat.st_gid)
+
+    assert {nested, db, root} <= set(chowned)
+
+
+def test_chown_tree_walks_when_sentinel_records_other_ids(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A runtime uid/gid change invalidates the previous repair's sentinel."""
+    if os.name == "nt":
+        pytest.skip("hosted_entrypoint uses POSIX uid/gid APIs")
+
+    from vexic import hosted_entrypoint
+
+    root, nested, db, chowned = _chown_fixture(monkeypatch, tmp_path)
+    (root / ".chown-complete").write_text("999:999", encoding="utf-8")
+    stat = root.lstat()
+
+    hosted_entrypoint._chown_tree(root, stat.st_uid, stat.st_gid)
+
+    assert {nested, db, root} <= set(chowned)
+
+
+def test_chown_tree_repairs_bottom_up_and_stamps_completion(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The root directory flips ownership last and the completion sentinel is
+    written first: an interrupted repair leaves either the sentinel stale or
+    the root mismatched, so the next boot resumes the walk."""
+    if os.name == "nt":
+        pytest.skip("hosted_entrypoint uses POSIX uid/gid APIs")
+
+    from vexic import hosted_entrypoint
+
+    root, nested, db, chowned = _chown_fixture(monkeypatch, tmp_path)
 
     # Target ids differ from the tree's actual owner, so a repair must run.
     hosted_entrypoint._chown_tree(root, 10001, 10001)
 
-    assert set(chowned) == {root, nested, nested / "customer.db"}
+    sentinel = root / ".chown-complete"
+    assert sentinel.read_text(encoding="utf-8") == "10001:10001"
+    assert set(chowned) == {root, nested, db, sentinel}
     assert chowned[-1] == root
