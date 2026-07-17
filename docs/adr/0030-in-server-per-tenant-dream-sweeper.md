@@ -53,6 +53,19 @@ user-triggered sweeps. A failing phase stops its chain (Deep must not promote
 over a failed Light) and fails closed content-free; missing dream ports skip
 scheduling entirely.
 
+> Amended for COA-395. The pre-phase prelude of `_run_dream_phase_with_usage`
+> -- the execution-time retirement re-check plus live local-service
+> construction, before any phase runs -- now retries in-process on a
+> `retryable_operational` fault (bounded attempts with linear backoff over the
+> shared `is_retryable_operational_error` predicate), so a single transient
+> Turso blip at first tenant/connection touch shortly after container start no
+> longer fails the whole sweep until the next tick. Phase execution itself is
+> deliberately NOT retried: each phase durably records its own `dream_runs`
+> error row before re-raising, so a whole-phase retry would double-record and
+> re-spend model calls -- mid-phase transient faults keep the fail-closed stop
+> above. `MutationOutcomeUnknown` is excluded from the retry (a lost commit
+> acknowledgement is unsafe to re-run) and also fails closed.
+
 ### State, knobs, and retirement
 
 - Sweeper bookkeeping lives in the control-plane catalog's `dream_sweep_state`
