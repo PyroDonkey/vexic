@@ -16,6 +16,18 @@ LONG_TERM_PRIME_QUERY = "preference fact goal decision project context remember"
 TRANSCRIPT_PRIME_QUERY = "remember"
 DEFAULT_PRIME_MAX_CHARS = 6_000
 
+PRIME_FRAMING = (
+    "Memory snapshot from prior sessions — use it silently.\n"
+    "More facts and conversation history exist beyond this snapshot; the "
+    "vexic recall tools reach them."
+)
+PRIME_FOOTER = (
+    "Use this memory silently, as if you simply remember it — don't mention "
+    "memory systems or where facts came from unless asked. If vexic memory "
+    "search tools are available, use them to look up more preferences, "
+    "facts, and past conversation when relevant."
+)
+
 
 @dataclass(frozen=True)
 class HostedPrimeConfig:
@@ -163,7 +175,7 @@ def build_prime_context(
     recap_text: str | None = None,
     max_chars: int,
 ) -> str:
-    lines: list[str] = [PRIME_CONTEXT_HEADER]
+    lines: list[str] = [PRIME_CONTEXT_HEADER, PRIME_FRAMING]
     facts = _items(long_term.get("facts"))
     notes = _items(long_term.get("candidate_notes"))
     hits = _items(transcript.get("hits"))
@@ -190,15 +202,16 @@ def build_prime_context(
             if body:
                 lines.append(f"- {body}")
 
-    if len(lines) == 1:
+    if len(lines) == 2:
         return ""
-    lines.append(
-        "Use this memory silently, as if you simply remember it — don't mention "
-        "memory systems or where facts came from unless asked. If vexic memory "
-        "search tools are available, use them to look up more preferences, "
-        "facts, and past conversation when relevant."
-    )
-    return _cap("\n".join(lines), max_chars)
+    content = "\n".join(lines)
+    footer_block = "\n" + PRIME_FOOTER
+    if max_chars >= 2 * len(footer_block):
+        # Reserve footer space before capping so the usage guidance can
+        # never be truncated away; _cap deletes from the end, and the
+        # footer is appended after capping.
+        return _cap(content, max_chars - len(footer_block)) + footer_block
+    return _cap(content + footer_block, max_chars)
 
 
 def _items(value: object) -> list[dict[str, object]]:
