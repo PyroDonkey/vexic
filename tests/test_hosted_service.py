@@ -2260,7 +2260,10 @@ class HostedControlPlaneKeyCompensationTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def test_metadata_failure_revokes_the_minted_key(self) -> None:
-        """Compensation: a failed metadata write must not leave a live key."""
+        """Pins the pre-existing fail-closed compensation: a failed metadata
+        write revokes the minted key. This behavior predates the loud
+        compensation-failure hardening, whose delta is pinned by
+        test_failed_compensation_names_the_orphaned_key below."""
         self._fault_injected_keys(("INSERT INTO hosted_api_key_metadata",))
 
         with self.assertRaises(sqlite3.OperationalError):

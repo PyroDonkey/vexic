@@ -492,6 +492,11 @@ class HostedTenantCatalog:
                     # the existence check and the INSERT (check-then-insert
                     # race). Converge on the winner's row instead of failing:
                     # roll back and continue down the already-exists path.
+                    # `is_unique_violation` is broader than its name (any
+                    # constraint violation classifies True), so the re-read
+                    # below is the real verification: no winner row means the
+                    # violation was not this race, and the original error
+                    # re-raises.
                     conn.rollback()
                     row = _read_tenant_row()
                     if row is None:
@@ -1953,7 +1958,10 @@ class HostedApiKeyStore:
                         revoked_by="control-plane-metadata-failure",
                     )
                 except PermissionError:
-                    # The credential row never landed; nothing live to revoke.
+                    # The credential row provably landed (create_key committed
+                    # it and _load_key read it back above), so PermissionError
+                    # here means it vanished concurrently -- either way there
+                    # is nothing live left to revoke.
                     pass
                 except Exception as revoke_exc:
                     raise RuntimeError(

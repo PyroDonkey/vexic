@@ -158,6 +158,14 @@ def is_unique_violation(exc: BaseException) -> bool:
     raises a bare :class:`ValueError` whose message contains ``SQLITE_CONSTRAINT``
     or ``UNIQUE constraint failed``. An unrelated ``ValueError`` returns ``False``
     so adopting sites re-raise it.
+
+    Deliberately broader than the name on both backends: any
+    :class:`sqlite3.IntegrityError` (NOT NULL/CHECK/FK included) and any
+    libSQL ``SQLITE_CONSTRAINT`` fault classify True, keeping local SQLite
+    and Turso consistent for the HTTP 409/500 boundary classifiers.
+    Lost-race adopters must therefore re-verify (re-read the row) and
+    re-raise when no winner exists, rather than trusting True to mean
+    "duplicate key".
     """
     if isinstance(exc, sqlite3.IntegrityError):
         return True
