@@ -1891,13 +1891,31 @@ class HostedApiKeyStore:
                         ),
                     )
                     conn.commit()
-            except Exception:
-                # NOTE(alpha): compensate here instead of threading a shared transaction through create_key.
-                with suppress(PermissionError):
+            except Exception as metadata_exc:
+                # The credential row and its metadata row commit in separate
+                # transactions, so compensate (revoke the minted key) instead
+                # of threading a shared transaction through create_key. The
+                # compensation must fail closed and loud: a key without
+                # metadata never appears in console listings, so if the
+                # revoke also fails the error names the orphaned live key for
+                # manual revocation instead of masking the failure.
+                try:
                     self.revoke_key(
                         provisioned.key_id,
                         revoked_by="control-plane-metadata-failure",
                     )
+                except PermissionError:
+                    # The credential row never landed; nothing live to revoke.
+                    pass
+                except Exception as revoke_exc:
+                    raise RuntimeError(
+                        f"Hosted API key {provisioned.key_id} was minted but "
+                        "its control-plane metadata write failed, and the "
+                        "compensating revoke also failed "
+                        f"({type(revoke_exc).__name__}); the key is live but "
+                        f"invisible to console listings -- revoke key "
+                        f"{provisioned.key_id} manually."
+                    ) from metadata_exc
                 raise
         return provisioned, record
 

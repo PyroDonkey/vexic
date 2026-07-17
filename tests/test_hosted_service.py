@@ -2144,3 +2144,85 @@ class HostedProvisioningRaceTests(unittest.TestCase):
             ).fetchall()
         self.assertEqual(rows, [("customer-rival.db", 1)])
         self.assertTrue((self.root / "customer-rival.db").exists())
+
+
+class _FaultInjectingConnection:
+    """Proxy that fails any statement containing one of the given fragments."""
+
+    def __init__(self, conn: sqlite3.Connection, fail_fragments: tuple[str, ...]) -> None:
+        self._conn = conn
+        self._fail_fragments = fail_fragments
+
+    def execute(self, sql: str, *args: object) -> object:
+        for fragment in self._fail_fragments:
+            if fragment in sql:
+                raise sqlite3.OperationalError(f"injected fault: {fragment}")
+        return self._conn.execute(sql, *args)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._conn, name)
+
+
+class HostedControlPlaneKeyCompensationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.keys = HostedApiKeyStore(self.root)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _fault_injected_keys(self, fail_fragments: tuple[str, ...]) -> None:
+        real_connect = type(self.keys)._connect_control
+
+        def connect_with_faults(store: HostedApiKeyStore) -> _FaultInjectingConnection:
+            return _FaultInjectingConnection(real_connect(store), fail_fragments)
+
+        patcher = patch.object(
+            type(self.keys), "_connect_control", connect_with_faults
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_metadata_failure_revokes_the_minted_key(self) -> None:
+        """Compensation: a failed metadata write must not leave a live key."""
+        self._fault_injected_keys(("INSERT INTO hosted_api_key_metadata",))
+
+        with self.assertRaises(sqlite3.OperationalError):
+            self.keys.create_control_plane_key(
+                tenant_id="tenant-a", project_id="proj-a", name="console key"
+            )
+
+        with closing(sqlite3.connect(self.root / "control-plane.db")) as conn:
+            rows = conn.execute(
+                "SELECT revoked_at, revoked_by FROM hosted_api_keys"
+            ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertIsNotNone(rows[0][0])
+        self.assertEqual(rows[0][1], "control-plane-metadata-failure")
+
+    def test_failed_compensation_names_the_orphaned_key(self) -> None:
+        """If the compensating revoke also fails, the error must name the
+        orphaned live key for manual revocation and keep the original
+        metadata failure as the cause -- never a bare revoke error that
+        hides the fail-open credential."""
+        self._fault_injected_keys(
+            (
+                "INSERT INTO hosted_api_key_metadata",
+                "UPDATE hosted_api_keys",
+            )
+        )
+
+        with self.assertRaises(RuntimeError) as caught:
+            self.keys.create_control_plane_key(
+                tenant_id="tenant-a", project_id="proj-a", name="console key"
+            )
+
+        message = str(caught.exception)
+        with closing(sqlite3.connect(self.root / "control-plane.db")) as conn:
+            (key_id,) = conn.execute("SELECT key_id FROM hosted_api_keys").fetchone()
+        self.assertIn(key_id, message)
+        self.assertIn("revoke", message)
+        self.assertIn("manually", message)
+        self.assertIsInstance(caught.exception.__cause__, sqlite3.OperationalError)
+        self.assertIn("hosted_api_key_metadata", str(caught.exception.__cause__))
