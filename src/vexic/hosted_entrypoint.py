@@ -24,11 +24,18 @@ def _runtime_ids(user: str) -> tuple[int, int]:
 
 def _chown_tree(root: Path, uid: int, gid: int) -> None:
     root.mkdir(parents=True, exist_ok=True)
-    # NOTE(alpha): recursive volume repair is fine for alpha; use a one-time migration if the volume grows.
-    for current, dir_names, file_names in os.walk(root):
-        os.lchown(current, uid, gid)
+    # Guarded one-time repair: skip the O(volume) walk when the root already
+    # belongs to the runtime user. The walk chowns bottom-up and flips the
+    # root last, so a correctly-owned root proves every child was repaired;
+    # an interrupted repair leaves the root mismatched and the next boot
+    # resumes the walk instead of trusting a half-repaired tree.
+    stat = root.lstat()
+    if stat.st_uid == uid and stat.st_gid == gid:
+        return
+    for current, dir_names, file_names in os.walk(root, topdown=False):
         for name in (*dir_names, *file_names):
             os.lchown(Path(current) / name, uid, gid)
+    os.lchown(root, uid, gid)
 
 
 def _uvicorn_command() -> list[str]:

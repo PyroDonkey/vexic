@@ -135,3 +135,62 @@ def test_hosted_entrypoint_repairs_volume_then_drops_privileges(
             ],
         ),
     )
+
+
+def test_chown_tree_skips_walk_when_root_already_owned(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A correctly-owned volume root must not trigger the O(volume) re-chown."""
+    if os.name == "nt":
+        pytest.skip("hosted_entrypoint uses POSIX uid/gid APIs")
+
+    from vexic import hosted_entrypoint
+
+    root = tmp_path / "volume"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    (nested / "customer.db").write_text("", encoding="utf-8")
+
+    chowned: list[Path] = []
+    monkeypatch.setattr(
+        hosted_entrypoint.os,
+        "lchown",
+        lambda path, uid, gid: chowned.append(Path(path)),
+    )
+
+    stat = root.lstat()
+    hosted_entrypoint._chown_tree(root, stat.st_uid, stat.st_gid)
+
+    assert chowned == []
+
+
+def test_chown_tree_repairs_bottom_up_so_root_marks_completion(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The root directory flips ownership last: a correctly-owned root then
+    proves the whole tree was repaired, and an interrupted repair leaves the
+    root mismatched so the next boot resumes the walk instead of skipping it."""
+    if os.name == "nt":
+        pytest.skip("hosted_entrypoint uses POSIX uid/gid APIs")
+
+    from vexic import hosted_entrypoint
+
+    root = tmp_path / "volume"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    (nested / "customer.db").write_text("", encoding="utf-8")
+
+    chowned: list[Path] = []
+    monkeypatch.setattr(
+        hosted_entrypoint.os,
+        "lchown",
+        lambda path, uid, gid: chowned.append(Path(path)),
+    )
+
+    # Target ids differ from the tree's actual owner, so a repair must run.
+    hosted_entrypoint._chown_tree(root, 10001, 10001)
+
+    assert set(chowned) == {root, nested, nested / "customer.db"}
+    assert chowned[-1] == root
