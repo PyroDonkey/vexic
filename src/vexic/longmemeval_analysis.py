@@ -1,0 +1,428 @@
+"""Offline miss-classification analysis for a LongMemEval run (COA-349).
+
+Reads a completed run directory (``diagnostics.jsonl`` plus per-question
+``memory.db`` files) and the source dataset, then buckets every judged-recall
+miss into exactly one failing-stage class:
+
+* **class 1** -- no live Tier 3 fact contains the gold answer: an
+  extraction or promotion miss (``sub_reason`` distinguishes the two from the
+  run's own stage diagnostics).
+* **class 2** -- a gold fact exists but ranked out of the returned top-k:
+  ``below_return_k`` when the recomputed full RRF rank exceeds ``RETURN_K``,
+  ``outside_retrieve_k`` when the fact never entered either top-``RETRIEVE_K``
+  retriever array.
+* **class 3** -- candidate multi-fact/derivation cases needing human review:
+  the gold fact was returned yet judged unsupported, or the answer appears
+  verbatim nowhere in the transcript so no single extracted fact could ever
+  contain it (aggregation/temporal answers).
+
+Rows whose answers are unmatchable by token containment (yes/no, very short)
+are reported unclassified with ``needs_manual_review``.
+
+This module only *reads* run artifacts: every ``memory.db`` is opened with
+SQLite's read-only URI mode, and the sole output is ``analysis_report.json``
+in the run directory plus a stdout summary. It deliberately imports the
+retrieval constants and ``reciprocal_rank_fusion`` from
+``vexic.subagents.retrieval`` so the offline rank recompute can never drift
+from live fusion semantics (COA-349 guardrail: no retrieval or promotion
+behavior changes).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import statistics
+import sys
+from contextlib import closing
+from pathlib import Path
+from typing import Any, Literal, Mapping, Sequence
+
+from pydantic import BaseModel
+
+from vexic.longmemeval import (
+    _contains_answer_tokens,
+    _load_dataset,
+    _matchable_answer_tokens,
+    _question_path_component,
+)
+from vexic.storage.connection import StorageConnection, connect
+from vexic.subagents.retrieval import RETURN_K, reciprocal_rank_fusion
+
+MissSubReason = Literal[
+    "extraction_miss",
+    "promotion_miss",
+    "below_return_k",
+    "outside_retrieve_k",
+    "retrieved_but_judged_miss",
+    "answer_not_verbatim_requires_join",
+    "unmatchable_answer",
+    "missing_question_db",
+]
+
+
+class MissClassification(BaseModel):
+    question_id: str
+    question_type: str | None
+    miss_class: Literal[1, 2, 3] | None
+    sub_reason: MissSubReason
+    needs_manual_review: bool
+    gold_fact_ids: list[int]
+    gold_fused_rank: int | None
+    evidence: dict[str, Any]
+
+
+class SubjectHistogram(BaseModel):
+    question_id: str
+    total_facts: int
+    distinct_subjects: int
+    median_facts_per_subject: float
+    max_facts_per_subject: int
+    top_subjects: list[tuple[str, int]]
+
+
+class AggregateHistogram(BaseModel):
+    total_facts: int
+    distinct_subjects: int
+    median_facts_per_subject: float
+    max_facts_per_subject: int
+
+
+class RunAnalysisReport(BaseModel):
+    run_dir: str
+    judged_recall_by_question_type: dict[str, dict[str, int]]
+    misses: list[MissClassification]
+    class_counts: dict[str, int]
+    subject_histograms: list[SubjectHistogram]
+    aggregate_histogram: AggregateHistogram
+
+
+def _open_readonly(db_path: Path) -> StorageConnection:
+    # SQLite read-only URI mode: the analysis must never mutate run artifacts.
+    return connect(f"file:{db_path}?mode=ro", uri=True)
+
+
+def _memory_db_path(run_dir: Path, question_id: str) -> Path:
+    return run_dir / _question_path_component(question_id) / "memory.db"
+
+
+def _load_diagnostics(run_dir: Path) -> list[dict[str, Any]]:
+    diagnostics_path = run_dir / "diagnostics.jsonl"
+    return [
+        json.loads(line)
+        for line in diagnostics_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def _live_facts(conn: StorageConnection) -> list[tuple[int, str]]:
+    rows = conn.execute(
+        "SELECT id, fact_text FROM long_term_memory WHERE retired = 0"
+    ).fetchall()
+    return [(int(fact_id), fact_text) for fact_id, fact_text in rows]
+
+
+def _answer_retrieval_arrays(
+    conn: StorageConnection,
+    question_id: str,
+) -> tuple[list[int], list[int], list[int]]:
+    row = conn.execute(
+        """
+        SELECT keyword_fact_ids, vector_fact_ids, fused_fact_ids
+        FROM retrieval_events
+        WHERE session_id = ?
+        LIMIT 1
+        """,
+        (f"longmemeval:{question_id}:answer",),
+    ).fetchone()
+    if row is None:
+        return [], [], []
+    return tuple(json.loads(value) for value in row)
+
+
+def _fact_texts(
+    conn: StorageConnection,
+    fact_ids: Sequence[int],
+) -> list[str]:
+    texts: list[str] = []
+    for fact_id in fact_ids:
+        row = conn.execute(
+            "SELECT fact_text FROM long_term_memory WHERE id = ?",
+            (fact_id,),
+        ).fetchone()
+        if row is not None:
+            texts.append(row[0])
+    return texts
+
+
+def _classify_miss(
+    diagnostics_row: Mapping[str, Any],
+    dataset_row: Mapping[str, Any],
+    db_path: Path,
+) -> MissClassification:
+    question_id = diagnostics_row["question_id"]
+    question_type = diagnostics_row.get("question_type")
+    answer = dataset_row.get("answer")
+    evidence: dict[str, Any] = {
+        "question": dataset_row.get("question"),
+        "answer": answer,
+    }
+
+    def result(
+        miss_class: Literal[1, 2, 3] | None,
+        sub_reason: MissSubReason,
+        *,
+        needs_manual_review: bool,
+        gold_fact_ids: list[int] = [],
+        gold_fused_rank: int | None = None,
+    ) -> MissClassification:
+        return MissClassification(
+            question_id=question_id,
+            question_type=question_type,
+            miss_class=miss_class,
+            sub_reason=sub_reason,
+            needs_manual_review=needs_manual_review,
+            gold_fact_ids=gold_fact_ids,
+            gold_fused_rank=gold_fused_rank,
+            evidence=evidence,
+        )
+
+    if not db_path.exists():
+        return result(None, "missing_question_db", needs_manual_review=True)
+
+    answer_tokens = _matchable_answer_tokens(answer)
+    if not answer_tokens:
+        return result(None, "unmatchable_answer", needs_manual_review=True)
+
+    with closing(_open_readonly(db_path)) as conn:
+        facts = _live_facts(conn)
+        gold_fact_ids = [
+            fact_id
+            for fact_id, fact_text in facts
+            if _contains_answer_tokens(fact_text, answer_tokens)
+        ]
+        keyword_ids, vector_ids, fused_returned = _answer_retrieval_arrays(
+            conn,
+            question_id,
+        )
+        evidence["retrieved_fact_texts"] = _fact_texts(conn, fused_returned)
+        evidence["gold_fact_texts"] = _fact_texts(conn, gold_fact_ids)
+
+    if not gold_fact_ids:
+        if diagnostics_row.get("answer_found_in_tier1") is False:
+            # The answer appears verbatim nowhere in the ingested transcript,
+            # so no extracted fact could ever contain it: deriving it needs a
+            # join over multiple facts. Human confirmation required.
+            return result(
+                3,
+                "answer_not_verbatim_requires_join",
+                needs_manual_review=True,
+            )
+        sub_reason: MissSubReason = (
+            "promotion_miss"
+            if diagnostics_row.get("answer_extracted_to_tier2")
+            else "extraction_miss"
+        )
+        return result(1, sub_reason, needs_manual_review=False)
+
+    # Recompute the untruncated fused ranking from the persisted per-retriever
+    # arrays; the stored fused_fact_ids column is truncated to the returned
+    # top-k and cannot show where a ranked-out fact landed.
+    fused = reciprocal_rank_fusion([list(keyword_ids), list(vector_ids)])
+    ranks = [
+        fused.index(fact_id) + 1 for fact_id in gold_fact_ids if fact_id in fused
+    ]
+    gold_fused_rank = min(ranks) if ranks else None
+    evidence["keyword_fact_ids"] = list(keyword_ids)
+    evidence["vector_fact_ids"] = list(vector_ids)
+
+    if gold_fused_rank is None:
+        return result(
+            2,
+            "outside_retrieve_k",
+            needs_manual_review=False,
+            gold_fact_ids=gold_fact_ids,
+        )
+    if gold_fused_rank > RETURN_K:
+        return result(
+            2,
+            "below_return_k",
+            needs_manual_review=False,
+            gold_fact_ids=gold_fact_ids,
+            gold_fused_rank=gold_fused_rank,
+        )
+    return result(
+        3,
+        "retrieved_but_judged_miss",
+        needs_manual_review=True,
+        gold_fact_ids=gold_fact_ids,
+        gold_fused_rank=gold_fused_rank,
+    )
+
+
+def _subject_counts(db_path: Path) -> list[tuple[str, int]] | None:
+    if not db_path.exists():
+        return None
+    with closing(_open_readonly(db_path)) as conn:
+        rows = conn.execute(
+            """
+            SELECT subject, COUNT(*) AS n
+            FROM long_term_memory
+            WHERE retired = 0
+            GROUP BY subject
+            ORDER BY n DESC, subject
+            """
+        ).fetchall()
+    counts = [(subject, int(count)) for subject, count in rows]
+    return counts or None
+
+
+def _subject_histogram(
+    question_id: str,
+    counts: Sequence[tuple[str, int]],
+    *,
+    top_n: int = 10,
+) -> SubjectHistogram:
+    values = [count for _, count in counts]
+    return SubjectHistogram(
+        question_id=question_id,
+        total_facts=sum(values),
+        distinct_subjects=len(counts),
+        median_facts_per_subject=statistics.median(values),
+        max_facts_per_subject=max(values),
+        top_subjects=list(counts[:top_n]),
+    )
+
+
+def _aggregate_histogram(all_counts: Sequence[int]) -> AggregateHistogram:
+    # Pools every (db, subject) count as one observation. Subjects are not
+    # deduplicated across question DBs: each DB is an isolated corpus, so the
+    # same subject string in two DBs is two observations.
+    if not all_counts:
+        return AggregateHistogram(
+            total_facts=0,
+            distinct_subjects=0,
+            median_facts_per_subject=0,
+            max_facts_per_subject=0,
+        )
+    return AggregateHistogram(
+        total_facts=sum(all_counts),
+        distinct_subjects=len(all_counts),
+        median_facts_per_subject=statistics.median(all_counts),
+        max_facts_per_subject=max(all_counts),
+    )
+
+
+def _recall_by_question_type(
+    diagnostics_rows: Sequence[Mapping[str, Any]],
+) -> dict[str, dict[str, int]]:
+    recall: dict[str, dict[str, int]] = {}
+    for row in diagnostics_rows:
+        if row.get("status") != "ok" or row.get("judged_recall_pass") is None:
+            continue
+        question_type = row.get("question_type") or "<unknown>"
+        bucket = recall.setdefault(question_type, {"supported": 0, "total": 0})
+        bucket["total"] += 1
+        if row.get("judged_recall_pass"):
+            bucket["supported"] += 1
+    return recall
+
+
+def analyze_run(run_dir: Path, dataset_path: Path) -> RunAnalysisReport:
+    """Classify every judged-recall miss in a run and build subject histograms."""
+
+    diagnostics_rows = _load_diagnostics(run_dir)
+    dataset_by_id = {
+        row.get("question_id"): row for row in _load_dataset(dataset_path)
+    }
+
+    misses: list[MissClassification] = []
+    histograms: list[SubjectHistogram] = []
+    pooled_counts: list[int] = []
+    for row in diagnostics_rows:
+        question_id = row.get("question_id")
+        if not isinstance(question_id, str):
+            continue
+        db_path = _memory_db_path(run_dir, question_id)
+        counts = _subject_counts(db_path)
+        if counts is not None:
+            histograms.append(_subject_histogram(question_id, counts))
+            pooled_counts.extend(count for _, count in counts)
+        if row.get("status") != "ok" or row.get("judged_recall_pass") is not False:
+            continue
+        misses.append(_classify_miss(row, dataset_by_id.get(question_id, {}), db_path))
+
+    class_counts: dict[str, int] = {}
+    for miss in misses:
+        key = "unclassified" if miss.miss_class is None else f"class_{miss.miss_class}"
+        class_counts[key] = class_counts.get(key, 0) + 1
+
+    return RunAnalysisReport(
+        run_dir=str(run_dir),
+        judged_recall_by_question_type=_recall_by_question_type(diagnostics_rows),
+        misses=misses,
+        class_counts=class_counts,
+        subject_histograms=histograms,
+        aggregate_histogram=_aggregate_histogram(pooled_counts),
+    )
+
+
+def _print_summary(report: RunAnalysisReport) -> None:
+    print(f"Run: {report.run_dir}")
+    for question_type, bucket in sorted(
+        report.judged_recall_by_question_type.items()
+    ):
+        print(
+            f"  {question_type}: {bucket['supported']}/{bucket['total']} supported"
+        )
+    print(
+        "Miss classes: "
+        f"class 1 (fact absent) = {report.class_counts.get('class_1', 0)}, "
+        f"class 2 (ranked out) = {report.class_counts.get('class_2', 0)}, "
+        f"class 3 (join/manual) = {report.class_counts.get('class_3', 0)}, "
+        f"unclassified = {report.class_counts.get('unclassified', 0)}"
+    )
+    manual = [miss.question_id for miss in report.misses if miss.needs_manual_review]
+    if manual:
+        print(f"Needs manual review: {', '.join(manual)}")
+    aggregate = report.aggregate_histogram
+    print(
+        "Subjects (pooled across question DBs): "
+        f"{aggregate.total_facts} facts, "
+        f"{aggregate.distinct_subjects} distinct subjects, "
+        f"median {aggregate.median_facts_per_subject} facts/subject, "
+        f"max {aggregate.max_facts_per_subject}"
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Classify LongMemEval judged-recall misses by failing stage and "
+            "build per-subject fact histograms (COA-349). Read-only over run "
+            "artifacts."
+        )
+    )
+    parser.add_argument("--run-dir", required=True, type=Path)
+    parser.add_argument("--dataset", required=True, type=Path)
+    parser.add_argument(
+        "--report-path",
+        type=Path,
+        default=None,
+        help="Where to write the JSON report (default: <run-dir>/analysis_report.json).",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    report = analyze_run(args.run_dir, args.dataset)
+    report_path = args.report_path or args.run_dir / "analysis_report.json"
+    report_path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
+    _print_summary(report)
+    print(f"Report: {report_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
