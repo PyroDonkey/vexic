@@ -1,4 +1,4 @@
-"""Conformance tests for the COA-349 LongMemEval miss-classification analysis.
+"""Conformance tests for the LongMemEval miss-classification analysis.
 
 The analysis module reads a completed LongMemEval run directory
 (diagnostics.jsonl plus the per-question memory.db files) and buckets every

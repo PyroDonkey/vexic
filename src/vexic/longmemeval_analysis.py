@@ -1,4 +1,4 @@
-"""Offline miss-classification analysis for a LongMemEval run (COA-349).
+"""Offline miss-classification analysis for a LongMemEval run.
 
 Reads a completed run directory (``diagnostics.jsonl`` plus per-question
 ``memory.db`` files) and the source dataset, then buckets every judged-recall
@@ -24,8 +24,8 @@ SQLite's read-only URI mode, and the sole output is ``analysis_report.json``
 in the run directory plus a stdout summary. It deliberately imports the
 retrieval constants and ``reciprocal_rank_fusion`` from
 ``vexic.subagents.retrieval`` so the offline rank recompute can never drift
-from live fusion semantics (COA-349 guardrail: no retrieval or promotion
-behavior changes).
+from live fusion semantics; the diagnostic changes no retrieval or promotion
+behavior.
 """
 
 from __future__ import annotations
@@ -399,7 +399,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Classify LongMemEval judged-recall misses by failing stage and "
-            "build per-subject fact histograms (COA-349). Read-only over run "
+            "build per-subject fact histograms. Read-only over run "
             "artifacts."
         )
     )
