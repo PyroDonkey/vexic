@@ -10,7 +10,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Install gitleaks
@@ -27,7 +27,7 @@ jobs:
       - name: Secret scan (full history)
         run: gitleaks git . --log-opts="--all" --redact --verbose
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v8.3.2
       - name: Set up Python
         run: uv python install 3.13
       - name: Check Python annotations
