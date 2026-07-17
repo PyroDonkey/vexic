@@ -472,14 +472,17 @@ class HostedTenantCatalog:
             row = _read_tenant_row()
             if row is None:
                 db_filename = self._allocate_db_filename(conn)
-                target = self._new_customer_target(tenant_id, customer_target)
                 try:
+                    # Insert only the caller-supplied target (or NULL) here;
+                    # the factory mint is deferred until this INSERT wins so
+                    # a lost race never strands a freshly-minted remote
+                    # customer database.
                     conn.execute(
                         """
                         INSERT INTO tenants (tenant_id, db_filename, active, customer_target)
                         VALUES (?, ?, 0, ?)
                         """,
-                        (tenant_id, db_filename, target),
+                        (tenant_id, db_filename, customer_target),
                     )
                     conn.commit()
                 except (sqlite3.IntegrityError, ValueError) as exc:
@@ -494,6 +497,12 @@ class HostedTenantCatalog:
                     if row is None:
                         raise
             if row is None:
+                # This process won the INSERT: mint the customer target only
+                # now. A crash before the UPDATE below leaves the row with a
+                # NULL target, which the already-exists path (and
+                # `provision_missing_customer_targets`) heals on the next
+                # provision.
+                target = self._new_customer_target(tenant_id, customer_target)
                 needs_customer_init = True
             else:
                 db_filename = row[0]
@@ -501,6 +510,10 @@ class HostedTenantCatalog:
                 if customer_target is None and row[2]:
                     target = None  # keep the existing customer target
                 else:
+                    # Last-writer-wins, matching sequential re-provisioning:
+                    # an explicit customer_target (or a factory heal of a
+                    # NULL target) overwrites whatever the committed row
+                    # holds via the UPDATE below.
                     target = self._new_customer_target(tenant_id, customer_target)
             if needs_customer_init:
                 tenant_db_path = self.root_path / db_filename

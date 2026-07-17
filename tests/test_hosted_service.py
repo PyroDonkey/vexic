@@ -2145,6 +2145,59 @@ class HostedProvisioningRaceTests(unittest.TestCase):
         self.assertEqual(rows, [("customer-rival.db", 1)])
         self.assertTrue((self.root / "customer-rival.db").exists())
 
+    def test_lost_race_never_mints_a_customer_target(self) -> None:
+        """The customer-target factory provisions a real remote database, so
+        the loser of the check-then-insert race must not invoke it: a minted
+        target the loser then discards is an orphaned remote database."""
+        minted: list[str] = []
+
+        def factory(tenant_id: str) -> str:
+            minted.append(tenant_id)
+            return f"libsql://minted-{tenant_id}.example"
+
+        catalog = HostedTenantCatalog(self.root, customer_target_factory=factory)
+        control_db = self.root / "control-plane.db"
+        real_allocate = catalog._allocate_db_filename
+
+        def rival_commits_then_allocate(conn: sqlite3.Connection) -> str:
+            with closing(sqlite3.connect(control_db)) as rival:
+                rival.execute(
+                    """
+                    INSERT INTO tenants
+                        (tenant_id, db_filename, active, customer_target)
+                    VALUES (?, ?, 0, ?)
+                    """,
+                    ("tenant-race", "customer-rival.db", "libsql://rival.example"),
+                )
+                rival.commit()
+            return real_allocate(conn)
+
+        with patch.object(
+            catalog,
+            "_allocate_db_filename",
+            side_effect=rival_commits_then_allocate,
+        ):
+            tenant = catalog.provision_tenant("tenant-race")
+
+        self.assertEqual(minted, [])
+        self.assertEqual(tenant.customer_target, "libsql://rival.example")
+
+    def test_winning_insert_still_mints_a_customer_target(self) -> None:
+        """Deferring the mint until after the INSERT wins must not change the
+        uncontended path: the factory target lands on the committed row."""
+        minted: list[str] = []
+
+        def factory(tenant_id: str) -> str:
+            minted.append(tenant_id)
+            return f"libsql://minted-{tenant_id}.example"
+
+        catalog = HostedTenantCatalog(self.root, customer_target_factory=factory)
+
+        tenant = catalog.provision_tenant("tenant-fresh")
+
+        self.assertEqual(minted, ["tenant-fresh"])
+        self.assertEqual(tenant.customer_target, "libsql://minted-tenant-fresh.example")
+
 
 class _FaultInjectingConnection:
     """Proxy that fails any statement containing one of the given fragments."""
