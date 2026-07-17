@@ -58,3 +58,38 @@ def dream_failure_recorded(exc: BaseException) -> bool:
         seen.add(id(current))
         current = current.__cause__
     return False
+
+
+# Marks a dream-phase exception raised in the pre-phase prelude -- the
+# execution-time retirement re-check and live local-service construction --
+# before the phase touched tenant memory. The sweeper reads it to hold the
+# summarize watermark for such a fault (never-run), exactly like the retirement
+# gate, rather than advancing it as if the phase ran and failed (anti-spend).
+# Advancing over a prelude fault would strand the never-summarized rows.
+_DREAM_PHASE_NOT_STARTED_ATTR = "_vexic_dream_phase_not_started"
+
+
+def mark_dream_phase_not_started(exc: BaseException) -> BaseException:
+    """Tag a dream-phase exception as raised before phase execution began.
+
+    Returns ``exc`` so callers can ``raise mark_dream_phase_not_started(exc)``.
+    """
+    setattr(exc, _DREAM_PHASE_NOT_STARTED_ATTR, True)
+    return exc
+
+
+def dream_phase_not_started(exc: BaseException) -> bool:
+    """True when a dream-phase exception was tagged as a pre-phase prelude fault.
+
+    Walks the ``__cause__`` chain for parity with :func:`dream_failure_recorded`
+    so the mark survives an explicit re-wrap. Defaults ``False`` so an untagged
+    phase-execution failure is treated as ran-and-failed.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if getattr(current, _DREAM_PHASE_NOT_STARTED_ATTR, False):
+            return True
+        seen.add(id(current))
+        current = current.__cause__
+    return False

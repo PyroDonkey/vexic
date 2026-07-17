@@ -63,7 +63,11 @@ from vexic.contract import (
     SourceTranscriptMessage,
     TrustBoundary,
 )
-from vexic.error_reporting import dream_failure_recorded
+from vexic.error_reporting import (
+    dream_failure_recorded,
+    dream_phase_not_started,
+    mark_dream_phase_not_started,
+)
 from vexic.ports import DreamPhasePorts, missing_host_port
 from vexic.service import (
     LocalMemoryService,
@@ -1237,12 +1241,15 @@ class HostedMemoryService:
                     # A SUMMARIZE phase that started then raised is ran-and-failed
                     # (advances, anti-spend); one whose worker never started is
                     # never-run (held). Distinguish them by the worker signal.
-                    # A retirement rejection raises before the phase touches
-                    # memory, so it is never-run even though the worker started.
+                    # A retirement rejection or any other pre-phase prelude fault
+                    # raises before the phase touches memory, so it is never-run
+                    # even though the worker started -- `dream_phase_not_started`
+                    # tags those (the retirement gate stays explicit alongside).
                     if (
                         request.phase is DreamPhase.SUMMARIZE
                         and worker_started.is_set()
                         and not isinstance(exc, HostedScopeRetired)
+                        and not dream_phase_not_started(exc)
                     ):
                         summarize_ran = True
                     # Surface to the sweeper whether the failing phase durably
@@ -1479,7 +1486,20 @@ class HostedMemoryService:
         # phase durably records its own `dream_runs` error row before
         # re-raising, so retrying it would double-record and re-spend model
         # calls. Mid-phase transient faults keep today's fail-closed behaviour.
-        service = await self._dream_phase_prelude(request, tenant)
+        try:
+            service = await self._dream_phase_prelude(request, tenant)
+        except Exception as exc:
+            # The prelude runs before the phase touches tenant memory. Tag its
+            # faults (exhausted storage retry, MutationOutcomeUnknown, a
+            # non-retryable operational fault, or the retirement gate) so a
+            # failing SUMMARIZE prelude counts as never-run and holds the
+            # summarize watermark, exactly like the retirement gate -- not as
+            # ran-and-failed, which would strand the never-summarized rows.
+            raise mark_dream_phase_not_started(exc)
+        # Only phase execution needs the NotImplementedError -> host-port
+        # conversion: live local-service construction in the prelude raises no
+        # NotImplementedError (LocalMemoryService.__init__ does not), so a
+        # partially-wired agent factory surfaces here inside the phase run.
         try:
             return await _run_local_dream_phase_with_usage(service, request)
         except NotImplementedError as exc:

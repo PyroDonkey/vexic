@@ -1842,6 +1842,10 @@ class SystemDreamPhaseRetryTests(unittest.IsolatedAsyncioTestCase):
         # The prelude fault is pre-write and unmarked, so the sweeper must retry
         # next tick rather than advance the 24h clock over an unrecorded failure.
         self.assertFalse(outcome.durably_recorded)
+        # The SUMMARIZE phase never touched memory (the prelude failed before
+        # phase execution), so the summarize watermark must be held, not
+        # advanced over rows that were never summarized.
+        self.assertFalse(outcome.summarize_ran)
         events = service.dream_trigger_job_events
         self.assertEqual([event.status for event in events], ["running", "error"])
         # Content-free terminal event: only the exception class name, no leaked
@@ -1884,6 +1888,9 @@ class SystemDreamPhaseRetryTests(unittest.IsolatedAsyncioTestCase):
         # the chain stops on the first fault instead of retrying to success.
         self.assertEqual(calls["n"], 1)
         self.assertFalse(outcome.durably_recorded)
+        # A MutationOutcomeUnknown prelude fault never ran the SUMMARIZE phase,
+        # so the summarize watermark must be held, not advanced.
+        self.assertFalse(outcome.summarize_ran)
         events = service.dream_trigger_job_events
         self.assertEqual([event.status for event in events], ["running", "error"])
         self.assertEqual(events[-1].error_type, "MutationOutcomeUnknown")
