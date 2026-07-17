@@ -1,0 +1,14 @@
+# Keeps the SHA-pinned actions in .github/workflows/ current. Actions are
+# pinned to full commit SHAs (with version comments) because floating major
+# tags are mutable; Dependabot understands SHA pins and bumps them alongside
+# the version comment.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
