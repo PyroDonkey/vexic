@@ -91,6 +91,12 @@ class ServerInstructionsTests(unittest.TestCase):
             # deny-gate backstop must remain verbatim
             self.assertIn("search before denying, don't refuse to deny", instructions)
 
+    def test_instructions_flag_truncated_snapshot_items_as_incomplete(self) -> None:
+        for expand in (False, True):
+            instructions = server_instructions(expand)
+            self.assertIn("'…' or marked '[truncated]'", instructions)
+            self.assertIn("use the recall tools to retrieve the full text", instructions)
+
 
 class ToolDescriptionTests(unittest.TestCase):
     def test_user_memory_description_has_search_before_deny_tail(self) -> None:

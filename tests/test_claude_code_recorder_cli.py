@@ -3072,6 +3072,79 @@ class ClaudeCodeRecorderPrimeCommandTests(unittest.TestCase):
             context = json.loads(stdout.getvalue())["hookSpecificOutput"]["additionalContext"]
             self.assertLessEqual(len(context), 200)
 
+    def test_prime_fetch_trimmed_recap_carries_truncation_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "session-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+
+            class _Response:
+                def __init__(self, payload: dict[str, object]) -> None:
+                    self._payload = payload
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc):
+                    return False
+
+                def read(self) -> bytes:
+                    return json.dumps(self._payload).encode("utf-8")
+
+            def fake_urlopen(request, timeout):
+                if request.full_url.endswith("/v1/fresh_context"):
+                    return _Response(
+                        {
+                            "summaries": [],
+                            "recent": [],
+                            "text": "Recap cedar " * 200,
+                            "truncated": False,
+                        }
+                    )
+                if request.full_url.endswith("/v1/search_long_term"):
+                    return _Response({"facts": [], "candidate_notes": []})
+                return _Response({"hits": []})
+
+            stdout = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--max-chars",
+                        "2000",
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            context = json.loads(stdout.getvalue())["hookSpecificOutput"]["additionalContext"]
+            self.assertLessEqual(len(context), 2000)
+            lines = context.splitlines()
+            recap_index = lines.index("Prior conversation recap:")
+            recap_line = lines[recap_index + 1]
+            self.assertTrue(
+                recap_line.endswith("…"),
+                f"expected truncated recap to end with an ellipsis marker, got: {recap_line!r}",
+            )
+
     def test_prime_huge_recap_does_not_starve_long_term_and_transcript_sections(
         self,
     ) -> None:

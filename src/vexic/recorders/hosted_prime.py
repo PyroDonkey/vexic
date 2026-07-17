@@ -104,9 +104,7 @@ def fetch_prime_context(
     if fresh_context is not None:
         recap_text = _str(fresh_context.get("text"))
         if recap_text is not None:
-            recap_cap = max_chars // 4
-            if len(recap_text) > recap_cap:
-                recap_text = recap_text[:recap_cap].rstrip()
+            recap_text = _cap_item(recap_text, max_chars // 4)
     long_term = _safe_post_search(
         config,
         "search_long_term",
