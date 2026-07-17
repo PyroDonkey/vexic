@@ -2096,3 +2096,248 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(api_key.raw_key, ledger_text)
         self.assertNotIn(api_key.raw_key.encode("utf-8"), ledger_bytes)
         self.assertNotIn(b"Dream phase host port is not configured", ledger_bytes)
+
+
+class HostedProvisioningRaceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.catalog = HostedTenantCatalog(self.root)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_provision_tenant_converges_when_rival_commits_first(self) -> None:
+        """Two provisioners racing on the same tenant_id must converge onto the
+        winner's committed row instead of failing with IntegrityError."""
+        control_db = self.root / "control-plane.db"
+        real_allocate = self.catalog._allocate_db_filename
+
+        def rival_commits_then_allocate(conn: sqlite3.Connection) -> str:
+            # Simulate a concurrent provisioner winning the race between this
+            # call's existence check and its INSERT.
+            with closing(sqlite3.connect(control_db)) as rival:
+                rival.execute(
+                    """
+                    INSERT INTO tenants (tenant_id, db_filename, active)
+                    VALUES (?, ?, 0)
+                    """,
+                    ("tenant-race", "customer-rival.db"),
+                )
+                rival.commit()
+            return real_allocate(conn)
+
+        with patch.object(
+            self.catalog,
+            "_allocate_db_filename",
+            side_effect=rival_commits_then_allocate,
+        ):
+            tenant = self.catalog.provision_tenant("tenant-race")
+
+        self.assertEqual(tenant.tenant_id, "tenant-race")
+        # The loser adopted the winner's row: one tenants row, the rival's
+        # db_filename, activated and initialized.
+        with closing(sqlite3.connect(control_db)) as conn:
+            rows = conn.execute(
+                "SELECT db_filename, active FROM tenants WHERE tenant_id = ?",
+                ("tenant-race",),
+            ).fetchall()
+        self.assertEqual(rows, [("customer-rival.db", 1)])
+        self.assertTrue((self.root / "customer-rival.db").exists())
+
+    def test_lost_race_never_mints_a_customer_target(self) -> None:
+        """The customer-target factory provisions a real remote database, so
+        the loser of the check-then-insert race must not invoke it: a minted
+        target the loser then discards is an orphaned remote database."""
+        minted: list[str] = []
+
+        def factory(tenant_id: str) -> str:
+            minted.append(tenant_id)
+            return f"libsql://minted-{tenant_id}.example"
+
+        catalog = HostedTenantCatalog(self.root, customer_target_factory=factory)
+        control_db = self.root / "control-plane.db"
+        real_allocate = catalog._allocate_db_filename
+
+        def rival_commits_then_allocate(conn: sqlite3.Connection) -> str:
+            with closing(sqlite3.connect(control_db)) as rival:
+                rival.execute(
+                    """
+                    INSERT INTO tenants
+                        (tenant_id, db_filename, active, customer_target)
+                    VALUES (?, ?, 0, ?)
+                    """,
+                    ("tenant-race", "customer-rival.db", "libsql://rival.example"),
+                )
+                rival.commit()
+            return real_allocate(conn)
+
+        with patch.object(
+            catalog,
+            "_allocate_db_filename",
+            side_effect=rival_commits_then_allocate,
+        ):
+            tenant = catalog.provision_tenant("tenant-race")
+
+        self.assertEqual(minted, [])
+        self.assertEqual(tenant.customer_target, "libsql://rival.example")
+
+    def test_winning_insert_still_mints_a_customer_target(self) -> None:
+        """Deferring the mint until after the INSERT wins must not change the
+        uncontended path: the factory target lands on the committed row."""
+        minted: list[str] = []
+
+        def factory(tenant_id: str) -> str:
+            minted.append(tenant_id)
+            return f"libsql://minted-{tenant_id}.example"
+
+        catalog = HostedTenantCatalog(self.root, customer_target_factory=factory)
+
+        tenant = catalog.provision_tenant("tenant-fresh")
+
+        self.assertEqual(minted, ["tenant-fresh"])
+        self.assertEqual(tenant.customer_target, "libsql://minted-tenant-fresh.example")
+
+    def test_customer_init_backs_off_on_transient_lock_contention(self) -> None:
+        """Winner and loser of the provisioning race can both reach the
+        idempotent customer-db init concurrently; the loser's transient
+        'database is locked' must back off and retry instead of failing the
+        provision (init_db's 5s busy wait does not cover a slow winner)."""
+        from vexic.hosted_local import LocalMemoryService
+
+        calls = {"count": 0}
+        real_init = LocalMemoryService.init_schema
+
+        def locked_once(service: LocalMemoryService) -> None:
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            real_init(service)
+
+        with patch("vexic.hosted_local.LocalMemoryService.init_schema", locked_once):
+            tenant = self.catalog.provision_tenant("tenant-locked")
+
+        self.assertEqual(calls["count"], 2)
+        self.assertEqual(tenant.tenant_id, "tenant-locked")
+
+
+class _FaultInjectingConnection:
+    """Proxy that fails any statement containing one of the given fragments."""
+
+    def __init__(self, conn: sqlite3.Connection, fail_fragments: tuple[str, ...]) -> None:
+        self._conn = conn
+        self._fail_fragments = fail_fragments
+
+    def execute(self, sql: str, *args: object) -> object:
+        for fragment in self._fail_fragments:
+            if fragment in sql:
+                raise sqlite3.OperationalError(f"injected fault: {fragment}")
+        return self._conn.execute(sql, *args)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._conn, name)
+
+
+class HostedControlPlaneKeyCompensationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.keys = HostedApiKeyStore(self.root)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _fault_injected_keys(self, fail_fragments: tuple[str, ...]) -> None:
+        real_connect = type(self.keys)._connect_control
+
+        def connect_with_faults(store: HostedApiKeyStore) -> _FaultInjectingConnection:
+            return _FaultInjectingConnection(real_connect(store), fail_fragments)
+
+        patcher = patch.object(
+            type(self.keys), "_connect_control", connect_with_faults
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_metadata_failure_revokes_the_minted_key(self) -> None:
+        """Pins the pre-existing fail-closed compensation: a failed metadata
+        write revokes the minted key. This behavior predates the loud
+        compensation-failure hardening, whose delta is pinned by
+        test_failed_compensation_names_the_orphaned_key below."""
+        self._fault_injected_keys(("INSERT INTO hosted_api_key_metadata",))
+
+        with self.assertRaises(sqlite3.OperationalError):
+            self.keys.create_control_plane_key(
+                tenant_id="tenant-a", project_id="proj-a", name="console key"
+            )
+
+        with closing(sqlite3.connect(self.root / "control-plane.db")) as conn:
+            rows = conn.execute(
+                "SELECT revoked_at, revoked_by FROM hosted_api_keys"
+            ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertIsNotNone(rows[0][0])
+        self.assertEqual(rows[0][1], "control-plane-metadata-failure")
+
+    def test_failed_compensation_names_the_orphaned_key(self) -> None:
+        """If the compensating revoke also fails, the error must name the
+        orphaned live key for manual revocation and keep the original
+        metadata failure as the cause -- never a bare revoke error that
+        hides the fail-open credential."""
+        self._fault_injected_keys(
+            (
+                "INSERT INTO hosted_api_key_metadata",
+                "UPDATE hosted_api_keys",
+            )
+        )
+
+        with self.assertRaises(RuntimeError) as caught:
+            self.keys.create_control_plane_key(
+                tenant_id="tenant-a", project_id="proj-a", name="console key"
+            )
+
+        message = str(caught.exception)
+        with closing(sqlite3.connect(self.root / "control-plane.db")) as conn:
+            (key_id,) = conn.execute("SELECT key_id FROM hosted_api_keys").fetchone()
+        self.assertIn(key_id, message)
+        self.assertIn("revoke", message)
+        self.assertIn("manually", message)
+        self.assertIsInstance(caught.exception.__cause__, sqlite3.OperationalError)
+        self.assertIn("hosted_api_key_metadata", str(caught.exception.__cause__))
+
+
+class HostedUsageEventCursorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.catalog = HostedTenantCatalog(Path(self.temp_dir.name))
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    @staticmethod
+    def _event(operation: str) -> HostedUsageEvent:
+        return HostedUsageEvent(
+            kind="request",
+            operation=operation,
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            status="ok",
+            recorded_at="2026-07-16T00:00:00Z",
+        )
+
+    def test_usage_events_after_durable_id_cutoff(self) -> None:
+        """A durable MAX(id) cutoff isolates the events recorded after it,
+        independent of list positions that concurrent writers or pruning
+        could shift."""
+        self.catalog.record_usage_event(self._event("before-1"))
+        self.catalog.record_usage_event(self._event("before-2"))
+
+        cutoff = self.catalog.last_usage_event_id("tenant-a")
+        self.catalog.record_usage_event(self._event("after-1"))
+        self.catalog.record_usage_event(self._event("after-2"))
+
+        events = self.catalog.usage_events("tenant-a", after_id=cutoff)
+        self.assertEqual([event.operation for event in events], ["after-1", "after-2"])
+
+    def test_last_usage_event_id_is_zero_for_untracked_tenant(self) -> None:
+        self.assertEqual(self.catalog.last_usage_event_id("tenant-a"), 0)
