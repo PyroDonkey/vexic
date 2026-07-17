@@ -738,6 +738,67 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             ["Ryan keeps cedar notes tentative."],
         )
 
+    async def test_candidate_fallback_skipped_for_tombstoned_scope(self) -> None:
+        # The fallback records retrieval telemetry (a write into
+        # candidate_retrieval_events plus counter updates) and serves
+        # tentative notes; both are wrong for a scope marked for erasure.
+        # Under a partial-flag tombstone (retrieval_blocked = 0) the search
+        # itself proceeds as a read, but the fallback is skipped entirely:
+        # nothing recorded, no notes served from the doomed scope.
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        commit_dream_cycle(
+            self.db_path,
+            [
+                FactCandidate(
+                    fact_text="Ryan keeps cedar notes tentative.",
+                    subject="Ryan",
+                    category="fact",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[1],
+                )
+            ],
+            candidate_embeddings=[_unit_vector(1.0)],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO scope_tombstones
+                        (target_tenant_id, target_session_id,
+                         created_by_principal_id, created_by_principal_type, reason,
+                         retrieval_blocked, export_blocked, replay_blocked,
+                         rebuild_blocked, physical_purge_deferred)
+                    VALUES ('tenant-a', 'default', 'operator', 'operator',
+                            'flags all zero', 0, 0, 0, 0, 1)
+                    """
+                )
+
+        with patch(
+            "vexic.subagents.retrieval.embed_texts",
+            side_effect=lambda texts: [_unit_vector(1.0) for _ in texts],
+        ):
+            result = await service.search_long_term(
+                SearchLongTermRequest(scope=_scope(), query="cedar notes")
+            )
+
+        self.assertEqual(result.facts, [])
+        self.assertEqual(result.candidate_notes, [])
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            events = conn.execute(
+                "SELECT COUNT(*) FROM candidate_retrieval_events"
+            ).fetchone()[0]
+        self.assertEqual(events, 0)
+
     async def test_search_long_term_returns_contract_facts(self) -> None:
         from vexic.service import LocalMemoryService
 

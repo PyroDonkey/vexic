@@ -28,6 +28,7 @@ from vexic.contract import (
 )
 from vexic.embeddings import EMBEDDING_DIM
 from vexic.models import FactCandidate
+from vexic.ports import HostPortNotConfigured
 from vexic.service import LocalMemoryService
 from vexic.storage import (
     commit_deep_cycle,
@@ -585,6 +586,50 @@ class PurgeScopeTests(unittest.IsolatedAsyncioTestCase):
                     """,
                     (session_id,),
                 )
+
+    async def _run_dream(self, phase: DreamPhase, session_id: str | None):
+        scope = _scope({MemoryCapability.ADMIN_REBUILD}).model_copy(
+            update={"session_id": session_id}
+        )
+        return await self.service.run_dream_phase(
+            RunDreamPhaseRequest(
+                scope=scope,
+                phase=phase,
+                redaction=RedactionContext(forbidden_values=()),
+            )
+        )
+
+    async def test_dream_phases_blocked_agent_wide_while_purge_pends(self) -> None:
+        # Dream phases are agent-wide sweeps: Light reads messages by agent
+        # across ALL sessions, REM/Deep operate on candidates agent-wide, and
+        # Summarize keys its rows to the source sessions. While a purge is
+        # pending, a dream run under ANY session scope could consolidate the
+        # doomed session's still-present rows into outputs the purge then
+        # erases by source intersection -- so the whole agent is blocked, not
+        # just the tombstoned session.
+        await self._tombstone("session-1")
+
+        for phase in DreamPhase:
+            for session_id in (None, "session-2"):
+                with self.subTest(phase=phase, session_id=session_id):
+                    with self.assertRaisesRegex(PermissionError, "purge pending"):
+                        await self._run_dream(phase, session_id)
+
+    async def test_dream_phases_resume_after_purge_except_erased_session(self) -> None:
+        # Once the purge completes, the doomed source rows are gone, so the
+        # agent-wide block would be pure over-blocking (the tombstone survives
+        # forever as the audit record). Other sessions pass the gates again --
+        # reaching the host-port check in this port-less fixture -- while the
+        # erased session itself stays blocked by the erase-key write gate.
+        await self._tombstone("session-1")
+        await self._purge("session-1")
+
+        for phase in DreamPhase:
+            with self.subTest(phase=phase):
+                with self.assertRaises(HostPortNotConfigured):
+                    await self._run_dream(phase, "session-2")
+                with self.assertRaisesRegex(PermissionError, "tombstoned for write"):
+                    await self._run_dream(phase, "session-1")
 
     async def test_dream_phase_writes_rejected_for_any_tombstone_flags(self) -> None:
         # Candidate/fact writes fail closed on ANY matching tombstone, even one

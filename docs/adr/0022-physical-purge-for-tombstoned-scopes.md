@@ -91,21 +91,40 @@ erasure.
   operators stop recorders and pipelines for the scope first. This ADR
   originally left writes to a tombstoned scope unblocked, so a late write
   could slip in silently and be erased or orphaned by the deferred purge.
-  Amendment (2026-07, COA-334): that gap is closed. `append_transcript`,
-  `ingest_source_transcript`, dream-phase candidate/fact writes,
-  `record_retrieval_event`, and `retire_fact` fail closed with a
-  `PermissionError` when a tombstone matches the write's erase key,
-  regardless of which lifecycle flags the tombstone carries. The write gate
-  matches exactly the key the physical purge erases by: session (a NULL
-  target session matches every session) plus exact agent -- project and user
-  fields on a tombstone do not narrow the physical erase (the tables carry no
-  such columns), so they do not exempt a write either. Because the tombstone
-  survives the purge as the audit record, the write block persists after the
-  purge completes: a purged scope cannot be silently re-populated. The gate
-  and the subsequent insert run on separate connections, so a `delete_scope`
-  committing between them can still land rows that a later purge erases;
-  this residual race is accepted and covered by the same "operators stop
-  recorders and pipelines first" posture above.
+  Amendment (2026-07, COA-334): that gap is closed, in three parts.
+  - Direct writes -- `append_transcript`, `ingest_source_transcript`,
+    `record_retrieval_event`, and `retire_fact` -- fail closed with a
+    `PermissionError` when a tombstone matches the write's session (a NULL
+    target session matches every session) plus exact agent, regardless of
+    which lifecycle flags the tombstone carries. That is the key the purge
+    erases messages and session-scoped telemetry by; project and user fields
+    on a tombstone do not narrow the physical erase (the tables carry no
+    such columns), so they do not exempt a write either. Because the
+    tombstone survives the purge as the audit record, this block persists
+    after the purge completes: a purged scope cannot be silently
+    re-populated.
+  - Dream phases are blocked agent-wide while any tombstone for the exact
+    agent has its physical purge pending (`physical_purge_deferred = 1`).
+    A per-session gate cannot protect them: the sweeps read sources by agent
+    across all sessions, so a run under any session scope could consolidate
+    a doomed session's still-present rows into candidates, facts, or
+    summaries the purge then erases by source intersection. Once the purge
+    completes the doomed sources are gone, so only the per-session write
+    gate remains -- the agent-wide block must not outlive the purge, or one
+    session's erasure would disable dreaming for the agent forever.
+  - The `search_long_term` candidate fallback is skipped entirely (no
+    tentative notes, no retrieval telemetry recorded) when the write gate
+    matches the scope; the search itself remains a read governed by the
+    tombstone's retrieval flag.
+  Accepted residuals: `retire_fact` under a session-granular tombstone may
+  over-block a fact whose sources span other sessions (it errs closed);
+  `rebuild`'s projection repair stays exempt from the write gate because
+  projections are non-canonical and rebuildable (memory invariant 3), and it
+  remains gated by the tombstone's rebuild flag; and the gate and the
+  subsequent insert run on separate connections, so a `delete_scope`
+  committing between them can still land rows that a later purge erases --
+  covered by the same "operators stop recorders and pipelines first" posture
+  above.
 - Supersedes the "purge deferred" wording in `docs/memory-service-contract.md`
   and the "physical purge semantics" non-goal in `docs/architecture.md`; both
   are updated with this ADR. ADR 0008's backup posture is unchanged.

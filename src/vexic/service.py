@@ -118,11 +118,6 @@ _TOMBSTONE_FLAG_COLUMNS = {
     "export": "export_blocked",
     "replay": "replay_blocked",
     "rebuild": "rebuild_blocked",
-    # Writes are blocked by ANY matching tombstone, regardless of which
-    # lifecycle flags it carries: every tombstone marks the scope for erasure
-    # (pending or completed purge, ADR 0022), so new content written into it
-    # would be either erased by the purge or orphaned behind the audit record.
-    "write": None,
 }
 
 
@@ -231,28 +226,82 @@ class LocalMemoryService(MemoryService):
             return False
         return row["target_agent_id"] == scope.agent_id
 
-    def _assert_not_tombstoned(self, scope: MemoryScope, operation: str) -> None:
-        column_name = _TOMBSTONE_FLAG_COLUMNS[operation]
-        flag_filter = "" if column_name is None else f"AND {column_name} = 1"
-        # Reads gate logical access and honor the tombstone's full scope
-        # pattern; writes gate against the physical erase key (see
-        # _scope_matches_tombstone_erase_key).
-        matches = (
-            self._scope_matches_tombstone_erase_key
-            if operation == "write"
-            else self._scope_matches_tombstone
+    def _tombstone_blocks_write(self, scope: MemoryScope) -> bool:
+        """Whether any tombstone blocks writes into this scope.
+
+        Writes are blocked by ANY matching tombstone, regardless of which
+        lifecycle flags it carries: every tombstone marks the scope for
+        erasure (pending or completed purge, ADR 0022), so new content
+        written into it would be either erased by the purge or orphaned
+        behind the audit record. Matching uses the physical erase key; reads
+        gate logical access and honor the tombstone's full scope pattern
+        instead.
+        """
+        with closing(connect(self.db_path)) as conn:
+            rows = rows_as_dicts(conn.execute(
+                """
+                SELECT target_session_id, target_agent_id
+                FROM scope_tombstones
+                WHERE target_tenant_id = ?
+                """,
+                (scope.tenant_id,),
+            ))
+        return any(
+            self._scope_matches_tombstone_erase_key(scope, row) for row in rows
         )
+
+    def _assert_not_tombstoned(self, scope: MemoryScope, operation: str) -> None:
+        if operation == "write":
+            if self._tombstone_blocks_write(scope):
+                raise PermissionError("Memory scope is tombstoned for write.")
+            return
+        column_name = _TOMBSTONE_FLAG_COLUMNS[operation]
         with closing(connect(self.db_path)) as conn:
             rows = rows_as_dicts(conn.execute(
                 f"""
                 SELECT target_project_id, target_user_id, target_session_id, target_agent_id
                 FROM scope_tombstones
-                WHERE target_tenant_id = ? {flag_filter}
+                WHERE target_tenant_id = ? AND {column_name} = 1
                 """,
                 (scope.tenant_id,),
             ))
-        if any(matches(scope, row) for row in rows):
+        if any(self._scope_matches_tombstone(scope, row) for row in rows):
             raise PermissionError(f"Memory scope is tombstoned for {operation}.")
+
+    def _assert_no_pending_purge_for_agent(self, scope: MemoryScope) -> None:
+        """Block agent-wide sweeps while a physical purge is pending.
+
+        Dream phases read source rows by agent across ALL sessions (Light
+        reads messages agent-wide, REM/Deep operate on candidates agent-wide,
+        Summarize keys its rows to the source sessions), so a per-session
+        gate cannot protect them: a run under any session scope could
+        consolidate a doomed session's still-present rows into outputs the
+        purge then erases by source intersection. While any tombstone for
+        this exact agent has its physical purge pending
+        (``physical_purge_deferred = 1``; the purge transaction flips it to 0
+        on completion, and a dry run rolls the flip back), the whole agent is
+        blocked. After the purge completes the doomed sources are gone, so
+        only the per-session erase-key write gate remains -- an agent-wide
+        block would otherwise outlive the purge forever, because tombstones
+        survive as audit records.
+        """
+        with closing(connect(self.db_path)) as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM scope_tombstones
+                WHERE target_tenant_id = ?
+                    AND target_agent_id IS ?
+                    AND physical_purge_deferred = 1
+                LIMIT 1
+                """,
+                (scope.tenant_id, scope.agent_id),
+            ).fetchone()
+        if row is not None:
+            raise PermissionError(
+                "Agent scope has a physical purge pending; dream phases are "
+                "blocked until purge_scope completes."
+            )
 
     def _artifact_root(self) -> Path:
         if self.artifact_dir is None:
@@ -693,6 +742,14 @@ class LocalMemoryService(MemoryService):
                 ]
             )
 
+        if self._tombstone_blocks_write(self._with_default_session(request.scope)):
+            # The candidate fallback records retrieval telemetry (an INSERT
+            # into candidate_retrieval_events plus counter updates) and serves
+            # tentative notes; both are wrong for a scope marked for erasure.
+            # The search itself is a read governed by the retrieval flag
+            # above, so skip the fallback rather than failing the read.
+            return SearchLongTermResult(candidate_notes=[])
+
         notes = await retrieve_candidate_fallback(
             self.db_path,
             request.query,
@@ -1010,6 +1067,10 @@ async def _run_dream_phase_with_usage(
         service._with_default_session(request.scope),
         "write",
     )
+    # And because the sweeps read sources agent-wide across sessions, the
+    # whole agent is additionally blocked while any purge is pending for it
+    # (see _assert_no_pending_purge_for_agent).
+    service._assert_no_pending_purge_for_agent(request.scope)
     ports = service.dream_phase_ports
     if ports is None:
         raise missing_host_port("Dream phase")
