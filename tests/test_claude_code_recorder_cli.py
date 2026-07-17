@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from http.client import IncompleteRead, RemoteDisconnected
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 
@@ -467,7 +467,7 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
 
         self.assertRegex(str(caught.exception), "hosted ingest failed: HTTP 503")
         self.assertEqual(len(calls), 3)
-        self.assertEqual(sleep_mock.call_count, 2)
+        self.assertEqual(sleep_mock.call_args_list, [call(0.5), call(1.0)])
 
     def test_write_status_does_not_leak_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1905,6 +1905,7 @@ class ClaudeCodeRecorderIngestCommandMoreTests(unittest.TestCase):
             self.assertFalse(status["ok"])
             self.assertEqual(status["error"], "hosted ingest failed: HTTP 503")
             self.assertEqual(status["source_session_id"], "claude-session")
+            self.assertEqual(status["transcript_path"], str(root / "session.jsonl"))
             self.assertNotIn("vx_secret", json.dumps(status))
 
     def test_ingest_auth_failure_still_returns_two(self) -> None:
@@ -1923,6 +1924,7 @@ class ClaudeCodeRecorderIngestCommandMoreTests(unittest.TestCase):
             self.assertFalse(status["ok"])
             self.assertEqual(status["error"], "hosted ingest failed: HTTP 403")
             self.assertEqual(status["source_session_id"], "claude-session")
+            self.assertEqual(status["transcript_path"], str(root / "session.jsonl"))
             self.assertNotIn("vx_secret", json.dumps(status))
 
     def test_ingest_non_transport_failure_still_returns_two(self) -> None:
