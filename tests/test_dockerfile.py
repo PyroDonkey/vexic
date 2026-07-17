@@ -219,6 +219,29 @@ def test_chown_tree_walks_when_sentinel_records_other_ids(
     assert {nested, db, root} <= set(chowned)
 
 
+def test_chown_tree_walk_error_aborts_before_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An unscannable subtree must abort the repair before the completion
+    sentinel lands: os.walk swallows scandir errors by default, which would
+    mark the skipped files complete and leave them permanently mis-owned."""
+    if os.name == "nt":
+        pytest.skip("hosted_entrypoint uses POSIX uid/gid APIs")
+
+    from vexic import hosted_entrypoint
+
+    root, nested, _db, _chowned = _chown_fixture(monkeypatch, tmp_path)
+    nested.chmod(0)
+    try:
+        with pytest.raises(OSError):
+            hosted_entrypoint._chown_tree(root, 10001, 10001)
+    finally:
+        nested.chmod(0o755)
+
+    assert not (root / ".chown-complete").exists()
+
+
 def test_chown_tree_repairs_bottom_up_and_stamps_completion(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

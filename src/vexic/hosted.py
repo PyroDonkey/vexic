@@ -1742,6 +1742,10 @@ def run_dream_phase_command(
     # Snapshot a durable row-id cutoff so the per-run usage report holds under
     # concurrent writers of a shared control plane: list positions shift when
     # other processes insert or prune tenant events mid-run, row ids do not.
+    # Accepted residual: the cutoff separates before/after, not whose -- two
+    # dream-phase commands running concurrently for the SAME tenant would each
+    # report the other's post-cutoff events. Per-run attribution needs a run-id
+    # column on hosted_usage_events; not warranted for the staging CLI.
     usage_event_cutoff = catalog.last_usage_event_id(args.tenant_id)
     runner = HostedBackgroundJobRunner(service)
     with contextlib.redirect_stdout(sys.stderr):

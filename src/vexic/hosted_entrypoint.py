@@ -46,7 +46,15 @@ def _chown_tree(root: Path, uid: int, gid: int) -> None:
         stat = root.lstat()
         if stat.st_uid == uid and stat.st_gid == gid:
             return
-    for current, dir_names, file_names in os.walk(root, topdown=False):
+    def _raise_walk_error(error: OSError) -> None:
+        # os.walk swallows scandir errors by default; a skipped subtree must
+        # abort the repair before the sentinel lands, or the skipped files
+        # would be marked complete and never healed.
+        raise error
+
+    for current, dir_names, file_names in os.walk(
+        root, topdown=False, onerror=_raise_walk_error
+    ):
         for name in (*dir_names, *file_names):
             os.lchown(Path(current) / name, uid, gid)
     sentinel.write_text(stamp, encoding="utf-8")
