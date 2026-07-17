@@ -14,14 +14,12 @@ which the local service supports with no host ports. The model-backed Tier 2/3
 path (``search_long_term`` after dream phases) needs host adapters and is
 deliberately out of scope here; this runner never wires a provider.
 
-Retrieval note: the local ``search_transcript`` contract uses all-tokens-must-
-match FTS keyword semantics, so a full natural-language question (with
-stopwords and inflected verbs) rarely matches a short transcript. This runner
-therefore issues one query per content keyword (a deterministic stopword
-strip) through the real ``search_transcript`` and unions the hits -- a
-recall-oriented retrieval set built from the single-token API. It records the
-raw-question hit count alongside the unioned-keyword hit count so the metric
-stays honest about what was searched.
+Retrieval note: ``search_transcript`` uses any-token OR keyword semantics with
+bm25 ranking (ADR 0036), so the raw natural-language question is issued as a
+single query -- the same shape a live MCP caller sends. No client-side keyword
+splitting or hit-unioning is needed. Pass rates are not comparable to runs
+from before ADR 0036: the old per-keyword union scored up to keywords x limit
+bodies, this runner scores at most ``limit`` bodies from one query.
 
 Exit code is always 0 (this is an eval, not a gate). The final stdout line is a
 machine-readable JSON summary.
@@ -179,43 +177,8 @@ def _scope(tenant_id: str) -> MemoryScope:
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
-# Common English stopwords plus question framing words. Stripping these turns a
-# natural-language question into a keyword query that the all-tokens FTS path
-# can match. This is a deterministic transform, not a relevance heuristic.
-_STOPWORDS = frozenset(
-    {
-        "a", "an", "and", "are", "as", "at", "be", "been", "by", "did", "do",
-        "does", "for", "from", "had", "has", "have", "how", "i", "in", "is",
-        "it", "its", "me", "my", "of", "on", "or", "que", "she", "so", "tell",
-        "that", "the", "their", "them", "then", "there", "these", "they",
-        "this", "to", "was", "we", "were", "what", "when", "where", "which",
-        "who", "whom", "why", "will", "with", "would", "you", "your",
-    }
-)
-
-
 def _tokens(text: str) -> list[str]:
     return _TOKEN_RE.findall(text.lower())
-
-
-def question_keywords(question: str) -> list[str]:
-    """Reduce a question to its content keywords for keyword retrieval.
-
-    Duplicates are dropped while preserving order. If a question is all
-    stopwords, fall back to its raw tokens so retrieval still has something to
-    search on.
-    """
-    keywords: list[str] = []
-    for tok in _tokens(question):
-        if tok not in _STOPWORDS and tok not in keywords:
-            keywords.append(tok)
-    if keywords:
-        return keywords
-    fallback: list[str] = []
-    for tok in _tokens(question):
-        if tok not in fallback:
-            fallback.append(tok)
-    return fallback
 
 
 def _normalized(text: str) -> str:
@@ -291,43 +254,23 @@ async def evaluate_row(
         )
         inserted = sum(1 for item in ingest_result.items if item.status == "inserted")
 
-        # Honest diagnostic: how the raw natural-language question fares under
-        # the all-tokens FTS contract (usually 0 hits on short transcripts).
-        raw_result = await service.search_transcript(
+        # Scored path: the raw question as one OR-semantics query through the
+        # real service, ranked by bm25 (ADR 0036).
+        result = await service.search_transcript(
             SearchTranscriptRequest(
                 scope=scope,
                 query=row.question,
                 limit=limit,
             )
         )
-
-        # Scored path: union the hits from one query per content keyword,
-        # all through the same real service. Dedupe by message_id, keeping a
-        # stable order so scoring is deterministic.
-        keywords = question_keywords(row.question)
-        seen_ids: set[int] = set()
-        hit_bodies: list[str] = []
-        for keyword in keywords:
-            keyword_result = await service.search_transcript(
-                SearchTranscriptRequest(
-                    scope=scope,
-                    query=keyword,
-                    limit=limit,
-                )
-            )
-            for hit in keyword_result.hits:
-                if hit.message_id not in seen_ids:
-                    seen_ids.add(hit.message_id)
-                    hit_bodies.append(hit.body)
+        hit_bodies = [hit.body for hit in result.hits]
         score = score_row(row.expected_fact, hit_bodies)
 
     return {
         "id": row.row_id,
         "question": row.question,
-        "keywords": keywords,
         "expected_fact": row.expected_fact,
         "messages_ingested": inserted,
-        "raw_question_hits": len(raw_result.hits),
         "hits": len(hit_bodies),
         "score": score,
     }

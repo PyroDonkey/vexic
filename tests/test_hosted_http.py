@@ -3566,6 +3566,75 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(job_usage[-1].model_requests, 1)
         self.assertEqual(job_usage[-1].total_tokens, 5)
 
+    def test_run_dream_phase_cli_usage_report_survives_concurrent_writers(self) -> None:
+        """The per-run usage report must cut on durable event ids, not list
+        positions: a concurrent writer of the shared control plane that
+        removes or shifts earlier rows mid-run must not make the report drop
+        this run's events."""
+        from vexic.hosted import HostedBackgroundJobRunner
+
+        raw_key, adapter = self._prepare_dream_phase_run()
+        self.catalog.record_usage_event(
+            HostedUsageEvent(
+                kind="request",
+                operation="append_transcript",
+                tenant_id="tenant-a",
+                principal_id="agent-a",
+                status="ok",
+                recorded_at="2026-07-16T00:00:00Z",
+            )
+        )
+        control_db = self.root / "control-plane.db"
+        real_run = HostedBackgroundJobRunner.run_dream_phase
+
+        async def prune_then_run(runner, api_key, request):  # type: ignore[no-untyped-def]
+            # Simulate a concurrent operator pruning an earlier usage row for
+            # this tenant after the CLI snapshotted its pre-run state.
+            with sqlite3.connect(control_db) as conn:
+                conn.execute(
+                    """
+                    DELETE FROM hosted_usage_events
+                    WHERE id = (SELECT MIN(id) FROM hosted_usage_events)
+                    """
+                )
+                conn.commit()
+            return await real_run(runner, api_key, request)
+
+        stdout = io.StringIO()
+        with patch.object(HostedBackgroundJobRunner, "run_dream_phase", prune_then_run):
+            with patch.dict(os.environ, {"VEXIC_TEST_API_KEY": f"{raw_key}\n"}):
+                with contextlib.redirect_stdout(stdout):
+                    exit_code = _main_result(
+                        [
+                            "run-dream-phase",
+                            "--root",
+                            self.temp_dir.name,
+                            "--api-key-env",
+                            "VEXIC_TEST_API_KEY",
+                            "--adapter",
+                            str(adapter),
+                            "--model-group",
+                            "fake",
+                            "--tenant-id",
+                            "tenant-a",
+                            "--project-id",
+                            "project-a",
+                            "--session-id",
+                            "session-a",
+                            "--agent-id",
+                            "agent-a",
+                            "--phase",
+                            "light",
+                        ]
+                    )
+
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(
+            [event["operation"] for event in payload["usage_events"]],
+            ["run_dream_phase", "run_dream_phase"],
+        )
+
     def test_run_dream_phase_cli_missing_adapter_fails_as_missing_host_port(self) -> None:
         stderr = io.StringIO()
 

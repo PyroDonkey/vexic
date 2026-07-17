@@ -205,6 +205,140 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(result.hits), 7)
 
+    async def test_search_transcript_matches_natural_language_query_with_dead_token(
+        self,
+    ) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        save_messages(
+            self.db_path,
+            [
+                ModelRequest(
+                    parts=[
+                        UserPromptPart(
+                            content=(
+                                "The priming payload arrives at startup "
+                                "via the SessionStart hook"
+                            )
+                        )
+                    ]
+                )
+            ],
+            session_id="default",
+        )
+
+        result = await service.search_transcript(
+            SearchTranscriptRequest(scope=_scope(), query="priming payload session start")
+        )
+
+        self.assertEqual(len(result.hits), 1)
+        self.assertIn("priming payload", result.hits[0].body)
+
+    async def test_search_transcript_ranks_more_matching_tokens_first(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        save_messages(
+            self.db_path,
+            [
+                ModelRequest(parts=[UserPromptPart(content="priming happens later")]),
+                ModelRequest(
+                    parts=[
+                        UserPromptPart(content="priming payload arrives during startup")
+                    ]
+                ),
+                ModelRequest(parts=[UserPromptPart(content="unrelated cedar filler")]),
+            ],
+            session_id="default",
+        )
+
+        result = await service.search_transcript(
+            SearchTranscriptRequest(scope=_scope(), query="priming payload session start")
+        )
+
+        self.assertEqual(len(result.hits), 2)
+        self.assertIn("priming payload", result.hits[0].body)
+        self.assertIn("priming happens", result.hits[1].body)
+
+    async def test_search_transcript_returns_no_hits_for_unsearchable_query(
+        self,
+    ) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="cedar detail")])],
+            session_id="default",
+        )
+
+        for query in ("!!!", "   ", '"', "()"):
+            result = await service.search_transcript(
+                SearchTranscriptRequest(scope=_scope(), query=query)
+            )
+            self.assertEqual(result.hits, [], f"query {query!r} should yield no hits")
+
+    async def test_search_transcript_rare_token_target_survives_limit_crowding(
+        self,
+    ) -> None:
+        # OR semantics widen the candidate set; bm25 IDF weighting must keep a
+        # message matching the rare content token inside the limit window even
+        # when chatty messages match several common query tokens (ADR 0036).
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        filler = [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content=f"we did what we did and the time last we decide {i}"
+                    )
+                ]
+            )
+            for i in range(10)
+        ]
+        target = ModelRequest(
+            parts=[UserPromptPart(content="the priming payload arrives at startup")]
+        )
+        save_messages(self.db_path, filler + [target], session_id="default")
+
+        result = await service.search_transcript(
+            SearchTranscriptRequest(
+                scope=_scope(),
+                query="what did we decide about the priming payload last time",
+                limit=5,
+            )
+        )
+
+        self.assertEqual(len(result.hits), 5)
+        self.assertIn("priming payload", result.hits[0].body)
+
+    async def test_search_transcript_breaks_rank_ties_by_message_id(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        save_messages(
+            self.db_path,
+            [
+                ModelRequest(parts=[UserPromptPart(content=f"cedar tie {index}")])
+                for index in range(4)
+            ],
+            session_id="default",
+        )
+
+        result = await service.search_transcript(
+            SearchTranscriptRequest(scope=_scope(), query="cedar", limit=4)
+        )
+
+        message_ids = [hit.message_id for hit in result.hits]
+        self.assertEqual(message_ids, sorted(message_ids))
+
     async def test_search_messages_rejects_non_positive_limit(self) -> None:
         from vexic.service import LocalMemoryService
 
@@ -236,6 +370,40 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                     scope=_scope(capabilities={MemoryCapability.WRITE}),
                     messages_json=[
                         single_message_adapter.dump_json(envelope).decode()
+                    ],
+                    redaction=RedactionContext(forbidden_values=()),
+                )
+            )
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 0)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0],
+                0,
+            )
+
+    async def test_append_transcript_rejects_task_notification(self) -> None:
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        notification = ModelRequest(
+            parts=[
+                UserPromptPart(
+                    content=(
+                        "<task-notification>\nTask abc123 completed.\n"
+                        "</task-notification>"
+                    )
+                )
+            ]
+        )
+
+        with self.assertRaisesRegex(ValueError, "task-notification"):
+            await service.append_transcript(
+                AppendTranscriptRequest(
+                    scope=_scope(capabilities={MemoryCapability.WRITE}),
+                    messages_json=[
+                        single_message_adapter.dump_json(notification).decode()
                     ],
                     redaction=RedactionContext(forbidden_values=()),
                 )
@@ -569,6 +737,67 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             [note.fact_text for note in result.candidate_notes],
             ["Ryan keeps cedar notes tentative."],
         )
+
+    async def test_candidate_fallback_skipped_for_tombstoned_scope(self) -> None:
+        # The fallback records retrieval telemetry (a write into
+        # candidate_retrieval_events plus counter updates) and serves
+        # tentative notes; both are wrong for a scope marked for erasure.
+        # Under a partial-flag tombstone (retrieval_blocked = 0) the search
+        # itself proceeds as a read, but the fallback is skipped entirely:
+        # nothing recorded, no notes served from the doomed scope.
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(db_path=self.db_path, tenant_id="tenant-a")
+        service.init_schema()
+        commit_dream_cycle(
+            self.db_path,
+            [
+                FactCandidate(
+                    fact_text="Ryan keeps cedar notes tentative.",
+                    subject="Ryan",
+                    category="fact",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[1],
+                )
+            ],
+            candidate_embeddings=[_unit_vector(1.0)],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO scope_tombstones
+                        (target_tenant_id, target_session_id,
+                         created_by_principal_id, created_by_principal_type, reason,
+                         retrieval_blocked, export_blocked, replay_blocked,
+                         rebuild_blocked, physical_purge_deferred)
+                    VALUES ('tenant-a', 'default', 'operator', 'operator',
+                            'flags all zero', 0, 0, 0, 0, 1)
+                    """
+                )
+
+        with patch(
+            "vexic.subagents.retrieval.embed_texts",
+            side_effect=lambda texts: [_unit_vector(1.0) for _ in texts],
+        ):
+            result = await service.search_long_term(
+                SearchLongTermRequest(scope=_scope(), query="cedar notes")
+            )
+
+        self.assertEqual(result.facts, [])
+        self.assertEqual(result.candidate_notes, [])
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            events = conn.execute(
+                "SELECT COUNT(*) FROM candidate_retrieval_events"
+            ).fetchone()[0]
+        self.assertEqual(events, 0)
 
     async def test_search_long_term_returns_contract_facts(self) -> None:
         from vexic.service import LocalMemoryService
@@ -1363,37 +1592,23 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                     """
                 )
 
+        # Partial flags still gate matching READ operations per flag, but every
+        # mutating operation is additionally blocked by the flag-independent
+        # write gate: any tombstone marks the scope for erasure (ADR 0022), so
+        # database mutations fail closed regardless of the lifecycle flags.
         agent_a_write = _scope(agent_id="agent-a", capabilities={MemoryCapability.WRITE})
         agent_b_write = _scope(agent_id="agent-b", capabilities={MemoryCapability.WRITE})
-        with self.assertRaisesRegex(PermissionError, "tombstoned"):
-            await service.record_retrieval_event(
-                RecordRetrievalEventRequest(
-                    scope=agent_a_write,
-                    event=RetrievalEvent(
-                        event_id=0,
-                        referent_id=facts["agent-a"],
-                        session_id="default",
-                        query="cedar",
-                        retrieved_at="2026-06-20T00:00:00Z",
-                    ),
-                    redaction=RedactionContext(forbidden_values=()),
-                )
-            )
-        self.assertTrue(
-            (
-                await service.retire_fact(
-                    RetireFactRequest(scope=agent_a_write, fact_id=facts["agent-a"])
-                )
-            ).retired
-        )
-        self.assertGreater(
-            (
+        for scope, fact_id in (
+            (agent_a_write, facts["agent-a"]),
+            (agent_b_write, facts["agent-b"]),
+        ):
+            with self.assertRaisesRegex(PermissionError, "tombstoned"):
                 await service.record_retrieval_event(
                     RecordRetrievalEventRequest(
-                        scope=agent_b_write,
+                        scope=scope,
                         event=RetrievalEvent(
                             event_id=0,
-                            referent_id=facts["agent-b"],
+                            referent_id=fact_id,
                             session_id="default",
                             query="cedar",
                             retrieved_at="2026-06-20T00:00:00Z",
@@ -1401,13 +1616,23 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                         redaction=RedactionContext(forbidden_values=()),
                     )
                 )
-            ).event_id,
-            0,
-        )
+            with self.assertRaisesRegex(PermissionError, "tombstoned"):
+                await service.retire_fact(
+                    RetireFactRequest(scope=scope, fact_id=fact_id)
+                )
+
+        # Read side: the retrieval-only tombstone blocks agent-a's search while
+        # agent-b's tombstone (retrieval_blocked = 0) leaves search open.
         with self.assertRaisesRegex(PermissionError, "tombstoned"):
-            await service.retire_fact(
-                RetireFactRequest(scope=agent_b_write, fact_id=facts["agent-b"])
+            await service.search_transcript(
+                SearchTranscriptRequest(
+                    scope=_scope(agent_id="agent-a"), query="cedar"
+                )
             )
+        agent_b_search = await service.search_transcript(
+            SearchTranscriptRequest(scope=_scope(agent_id="agent-b"), query="cedar")
+        )
+        self.assertEqual(agent_b_search.hits, [])
 
     def test_session_summary_helpers_use_agent_scope(self) -> None:
         from vexic.storage import (
@@ -2071,6 +2296,17 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                         "unpaired-reminder",
                         "real text\n<system-reminder>\nunterminated",
                     ),
+                    source_message(
+                        "paired-notification",
+                        # A well-formed task-notification block at the boundary
+                        # means the recorder guard was bypassed: reject, never
+                        # strip.
+                        "real text\n<task-notification>report</task-notification>",
+                    ),
+                    source_message(
+                        "unpaired-notification",
+                        "real text\n<task-notification>\nunterminated",
+                    ),
                     source_message("clean", "clean cedar"),
                 ],
                 redaction=RedactionContext(forbidden_values=()),
@@ -2079,15 +2315,17 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [row.status for row in result.items],
-            ["rejected", "rejected", "rejected", "rejected", "inserted"],
+            ["rejected"] * 6 + ["inserted"],
         )
         self.assertEqual(
-            [row.reason for row in result.items[:4]],
+            [row.reason for row in result.items[:6]],
             [
                 "claude-code command envelope is not transcript text",
                 "claude-code command envelope is not transcript text",
                 "system-reminder block is not transcript text",
                 "system-reminder block is not transcript text",
+                "task-notification block is not transcript text",
+                "task-notification block is not transcript text",
             ],
         )
         with closing(sqlite3.connect(self.db_path)) as conn:

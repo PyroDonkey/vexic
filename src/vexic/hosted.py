@@ -1739,8 +1739,14 @@ def run_dream_phase_command(
         dream_phase_ports=_dream_phase_ports(args),
         customer_target_resolver=customer_target_resolver,
     )
-    # NOTE(alpha): staging CLI assumes no concurrent tenant writers; add event ids if shared.
-    usage_event_offset = len(catalog.usage_events(args.tenant_id))
+    # Snapshot a durable row-id cutoff so the per-run usage report holds under
+    # concurrent writers of a shared control plane: list positions shift when
+    # other processes insert or prune tenant events mid-run, row ids do not.
+    # Accepted residual: the cutoff separates before/after, not whose -- two
+    # dream-phase commands running concurrently for the SAME tenant would each
+    # report the other's post-cutoff events. Per-run attribution needs a run-id
+    # column on hosted_usage_events; not warranted for the staging CLI.
+    usage_event_cutoff = catalog.last_usage_event_id(args.tenant_id)
     runner = HostedBackgroundJobRunner(service)
     with contextlib.redirect_stdout(sys.stderr):
         result = asyncio.run(
@@ -1762,7 +1768,9 @@ def run_dream_phase_command(
                 "job_events": [_event_dict(event) for event in runner.job_events],
                 "usage_events": [
                     _event_dict(event)
-                    for event in catalog.usage_events(args.tenant_id)[usage_event_offset:]
+                    for event in catalog.usage_events(
+                        args.tenant_id, after_id=usage_event_cutoff
+                    )
                 ],
             },
             sort_keys=True,

@@ -343,10 +343,29 @@ writes `predictions.jsonl` and `diagnostics.jsonl` (stage decomposition:
 `answer_extracted_to_tier2`, `answer_promoted_to_tier3`,
 `answer_retrieved_from_tier3`, `answer_candidate_rank`), plus per-question-type
 judged-recall rates. `--selection stratified` round-robins across question
-types; `--resume-from-run` skips rows already `ok` in a prior run's
+types; repeatable `--type-weight multi-session=3` takes N rows from that
+question type per round-robin pass (others default to 1) for a diagnostic
+subset weighted toward specific types, still fully deterministic.
+`--resume-from-run` skips rows already `ok` in a prior run's
 diagnostics. Dream-phase runs require `--allow-live` and an `--adapter`; the
 judge fails closed with `HostPortNotConfigured` when no judge port is supplied.
 Do not vendor the LongMemEval benchmark corpus into this repo.
+
+After a judged-recall run, classify every miss by failing stage and build
+per-subject fact histograms with the read-only analysis module:
+
+```bash
+uv run python -m vexic.longmemeval_analysis \
+  --run-dir .eval-runs/longmemeval/<run-id> --dataset /path/to/longmemeval_s_cleaned.json
+```
+
+It buckets each miss into class 1 (no live Tier 3 fact contains the gold
+answer: extraction vs promotion miss), class 2 (a gold fact exists but ranked
+out of the returned top-k; the full RRF rank is recomputed offline from the
+persisted per-retriever arrays), or class 3 (join/derivation candidates
+flagged `needs_manual_review`, including answers that appear verbatim nowhere
+in the transcript). Every `memory.db` is opened read-only; the output is
+`analysis_report.json` in the run directory plus a stdout summary.
 
 ## Hosted MVP Shell
 

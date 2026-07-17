@@ -52,17 +52,18 @@ CATEGORY_CHECK = (
 )
 
 
-def _fts_match_query(query: str, *, any_token: bool = False) -> str | None:
+def _fts_match_query(query: str) -> str | None:
     # Shared FTS5 MATCH sanitizer: free-text queries may contain FTS operators
     # (AND, NEAR, unbalanced quotes), so each token is quoted into a bare-word
     # phrase. None means "nothing searchable" — callers return no rows.
-    # any_token=True ORs the tokens (recall-oriented retrieval feeding RRF);
-    # the default keeps transcript search's all-tokens-must-match semantics.
+    # Tokens are ORed: every keyword leg (transcript, Tier 2, Tier 3) is
+    # recall-oriented, and bm25 rank ordering surfaces messages matching more
+    # tokens first. All-tokens-must-match AND semantics were retired by
+    # ADR 0036 — one dead token must not empty a recall surface.
     tokens = re.findall(r"[\w]+", query, flags=re.UNICODE)
     if not tokens:
         return None
-    separator = " OR " if any_token else " "
-    return separator.join(f'"{token}"' for token in tokens)
+    return " OR ".join(f'"{token}"' for token in tokens)
 
 
 def _table_columns(conn: sqlite3.Connection, table_name: str) -> list[str]:

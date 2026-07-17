@@ -24,11 +24,42 @@ def _runtime_ids(user: str) -> tuple[int, int]:
 
 def _chown_tree(root: Path, uid: int, gid: int) -> None:
     root.mkdir(parents=True, exist_ok=True)
-    # NOTE(alpha): recursive volume repair is fine for alpha; use a one-time migration if the volume grows.
-    for current, dir_names, file_names in os.walk(root):
-        os.lchown(current, uid, gid)
+    # Guarded one-time repair: skip the O(volume) walk only when a previous
+    # run of THIS code finished it for the same uid:gid -- proven by the
+    # completion sentinel written after the walk plus a correctly-owned root.
+    # Root ownership alone is not proof: the pre-sentinel entrypoint chowned
+    # the root first, so an interrupted old repair leaves a correct root over
+    # mis-owned children; the sentinel forces one unconditional heal on the
+    # first boot after this ships. The walk chowns bottom-up, stamps the
+    # sentinel, and flips the root last, so an interrupted repair leaves the
+    # guard unsatisfied and the next boot resumes it. Assumed out of scope
+    # operationally: an external writer (docker exec as root, snapshot
+    # restore) planting mis-owned files under a correct root and matching
+    # sentinel -- delete the sentinel to force a full re-repair.
+    sentinel = root / ".chown-complete"
+    stamp = f"{uid}:{gid}"
+    try:
+        sentinel_matches = sentinel.read_text(encoding="utf-8").strip() == stamp
+    except OSError:
+        sentinel_matches = False
+    if sentinel_matches:
+        stat = root.lstat()
+        if stat.st_uid == uid and stat.st_gid == gid:
+            return
+    def _raise_walk_error(error: OSError) -> None:
+        # os.walk swallows scandir errors by default; a skipped subtree must
+        # abort the repair before the sentinel lands, or the skipped files
+        # would be marked complete and never healed.
+        raise error
+
+    for current, dir_names, file_names in os.walk(
+        root, topdown=False, onerror=_raise_walk_error
+    ):
         for name in (*dir_names, *file_names):
             os.lchown(Path(current) / name, uid, gid)
+    sentinel.write_text(stamp, encoding="utf-8")
+    os.lchown(sentinel, uid, gid)
+    os.lchown(root, uid, gid)
 
 
 def _uvicorn_command() -> list[str]:

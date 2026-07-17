@@ -5,6 +5,37 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-07-16
+
+Reliability patch plus evaluation tooling. No public memory contract change;
+`CONTRACT_VERSION` stays `0.1.0`.
+
+### Added
+
+- LongMemEval weighted sampling (`--type-weight TYPE=N`) and the
+  `vexic.longmemeval_analysis` miss-classification module for diagnosing
+  retrieval misses in eval runs (#237).
+
+### Fixed
+
+- Transcript ingest strips harness-injected `<task-notification>` blocks the
+  same way as system-reminder blocks, keeping subagent reports and tool
+  returns out of searchable transcript text (ADR 0034, #235).
+- Transcript recall uses any-token OR FTS semantics with bm25 ranking, so a
+  query only partially matching stored text still recalls it (ADR 0036,
+  #236).
+- Writes to a tombstoned scope fail closed both before and after physical
+  purge (ADR 0022, #240).
+- Four hosted-layer alpha staging shortcuts are hardened in the in-process
+  hosted shell (#239).
+
+### Changed
+
+- GitHub Actions workflows moved off deprecated Node 20 runtimes, are
+  SHA-pinned, and Dependabot now watches the actions ecosystem (#238, #241).
+
+[0.1.5]: https://github.com/PyroDonkey/vexic/releases/tag/v0.1.5
+
 ## [0.1.4] - 2026-07-16
 
 Reliability patch for the internal-alpha hosted stack. No public memory

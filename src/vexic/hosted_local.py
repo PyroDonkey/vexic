@@ -32,6 +32,7 @@ from vexic.storage.errors import (
     is_duplicate_column_error,
     is_operational_error,
     is_retryable_operational_error,
+    is_unique_violation,
 )
 
 
@@ -457,25 +458,56 @@ class HostedTenantCatalog:
             if not project_id.strip():
                 raise ValueError("project_id must not be blank.")
         with closing(self._connect_control()) as conn:
-            row = conn.execute(
-                """
-                SELECT db_filename, active, customer_target
-                FROM tenants
-                WHERE tenant_id = ?
-                """,
-                (tenant_id,),
-            ).fetchone()
+
+            def _read_tenant_row() -> tuple[str, int, str | None] | None:
+                return conn.execute(
+                    """
+                    SELECT db_filename, active, customer_target
+                    FROM tenants
+                    WHERE tenant_id = ?
+                    """,
+                    (tenant_id,),
+                ).fetchone()
+
+            row = _read_tenant_row()
             if row is None:
                 db_filename = self._allocate_db_filename(conn)
+                try:
+                    # Insert only the caller-supplied target (or NULL) here;
+                    # the factory mint is deferred until this INSERT wins so
+                    # a lost race never strands a freshly-minted remote
+                    # customer database.
+                    conn.execute(
+                        """
+                        INSERT INTO tenants (tenant_id, db_filename, active, customer_target)
+                        VALUES (?, ?, 0, ?)
+                        """,
+                        (tenant_id, db_filename, customer_target),
+                    )
+                    conn.commit()
+                except (sqlite3.IntegrityError, ValueError) as exc:
+                    if not is_unique_violation(exc):
+                        raise
+                    # A concurrent provisioner committed this tenant between
+                    # the existence check and the INSERT (check-then-insert
+                    # race). Converge on the winner's row instead of failing:
+                    # roll back and continue down the already-exists path.
+                    # `is_unique_violation` is broader than its name (any
+                    # constraint violation classifies True), so the re-read
+                    # below is the real verification: no winner row means the
+                    # violation was not this race, and the original error
+                    # re-raises.
+                    conn.rollback()
+                    row = _read_tenant_row()
+                    if row is None:
+                        raise
+            if row is None:
+                # This process won the INSERT: mint the customer target only
+                # now. A crash before the UPDATE below leaves the row with a
+                # NULL target, which the already-exists path (and
+                # `provision_missing_customer_targets`) heals on the next
+                # provision.
                 target = self._new_customer_target(tenant_id, customer_target)
-                conn.execute(
-                    """
-                    INSERT INTO tenants (tenant_id, db_filename, active, customer_target)
-                    VALUES (?, ?, 0, ?)
-                    """,
-                    (tenant_id, db_filename, target),
-                )
-                conn.commit()
                 needs_customer_init = True
             else:
                 db_filename = row[0]
@@ -483,10 +515,22 @@ class HostedTenantCatalog:
                 if customer_target is None and row[2]:
                     target = None  # keep the existing customer target
                 else:
+                    # Last-writer-wins, matching sequential re-provisioning:
+                    # an explicit customer_target (or a factory heal of a
+                    # NULL target) overwrites whatever the committed row
+                    # holds via the UPDATE below.
                     target = self._new_customer_target(tenant_id, customer_target)
             if needs_customer_init:
                 tenant_db_path = self.root_path / db_filename
-                LocalMemoryService(db_path=str(tenant_db_path), tenant_id=tenant_id).init_schema()
+                # The winner and the converging loser of the provisioning
+                # race can both reach this idempotent init concurrently, and
+                # init_db's local 5s busy wait does not cover a slow winner:
+                # back off on the loser's retryable lock fault the same way
+                # concurrent container startups do for the control plane.
+                service = LocalMemoryService(
+                    db_path=str(tenant_db_path), tenant_id=tenant_id
+                )
+                _run_schema_init_with_backoff(service.init_schema)
             conn.execute(
                 """
                 UPDATE tenants
@@ -1281,6 +1325,29 @@ class HostedTenantCatalog:
                 ).fetchall()
         return [HostedAuditEvent(*row) for row in rows]
 
+    def last_usage_event_id(self, tenant_id: str | None) -> int:
+        """Durable id of the tenant's newest usage event (0 when none exist).
+
+        Callers that need "events recorded after this point" snapshot this
+        cutoff and pass it to ``usage_events(after_id=...)``: row ids are
+        stable under concurrent writers of a shared control plane, unlike
+        list positions.
+        """
+        if tenant_id is None:
+            condition, params = "tenant_id IS NULL", ()
+        else:
+            condition, params = "tenant_id = ?", (tenant_id,)
+        with closing(self._connect_control()) as conn:
+            row = conn.execute(
+                f"""
+                SELECT COALESCE(MAX(id), 0)
+                FROM hosted_usage_events
+                WHERE {condition}
+                """,
+                params,
+            ).fetchone()
+        return int(row[0])
+
     def usage_events(
         self,
         tenant_id: str | None,
@@ -1288,6 +1355,7 @@ class HostedTenantCatalog:
         project_id: str | None = None,
         recorded_at_gte: str | None = None,
         recorded_at_lt: str | None = None,
+        after_id: int | None = None,
     ) -> list[HostedUsageEvent]:
         conditions: list[str]
         params: list[object] = []
@@ -1299,6 +1367,9 @@ class HostedTenantCatalog:
         if project_id is not None:
             conditions.append("project_id = ?")
             params.append(project_id)
+        if after_id is not None:
+            conditions.append("id > ?")
+            params.append(after_id)
         if recorded_at_gte is not None:
             conditions.append("julianday(recorded_at) >= julianday(?)")
             params.append(recorded_at_gte)
@@ -1484,8 +1555,9 @@ class HostedTenantCatalog:
             conn.commit()
 
     def _allocate_db_filename(self, conn: sqlite3.Connection) -> str:
-        # NOTE(alpha): local staging assumes serialized provisioning; retry INSERT on
-        # IntegrityError if concurrent tenant creation becomes a real workload.
+        # Check-then-use is a hint, not a lock: concurrent provisioning is
+        # settled by the tenants UNIQUE constraints, and `provision_tenant`
+        # converges on the winner's committed row when its INSERT loses.
         for _ in range(100):
             db_filename = f"customer-{secrets.token_hex(16)}.db"
             exists = conn.execute(
@@ -1872,13 +1944,34 @@ class HostedApiKeyStore:
                         ),
                     )
                     conn.commit()
-            except Exception:
-                # NOTE(alpha): compensate here instead of threading a shared transaction through create_key.
-                with suppress(PermissionError):
+            except Exception as metadata_exc:
+                # The credential row and its metadata row commit in separate
+                # transactions, so compensate (revoke the minted key) instead
+                # of threading a shared transaction through create_key. The
+                # compensation must fail closed and loud: a key without
+                # metadata never appears in console listings, so if the
+                # revoke also fails the error names the orphaned live key for
+                # manual revocation instead of masking the failure.
+                try:
                     self.revoke_key(
                         provisioned.key_id,
                         revoked_by="control-plane-metadata-failure",
                     )
+                except PermissionError:
+                    # The credential row provably landed (create_key committed
+                    # it and _load_key read it back above), so PermissionError
+                    # here means it vanished concurrently -- either way there
+                    # is nothing live left to revoke.
+                    pass
+                except Exception as revoke_exc:
+                    raise RuntimeError(
+                        f"Hosted API key {provisioned.key_id} was minted but "
+                        "its control-plane metadata write failed, and the "
+                        "compensating revoke also failed "
+                        f"({type(revoke_exc).__name__}); the key is live but "
+                        f"invisible to console listings -- revoke key "
+                        f"{provisioned.key_id} manually."
+                    ) from metadata_exc
                 raise
         return provisioned, record
 

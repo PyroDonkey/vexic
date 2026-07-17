@@ -14,6 +14,7 @@ from vexic.contract import (
     SourceTranscriptMessage,
     harness_envelope_reason,
     strip_system_reminder_blocks,
+    strip_task_notification_blocks,
 )
 from vexic.recorders.transcript_cursor import TranscriptCursor, line_sha256
 from vexic.storage import single_message_adapter
@@ -63,6 +64,7 @@ def source_message_from_claude_code_row(
     if text is None:
         return None
     text = strip_system_reminder_blocks(text)
+    text = strip_task_notification_blocks(text)
     if not text:
         return None
     if PRIME_CONTEXT_HEADER in text:
