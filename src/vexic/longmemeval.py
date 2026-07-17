@@ -634,6 +634,13 @@ def _select_instances(
     if selection != "stratified":
         raise ValueError(f"Unsupported LongMemEval selection: {selection}")
 
+    if type_weights is not None:
+        for group_name, weight in type_weights.items():
+            if weight < 1:
+                raise ValueError(
+                    f"type weight for {group_name!r} must be at least 1, got {weight}"
+                )
+
     groups: dict[str, list[dict[str, Any]]] = {}
     for raw in raw_instances:
         question_type = raw.get("question_type")

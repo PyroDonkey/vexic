@@ -16,7 +16,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
-from contextlib import closing, redirect_stdout
+from contextlib import closing, redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from vexic.longmemeval import question_db_path
@@ -393,6 +393,169 @@ class LongMemEvalAnalysisTests(unittest.TestCase):
 
         self.assertEqual(report.aggregate_histogram.distinct_subjects, 21)
         self.assertEqual(report.aggregate_histogram.median_facts_per_subject, 1)
+
+    def test_invalid_event_array_json_yields_analysis_error_not_crash(self) -> None:
+        self._write_run([_diagnostics_row("q-badjson")])
+        dataset = self._write_dataset([self._dataset_row("q-badjson", "Boston Marathon")])
+        db_path = self._seed_question_db(
+            "q-badjson",
+            [("The user ran the Boston Marathon in 2023.", "user")],
+        )
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute(
+                """
+                INSERT INTO retrieval_events (
+                    fact_id, session_id, query,
+                    keyword_fact_ids, vector_fact_ids, fused_fact_ids
+                ) VALUES (1, 'longmemeval:q-badjson:answer', 'q', 'null', '"1,2"', '{}')
+                """
+            )
+            conn.commit()
+
+        report = analyze_run(self.run_dir, dataset)
+
+        miss = report.misses[0]
+        self.assertIsNone(miss.miss_class)
+        self.assertEqual(miss.sub_reason, "analysis_error")
+        self.assertTrue(miss.needs_manual_review)
+        self.assertIn("error", miss.evidence)
+
+    def test_corrupt_question_db_isolated_to_that_question(self) -> None:
+        self._write_run(
+            [_diagnostics_row("q-corrupt"), _diagnostics_row("q-good")]
+        )
+        dataset = self._write_dataset(
+            [
+                self._dataset_row("q-corrupt", "Boston Marathon"),
+                self._dataset_row("q-good", "Boston Marathon"),
+            ]
+        )
+        corrupt_path = self._seed_question_db("q-corrupt", [("Fact.", "user")])
+        corrupt_path.write_bytes(b"this is not a sqlite database at all")
+        self._seed_question_db("q-good", [("Filler only.", "user")])
+
+        report = analyze_run(self.run_dir, dataset)
+
+        by_id = {miss.question_id: miss for miss in report.misses}
+        self.assertEqual(by_id["q-corrupt"].sub_reason, "analysis_error")
+        self.assertIsNone(by_id["q-corrupt"].miss_class)
+        self.assertEqual(by_id["q-good"].miss_class, 1)
+
+    def test_malformed_diagnostics_line_skipped_and_counted(self) -> None:
+        good_row = _diagnostics_row("q-fine")
+        (self.run_dir / "diagnostics.jsonl").write_text(
+            json.dumps(good_row) + '\n{"question_id": "q-truncated", "status',
+            encoding="utf-8",
+        )
+        dataset = self._write_dataset([self._dataset_row("q-fine", "Boston Marathon")])
+        self._seed_question_db("q-fine", [("Filler.", "user")])
+
+        report = analyze_run(self.run_dir, dataset)
+
+        self.assertEqual([miss.question_id for miss in report.misses], ["q-fine"])
+        self.assertEqual(report.skipped_diagnostics_lines, 1)
+
+    def test_missing_dataset_row_labeled_missing_dataset_row(self) -> None:
+        self._write_run([_diagnostics_row("q-orphan")])
+        dataset = self._write_dataset([self._dataset_row("q-other", "whatever")])
+        self._seed_question_db("q-orphan", [("Filler.", "user")])
+
+        report = analyze_run(self.run_dir, dataset)
+
+        miss = report.misses[0]
+        self.assertIsNone(miss.miss_class)
+        self.assertEqual(miss.sub_reason, "missing_dataset_row")
+        self.assertTrue(miss.needs_manual_review)
+
+    def test_duplicate_diagnostics_rows_use_last_and_count_once(self) -> None:
+        self._write_run(
+            [
+                _diagnostics_row("q-retry", judged_recall_pass=False),
+                _diagnostics_row("q-retry", judged_recall_pass=True),
+            ]
+        )
+        dataset = self._write_dataset([self._dataset_row("q-retry", "Boston Marathon")])
+        self._seed_question_db("q-retry", [("Fact.", "ryan"), ("Other.", "boston")])
+
+        report = analyze_run(self.run_dir, dataset)
+
+        # Last row wins: the retry passed, so there is no miss, and the
+        # question DB is counted exactly once in the histograms.
+        self.assertEqual(report.misses, [])
+        self.assertEqual(len(report.subject_histograms), 1)
+        self.assertEqual(report.aggregate_histogram.total_facts, 2)
+        self.assertEqual(
+            report.judged_recall_by_question_type,
+            {"multi-session": {"supported": 1, "total": 1}},
+        )
+
+    def test_duplicate_dataset_rows_first_wins(self) -> None:
+        self._write_run([_diagnostics_row("q-dup")])
+        first = self._dataset_row("q-dup", "Boston Marathon")
+        second = self._dataset_row("q-dup", "Chicago Marathon")
+        dataset = self._write_dataset([first, second])
+        self._seed_question_db(
+            "q-dup",
+            [("The user ran the Boston Marathon in 2023.", "user")],
+        )
+
+        report = analyze_run(self.run_dir, dataset)
+
+        # First dataset row wins: the Boston answer matches the fact, so the
+        # miss is not class 1.
+        self.assertEqual(report.misses[0].gold_fact_ids, [1])
+        self.assertNotEqual(report.misses[0].miss_class, 1)
+
+    def test_cli_refuses_non_json_report_path(self) -> None:
+        self._write_run([_diagnostics_row("q-guard")])
+        dataset = self._write_dataset([self._dataset_row("q-guard", "Boston Marathon")])
+        db_path = self._seed_question_db("q-guard", [("Filler.", "user")])
+        before = db_path.read_bytes()
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            with self.assertRaises(SystemExit):
+                analysis_main(
+                    [
+                        "--run-dir",
+                        str(self.run_dir),
+                        "--dataset",
+                        str(dataset),
+                        "--report-path",
+                        str(db_path),
+                    ]
+                )
+
+        self.assertEqual(db_path.read_bytes(), before)
+
+    def test_cli_errors_cleanly_on_missing_diagnostics(self) -> None:
+        dataset = self._write_dataset([self._dataset_row("q-none", "whatever")])
+        empty_run = self.root / "empty-run"
+        empty_run.mkdir()
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            exit_code = analysis_main(
+                ["--run-dir", str(empty_run), "--dataset", str(dataset)]
+            )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("diagnostics.jsonl", stderr.getvalue())
+
+    def test_empty_question_db_reports_zero_fact_histogram(self) -> None:
+        self._write_run([_diagnostics_row("q-empty", judged_recall_pass=True)])
+        dataset = self._write_dataset([self._dataset_row("q-empty", "whatever")])
+        db_path = question_db_path(self.run_dir, "q-empty")
+        init_db(str(db_path))
+
+        report = analyze_run(self.run_dir, dataset)
+
+        histogram = report.subject_histograms[0]
+        self.assertEqual(histogram.question_id, "q-empty")
+        self.assertEqual(histogram.total_facts, 0)
+        self.assertEqual(histogram.distinct_subjects, 0)
+        self.assertEqual(histogram.median_facts_per_subject, 0)
+        self.assertEqual(histogram.max_facts_per_subject, 0)
 
     def test_analysis_opens_memory_db_read_only(self) -> None:
         db_path = self._seed_question_db("q-ro", [("Fact.", "user")])

@@ -624,6 +624,15 @@ class LongMemEvalArtifactTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    def test_select_instances_rejects_non_positive_type_weight(self) -> None:
+        with self.assertRaisesRegex(ValueError, "type weight.*at least 1"):
+            _select_instances(
+                self._typed_rows(),
+                limit=3,
+                selection="stratified",
+                type_weights={"multi-session": 0},
+            )
+
     def test_parser_accepts_repeated_type_weight_and_rejects_malformed(self) -> None:
         parser = build_parser()
         base_args = [

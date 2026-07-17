@@ -58,6 +58,8 @@ MissSubReason = Literal[
     "answer_not_verbatim_requires_join",
     "unmatchable_answer",
     "missing_question_db",
+    "missing_dataset_row",
+    "analysis_error",
 ]
 
 
@@ -95,6 +97,7 @@ class RunAnalysisReport(BaseModel):
     class_counts: dict[str, int]
     subject_histograms: list[SubjectHistogram]
     aggregate_histogram: AggregateHistogram
+    skipped_diagnostics_lines: int = 0
 
 
 def _open_readonly(db_path: Path) -> StorageConnection:
@@ -106,13 +109,28 @@ def _memory_db_path(run_dir: Path, question_id: str) -> Path:
     return run_dir / _question_path_component(question_id) / "memory.db"
 
 
-def _load_diagnostics(run_dir: Path) -> list[dict[str, Any]]:
+def _load_diagnostics(run_dir: Path) -> tuple[list[dict[str, Any]], int]:
+    """Parse diagnostics rows, skipping (and counting) malformed lines.
+
+    A run that crashed mid-write commonly leaves one truncated trailing line;
+    one bad record must not cost the report for every well-formed row.
+    """
     diagnostics_path = run_dir / "diagnostics.jsonl"
-    return [
-        json.loads(line)
-        for line in diagnostics_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    rows: list[dict[str, Any]] = []
+    skipped = 0
+    for line in diagnostics_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            skipped += 1
+            continue
+        if not isinstance(row, dict):
+            skipped += 1
+            continue
+        rows.append(row)
+    return rows, skipped
 
 
 def _live_facts(conn: StorageConnection) -> list[tuple[int, str]]:
@@ -120,6 +138,17 @@ def _live_facts(conn: StorageConnection) -> list[tuple[int, str]]:
         "SELECT id, fact_text FROM long_term_memory WHERE retired = 0"
     ).fetchall()
     return [(int(fact_id), fact_text) for fact_id, fact_text in rows]
+
+
+def _parsed_id_list(value: Any) -> list[int]:
+    parsed = json.loads(value)
+    if not isinstance(parsed, list) or not all(
+        isinstance(item, int) and not isinstance(item, bool) for item in parsed
+    ):
+        raise ValueError(
+            f"retrieval event column is not a JSON list of fact ids: {value!r}"
+        )
+    return parsed
 
 
 def _answer_retrieval_arrays(
@@ -137,7 +166,8 @@ def _answer_retrieval_arrays(
     ).fetchone()
     if row is None:
         return [], [], []
-    return tuple(json.loads(value) for value in row)
+    keyword_ids, vector_ids, fused_ids = (_parsed_id_list(value) for value in row)
+    return keyword_ids, vector_ids, fused_ids
 
 
 def _fact_texts(
@@ -157,14 +187,14 @@ def _fact_texts(
 
 def _classify_miss(
     diagnostics_row: Mapping[str, Any],
-    dataset_row: Mapping[str, Any],
+    dataset_row: Mapping[str, Any] | None,
     db_path: Path,
 ) -> MissClassification:
     question_id = diagnostics_row["question_id"]
     question_type = diagnostics_row.get("question_type")
-    answer = dataset_row.get("answer")
+    answer = None if dataset_row is None else dataset_row.get("answer")
     evidence: dict[str, Any] = {
-        "question": dataset_row.get("question"),
+        "question": None if dataset_row is None else dataset_row.get("question"),
         "answer": answer,
     }
 
@@ -186,6 +216,12 @@ def _classify_miss(
             gold_fused_rank=gold_fused_rank,
             evidence=evidence,
         )
+
+    if dataset_row is None:
+        # A diagnostics question_id absent from the supplied --dataset is a
+        # dataset/run mismatch, not an answer-shape limitation; labeling it
+        # unmatchable would send the investigation down the wrong path.
+        return result(None, "missing_dataset_row", needs_manual_review=True)
 
     if not db_path.exists():
         return result(None, "missing_question_db", needs_manual_review=True)
@@ -273,8 +309,9 @@ def _subject_counts(db_path: Path) -> list[tuple[str, int]] | None:
             ORDER BY n DESC, subject
             """
         ).fetchall()
-    counts = [(subject, int(count)) for subject, count in rows]
-    return counts or None
+    # An empty list is a real observation (the DB exists but holds zero live
+    # facts -- itself a diagnostic signal); ``None`` means the DB is absent.
+    return [(subject, int(count)) for subject, count in rows]
 
 
 def _subject_histogram(
@@ -288,8 +325,8 @@ def _subject_histogram(
         question_id=question_id,
         total_facts=sum(values),
         distinct_subjects=len(counts),
-        median_facts_per_subject=statistics.median(values),
-        max_facts_per_subject=max(values),
+        median_facts_per_subject=statistics.median(values) if values else 0,
+        max_facts_per_subject=max(values) if values else 0,
         top_subjects=list(counts[:top_n]),
     )
 
@@ -328,29 +365,62 @@ def _recall_by_question_type(
     return recall
 
 
+def _analysis_error(
+    question_id: str,
+    question_type: Any,
+    exc: Exception,
+) -> MissClassification:
+    return MissClassification(
+        question_id=question_id,
+        question_type=question_type if isinstance(question_type, str) else None,
+        miss_class=None,
+        sub_reason="analysis_error",
+        needs_manual_review=True,
+        gold_fact_ids=[],
+        gold_fused_rank=None,
+        evidence={"error": f"{type(exc).__name__}: {exc}"},
+    )
+
+
 def analyze_run(run_dir: Path, dataset_path: Path) -> RunAnalysisReport:
     """Classify every judged-recall miss in a run and build subject histograms."""
 
-    diagnostics_rows = _load_diagnostics(run_dir)
-    dataset_by_id = {
-        row.get("question_id"): row for row in _load_dataset(dataset_path)
-    }
+    diagnostics_rows, skipped_lines = _load_diagnostics(run_dir)
+    # A resumed/retried run can emit several rows for one question_id; the
+    # chronologically last row is the question's final state, and each
+    # question DB must be counted exactly once.
+    rows_by_question_id: dict[str, dict[str, Any]] = {}
+    for row in diagnostics_rows:
+        question_id = row.get("question_id")
+        if isinstance(question_id, str):
+            rows_by_question_id[question_id] = row
+    # First dataset row wins on duplicate question_ids, deterministically.
+    dataset_by_id: dict[Any, dict[str, Any]] = {}
+    for row in _load_dataset(dataset_path):
+        dataset_by_id.setdefault(row.get("question_id"), row)
 
     misses: list[MissClassification] = []
     histograms: list[SubjectHistogram] = []
     pooled_counts: list[int] = []
-    for row in diagnostics_rows:
-        question_id = row.get("question_id")
-        if not isinstance(question_id, str):
-            continue
+    for question_id, row in rows_by_question_id.items():
         db_path = _memory_db_path(run_dir, question_id)
-        counts = _subject_counts(db_path)
+        # One corrupt question DB must not cost the report for every other
+        # question: classify what fails as analysis_error and keep going.
+        try:
+            counts = _subject_counts(db_path)
+        except Exception:
+            counts = None
         if counts is not None:
             histograms.append(_subject_histogram(question_id, counts))
             pooled_counts.extend(count for _, count in counts)
         if row.get("status") != "ok" or row.get("judged_recall_pass") is not False:
             continue
-        misses.append(_classify_miss(row, dataset_by_id.get(question_id, {}), db_path))
+        try:
+            misses.append(
+                _classify_miss(row, dataset_by_id.get(question_id), db_path)
+            )
+        except Exception as exc:
+            misses.append(_analysis_error(question_id, row.get("question_type"), exc))
 
     class_counts: dict[str, int] = {}
     for miss in misses:
@@ -359,11 +429,14 @@ def analyze_run(run_dir: Path, dataset_path: Path) -> RunAnalysisReport:
 
     return RunAnalysisReport(
         run_dir=str(run_dir),
-        judged_recall_by_question_type=_recall_by_question_type(diagnostics_rows),
+        judged_recall_by_question_type=_recall_by_question_type(
+            list(rows_by_question_id.values())
+        ),
         misses=misses,
         class_counts=class_counts,
         subject_histograms=histograms,
         aggregate_histogram=_aggregate_histogram(pooled_counts),
+        skipped_diagnostics_lines=skipped_lines,
     )
 
 
@@ -415,9 +488,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    report = analyze_run(args.run_dir, args.dataset)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     report_path = args.report_path or args.run_dir / "analysis_report.json"
+    if report_path.suffix != ".json":
+        # A stray --report-path aimed at a run artifact (e.g. a question's
+        # memory.db) would overwrite it; the report is the module's only write.
+        parser.error(f"--report-path must end in .json, got: {report_path}")
+    if not (args.run_dir / "diagnostics.jsonl").exists():
+        print(
+            f"error: no diagnostics.jsonl in {args.run_dir}; "
+            "is --run-dir a completed LongMemEval run directory?",
+            file=sys.stderr,
+        )
+        return 2
+    report = analyze_run(args.run_dir, args.dataset)
     report_path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
     _print_summary(report)
     print(f"Report: {report_path}")
