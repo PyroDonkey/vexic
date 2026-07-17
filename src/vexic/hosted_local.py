@@ -517,7 +517,15 @@ class HostedTenantCatalog:
                     target = self._new_customer_target(tenant_id, customer_target)
             if needs_customer_init:
                 tenant_db_path = self.root_path / db_filename
-                LocalMemoryService(db_path=str(tenant_db_path), tenant_id=tenant_id).init_schema()
+                # The winner and the converging loser of the provisioning
+                # race can both reach this idempotent init concurrently, and
+                # init_db's local 5s busy wait does not cover a slow winner:
+                # back off on the loser's retryable lock fault the same way
+                # concurrent container startups do for the control plane.
+                service = LocalMemoryService(
+                    db_path=str(tenant_db_path), tenant_id=tenant_id
+                )
+                _run_schema_init_with_backoff(service.init_schema)
             conn.execute(
                 """
                 UPDATE tenants

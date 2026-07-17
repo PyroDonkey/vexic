@@ -2198,6 +2198,28 @@ class HostedProvisioningRaceTests(unittest.TestCase):
         self.assertEqual(minted, ["tenant-fresh"])
         self.assertEqual(tenant.customer_target, "libsql://minted-tenant-fresh.example")
 
+    def test_customer_init_backs_off_on_transient_lock_contention(self) -> None:
+        """Winner and loser of the provisioning race can both reach the
+        idempotent customer-db init concurrently; the loser's transient
+        'database is locked' must back off and retry instead of failing the
+        provision (init_db's 5s busy wait does not cover a slow winner)."""
+        from vexic.hosted_local import LocalMemoryService
+
+        calls = {"count": 0}
+        real_init = LocalMemoryService.init_schema
+
+        def locked_once(service: LocalMemoryService) -> None:
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            real_init(service)
+
+        with patch("vexic.hosted_local.LocalMemoryService.init_schema", locked_once):
+            tenant = self.catalog.provision_tenant("tenant-locked")
+
+        self.assertEqual(calls["count"], 2)
+        self.assertEqual(tenant.tenant_id, "tenant-locked")
+
 
 class _FaultInjectingConnection:
     """Proxy that fails any statement containing one of the given fragments."""
