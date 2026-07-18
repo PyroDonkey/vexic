@@ -34,6 +34,7 @@ from vexic.hosted import HostedMemoryService
 from vexic.hosted_http import create_app
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 from vexic.recorders.cli import main as recorder_main
+from vexic.recorders.hosted_ingest import HostedIngestTransportError
 from vexic.recorders.transcript_cursor import (
     TranscriptCursor,
     cursor_path,
@@ -451,6 +452,34 @@ class RecorderTranscriptCursorTests(unittest.TestCase):
             )
             self.assertEqual(code, 2)
             self.assertEqual(harness.cursor_files(), [])
+            harness.posted.clear()
+
+            self.assertEqual(harness.run(), 0)
+            self.assertEqual(harness.posted_ids(), ["uuid-1", "uuid-2"])
+
+    def test_transport_error_post_does_not_advance_the_cursor(self) -> None:
+        # The fail-open twin of the RuntimeError/exit-2 pin above: an exhausted
+        # transient fault degrades to exit 1, the cursor stays unwritten, and
+        # the next run re-posts every row (the hosted ledger dedups).
+        with tempfile.TemporaryDirectory() as temp:
+            harness = _RecorderHarness(Path(temp))
+            _write_transcript(
+                harness.transcript,
+                [
+                    _user_row("uuid-1", "remember cedar"),
+                    _user_row("uuid-2", "and orchid"),
+                ],
+            )
+
+            code = harness.run(
+                post_error=HostedIngestTransportError(
+                    "hosted ingest failed: HTTP 503"
+                )
+            )
+            self.assertEqual(code, 1)
+            self.assertEqual(harness.cursor_files(), [])
+            status = json.loads(harness.status_path.read_text(encoding="utf-8"))
+            self.assertFalse(status["ok"])
             harness.posted.clear()
 
             self.assertEqual(harness.run(), 0)
