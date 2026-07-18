@@ -195,6 +195,18 @@ existing fetches is a separate, already-known follow-up; this ADR does not
 fix it and this work does not make it worse (the new subprocess is detached
 and adds no serial wait).
 
+> **Update 2026-07-18:** this follow-up is implemented, after a live session
+> lost its entire priming block to the 30s hook kill mid-`search_transcript`.
+> Empirical probes against the harness established that stdout is discarded
+> on timeout cancellation even when flushed early or from a SIGTERM trap, so
+> the only delivery path is a clean exit before the kill. `fetch_prime_context`
+> now fans the three reads out in parallel daemon threads under an
+> end-to-end deadline (default 20s, `--deadline-seconds`); reads that miss
+> the deadline degrade to their empty fallbacks. The dream trigger spawn
+> moved after the reads, and prime writes started/finished status records
+> (per-leg durations) so an external kill leaves a stale `started` marker as
+> evidence.
+
 ### D5 -- Cron producer: a new, deliberately dumb scheduled workflow
 
 > Retired by ADR 0030. The external cron producer is gone:

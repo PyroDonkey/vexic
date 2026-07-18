@@ -732,9 +732,11 @@ database's `dream_sweep_state` table.
 ### Recorder-side backstop trigger
 
 `recorder prime` (invoked from the Claude Code SessionStart hook) spawns a
-detached, fire-and-forget `vexic recorder trigger-dream` subprocess before
-doing its normal priming work, as a backstop between in-server sweeper ticks (ADR 0030). This
-adds no serial latency to the hook: the subprocess is spawned with
+detached, fire-and-forget `vexic recorder trigger-dream` subprocess after its
+priming reads complete, as a backstop between in-server sweeper ticks (ADR
+0030; moved from before the reads by the ADR 0025 D4 follow-up so prime's own
+trigger cannot compete with its reads for hosted capacity inside the hook
+budget). This adds no serial latency to the hook: the subprocess is spawned with
 `stdin`/`stdout`/`stderr` all `DEVNULL` and `start_new_session=True` (an
 inherited stdout pipe would keep the hook's own stdout open until the child
 exits, which would defeat the "zero added latency" goal) and prime does not
@@ -756,10 +758,17 @@ exits `0` and never affects prime's own output or exit code.
   restart or redeploy mid-sweep. The next trigger (cron or prime) re-runs
   idempotently, so no data is lost, but an in-flight sweep at deploy time is
   simply abandoned rather than resumed.
-- Prime's pre-existing serial-timeout budget (up to three sequential 15s
+- ~~Prime's pre-existing serial-timeout budget (up to three sequential 15s
   `urlopen` calls against the SessionStart hook's 30s kill) is unchanged by
   this work and remains a known follow-up to tighten or parallelize
-  separately.
+  separately.~~ Resolved by the ADR 0025 D4 follow-up: the three reads now
+  fan out in parallel daemon threads under an end-to-end deadline
+  (`--deadline-seconds`, default 20s) inside `fetch_prime_context`; reads
+  that miss the deadline degrade to their empty fallbacks and prime always
+  exits cleanly before the hook kill. `recorder prime` also writes a
+  `phase: "started"` attempt marker to the recorder status file before its
+  reads and a `phase: "finished"` record with per-leg durations after, so an
+  external kill leaves durable evidence instead of nothing.
 
 Revoke a throwaway key by key id, not by raw key:
 

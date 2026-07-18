@@ -5,6 +5,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Iterator
@@ -24,6 +25,7 @@ from vexic.recorders.claude_setup import (
 )
 from vexic.recorders.hosted_prime import (
     DEFAULT_PRIME_MAX_CHARS,
+    PRIME_DEADLINE_SECONDS,
     HostedPrimeConfig,
     fetch_prime_context,
     post_trigger_dream_phase,
@@ -184,6 +186,7 @@ def _parser() -> argparse.ArgumentParser:
     prime.add_argument("--session-id")
     prime.add_argument("--agent-id")
     prime.add_argument("--timeout-seconds", type=float, default=15.0)
+    prime.add_argument("--deadline-seconds", type=float, default=PRIME_DEADLINE_SECONDS)
     prime.add_argument("--max-chars", type=int, default=DEFAULT_PRIME_MAX_CHARS)
     prime.add_argument("--status-path", type=Path)
 
@@ -476,13 +479,28 @@ def _spawn_trigger_dream(config_path: Path) -> None:
 
 
 def _prime(args: argparse.Namespace) -> int:
+    started = time.monotonic()
+    status_session_id: str | None = None
     try:
         payload = _read_session_start_payload(args.hook_input)
         if payload.source not in {"startup", "clear"}:
             return 0
-        _spawn_trigger_dream(args.config)
         _apply_ingest_config(args)
-        context = fetch_prime_context(
+        status_session_id = args.session_id
+        # Attempt marker before any hosted read: the SessionStart hook kills
+        # this process at its timeout and no in-process handler can run, so a
+        # stale "started" record is the only durable evidence of a kill.
+        _try_write_status(
+            args.status_path,
+            RecorderStatus(
+                ok=False,
+                operation="prime",
+                source_session_id=status_session_id,
+                transcript_path=None,
+                phase="started",
+            ),
+        )
+        result = fetch_prime_context(
             HostedPrimeConfig(
                 base_url=args.base_url,
                 api_key=args.api_key,
@@ -492,20 +510,49 @@ def _prime(args: argparse.Namespace) -> int:
                 timeout_seconds=args.timeout_seconds,
             ),
             max_chars=args.max_chars,
+            deadline_seconds=args.deadline_seconds,
+        )
+        # Spawned after the reads so prime's own dream trigger cannot compete
+        # with them for hosted capacity inside the hook budget (ADR 0025 D4
+        # follow-up).
+        _spawn_trigger_dream(args.config)
+        _try_write_status(
+            args.status_path,
+            RecorderStatus(
+                ok=True,
+                operation="prime",
+                source_session_id=status_session_id,
+                transcript_path=None,
+                phase="finished",
+                legs=result.legs,
+                duration_ms=int((time.monotonic() - started) * 1000),
+            ),
         )
     except Exception as exc:
         # SessionStart priming is fail-open: stderr is the operator signal,
         # stdout stays empty so Claude Code receives no unsafe context.
         print(f"warning: {exc}", file=sys.stderr)
+        _try_write_status(
+            getattr(args, "status_path", None),
+            RecorderStatus(
+                ok=False,
+                operation="prime",
+                source_session_id=status_session_id,
+                transcript_path=None,
+                error=f"{type(exc).__name__}: {exc}",
+                phase="finished",
+                duration_ms=int((time.monotonic() - started) * 1000),
+            ),
+        )
         return 0
-    if not context:
+    if not result.context:
         return 0
     print(
         json.dumps(
             {
                 "hookSpecificOutput": {
                     "hookEventName": "SessionStart",
-                    "additionalContext": context,
+                    "additionalContext": result.context,
                 }
             },
             sort_keys=True,
