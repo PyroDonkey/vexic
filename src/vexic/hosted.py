@@ -21,6 +21,7 @@ from types import ModuleType
 from typing import Any, Awaitable, Callable, NamedTuple, Protocol, TypeVar
 
 from pydantic import BaseModel, ConfigDict, ValidationError
+from vexic.error_reporting import validation_error_message
 from vexic.contract import (
     AppendTranscriptRequest,
     AppendTranscriptResult,
@@ -287,7 +288,7 @@ async def _handle_hosted_write(
             auth=auth,
         )
         if isinstance(exc, ValidationError):
-            return error_response(400, "invalid_request", str(exc))
+            return error_response(400, "invalid_request", validation_error_message(exc))
         storage_error = _hosted_write_storage_error_response(exc, error_response)
         if storage_error is not None:
             return storage_error

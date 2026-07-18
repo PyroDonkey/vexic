@@ -2396,6 +2396,36 @@ class HostedHttpTests(unittest.TestCase):
         self.assertNotIn("input_value", raw)
         self.assertNotIn("errors.pydantic.dev", raw)
 
+    def test_hosted_write_preflight_validation_error_does_not_echo_marker(self) -> None:
+        class _MarkerModel(BaseModel):
+            limit: int
+
+        try:
+            _MarkerModel.model_validate({"limit": "sekret-marker-value"})
+        except ValidationError as exc:
+            validation_error = exc
+
+        api_key = self._api_key(capabilities={MemoryCapability.WRITE})
+        with patch(
+            "vexic.hosted.AppendTranscriptRequest",
+            side_effect=validation_error,
+        ):
+            response = self.client.post(
+                "/v1/append_transcript",
+                headers=self._write_headers(api_key),
+                json=self._append_body("preflight validation cedar"),
+            )
+
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["error"]["code"], "invalid_request")
+        message = body["error"]["message"]
+        self.assertIn("Input should be a valid integer", message)
+        raw = response.text
+        self.assertNotIn("sekret-marker-value", raw)
+        self.assertNotIn("input_value", raw)
+        self.assertNotIn("errors.pydantic.dev", raw)
+
     def test_hosted_ingest_storage_valueerror_mapping_logs_sanitized_category(self) -> None:
         api_key = self._api_key(capabilities={MemoryCapability.WRITE})
 

@@ -1,8 +1,13 @@
 import traceback
 
+from pydantic import ValidationError
+
 # Content-free error rendering for persisted diagnostics. Dependency-free
 # leaf, like vexic.redaction: dream phases and storage writers can record what
-# failed without recording what the user said.
+# failed without recording what the user said. Also home to
+# ``validation_error_message``, shared by the hosted FastAPI adapter and the
+# transport-agnostic hosted shell so both 400 paths sanitize the same way
+# without the shell importing the FastAPI adapter.
 
 
 def format_error_detail(exc: BaseException) -> str:
@@ -17,6 +22,28 @@ def format_error_detail(exc: BaseException) -> str:
     stack = "".join(frames.format())
     rendered = f"{type(exc).__name__}\n{stack}".rstrip()
     return rendered
+
+
+def validation_error_message(exc: ValidationError) -> str:
+    """Build a client-safe 400 message from a pydantic ``ValidationError``.
+
+    ``str(ValidationError)`` embeds the offending input value -- for the hosted
+    request models that input is the bound ``MemoryScope`` repr -- plus a
+    pydantic docs URL. Only the validator-authored ``msg`` text is client-safe,
+    so this drops the structured input, context, and URL and keeps the
+    deduplicated messages. This is safe only because the
+    contract validators feeding these callsites use static messages and never
+    interpolate client input into their own text; a validator that did would
+    have to be fixed at the validator, not masked here.
+    """
+    messages: list[str] = []
+    for error in exc.errors(include_url=False, include_input=False, include_context=False):
+        message = str(error["msg"]).removeprefix("Value error, ")
+        if message not in messages:
+            messages.append(message)
+    if not messages:
+        return "Invalid request."
+    return "; ".join(messages)
 
 
 # Marks whether a dream phase's terminal ``dream_runs`` error row was durably
