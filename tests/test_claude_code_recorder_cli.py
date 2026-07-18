@@ -484,6 +484,172 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         sleep_mock.assert_called_once_with(0.5)
 
+    def test_post_source_messages_429_honors_retry_after_seconds(self) -> None:
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self) -> bytes:
+                return b'{"items":[]}'
+
+        calls: list[int] = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(1)
+            if len(calls) == 1:
+                raise HTTPError(
+                    url="https://api.example.test/v1/ingest_source_transcript",
+                    code=429,
+                    msg="Too Many Requests",
+                    hdrs={"Retry-After": "7"},
+                    fp=None,
+                )
+            return _Response()
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch("vexic.recorders.hosted_ingest.random.uniform") as uniform_mock,
+        ):
+            result = post_source_messages(config, messages=[], forbidden_values=())
+
+        # The server-directed wait replaces the jittered backoff outright:
+        # the server value already staggers clients.
+        self.assertEqual(result, {"items": []})
+        self.assertEqual(len(calls), 2)
+        sleep_mock.assert_called_once_with(7.0)
+        uniform_mock.assert_not_called()
+
+    def test_post_source_messages_bad_retry_after_falls_back_to_backoff(self) -> None:
+        # Malformed ("soon"), zero, and negative Retry-After values all fall
+        # back to the jittered backoff. int("-1") parses, and an honored
+        # negative would reach time.sleep(-1) -> ValueError -> loud exit 2,
+        # exactly the failure mode the 429 allowlist removes.
+        for raw in ("soon", "0", "-1"):
+            with self.subTest(retry_after=raw):
+                config = HostedIngestConfig(
+                    base_url="https://api.example.test",
+                    api_key="vx_secret",
+                    project_id="project-a",
+                    session_id="session-a",
+                    agent_id=None,
+                )
+
+                class _Response:
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *_exc):
+                        return False
+
+                    def read(self) -> bytes:
+                        return b'{"items":[]}'
+
+                calls: list[int] = []
+
+                def fake_urlopen(request, timeout):
+                    calls.append(1)
+                    if len(calls) == 1:
+                        raise HTTPError(
+                            url="https://api.example.test/v1/ingest_source_transcript",
+                            code=429,
+                            msg="Too Many Requests",
+                            hdrs={"Retry-After": raw},
+                            fp=None,
+                        )
+                    return _Response()
+
+                with (
+                    patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+                    patch(
+                        "vexic.recorders.hosted_ingest.time.sleep"
+                    ) as sleep_mock,
+                    patch(
+                        "vexic.recorders.hosted_ingest.random.uniform",
+                        return_value=1.0,
+                    ),
+                ):
+                    result = post_source_messages(
+                        config, messages=[], forbidden_values=()
+                    )
+
+                self.assertEqual(result, {"items": []})
+                sleep_mock.assert_called_once_with(0.5)
+
+    def test_post_source_messages_retry_after_capped(self) -> None:
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self) -> bytes:
+                return b'{"items":[]}'
+
+        def make_urlopen(calls: list[int]):
+            def fake_urlopen(request, timeout):
+                calls.append(1)
+                if len(calls) == 1:
+                    raise HTTPError(
+                        url="https://api.example.test/v1/ingest_source_transcript",
+                        code=429,
+                        msg="Too Many Requests",
+                        hdrs={"Retry-After": "120"},
+                        fp=None,
+                    )
+                return _Response()
+
+            return fake_urlopen
+
+        # Without a budget the defensive 30s constant caps the wait.
+        calls: list[int] = []
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", make_urlopen(calls)),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+        ):
+            post_source_messages(config, messages=[], forbidden_values=())
+        sleep_mock.assert_called_once_with(30.0)
+
+        # With a budget the remaining budget caps it further.
+        calls = []
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", make_urlopen(calls)),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch(
+                "vexic.recorders.hosted_ingest.time.monotonic",
+                # started, attempt-1 pre-check, retry decision (5s left),
+                # attempt-2 pre-check.
+                side_effect=[0.0, 0.0, 5.0, 5.0],
+            ),
+        ):
+            post_source_messages(
+                config,
+                messages=[],
+                forbidden_values=(),
+                budget_seconds=10.0,
+            )
+        sleep_mock.assert_called_once_with(5.0)
+
     def test_post_source_messages_408_exhausts_to_transport_error(self) -> None:
         from vexic.recorders.hosted_ingest import HostedIngestTransportError
 

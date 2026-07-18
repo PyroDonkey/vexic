@@ -27,6 +27,30 @@ _TRANSPORT_RETRY_BACKOFF_SECONDS = 0.5
 # stay loud.
 _RETRYABLE_STATUS_CODES = frozenset({408, 429})
 
+# Defensive cap on a server-directed Retry-After wait: a hostile or
+# misconfigured proxy sending "Retry-After: 86400" must not park a caller
+# that supplied no budget.
+_RETRY_AFTER_MAX_SECONDS = 30.0
+
+
+def _retry_after_seconds(exc: HTTPError) -> float | None:
+    """Positive integer-seconds Retry-After, capped; else None.
+
+    Only the integer-seconds form is honored; the HTTP-date form and any
+    malformed or non-positive value fall back to the jittered backoff.
+    """
+    headers = exc.headers
+    raw = headers.get("Retry-After") if headers is not None else None
+    if raw is None:
+        return None
+    try:
+        seconds = int(str(raw).strip())
+    except ValueError:
+        return None
+    if seconds <= 0:
+        return None
+    return min(float(seconds), _RETRY_AFTER_MAX_SECONDS)
+
 
 def _backoff_delay(attempt: int) -> float:
     # Jittered so overlapping async Stop hooks do not retry in lockstep
@@ -148,7 +172,11 @@ def post_source_messages(
             if attempt < _TRANSPORT_RETRY_ATTEMPTS and (
                 remaining is None or remaining > 0
             ):
-                delay = _backoff_delay(attempt)
+                # A 429's server-directed wait replaces the jittered backoff:
+                # the server value already staggers clients.
+                delay = _retry_after_seconds(exc) if exc.code == 429 else None
+                if delay is None:
+                    delay = _backoff_delay(attempt)
                 time.sleep(delay if remaining is None else min(delay, remaining))
                 continue
             # Only the finally-raised error reads its body; retried attempts
