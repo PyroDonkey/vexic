@@ -75,7 +75,16 @@ def post_source_messages(
     *,
     messages: list[SourceTranscriptMessage],
     forbidden_values: tuple[str, ...],
+    budget_seconds: float | None = None,
 ) -> dict[str, object]:
+    """POST one batch; `budget_seconds` bounds retries end to end.
+
+    With a budget, retry sleeps and per-attempt timeouts are capped to the
+    remaining budget and an exhausted budget raises
+    `HostedIngestTransportError` instead of attempting again. `None` keeps
+    the unbounded three-attempt behavior. Best-effort: an attempt already
+    in flight is never preempted, only its timeout is bounded.
+    """
     messages_payload = [message.model_dump(mode="json") for message in messages]
     assert_no_forbidden_secret_values_in_payload(
         forbidden_values,
@@ -107,9 +116,26 @@ def post_source_messages(
     # non-HTTP URLError, and read/parse failures on a POST that reached the
     # server) is retried and, once exhausted, re-raised as
     # HostedIngestTransportError so the caller can fail open.
+    started = time.monotonic()
+
+    def _remaining() -> float | None:
+        if budget_seconds is None:
+            return None
+        return budget_seconds - (time.monotonic() - started)
+
     for attempt in range(1, _TRANSPORT_RETRY_ATTEMPTS + 1):
+        remaining = _remaining()
+        if remaining is not None and remaining <= 0:
+            raise HostedIngestTransportError(
+                f"hosted ingest failed: retry budget of {budget_seconds:g}s exhausted"
+            )
+        timeout = (
+            config.timeout_seconds
+            if remaining is None
+            else min(config.timeout_seconds, remaining)
+        )
         try:
-            with urlopen(request, timeout=config.timeout_seconds) as response:
+            with urlopen(request, timeout=timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
             if exc.code < 500 and exc.code not in _RETRYABLE_STATUS_CODES:
@@ -118,8 +144,12 @@ def post_source_messages(
                 raise RuntimeError(
                     f"hosted ingest failed: HTTP {exc.code}{suffix}"
                 ) from exc
-            if attempt < _TRANSPORT_RETRY_ATTEMPTS:
-                time.sleep(_backoff_delay(attempt))
+            remaining = _remaining()
+            if attempt < _TRANSPORT_RETRY_ATTEMPTS and (
+                remaining is None or remaining > 0
+            ):
+                delay = _backoff_delay(attempt)
+                time.sleep(delay if remaining is None else min(delay, remaining))
                 continue
             # Only the finally-raised error reads its body; retried attempts
             # drop theirs so a per-attempt proxy body is never buffered.
@@ -129,8 +159,12 @@ def post_source_messages(
                 f"hosted ingest failed: HTTP {exc.code}{suffix}"
             ) from exc
         except _RESPONSE_TRANSPORT_ERRORS as exc:
-            if attempt < _TRANSPORT_RETRY_ATTEMPTS:
-                time.sleep(_backoff_delay(attempt))
+            remaining = _remaining()
+            if attempt < _TRANSPORT_RETRY_ATTEMPTS and (
+                remaining is None or remaining > 0
+            ):
+                delay = _backoff_delay(attempt)
+                time.sleep(delay if remaining is None else min(delay, remaining))
                 continue
             raise HostedIngestTransportError(
                 f"hosted ingest failed: {_transport_reason(exc)}"

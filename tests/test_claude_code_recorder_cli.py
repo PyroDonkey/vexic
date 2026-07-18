@@ -622,6 +622,183 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
         for args in uniform_mock.call_args_list:
             self.assertEqual(args, call(0.5, 1.5))
 
+    def test_post_source_messages_budget_exhausted_before_first_attempt(self) -> None:
+        from vexic.recorders.hosted_ingest import HostedIngestTransportError
+
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen") as urlopen_mock,
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch(
+                "vexic.recorders.hosted_ingest.time.monotonic",
+                side_effect=[0.0, 12.0],
+            ),
+        ):
+            with self.assertRaisesRegex(HostedIngestTransportError, "budget"):
+                post_source_messages(
+                    config,
+                    messages=[],
+                    forbidden_values=(),
+                    budget_seconds=10.0,
+                )
+
+        urlopen_mock.assert_not_called()
+        sleep_mock.assert_not_called()
+
+    def test_post_source_messages_budget_exhausted_before_retry(self) -> None:
+        from vexic.recorders.hosted_ingest import HostedIngestTransportError
+
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+        calls: list[int] = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(1)
+            raise HTTPError(
+                url="https://api.example.test/v1/ingest_source_transcript",
+                code=503,
+                msg="Service Unavailable",
+                hdrs={},
+                fp=None,
+            )
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch(
+                "vexic.recorders.hosted_ingest.time.monotonic",
+                # started, attempt-1 pre-check, attempt-1 retry decision: the
+                # budget is spent while the first attempt is in flight, so no
+                # second attempt and no sleep may happen.
+                side_effect=[0.0, 5.0, 12.0],
+            ),
+        ):
+            with self.assertRaises(HostedIngestTransportError) as caught:
+                post_source_messages(
+                    config,
+                    messages=[],
+                    forbidden_values=(),
+                    budget_seconds=10.0,
+                )
+
+        self.assertRegex(str(caught.exception), "hosted ingest failed: HTTP 503")
+        self.assertEqual(len(calls), 1)
+        sleep_mock.assert_not_called()
+
+    def test_post_source_messages_retry_sleep_capped_by_remaining_budget(self) -> None:
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self) -> bytes:
+                return b'{"items":[]}'
+
+        calls: list[int] = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(1)
+            if len(calls) == 1:
+                raise HTTPError(
+                    url="https://api.example.test/v1/ingest_source_transcript",
+                    code=503,
+                    msg="Service Unavailable",
+                    hdrs={},
+                    fp=None,
+                )
+            return _Response()
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch("vexic.recorders.hosted_ingest.random.uniform", return_value=1.0),
+            patch(
+                "vexic.recorders.hosted_ingest.time.monotonic",
+                # started, attempt-1 pre-check, attempt-1 retry decision,
+                # attempt-2 pre-check: 0.25s of budget is left at the retry
+                # decision, so the 0.5s backoff must shrink to fit it.
+                side_effect=[0.0, 0.0, 9.75, 9.75],
+            ),
+        ):
+            result = post_source_messages(
+                config,
+                messages=[],
+                forbidden_values=(),
+                budget_seconds=10.0,
+            )
+
+        self.assertEqual(result, {"items": []})
+        self.assertEqual(len(calls), 2)
+        sleep_mock.assert_called_once_with(0.25)
+
+    def test_post_source_messages_urlopen_timeout_capped_by_remaining_budget(
+        self,
+    ) -> None:
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self) -> bytes:
+                return b'{"items":[]}'
+
+        timeouts: list[float] = []
+
+        def fake_urlopen(request, timeout):
+            timeouts.append(timeout)
+            return _Response()
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch(
+                "vexic.recorders.hosted_ingest.time.monotonic",
+                # started, attempt-1 pre-check: 2s of budget left, so the
+                # 30s per-request timeout must shrink to the remaining 2s.
+                side_effect=[0.0, 8.0],
+            ),
+        ):
+            result = post_source_messages(
+                config,
+                messages=[],
+                forbidden_values=(),
+                budget_seconds=10.0,
+            )
+
+        self.assertEqual(result, {"items": []})
+        self.assertEqual(timeouts, [2.0])
+
     def test_post_source_messages_retries_response_read_timeout_then_succeeds(
         self,
     ) -> None:
