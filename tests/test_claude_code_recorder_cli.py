@@ -1093,6 +1093,45 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         self.assertEqual(sleep_mock.call_args_list, [call(0.5), call(1.0)])
 
+    def test_write_status_stamps_written_at_and_pid(self) -> None:
+        from datetime import datetime
+
+        with tempfile.TemporaryDirectory() as temp:
+            status_path = Path(temp) / "status.json"
+            write_status(
+                status_path,
+                RecorderStatus(
+                    ok=True,
+                    operation="ingest",
+                    source_session_id="session-1",
+                    transcript_path=None,
+                ),
+            )
+
+            payload = json.loads(status_path.read_text(encoding="utf-8"))
+            written_at = datetime.fromisoformat(payload["written_at"])
+            self.assertIsNotNone(written_at.tzinfo)
+            self.assertEqual(payload["pid"], os.getpid())
+
+    def test_write_status_preserves_explicit_written_at_and_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            status_path = Path(temp) / "status.json"
+            write_status(
+                status_path,
+                RecorderStatus(
+                    ok=True,
+                    operation="ingest",
+                    source_session_id="session-1",
+                    transcript_path=None,
+                    written_at="2026-07-18T00:00:00+00:00",
+                    pid=12345,
+                ),
+            )
+
+            payload = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["written_at"], "2026-07-18T00:00:00+00:00")
+            self.assertEqual(payload["pid"], 12345)
+
     def test_write_status_does_not_leak_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             status_path = Path(temp) / "status.json"
