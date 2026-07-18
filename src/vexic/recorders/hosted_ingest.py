@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import random
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from http.client import IncompleteRead
+from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
@@ -62,7 +64,13 @@ def _backoff_delay(attempt: int) -> float:
 _RESPONSE_READ_CHUNK_BYTES = 64 * 1024
 
 
-def _read_with_budget(response, remaining_fn) -> bytes:
+class _BodyReader(Protocol):
+    def read(self, size: int = -1, /) -> bytes: ...
+
+
+def _read_with_budget(
+    response: _BodyReader, remaining_fn: Callable[[], float | None]
+) -> bytes:
     """Read the whole body, re-checking the retry budget between recvs.
 
     The socket timeout bounds each recv, not the total read, so a proxy that
