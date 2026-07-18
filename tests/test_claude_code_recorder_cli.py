@@ -360,6 +360,7 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
         with (
             patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
             patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch("vexic.recorders.hosted_ingest.random.uniform", return_value=1.0),
         ):
             result = post_source_messages(config, messages=[], forbidden_values=())
 
@@ -397,6 +398,7 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
         with (
             patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
             patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch("vexic.recorders.hosted_ingest.random.uniform", return_value=1.0),
         ):
             result = post_source_messages(config, messages=[], forbidden_values=())
 
@@ -463,6 +465,7 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
         with (
             patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
             patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch("vexic.recorders.hosted_ingest.random.uniform", return_value=1.0),
         ):
             with self.assertRaises(HostedIngestTransportError) as caught:
                 post_source_messages(config, messages=[], forbidden_values=())
@@ -470,6 +473,40 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
         self.assertRegex(str(caught.exception), "hosted ingest failed: HTTP 503")
         self.assertEqual(len(calls), 3)
         self.assertEqual(sleep_mock.call_args_list, [call(0.5), call(1.0)])
+
+    def test_post_source_messages_backoff_is_jittered(self) -> None:
+        from vexic.recorders.hosted_ingest import HostedIngestTransportError
+
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        def fake_urlopen(request, timeout):
+            raise HTTPError(
+                url="https://api.example.test/v1/ingest_source_transcript",
+                code=503,
+                msg="Service Unavailable",
+                hdrs={},
+                fp=None,
+            )
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch(
+                "vexic.recorders.hosted_ingest.random.uniform", return_value=1.5
+            ) as uniform_mock,
+        ):
+            with self.assertRaises(HostedIngestTransportError):
+                post_source_messages(config, messages=[], forbidden_values=())
+
+        self.assertEqual(sleep_mock.call_args_list, [call(0.75), call(1.5)])
+        for args in uniform_mock.call_args_list:
+            self.assertEqual(args, call(0.5, 1.5))
 
     def test_post_source_messages_retries_response_read_timeout_then_succeeds(
         self,
@@ -506,6 +543,7 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
         with (
             patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
             patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch("vexic.recorders.hosted_ingest.random.uniform", return_value=1.0),
         ):
             result = post_source_messages(config, messages=[], forbidden_values=())
 
@@ -546,6 +584,7 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
         with (
             patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
             patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch("vexic.recorders.hosted_ingest.random.uniform", return_value=1.0),
         ):
             result = post_source_messages(config, messages=[], forbidden_values=())
 
@@ -586,6 +625,7 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
         with (
             patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
             patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch("vexic.recorders.hosted_ingest.random.uniform", return_value=1.0),
         ):
             with self.assertRaises(HostedIngestTransportError) as caught:
                 post_source_messages(config, messages=[], forbidden_values=())

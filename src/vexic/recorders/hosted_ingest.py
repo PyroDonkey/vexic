@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 import time
 from dataclasses import dataclass
 from http.client import IncompleteRead
@@ -19,6 +20,13 @@ from vexic.url_policy import require_http_url
 # dedupes any row that a retried-then-succeeded attempt double-delivers.
 _TRANSPORT_RETRY_ATTEMPTS = 3
 _TRANSPORT_RETRY_BACKOFF_SECONDS = 0.5
+
+
+def _backoff_delay(attempt: int) -> float:
+    # Jittered so overlapping async Stop hooks do not retry in lockstep
+    # against a struggling server; the multiplier form keeps the delay
+    # attempt-proportional and never zero.
+    return _TRANSPORT_RETRY_BACKOFF_SECONDS * attempt * random.uniform(0.5, 1.5)
 
 # Read/parse-phase failures on a POST that already reached the server. The POST
 # may have committed server-side, so re-POSTing is safe only because the ledger
@@ -103,7 +111,7 @@ def post_source_messages(
                     f"hosted ingest failed: HTTP {exc.code}{suffix}"
                 ) from exc
             if attempt < _TRANSPORT_RETRY_ATTEMPTS:
-                time.sleep(_TRANSPORT_RETRY_BACKOFF_SECONDS * attempt)
+                time.sleep(_backoff_delay(attempt))
                 continue
             # Only the finally-raised error reads its body; retried attempts
             # drop theirs so a per-attempt proxy body is never buffered.
@@ -114,7 +122,7 @@ def post_source_messages(
             ) from exc
         except _RESPONSE_TRANSPORT_ERRORS as exc:
             if attempt < _TRANSPORT_RETRY_ATTEMPTS:
-                time.sleep(_TRANSPORT_RETRY_BACKOFF_SECONDS * attempt)
+                time.sleep(_backoff_delay(attempt))
                 continue
             raise HostedIngestTransportError(
                 f"hosted ingest failed: {_transport_reason(exc)}"
