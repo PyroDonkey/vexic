@@ -150,11 +150,15 @@ The setup command updates the user's Claude Code hook config and writes a Vexic
 recorder config outside the repository. It installs a Stop hook for writes and a
 SessionStart hook for best-effort read priming on `startup` and `clear`;
 `resume` is skipped to avoid duplicate context dumps. No `.mcp.json` is written.
-The Stop hook is installed async: a transient hosted 5xx or connectivity failure
-is retried and then reported as a non-blocking warning in the recorder status
-file instead of derailing the conversation (a hosted 4xx auth/config fault still
-surfaces loudly). Installs made before this behavior must re-run
-`vexic setup claude-code` to upgrade the Stop hook to async.
+The Stop hook is installed async: a transient hosted 5xx, 429/408 (a 429
+honors an integer-seconds `Retry-After`), or connectivity failure is retried
+with jittered backoff under an end-to-end ingest deadline (`--deadline-seconds`,
+default 100s, inside the hook's 120s kill), and then reported as a non-blocking
+warning in the recorder status file instead of derailing the conversation; the
+next run re-posts from the start and the hosted ledger dedups (any other hosted
+4xx auth/config fault still surfaces loudly). Installs made before this
+behavior must re-run `vexic setup claude-code` to upgrade the Stop hook to
+async.
 
 Read-only memory search is opt-in (ADR 0027). Instead of writing any client
 config, setup *prints* a `claude mcp add vexic -- ...` command and leaves it to
