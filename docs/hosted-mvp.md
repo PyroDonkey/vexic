@@ -713,7 +713,10 @@ active tenant in the catalog and, per recorded agent scope:
   shorter failure backoff (`VEXIC_DREAM_FAILURE_BACKOFF_SECONDS`, default
   3600): a transient storage-write fault recovers within ~one backoff window,
   while a persistent unrecorded failure retries at that cadence rather than
-  re-running the full chain every tick.
+  re-running the full chain every tick. Before any phase runs, the pre-phase
+  tenant/connection prelude retries in-process on `retryable_operational`
+  storage faults (bounded attempts, ADR 0030 amendment); phase execution
+  itself and `MutationOutcomeUnknown` are never retried and fail closed.
 
 Scheduling reuses the trigger endpoint's machinery through
 `HostedMemoryService.schedule_system_dream`: pre-bound, server-minted
