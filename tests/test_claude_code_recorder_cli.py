@@ -630,25 +630,31 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
             post_source_messages(config, messages=[], forbidden_values=())
         sleep_mock.assert_called_once_with(30.0)
 
-        # With a budget the remaining budget caps it further.
+        # With a budget too small for the server-directed wait, the fault
+        # surfaces immediately instead of sleeping into certain exhaustion.
+        from vexic.recorders.hosted_ingest import HostedIngestTransportError
+
         calls = []
         with (
             patch("vexic.recorders.hosted_ingest.urlopen", make_urlopen(calls)),
             patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
             patch(
                 "vexic.recorders.hosted_ingest.time.monotonic",
-                # started, attempt-1 pre-check, retry decision (5s left),
-                # attempt-2 pre-check.
-                side_effect=[0.0, 0.0, 5.0, 5.0],
+                # started, attempt-1 pre-check, retry decision (5s left,
+                # which cannot fit the 30s-capped Retry-After wait).
+                side_effect=[0.0, 0.0, 5.0],
             ),
         ):
-            post_source_messages(
-                config,
-                messages=[],
-                forbidden_values=(),
-                budget_seconds=10.0,
-            )
-        sleep_mock.assert_called_once_with(5.0)
+            with self.assertRaises(HostedIngestTransportError) as caught:
+                post_source_messages(
+                    config,
+                    messages=[],
+                    forbidden_values=(),
+                    budget_seconds=10.0,
+                )
+        self.assertRegex(str(caught.exception), "hosted ingest failed: HTTP 429")
+        self.assertEqual(len(calls), 1)
+        sleep_mock.assert_not_called()
 
     def test_post_source_messages_408_exhausts_to_transport_error(self) -> None:
         from vexic.recorders.hosted_ingest import HostedIngestTransportError
@@ -863,7 +869,12 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         sleep_mock.assert_not_called()
 
-    def test_post_source_messages_retry_sleep_capped_by_remaining_budget(self) -> None:
+    def test_post_source_messages_skips_sleep_that_cannot_fit_the_budget(self) -> None:
+        # Sleeping into a guaranteed budget failure would only delay the
+        # fail-open exit: when the backoff cannot fit the remaining budget the
+        # underlying fault surfaces immediately, keeping its HTTP code.
+        from vexic.recorders.hosted_ingest import HostedIngestTransportError
+
         config = HostedIngestConfig(
             base_url="https://api.example.test",
             api_key="vx_secret",
@@ -871,30 +882,17 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
             session_id="session-a",
             agent_id=None,
         )
-
-        class _Response:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_exc):
-                return False
-
-            def read(self) -> bytes:
-                return b'{"items":[]}'
-
         calls: list[int] = []
 
         def fake_urlopen(request, timeout):
             calls.append(1)
-            if len(calls) == 1:
-                raise HTTPError(
-                    url="https://api.example.test/v1/ingest_source_transcript",
-                    code=503,
-                    msg="Service Unavailable",
-                    hdrs={},
-                    fp=None,
-                )
-            return _Response()
+            raise HTTPError(
+                url="https://api.example.test/v1/ingest_source_transcript",
+                code=503,
+                msg="Service Unavailable",
+                hdrs={},
+                fp=None,
+            )
 
         with (
             patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
@@ -902,22 +900,23 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
             patch("vexic.recorders.hosted_ingest.random.uniform", return_value=1.0),
             patch(
                 "vexic.recorders.hosted_ingest.time.monotonic",
-                # started, attempt-1 pre-check, attempt-1 retry decision,
-                # attempt-2 pre-check: 0.25s of budget is left at the retry
-                # decision, so the 0.5s backoff must shrink to fit it.
-                side_effect=[0.0, 0.0, 9.75, 9.75],
+                # started, attempt-1 pre-check, attempt-1 retry decision:
+                # 0.25s of budget is left there, which cannot fit the 0.5s
+                # backoff.
+                side_effect=[0.0, 0.0, 9.75],
             ),
         ):
-            result = post_source_messages(
-                config,
-                messages=[],
-                forbidden_values=(),
-                budget_seconds=10.0,
-            )
+            with self.assertRaises(HostedIngestTransportError) as caught:
+                post_source_messages(
+                    config,
+                    messages=[],
+                    forbidden_values=(),
+                    budget_seconds=10.0,
+                )
 
-        self.assertEqual(result, {"items": []})
-        self.assertEqual(len(calls), 2)
-        sleep_mock.assert_called_once_with(0.25)
+        self.assertRegex(str(caught.exception), "hosted ingest failed: HTTP 503")
+        self.assertEqual(len(calls), 1)
+        sleep_mock.assert_not_called()
 
     def test_post_source_messages_urlopen_timeout_capped_by_remaining_budget(
         self,

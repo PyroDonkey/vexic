@@ -179,6 +179,23 @@ def _positive_float(value: str) -> float:
     return parsed
 
 
+def _warn_hook_kill_margin(
+    deadline_seconds: float,
+    kill_seconds: float,
+    hook_name: str,
+    consequence: str,
+) -> None:
+    # A deadline crowding the hook kill silently recreates the uncontrolled
+    # mid-flight kill the deadline exists to prevent.
+    if deadline_seconds >= kill_seconds - 5:
+        print(
+            "warning: --deadline-seconds "
+            f"{deadline_seconds:g} leaves under 5s of margin before "
+            f"the {hook_name} hook kill ({kill_seconds:g}s); {consequence}",
+            file=sys.stderr,
+        )
+
+
 def _prime_status_path(path: Path | None) -> Path | None:
     # Prime records land in a sibling file, never the ingest status file: an
     # async Stop ingest overwriting a killed prime's stale "started" marker
@@ -434,14 +451,12 @@ def _ingest(args: argparse.Namespace) -> int:
         agent_id=args.agent_id,
         timeout_seconds=args.timeout_seconds,
     )
-    if args.deadline_seconds >= _STOP_HOOK_KILL_SECONDS - 5:
-        print(
-            "warning: --deadline-seconds "
-            f"{args.deadline_seconds:g} leaves under 5s of margin before "
-            f"the Stop hook kill ({_STOP_HOOK_KILL_SECONDS:g}s); a kill "
-            "skips the degraded status write and the controlled exit",
-            file=sys.stderr,
-        )
+    _warn_hook_kill_margin(
+        args.deadline_seconds,
+        _STOP_HOOK_KILL_SECONDS,
+        "Stop",
+        "a kill skips the degraded status write and the controlled exit",
+    )
     items: list[SourceTranscriptIngestItemResult] = []
     batches = list(_iter_hosted_message_batches(messages))
     started = time.monotonic()
@@ -567,14 +582,12 @@ def _prime(args: argparse.Namespace) -> int:
                 phase="started",
             ),
         )
-        if args.deadline_seconds >= _SESSION_START_HOOK_KILL_SECONDS - 5:
-            print(
-                "warning: --deadline-seconds "
-                f"{args.deadline_seconds:g} leaves under 5s of margin before "
-                f"the SessionStart hook kill ({_SESSION_START_HOOK_KILL_SECONDS:g}s); "
-                "a kill discards the entire priming block",
-                file=sys.stderr,
-            )
+        _warn_hook_kill_margin(
+            args.deadline_seconds,
+            _SESSION_START_HOOK_KILL_SECONDS,
+            "SessionStart",
+            "a kill discards the entire priming block",
+        )
         result = fetch_prime_context(
             HostedPrimeConfig(
                 base_url=args.base_url,

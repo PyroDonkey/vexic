@@ -58,6 +58,22 @@ def _backoff_delay(attempt: int) -> float:
     # attempt-proportional and never zero.
     return _TRANSPORT_RETRY_BACKOFF_SECONDS * attempt * random.uniform(0.5, 1.5)
 
+
+def _sleep_before_retry(attempt: int, remaining: float | None, delay: float) -> bool:
+    """Sleep ahead of one more attempt, or return False when retries are spent.
+
+    False when attempts are exhausted or the delay cannot fit the remaining
+    budget: sleeping into a guaranteed budget failure would only postpone the
+    fail-open exit and bury the underlying fault behind a generic budget
+    message.
+    """
+    if attempt >= _TRANSPORT_RETRY_ATTEMPTS:
+        return False
+    if remaining is not None and delay >= remaining:
+        return False
+    time.sleep(delay)
+    return True
+
 # Read/parse-phase failures on a POST that already reached the server. The POST
 # may have committed server-side, so re-POSTing is safe only because the ledger
 # dedupes; that is the same ambiguity fail-open + dedupe is built to absorb.
@@ -168,16 +184,12 @@ def post_source_messages(
                 raise RuntimeError(
                     f"hosted ingest failed: HTTP {exc.code}{suffix}"
                 ) from exc
-            remaining = _remaining()
-            if attempt < _TRANSPORT_RETRY_ATTEMPTS and (
-                remaining is None or remaining > 0
-            ):
-                # A 429's server-directed wait replaces the jittered backoff:
-                # the server value already staggers clients.
-                delay = _retry_after_seconds(exc) if exc.code == 429 else None
-                if delay is None:
-                    delay = _backoff_delay(attempt)
-                time.sleep(delay if remaining is None else min(delay, remaining))
+            # A 429's server-directed wait replaces the jittered backoff:
+            # the server value already staggers clients.
+            delay = _retry_after_seconds(exc) if exc.code == 429 else None
+            if delay is None:
+                delay = _backoff_delay(attempt)
+            if _sleep_before_retry(attempt, _remaining(), delay):
                 continue
             # Only the finally-raised error reads its body; retried attempts
             # drop theirs so a per-attempt proxy body is never buffered.
@@ -187,12 +199,7 @@ def post_source_messages(
                 f"hosted ingest failed: HTTP {exc.code}{suffix}"
             ) from exc
         except _RESPONSE_TRANSPORT_ERRORS as exc:
-            remaining = _remaining()
-            if attempt < _TRANSPORT_RETRY_ATTEMPTS and (
-                remaining is None or remaining > 0
-            ):
-                delay = _backoff_delay(attempt)
-                time.sleep(delay if remaining is None else min(delay, remaining))
+            if _sleep_before_retry(attempt, _remaining(), _backoff_delay(attempt)):
                 continue
             raise HostedIngestTransportError(
                 f"hosted ingest failed: {_transport_reason(exc)}"
