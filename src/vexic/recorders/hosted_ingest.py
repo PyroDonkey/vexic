@@ -5,7 +5,7 @@ import random
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from http.client import IncompleteRead
+from http.client import HTTPException
 from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
@@ -51,7 +51,11 @@ def _retry_after_seconds(exc: HTTPError) -> float | None:
         return None
     if seconds <= 0:
         return None
-    return min(float(seconds), _RETRY_AFTER_MAX_SECONDS)
+    # Compare as int before converting: int() parses arbitrary precision and
+    # float() overflows on a huge value, which must cap, not raise.
+    if seconds >= _RETRY_AFTER_MAX_SECONDS:
+        return _RETRY_AFTER_MAX_SECONDS
+    return float(seconds)
 
 
 def _backoff_delay(attempt: int) -> float:
@@ -115,7 +119,7 @@ def _sleep_before_retry(attempt: int, remaining: float | None, delay: float) -> 
 # dedupes; that is the same ambiguity fail-open + dedupe is built to absorb.
 _RESPONSE_TRANSPORT_ERRORS = (
     OSError,  # includes URLError, socket timeout, connection reset
-    IncompleteRead,
+    HTTPException,  # garbled replies: IncompleteRead, BadStatusLine, LineTooLong
     json.JSONDecodeError,
     UnicodeDecodeError,
 )

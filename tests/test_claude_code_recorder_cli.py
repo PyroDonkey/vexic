@@ -587,6 +587,95 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
                 self.assertEqual(result, {"items": []})
                 sleep_mock.assert_called_once_with(0.5)
 
+    def test_post_source_messages_huge_retry_after_is_capped_not_loud(self) -> None:
+        # int() parses arbitrary precision, so a 400-digit Retry-After must
+        # cap at the constant instead of overflowing float() into a loud
+        # exit-2 ValueError path.
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self, size: int = -1) -> bytes:
+                return b'{"items":[]}'
+
+        calls: list[int] = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(1)
+            if len(calls) == 1:
+                raise HTTPError(
+                    url="https://api.example.test/v1/ingest_source_transcript",
+                    code=429,
+                    msg="Too Many Requests",
+                    hdrs={"Retry-After": "9" * 400},
+                    fp=None,
+                )
+            return _Response()
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+        ):
+            result = post_source_messages(config, messages=[], forbidden_values=())
+
+        self.assertEqual(result, {"items": []})
+        sleep_mock.assert_called_once_with(30.0)
+
+    def test_post_source_messages_retries_garbled_status_line_then_succeeds(
+        self,
+    ) -> None:
+        # A garbled status line is a lost/garbled reply like IncompleteRead:
+        # it belongs to the retried transport class, not the loud exit-2 path.
+        from http.client import BadStatusLine
+
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self, size: int = -1) -> bytes:
+                return b'{"items":[]}'
+
+        calls: list[int] = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(1)
+            if len(calls) == 1:
+                raise BadStatusLine("<garbage>")
+            return _Response()
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch("vexic.recorders.hosted_ingest.random.uniform", return_value=1.0),
+        ):
+            result = post_source_messages(config, messages=[], forbidden_values=())
+
+        self.assertEqual(result, {"items": []})
+        self.assertEqual(len(calls), 2)
+        sleep_mock.assert_called_once_with(0.5)
+
     def test_post_source_messages_retry_after_capped(self) -> None:
         config = HostedIngestConfig(
             base_url="https://api.example.test",
