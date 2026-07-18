@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 import threading
 import time
@@ -128,7 +129,11 @@ def fetch_prime_context(
         ),
     }
     # Validate before fanning out so a bad base_url raises synchronously to
-    # the caller instead of dying inside worker threads.
+    # the caller instead of dying inside worker threads. Non-finite deadlines
+    # would turn thread.join into OverflowError (inf) or timing-dependent
+    # no-waits (nan).
+    if not (deadline_seconds > 0 and math.isfinite(deadline_seconds)):
+        raise ValueError("deadline_seconds must be a positive, finite number")
     require_http_url("base_url", config.base_url)
     results: dict[str, dict[str, object]] = {}
     legs: dict[str, dict[str, object]] = {}

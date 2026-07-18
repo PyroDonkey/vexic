@@ -203,9 +203,12 @@ and adds no serial wait).
 > now fans the three reads out in parallel daemon threads under an
 > end-to-end deadline (default 20s, `--deadline-seconds`); reads that miss
 > the deadline degrade to their empty fallbacks. The dream trigger spawn
-> moved after the reads, and prime writes started/finished status records
-> (per-leg durations) so an external kill leaves a stale `started` marker as
-> evidence.
+> moved after the reads (and, with the final status write, runs on a daemon
+> thread joined against the leftover hook budget so a post-print stall is
+> abandoned, not waited into the kill), and prime writes started/finished
+> status records (per-leg durations) to a sibling `-prime` status file so an
+> external kill leaves a stale `started` marker as evidence that an
+> overlapping ingest cannot overwrite.
 
 ### D5 -- Cron producer: a new, deliberately dumb scheduled workflow
 

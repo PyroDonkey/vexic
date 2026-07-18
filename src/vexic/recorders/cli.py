@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -159,9 +161,21 @@ _SESSION_START_HOOK_KILL_SECONDS = 30.0
 
 def _positive_float(value: str) -> float:
     parsed = float(value)
-    if not parsed > 0:
-        raise argparse.ArgumentTypeError("must be a positive number of seconds")
+    if not (parsed > 0 and math.isfinite(parsed)):
+        raise argparse.ArgumentTypeError(
+            "must be a positive, finite number of seconds"
+        )
     return parsed
+
+
+def _prime_status_path(path: Path | None) -> Path | None:
+    # Prime records land in a sibling file, never the ingest status file: an
+    # async Stop ingest overwriting a killed prime's stale "started" marker
+    # would destroy the very evidence the marker exists to preserve, and a
+    # prime write would likewise erase ingest counts an operator needs.
+    if path is None:
+        return None
+    return path.with_name(f"{path.stem}-prime{path.suffix}")
 
 
 def _try_write_status(path: Path | None, status: RecorderStatus) -> str | None:
@@ -508,7 +522,7 @@ def _prime(args: argparse.Namespace) -> int:
         # this process at its timeout and no in-process handler can run, so a
         # stale "started" record is the only durable evidence of a kill.
         _try_write_status(
-            args.status_path,
+            _prime_status_path(args.status_path),
             RecorderStatus(
                 ok=False,
                 operation="prime",
@@ -553,28 +567,43 @@ def _prime(args: argparse.Namespace) -> int:
                 ),
                 flush=True,
             )
-        _try_write_status(
-            args.status_path,
-            RecorderStatus(
-                ok=True,
-                operation="prime",
-                source_session_id=status_session_id,
-                transcript_path=None,
-                phase="finished",
-                legs=result.legs,
-                duration_ms=int((time.monotonic() - started) * 1000),
-            ),
+        # The harness discards even flushed stdout unless the process exits
+        # cleanly before the hook kill, so the remaining work (status write,
+        # dream spawn) runs in a daemon thread joined against the leftover
+        # hook budget: a stall there is abandoned, never waited into the
+        # kill window. Spawn stays after the reads so prime's own dream
+        # trigger cannot compete with them for hosted capacity (ADR 0025 D4
+        # follow-up).
+        def _finish() -> None:
+            _try_write_status(
+                _prime_status_path(args.status_path),
+                RecorderStatus(
+                    ok=True,
+                    operation="prime",
+                    source_session_id=status_session_id,
+                    transcript_path=None,
+                    phase="finished",
+                    legs=result.legs,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                ),
+            )
+            _spawn_trigger_dream(args.config)
+
+        finisher = threading.Thread(target=_finish, daemon=True)
+        finisher.start()
+        finisher.join(
+            max(
+                0.0,
+                (_SESSION_START_HOOK_KILL_SECONDS - 5.0)
+                - (time.monotonic() - started),
+            )
         )
-        # Spawned last so prime's own dream trigger can neither compete with
-        # the reads for hosted capacity nor delay stdout delivery (ADR 0025
-        # D4 follow-up).
-        _spawn_trigger_dream(args.config)
     except Exception as exc:
         # SessionStart priming is fail-open: stderr is the operator signal,
         # stdout stays empty so Claude Code receives no unsafe context.
         print(f"warning: {exc}", file=sys.stderr)
         _try_write_status(
-            getattr(args, "status_path", None),
+            _prime_status_path(getattr(args, "status_path", None)),
             RecorderStatus(
                 ok=False,
                 operation="prime",

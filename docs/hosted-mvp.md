@@ -765,10 +765,16 @@ exits `0` and never affects prime's own output or exit code.
   fan out in parallel daemon threads under an end-to-end deadline
   (`--deadline-seconds`, default 20s) inside `fetch_prime_context`; reads
   that miss the deadline degrade to their empty fallbacks and prime always
-  exits cleanly before the hook kill. `recorder prime` also writes a
-  `phase: "started"` attempt marker to the recorder status file before its
-  reads and a `phase: "finished"` record with per-leg durations after, so an
-  external kill leaves durable evidence instead of nothing.
+  exits cleanly before the hook kill; work remaining after the block is
+  printed (final status write, dream spawn) runs on a daemon thread joined
+  against the leftover hook budget so a stall there is abandoned rather than
+  waited into the kill window. `recorder prime` also writes a
+  `phase: "started"` attempt marker before its reads and a
+  `phase: "finished"` record with per-leg durations after, into a sibling
+  `<status-name>-prime.json` file (never the ingest status file, so
+  overlapping Stop-hook ingests and prime cannot erase each other's
+  records); a stale `started` marker is durable evidence of an external
+  kill.
 
 Revoke a throwaway key by key id, not by raw key:
 

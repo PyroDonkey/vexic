@@ -3851,6 +3851,12 @@ class ClaudeCodeRecorderPrimeDeadlineTests(unittest.TestCase):
         extra_argv: list[str] | None = None,
         config_overrides: dict[str, object] | None = None,
     ) -> tuple[int, str, float, Path]:
+        entered: list[str] = []
+
+        def counting_urlopen(request, timeout):
+            entered.append(request.full_url)
+            return fake_urlopen(request, timeout)
+
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             config_path = _write_trigger_config(root, **(config_overrides or {}))
@@ -3859,7 +3865,7 @@ class ClaudeCodeRecorderPrimeDeadlineTests(unittest.TestCase):
             stdout = io.StringIO()
             started = time.monotonic()
             with (
-                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                patch("vexic.recorders.hosted_prime.urlopen", counting_urlopen),
                 patch("vexic.recorders.cli.subprocess.Popen") as _popen,
                 contextlib.redirect_stdout(stdout),
             ):
@@ -3873,7 +3879,13 @@ class ClaudeCodeRecorderPrimeDeadlineTests(unittest.TestCase):
                         *(extra_argv or []),
                     ]
                 )
-            elapsed = time.monotonic() - started
+                elapsed = time.monotonic() - started
+                # Abandoned daemon workers must enter the fake before the
+                # patch is unwound, or a late-scheduled worker would hit the
+                # real urlopen after the test ends.
+                settle_deadline = time.monotonic() + 5.0
+                while len(entered) < 3 and time.monotonic() < settle_deadline:
+                    time.sleep(0.01)
             return code, stdout.getvalue(), elapsed, root
 
     def test_prime_reads_dispatch_in_parallel(self) -> None:
@@ -3949,7 +3961,8 @@ class ClaudeCodeRecorderPrimeDeadlineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             status_path = root / "status.json"
-            status_holder["path"] = status_path
+            prime_status_path = root / "status-prime.json"
+            status_holder["path"] = prime_status_path
             config_path = _write_trigger_config(root)
             hook_payload = root / "session-start.json"
             hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
@@ -3979,7 +3992,7 @@ class ClaudeCodeRecorderPrimeDeadlineTests(unittest.TestCase):
                 )
                 self.assertEqual(marker["operation"], "prime")
                 self.assertEqual(marker["phase"], "started")
-            final = json.loads(status_path.read_text(encoding="utf-8"))
+            final = json.loads(prime_status_path.read_text(encoding="utf-8"))
             self.assertEqual(final["operation"], "prime")
             self.assertEqual(final["phase"], "finished")
             self.assertTrue(final["ok"])
@@ -4023,7 +4036,7 @@ class ClaudeCodeRecorderPrimeDeadlineTests(unittest.TestCase):
                 )
 
             self.assertEqual(code, 0)
-            final = json.loads(status_path.read_text(encoding="utf-8"))
+            final = json.loads((root / "status-prime.json").read_text(encoding="utf-8"))
             self.assertTrue(final["ok"])
             self.assertEqual(final["legs"]["search_transcript"]["outcome"], "deadline")
             self.assertEqual(final["legs"]["fresh_context"]["outcome"], "ok")
@@ -4093,7 +4106,7 @@ class ClaudeCodeRecorderPrimeDeadlineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             status_path = root / "status.json"
-            status_holder["path"] = status_path
+            status_holder["path"] = root / "status-prime.json"
             config_path = _write_trigger_config(root)
             hook_payload = root / "session-start.json"
             hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
@@ -4208,6 +4221,117 @@ class ClaudeCodeRecorderPrimeDeadlineTests(unittest.TestCase):
                 "deadline",
                 "late-finishing worker must not rewrite a decided leg",
             )
+
+    def test_prime_status_lands_in_sibling_file_leaving_ingest_record_intact(self) -> None:
+        # Prime and ingest sharing one status file would let an async Stop
+        # ingest overwrite a killed prime's stale "started" marker — the very
+        # evidence the marker exists to preserve — and vice versa.
+        def fake_urlopen(request, timeout):
+            return _PrimeFakeResponse(_prime_endpoint_payload(request.full_url))
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            status_path = root / "status.json"
+            ingest_record = '{"ok": true, "operation": "ingest", "inserted": 7}\n'
+            status_path.write_text(ingest_record, encoding="utf-8")
+            config_path = _write_trigger_config(root)
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                patch("vexic.recorders.cli.subprocess.Popen"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--status-path",
+                        str(status_path),
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(
+                status_path.read_text(encoding="utf-8"),
+                ingest_record,
+                "prime must never touch the ingest status file",
+            )
+            prime_status = json.loads(
+                (root / "status-prime.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(prime_status["operation"], "prime")
+            self.assertEqual(prime_status["phase"], "finished")
+
+    def test_prime_deadline_flag_rejects_non_finite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = _write_trigger_config(root)
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--deadline-seconds",
+                        "inf",
+                    ]
+                )
+            self.assertEqual(code, 2, "inf must be a usage error, not join(inf)")
+            self.assertIn("finite", stderr.getvalue())
+
+    def test_prime_exits_within_hook_budget_when_post_print_work_stalls(self) -> None:
+        # The harness discards even flushed stdout unless the process exits
+        # cleanly before the hook kill, so a stalled dream spawn or status
+        # write after print must be abandoned, not waited on.
+        def fake_urlopen(request, timeout):
+            return _PrimeFakeResponse(_prime_endpoint_payload(request.full_url))
+
+        def stalling_popen(argv, **kwargs):
+            time.sleep(3.0)
+
+            class _FakeProcess:
+                pass
+
+            return _FakeProcess()
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = _write_trigger_config(root)
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            stdout = io.StringIO()
+            started = time.monotonic()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                patch("vexic.recorders.cli.subprocess.Popen", stalling_popen),
+                patch("vexic.recorders.cli._SESSION_START_HOOK_KILL_SECONDS", 5.0),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+            elapsed = time.monotonic() - started
+
+        self.assertEqual(code, 0)
+        self.assertLess(
+            elapsed,
+            2.0,
+            "post-print stall must be abandoned inside the hook budget",
+        )
+        emitted = json.loads(stdout.getvalue())
+        self.assertIn(
+            "Durable cedar preference",
+            emitted["hookSpecificOutput"]["additionalContext"],
+        )
 
 
 class _FakeSetupResult:
