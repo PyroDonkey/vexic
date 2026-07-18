@@ -151,6 +151,19 @@ def _argv_status_path(argv: list[str]) -> Path | None:
     return None
 
 
+# The Claude Code SessionStart hook installed by claude_setup kills prime at
+# this many seconds; a fetch deadline at or beyond it silently recreates the
+# lost-block failure the deadline exists to prevent.
+_SESSION_START_HOOK_KILL_SECONDS = 30.0
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if not parsed > 0:
+        raise argparse.ArgumentTypeError("must be a positive number of seconds")
+    return parsed
+
+
 def _try_write_status(path: Path | None, status: RecorderStatus) -> str | None:
     if path is None:
         return None
@@ -186,7 +199,11 @@ def _parser() -> argparse.ArgumentParser:
     prime.add_argument("--session-id")
     prime.add_argument("--agent-id")
     prime.add_argument("--timeout-seconds", type=float, default=15.0)
-    prime.add_argument("--deadline-seconds", type=float, default=PRIME_DEADLINE_SECONDS)
+    prime.add_argument(
+        "--deadline-seconds",
+        type=_positive_float,
+        default=PRIME_DEADLINE_SECONDS,
+    )
     prime.add_argument("--max-chars", type=int, default=DEFAULT_PRIME_MAX_CHARS)
     prime.add_argument("--status-path", type=Path)
 
@@ -500,6 +517,14 @@ def _prime(args: argparse.Namespace) -> int:
                 phase="started",
             ),
         )
+        if args.deadline_seconds >= _SESSION_START_HOOK_KILL_SECONDS - 5:
+            print(
+                "warning: --deadline-seconds "
+                f"{args.deadline_seconds:g} leaves under 5s of margin before "
+                f"the SessionStart hook kill ({_SESSION_START_HOOK_KILL_SECONDS:g}s); "
+                "a kill discards the entire priming block",
+                file=sys.stderr,
+            )
         result = fetch_prime_context(
             HostedPrimeConfig(
                 base_url=args.base_url,
@@ -512,10 +537,22 @@ def _prime(args: argparse.Namespace) -> int:
             max_chars=args.max_chars,
             deadline_seconds=args.deadline_seconds,
         )
-        # Spawned after the reads so prime's own dream trigger cannot compete
-        # with them for hosted capacity inside the hook budget (ADR 0025 D4
-        # follow-up).
-        _spawn_trigger_dream(args.config)
+        # stdout first: the hook consumes it only on a clean pre-timeout
+        # exit, so nothing that can stall (status I/O, subprocess spawn) may
+        # sit between a successful fetch and the print.
+        if result.context:
+            print(
+                json.dumps(
+                    {
+                        "hookSpecificOutput": {
+                            "hookEventName": "SessionStart",
+                            "additionalContext": result.context,
+                        }
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
         _try_write_status(
             args.status_path,
             RecorderStatus(
@@ -528,6 +565,10 @@ def _prime(args: argparse.Namespace) -> int:
                 duration_ms=int((time.monotonic() - started) * 1000),
             ),
         )
+        # Spawned last so prime's own dream trigger can neither compete with
+        # the reads for hosted capacity nor delay stdout delivery (ADR 0025
+        # D4 follow-up).
+        _spawn_trigger_dream(args.config)
     except Exception as exc:
         # SessionStart priming is fail-open: stderr is the operator signal,
         # stdout stays empty so Claude Code receives no unsafe context.
@@ -545,19 +586,6 @@ def _prime(args: argparse.Namespace) -> int:
             ),
         )
         return 0
-    if not result.context:
-        return 0
-    print(
-        json.dumps(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "SessionStart",
-                    "additionalContext": result.context,
-                }
-            },
-            sort_keys=True,
-        )
-    )
     return 0
 
 

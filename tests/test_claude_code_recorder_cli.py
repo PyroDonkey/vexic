@@ -4065,6 +4065,150 @@ class ClaudeCodeRecorderPrimeDeadlineTests(unittest.TestCase):
         self.assertEqual(events.count("spawn"), 1)
         self.assertEqual(events.count("read"), 3)
 
+    def test_prime_prints_context_before_spawn_and_final_status(self) -> None:
+        # A stalled Popen or status write after a successful fetch must not be
+        # able to hold the block inside the hook kill window: stdout first.
+        stdout_at_spawn: list[str] = []
+        status_exists_at_spawn: list[bool] = []
+        stdout = io.StringIO()
+        status_holder: dict[str, Path] = {}
+
+        def fake_urlopen(request, timeout):
+            return _PrimeFakeResponse(_prime_endpoint_payload(request.full_url))
+
+        def fake_popen(argv, **kwargs):
+            stdout_at_spawn.append(stdout.getvalue())
+            status_path = status_holder["path"]
+            if status_path.exists():
+                payload = json.loads(status_path.read_text(encoding="utf-8"))
+                status_exists_at_spawn.append(payload.get("phase") == "finished")
+            else:
+                status_exists_at_spawn.append(False)
+
+            class _FakeProcess:
+                pass
+
+            return _FakeProcess()
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            status_path = root / "status.json"
+            status_holder["path"] = status_path
+            config_path = _write_trigger_config(root)
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                patch("vexic.recorders.cli.subprocess.Popen", fake_popen),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--status-path",
+                        str(status_path),
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(stdout_at_spawn), 1)
+        emitted = json.loads(stdout_at_spawn[0])
+        self.assertIn(
+            "Durable cedar preference",
+            emitted["hookSpecificOutput"]["additionalContext"],
+            "hook JSON must be on stdout before the dream spawn runs",
+        )
+        self.assertEqual(
+            status_exists_at_spawn,
+            [True],
+            "finished status must be durable before the dream spawn runs",
+        )
+
+    def test_prime_deadline_flag_warns_when_at_or_above_hook_budget(self) -> None:
+        def fake_urlopen(request, timeout):
+            return _PrimeFakeResponse(_prime_endpoint_payload(request.full_url))
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = _write_trigger_config(root)
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            stderr = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                patch("vexic.recorders.cli.subprocess.Popen"),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--deadline-seconds",
+                        "30",
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        self.assertIn("hook", stderr.getvalue())
+        self.assertIn("30", stderr.getvalue())
+
+    def test_prime_deadline_flag_rejects_non_positive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = _write_trigger_config(root)
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--deadline-seconds",
+                        "0",
+                    ]
+                )
+            self.assertEqual(code, 2, "usage error must surface, not run the reads")
+            self.assertIn("positive", stderr.getvalue())
+
+    def test_prime_legs_frozen_at_deadline_decision_despite_late_worker(self) -> None:
+        # A worker that finishes shortly after the deadline decision must not
+        # rewrite its leg to "ok" or smuggle its section into the context: the
+        # emitted block and the status legs must describe the same snapshot.
+        def fake_urlopen(request, timeout):
+            if request.full_url.endswith("/v1/search_transcript"):
+                time.sleep(2.0)
+            return _PrimeFakeResponse(_prime_endpoint_payload(request.full_url))
+
+        config = hosted_prime.HostedPrimeConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+        with patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen):
+            result = hosted_prime.fetch_prime_context(config, deadline_seconds=0.5)
+            self.assertEqual(result.legs["search_transcript"]["outcome"], "deadline")
+            self.assertNotIn("recent cedar note", result.context)
+            time.sleep(2.5)
+            self.assertEqual(
+                result.legs["search_transcript"]["outcome"],
+                "deadline",
+                "late-finishing worker must not rewrite a decided leg",
+            )
+
 
 class _FakeSetupResult:
     def __init__(self) -> None:

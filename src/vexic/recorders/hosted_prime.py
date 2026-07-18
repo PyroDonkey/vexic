@@ -159,25 +159,38 @@ def fetch_prime_context(
     }
     for thread in threads.values():
         thread.start()
+    # Freeze one snapshot per leg at the join decision. Workers abandoned at
+    # the deadline keep running (daemon) and keep writing into `legs` and
+    # `results`; without the snapshot a late finisher could rewrite its leg
+    # to "ok" or smuggle its section into the context, making the emitted
+    # block and the reported status describe different states.
+    final_legs: dict[str, dict[str, object]] = {}
+    final_results: dict[str, dict[str, object]] = {}
     for name, thread in threads.items():
         remaining = deadline_seconds - (time.monotonic() - started)
         if remaining > 0:
             thread.join(remaining)
         if thread.is_alive():
-            legs[name] = {
+            final_legs[name] = {
                 "duration_ms": int((time.monotonic() - started) * 1000),
                 "outcome": "deadline",
             }
+        else:
+            # join() returned because the worker finished, so its writes to
+            # legs/results are complete and visible.
+            final_legs[name] = legs[name]
+            if name in results:
+                final_results[name] = results[name]
 
-    fresh_context = results.get("fresh_context")
+    fresh_context = final_results.get("fresh_context")
     recap_text = None
     if fresh_context is not None:
         recap_text = _str(fresh_context.get("text"))
         if recap_text is not None:
             recap_text = _cap_item(recap_text, max_chars // 4)
     context = build_prime_context(
-        results.get("search_long_term", {}),
-        results.get("search_transcript", {}),
+        final_results.get("search_long_term", {}),
+        final_results.get("search_transcript", {}),
         recap_text=recap_text,
         max_chars=max_chars,
     )
@@ -185,7 +198,7 @@ def fetch_prime_context(
         assert_no_forbidden_secret_values((config.api_key,), context)
     except ValueError:
         raise RuntimeError("hosted prime failed: forbidden secret in response") from None
-    return PrimeFetchResult(context=context, legs=legs)
+    return PrimeFetchResult(context=context, legs=final_legs)
 
 
 def _safe_post_search(
