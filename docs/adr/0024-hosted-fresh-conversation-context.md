@@ -125,10 +125,11 @@ a caller should paginate or use `expand_history` directly instead).
 ### Two-layer prime re-ingestion guard
 
 `PRIME_CONTEXT_HEADER = "Vexic memory priming:"` marks host-injected priming
-context (which now leads with a "Prior conversation recap:" section built
-from `fresh_context`, ahead of the existing long-term/transcript search
-sections). Two independent layers keep that injected text from re-entering
-Tier 1 and being re-summarized or re-extracted:
+context (which opens with a fixed framing line, then a "Prior conversation
+recap:" section built from `fresh_context`, ahead of the existing
+long-term/transcript search sections). Two independent layers keep that
+injected text from re-entering Tier 1 and being re-summarized or
+re-extracted:
 
 1. **Recorder-side**: the Claude Code JSONL parser (`recorders/claude_code.py`)
    skips any row whose text contains `PRIME_CONTEXT_HEADER` before it is ever
@@ -148,13 +149,19 @@ silent unbounded drift with no data-loss signal to notice it by.
 ### SessionStart priming integration
 
 `vexic.recorders.hosted_prime.fetch_prime_context` now calls
-`fetch_fresh_context` (token budget = `max_chars // 4`) before its existing
+`fetch_fresh_context` (token budget = `max_chars // 16`) before its existing
 long-term/transcript search calls, and prepends the returned recap text as a
-"Prior conversation recap:" section when present. The call is fail-open: an
+"Prior conversation recap:" section when present, trimmed to a
+`max_chars // 4` char acceptance cap. The call is fail-open: an
 HTTP error, timeout, or a key without `memory:fresh-context` (`403`) all
 result in `fetch_fresh_context` returning `None`, and priming continues with
 whatever the long-term/transcript search legs return -- unchanged from the
 ADR 0018 posture that a hosted outage must not block Claude Code startup.
+At render time, `build_prime_context` further caps the recap body to
+`PRIME_RECAP_CAP` (500 chars) and each transcript-hit body to `PRIME_ITEM_CAP`
+(400 chars). Long-term facts are not per-item capped at render time; COA-403
+scoped per-item caps to the recap and transcript hits, leaving facts bounded
+by the `search_long_term` `limit` and the overall `max_chars` block cap.
 
 ## Out Of Scope / Deferred
 

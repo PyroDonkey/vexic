@@ -1,8 +1,13 @@
 import traceback
 
+from pydantic import ValidationError
+
 # Content-free error rendering for persisted diagnostics. Dependency-free
 # leaf, like vexic.redaction: dream phases and storage writers can record what
-# failed without recording what the user said.
+# failed without recording what the user said. Also home to
+# ``validation_error_message``, shared by the hosted FastAPI adapter and the
+# transport-agnostic hosted shell so both 400 paths sanitize the same way
+# without the shell importing the FastAPI adapter.
 
 
 def format_error_detail(exc: BaseException) -> str:
@@ -17,6 +22,28 @@ def format_error_detail(exc: BaseException) -> str:
     stack = "".join(frames.format())
     rendered = f"{type(exc).__name__}\n{stack}".rstrip()
     return rendered
+
+
+def validation_error_message(exc: ValidationError) -> str:
+    """Build a client-safe 400 message from a pydantic ``ValidationError``.
+
+    ``str(ValidationError)`` embeds the offending input value -- for the hosted
+    request models that input is the bound ``MemoryScope`` repr -- plus a
+    pydantic docs URL. Only the validator-authored ``msg`` text is client-safe,
+    so this drops the structured input, context, and URL and keeps the
+    deduplicated messages. This is safe only because the
+    contract validators feeding these callsites use static messages and never
+    interpolate client input into their own text; a validator that did would
+    have to be fixed at the validator, not masked here.
+    """
+    messages: list[str] = []
+    for error in exc.errors(include_url=False, include_input=False, include_context=False):
+        message = str(error["msg"]).removeprefix("Value error, ")
+        if message not in messages:
+            messages.append(message)
+    if not messages:
+        return "Invalid request."
+    return "; ".join(messages)
 
 
 # Marks whether a dream phase's terminal ``dream_runs`` error row was durably
@@ -54,6 +81,41 @@ def dream_failure_recorded(exc: BaseException) -> bool:
     current: BaseException | None = exc
     while current is not None and id(current) not in seen:
         if getattr(current, _DREAM_RECORDED_ATTR, False):
+            return True
+        seen.add(id(current))
+        current = current.__cause__
+    return False
+
+
+# Marks a dream-phase exception raised in the pre-phase prelude -- the
+# execution-time retirement re-check and live local-service construction --
+# before the phase touched tenant memory. The sweeper reads it to hold the
+# summarize watermark for such a fault (never-run), exactly like the retirement
+# gate, rather than advancing it as if the phase ran and failed (anti-spend).
+# Advancing over a prelude fault would strand the never-summarized rows.
+_DREAM_PHASE_NOT_STARTED_ATTR = "_vexic_dream_phase_not_started"
+
+
+def mark_dream_phase_not_started(exc: BaseException) -> BaseException:
+    """Tag a dream-phase exception as raised before phase execution began.
+
+    Returns ``exc`` so callers can ``raise mark_dream_phase_not_started(exc)``.
+    """
+    setattr(exc, _DREAM_PHASE_NOT_STARTED_ATTR, True)
+    return exc
+
+
+def dream_phase_not_started(exc: BaseException) -> bool:
+    """True when a dream-phase exception was tagged as a pre-phase prelude fault.
+
+    Walks the ``__cause__`` chain for parity with :func:`dream_failure_recorded`
+    so the mark survives an explicit re-wrap. Defaults ``False`` so an untagged
+    phase-execution failure is treated as ran-and-failed.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if getattr(current, _DREAM_PHASE_NOT_STARTED_ATTR, False):
             return True
         seen.add(id(current))
         current = current.__cause__

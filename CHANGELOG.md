@@ -5,6 +5,44 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6] - 2026-07-17
+
+Session-start priming robustness plus recorder and hosted-layer reliability
+fixes. No public memory contract change; `CONTRACT_VERSION` stays `0.1.0`.
+
+### Fixed
+
+- Session-start prime usage guidance survives truncation: a fixed framing
+  block leads the injected snapshot and footer space is reserved before
+  capping, so the instructions can no longer be the first thing truncated
+  away (#246).
+- Recorder transcript-cursor writes are monotonic, so overlapping async Stop
+  ingests can no longer regress the cursor and re-post already-ledgered
+  rows; equal-offset content corrections still write through so same-length
+  transcript rewrites self-heal (#248).
+- Hosted write-route preflight 400 responses sanitize pydantic
+  `ValidationError` messages through the same client-safe builder as the
+  HTTP adapter, instead of echoing raw input values (#249).
+- Dream-phase prelude retries retryable operational faults with a bounded
+  backoff (#243).
+- Recorder Stop hook fails open on transient hosted errors instead of
+  derailing the conversation with a blocking exit (#244).
+- Hosted 400 responses in the HTTP adapter sanitize pydantic
+  `ValidationError` messages (#245).
+
+### Changed
+
+- Prime snapshot sections carry per-item caps (transcript hits and the
+  recap body) with an explicit truncation marker at both fetch and render
+  time, so one long item cannot starve the other sections; the full text
+  stays reachable through the recall tools (#246).
+- MCP `server_instructions` now describe session-start priming: visible
+  snapshot facts need no re-search (explicitly subordinate to the
+  search-before-denying rule) and truncated snapshot items are flagged as
+  incomplete (#246).
+
+[0.1.6]: https://github.com/PyroDonkey/vexic/releases/tag/v0.1.6
+
 ## [0.1.5] - 2026-07-16
 
 Reliability patch plus evaluation tooling. No public memory contract change;

@@ -570,6 +570,32 @@ class TriggerDreamPhaseHttpTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
 
+    def test_rejects_non_summarize_phase_with_business_rule_message_only(self) -> None:
+        client = self._client(ports=None)
+        api_key = self._api_key(capabilities={MemoryCapability.DREAM_TRIGGER})
+
+        response = client.post(
+            "/v1/trigger_dream_phase",
+            headers=self._headers(api_key),
+            json={"phase": "light"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["error"]["code"], "invalid_request")
+        self.assertEqual(
+            body["error"]["message"],
+            "trigger_dream_phase only supports phase='summarize' in v1.",
+        )
+        raw = response.text
+        for leak in (
+            "input_value",
+            "errors.pydantic.dev",
+            "MemoryScope",
+            "For further information",
+        ):
+            self.assertNotIn(leak, raw)
+
     def test_missing_build_summary_agent_returns_503_synchronously(self) -> None:
         client = self._client(ports=DreamPhasePorts(model_group="fake"))
         api_key = self._api_key(capabilities={MemoryCapability.DREAM_TRIGGER})

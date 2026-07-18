@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
+from http.client import IncompleteRead
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
@@ -9,6 +11,38 @@ from urllib.request import Request, urlopen
 from vexic.contract import SourceTranscriptMessage
 from vexic.redaction import assert_no_forbidden_secret_values_in_payload
 from vexic.url_policy import require_http_url
+
+# Bounded in-process retry of transient transport faults. A hosted 5xx, a
+# non-HTTP connectivity fault, and a lost/garbled response (a POST that
+# succeeded but whose reply could not be read or parsed) are all retried; each
+# retry is a fresh POST of the same request, and the hosted source ledger
+# dedupes any row that a retried-then-succeeded attempt double-delivers.
+_TRANSPORT_RETRY_ATTEMPTS = 3
+_TRANSPORT_RETRY_BACKOFF_SECONDS = 0.5
+
+# Read/parse-phase failures on a POST that already reached the server. The POST
+# may have committed server-side, so re-POSTing is safe only because the ledger
+# dedupes; that is the same ambiguity fail-open + dedupe is built to absorb.
+_RESPONSE_TRANSPORT_ERRORS = (
+    OSError,  # includes URLError, socket timeout, connection reset
+    IncompleteRead,
+    json.JSONDecodeError,
+    UnicodeDecodeError,
+)
+
+
+class HostedIngestTransportError(RuntimeError):
+    """Transient transport-layer ingest failure that is safe to fail open.
+
+    Raised for a hosted 5xx (`HTTPError` with `code >= 500`), a non-HTTP
+    connectivity fault (a `URLError` that is not an `HTTPError`: DNS, timeout,
+    connection refused), or a lost/garbled response (the POST reached the
+    server but reading or JSON-parsing its reply failed). A 4xx keeps the
+    plain `RuntimeError` so auth/config faults (rotated key, wrong project)
+    stay loud and surface on sync installs instead of silently killing
+    recording. Subclasses `RuntimeError` so existing callers that catch
+    `RuntimeError` still handle it.
+    """
 
 
 @dataclass(frozen=True)
@@ -52,15 +86,53 @@ def post_source_messages(
         headers=headers,
         method="POST",
     )
-    try:
-        with urlopen(request, timeout=config.timeout_seconds) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        detail = _error_body_detail(exc)
-        suffix = f" ({detail})" if detail else ""
-        raise RuntimeError(f"hosted ingest failed: HTTP {exc.code}{suffix}") from exc
-    except URLError as exc:
-        raise RuntimeError(f"hosted ingest failed: {type(exc.reason).__name__}") from exc
+    # HTTPError subclasses URLError, so it is caught first: a hosted 5xx is a
+    # transient transport fault and a 4xx is a caller/auth fault. The transport
+    # class (5xx, non-HTTP URLError, and read/parse failures on a POST that
+    # reached the server) is retried and, once exhausted, re-raised as
+    # HostedIngestTransportError so the caller can fail open.
+    for attempt in range(1, _TRANSPORT_RETRY_ATTEMPTS + 1):
+        try:
+            with urlopen(request, timeout=config.timeout_seconds) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            if exc.code < 500:
+                detail = _error_body_detail(exc)
+                suffix = f" ({detail})" if detail else ""
+                raise RuntimeError(
+                    f"hosted ingest failed: HTTP {exc.code}{suffix}"
+                ) from exc
+            if attempt < _TRANSPORT_RETRY_ATTEMPTS:
+                time.sleep(_TRANSPORT_RETRY_BACKOFF_SECONDS * attempt)
+                continue
+            # Only the finally-raised error reads its body; retried attempts
+            # drop theirs so a per-attempt proxy body is never buffered.
+            detail = _error_body_detail(exc)
+            suffix = f" ({detail})" if detail else ""
+            raise HostedIngestTransportError(
+                f"hosted ingest failed: HTTP {exc.code}{suffix}"
+            ) from exc
+        except _RESPONSE_TRANSPORT_ERRORS as exc:
+            if attempt < _TRANSPORT_RETRY_ATTEMPTS:
+                time.sleep(_TRANSPORT_RETRY_BACKOFF_SECONDS * attempt)
+                continue
+            raise HostedIngestTransportError(
+                f"hosted ingest failed: {_transport_reason(exc)}"
+            ) from exc
+    # Unreachable: the loop either returns or raises on the final attempt.
+    raise AssertionError("hosted ingest retry loop exited without returning")
+
+
+def _transport_reason(exc: BaseException) -> str:
+    """Sanitized reason name for a transport fault, never the response body.
+
+    A `URLError` carries its underlying cause in `.reason`; everything else
+    (read timeout, incomplete read, JSON/decode failure) is named by its own
+    type so a garbled response body can never reach the recorder's output.
+    """
+    if isinstance(exc, URLError) and not isinstance(exc, HTTPError):
+        return type(exc.reason).__name__
+    return type(exc).__name__
 
 
 _ERROR_DETAIL_MAX_CHARS = 300

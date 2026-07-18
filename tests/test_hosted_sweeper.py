@@ -38,6 +38,7 @@ from vexic.hosted_sweeper import (
 from vexic.ports import DreamPhasePorts
 from vexic.storage import agent_watermarks, init_db, save_messages
 from vexic.storage.connection import StorageTarget
+from vexic.storage.errors import MutationOutcomeUnknown
 
 NOW = datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc)
 
@@ -136,6 +137,17 @@ def _seed_compactable_span(db_path: object, *, agent_id: str | None = None) -> N
 def _summary_row_count(db_path: object) -> int:
     with closing(sqlite3.connect(db_path)) as conn:
         return conn.execute("SELECT COUNT(*) FROM session_summaries").fetchone()[0]
+
+
+def _hrana_locked_error() -> ValueError:
+    """The retryable operational fault Turso surfaces as a bare libSQL
+    ``ValueError`` when a writer loses the lock (same shape as
+    ``tests/test_control_plane_migrations.py`` uses): a boot-blip at first
+    tenant/connection touch that a retry can clear."""
+    return ValueError(
+        'Hrana: `stream error: `Error { message: "SQLite error: '
+        'database is locked", code: "SQLITE_BUSY" }}`'
+    )
 
 
 class CrossProcessDreamLeaseTests(unittest.IsolatedAsyncioTestCase):
@@ -1721,6 +1733,201 @@ class DreamSweepStateMigrationTests(unittest.TestCase):
                 state.last_dream_completed_at, "2026-07-01T00:00:00+00:00"
             )
             self.assertIsNone(state.last_dream_failed_at)
+
+
+class SystemDreamPhaseRetryTests(unittest.IsolatedAsyncioTestCase):
+    """A single transient Turso operational fault at the pre-phase prelude
+    (retirement re-check + live local-service construction) must be retried
+    in-process rather than failing the whole sweep until the next tick
+    tick. Phase execution and ``MutationOutcomeUnknown`` are deliberately
+    NOT retried — those keep fail-closed behaviour.
+    """
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.catalog = HostedTenantCatalog(self.root)
+        self.keys = HostedApiKeyStore(self.root)
+
+    def tearDown(self) -> None:
+        # Mirror CrossProcessDreamLeaseTests: an uninterruptible worker thread
+        # may still be draining sidecar files as the temp dir is removed.
+        shutil.rmtree(self.root, ignore_errors=True)
+        self.temp_dir.cleanup()
+
+    def _service(self, ports: DreamPhasePorts) -> HostedMemoryService:
+        return HostedMemoryService(
+            self.catalog,
+            self.keys,
+            telemetry=self.catalog,
+            dream_phase_ports=ports,
+        )
+
+    async def test_system_dream_phase_retries_transient_storage_fault_then_completes(
+        self,
+    ) -> None:
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        service = self._service(_summary_ports())
+
+        calls = {"n": 0}
+        real_get_tenant = service.catalog.get_tenant
+
+        def flaky_get_tenant(tenant_id: str, *args: object, **kwargs: object) -> object:
+            # The in-phase retirement re-check (:1471) is the only get_tenant
+            # call on the job path once scheduling's :1101 call has landed, so
+            # the counter cleanly measures prelude attempts.
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise _hrana_locked_error()
+            return real_get_tenant(tenant_id, *args, **kwargs)
+
+        with patch.object(
+            hosted, "_DREAM_PHASE_RETRY_BACKOFF_SECONDS", 0.0, create=True
+        ):
+            task = service.schedule_system_dream(
+                "tenant-a", agent_id=None, phases=(DreamPhase.SUMMARIZE,)
+            )
+            self.assertIsNotNone(task)
+            # Install after scheduling so the schedule-time :1101 get_tenant runs
+            # unwrapped; the task has not reached an await yet, so the wrapper is
+            # in place before the phase's prelude touches get_tenant.
+            service.catalog.get_tenant = flaky_get_tenant
+            try:
+                outcome = await task
+            finally:
+                service.catalog.get_tenant = real_get_tenant
+
+        self.assertTrue(outcome.durably_recorded)
+        self.assertTrue(outcome.summarize_ran)
+        self.assertGreater(_summary_row_count(tenant.db_path), 0)
+        # One failed prelude attempt then a successful retry.
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(
+            [event.status for event in service.dream_trigger_job_events],
+            ["running", "ok"],
+        )
+
+    async def test_system_dream_phase_stops_chain_after_retries_exhausted(
+        self,
+    ) -> None:
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        service = self._service(_summary_ports())
+
+        calls = {"n": 0}
+        real_get_tenant = service.catalog.get_tenant
+
+        def always_failing_get_tenant(
+            tenant_id: str, *args: object, **kwargs: object
+        ) -> object:
+            calls["n"] += 1
+            raise _hrana_locked_error()
+
+        with patch.object(
+            hosted, "_DREAM_PHASE_RETRY_BACKOFF_SECONDS", 0.0, create=True
+        ):
+            task = service.schedule_system_dream(
+                "tenant-a", agent_id=None, phases=(DreamPhase.SUMMARIZE,)
+            )
+            self.assertIsNotNone(task)
+            service.catalog.get_tenant = always_failing_get_tenant
+            try:
+                outcome = await task
+            finally:
+                service.catalog.get_tenant = real_get_tenant
+
+        # Three attempts (two retries) then the chain stops fail-closed.
+        self.assertEqual(calls["n"], 3)
+        # The prelude fault is pre-write and unmarked, so the sweeper must retry
+        # next tick rather than advance the 24h clock over an unrecorded failure.
+        self.assertFalse(outcome.durably_recorded)
+        # The SUMMARIZE phase never touched memory (the prelude failed before
+        # phase execution), so the summarize watermark must be held, not
+        # advanced over rows that were never summarized.
+        self.assertFalse(outcome.summarize_ran)
+        events = service.dream_trigger_job_events
+        self.assertEqual([event.status for event in events], ["running", "error"])
+        # Content-free terminal event: only the exception class name, no leaked
+        # fault message (HostedJobEvent carries no content field).
+        self.assertEqual(events[-1].error_type, "ValueError")
+        self.assertEqual(_summary_row_count(tenant.db_path), 0)
+
+    async def test_system_dream_phase_does_not_retry_mutation_outcome_unknown(
+        self,
+    ) -> None:
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        service = self._service(_summary_ports())
+
+        calls = {"n": 0}
+        real_get_tenant = service.catalog.get_tenant
+
+        def flaky_get_tenant(tenant_id: str, *args: object, **kwargs: object) -> object:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # A lost commit acknowledgement: outcome unknown, so re-running
+                # the prelude is unsafe and must NOT be retried.
+                raise MutationOutcomeUnknown("commit acknowledgement lost")
+            return real_get_tenant(tenant_id, *args, **kwargs)
+
+        with patch.object(
+            hosted, "_DREAM_PHASE_RETRY_BACKOFF_SECONDS", 0.0, create=True
+        ):
+            task = service.schedule_system_dream(
+                "tenant-a", agent_id=None, phases=(DreamPhase.SUMMARIZE,)
+            )
+            self.assertIsNotNone(task)
+            service.catalog.get_tenant = flaky_get_tenant
+            try:
+                outcome = await task
+            finally:
+                service.catalog.get_tenant = real_get_tenant
+
+        # Exactly one attempt: MutationOutcomeUnknown is excluded from retry, so
+        # the chain stops on the first fault instead of retrying to success.
+        self.assertEqual(calls["n"], 1)
+        self.assertFalse(outcome.durably_recorded)
+        # A MutationOutcomeUnknown prelude fault never ran the SUMMARIZE phase,
+        # so the summarize watermark must be held, not advanced.
+        self.assertFalse(outcome.summarize_ran)
+        events = service.dream_trigger_job_events
+        self.assertEqual([event.status for event in events], ["running", "error"])
+        self.assertEqual(events[-1].error_type, "MutationOutcomeUnknown")
+        self.assertEqual(_summary_row_count(tenant.db_path), 0)
+
+    async def test_mid_phase_fault_is_not_retried(self) -> None:
+        tenant = self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        _seed_compactable_span(tenant.db_path)
+        service = self._service(_summary_ports())
+
+        calls = {"n": 0}
+
+        async def failing_phase(*args: object, **kwargs: object) -> object:
+            # A retryable fault raised INSIDE phase execution (after the prelude
+            # resolved the live service). Phase work durably records its own
+            # error row and re-spends model calls, so it must run exactly once.
+            calls["n"] += 1
+            raise _hrana_locked_error()
+
+        with patch.object(
+            hosted, "_run_local_dream_phase_with_usage", failing_phase
+        ), patch.object(
+            hosted, "_DREAM_PHASE_RETRY_BACKOFF_SECONDS", 0.0, create=True
+        ):
+            task = service.schedule_system_dream(
+                "tenant-a", agent_id=None, phases=(DreamPhase.SUMMARIZE,)
+            )
+            self.assertIsNotNone(task)
+            outcome = await task
+
+        # Single execution: the retry seam wraps only the prelude, never the
+        # phase — pins the narrow scope (audit B1).
+        self.assertEqual(calls["n"], 1)
+        self.assertFalse(outcome.durably_recorded)
+        events = service.dream_trigger_job_events
+        self.assertEqual([event.status for event in events], ["running", "error"])
+        self.assertEqual(_summary_row_count(tenant.db_path), 0)
 
 
 if __name__ == "__main__":

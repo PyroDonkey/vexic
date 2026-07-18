@@ -76,6 +76,27 @@ class ServerInstructionsTests(unittest.TestCase):
 
         self.assertIn("search before denying, don't refuse to deny", instructions)
 
+    def test_instructions_mention_session_start_priming_and_dont_research(self) -> None:
+        for expand in (False, True):
+            instructions = server_instructions(expand)
+            self.assertIn("SESSION-START PRIMING", instructions)
+            self.assertIn("Vexic memory priming:", instructions)
+            self.assertIn("need no re-search", instructions)
+
+    def test_dont_research_guidance_stays_subordinate_to_deny_gate(self) -> None:
+        for expand in (False, True):
+            instructions = server_instructions(expand)
+            self.assertIn("never weakens", instructions)
+            self.assertIn("a sample, not the whole memory", instructions)
+            # deny-gate backstop must remain verbatim
+            self.assertIn("search before denying, don't refuse to deny", instructions)
+
+    def test_instructions_flag_truncated_snapshot_items_as_incomplete(self) -> None:
+        for expand in (False, True):
+            instructions = server_instructions(expand)
+            self.assertIn("'…' or marked '[truncated]'", instructions)
+            self.assertIn("use the recall tools to retrieve the full text", instructions)
+
 
 class ToolDescriptionTests(unittest.TestCase):
     def test_user_memory_description_has_search_before_deny_tail(self) -> None:

@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from vexic import CONTRACT_VERSION
+from vexic.error_reporting import validation_error_message
 from vexic.contract import (
     DreamPhase,
     ExpandHistoryResult,
@@ -689,7 +690,7 @@ async def _handle_trigger_dream_phase(
             phase=phase,
         )
     except ValidationError as exc:
-        return _error_response(400, "invalid_request", str(exc))
+        return _error_response(400, "invalid_request", validation_error_message(exc))
     except ValueError as exc:
         return _value_error_response(exc)
 
@@ -751,11 +752,12 @@ def _value_error_response(exc: ValueError) -> JSONResponse:
     client-fault 400 or echo the Hrana payload. ``pydantic.ValidationError``
     subclasses ``ValueError`` and can embed marker-like client input in its
     message, so it is classified as a client fault before the storage
-    classifiers run. Storage detail is never logged, mirroring the sanitized
-    control-plane logging convention.
+    classifiers run and its message is sanitized through
+    ``validation_error_message`` rather than dumped raw. Storage detail is
+    never logged, mirroring the sanitized control-plane logging convention.
     """
     if isinstance(exc, ValidationError):
-        return _error_response(400, "invalid_request", str(exc))
+        return _error_response(400, "invalid_request", validation_error_message(exc))
     storage_error = _storage_error_response(exc)
     if storage_error is not None:
         return storage_error
