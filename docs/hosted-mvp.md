@@ -777,7 +777,11 @@ exits `0` and never affects prime's own output or exit code.
   `<status-name>-prime.json` file (never the ingest status file, so
   overlapping Stop-hook ingests and prime cannot erase each other's
   records); a stale `started` marker is durable evidence of an external
-  kill.
+  kill. The Stop-hook ingest posting loop has the parallel bound: an
+  end-to-end deadline (`--deadline-seconds` on `recorder ingest`, default
+  100s inside the async Stop hook's 120s kill) that stops posting, writes a
+  degraded status, and fails open with exit 1 on expiry; the next run
+  re-posts from the start and the hosted source ledger dedups.
 
 Revoke a throwaway key by key id, not by raw key:
 

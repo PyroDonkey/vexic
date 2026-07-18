@@ -158,6 +158,17 @@ def _argv_status_path(argv: list[str]) -> Path | None:
 # lost-block failure the deadline exists to prevent.
 _SESSION_START_HOOK_KILL_SECONDS = 30.0
 
+# The async Stop hook installed by claude_setup kills ingest at this many
+# seconds, with no in-process handler able to run afterward.
+_STOP_HOOK_KILL_SECONDS = 120.0
+
+# End-to-end budget for the ingest posting loop. Without it a multi-batch
+# transcript is unbounded (each batch can burn ~91.5s of retries) and the Stop
+# hook kill lands mid-flight with no status write and no controlled exit. The
+# default leaves margin inside the 120s kill for the degraded status write and
+# the fail-open exit 1.
+INGEST_DEADLINE_SECONDS = 100.0
+
 
 def _positive_float(value: str) -> float:
     parsed = float(value)
@@ -166,6 +177,23 @@ def _positive_float(value: str) -> float:
             "must be a positive, finite number of seconds"
         )
     return parsed
+
+
+def _warn_hook_kill_margin(
+    deadline_seconds: float,
+    kill_seconds: float,
+    hook_name: str,
+    consequence: str,
+) -> None:
+    # A deadline crowding the hook kill silently recreates the uncontrolled
+    # mid-flight kill the deadline exists to prevent.
+    if deadline_seconds >= kill_seconds - 5:
+        print(
+            "warning: --deadline-seconds "
+            f"{deadline_seconds:g} leaves under 5s of margin before "
+            f"the {hook_name} hook kill ({kill_seconds:g}s); {consequence}",
+            file=sys.stderr,
+        )
 
 
 def _prime_status_path(path: Path | None) -> Path | None:
@@ -201,6 +229,11 @@ def _parser() -> argparse.ArgumentParser:
     ingest.add_argument("--session-id")
     ingest.add_argument("--agent-id")
     ingest.add_argument("--timeout-seconds", type=float, default=30.0)
+    ingest.add_argument(
+        "--deadline-seconds",
+        type=_positive_float,
+        default=INGEST_DEADLINE_SECONDS,
+    )
     ingest.add_argument("--forbidden-value", action="append", default=[])
     ingest.add_argument("--status-path", type=Path)
 
@@ -394,6 +427,10 @@ def _try_write_cursor(
 
 
 def _ingest(args: argparse.Namespace) -> int:
+    # The deadline clock starts before the transcript scan: a large full
+    # reread eats hook-kill margin too, and "end-to-end" must mean the whole
+    # run, not just the posting loop.
+    started = time.monotonic()
     payload = _read_hook_payload(args.hook_input)
     transcript_path = payload.transcript_path
     source_session_id = payload.session_id
@@ -418,13 +455,30 @@ def _ingest(args: argparse.Namespace) -> int:
         agent_id=args.agent_id,
         timeout_seconds=args.timeout_seconds,
     )
+    _warn_hook_kill_margin(
+        args.deadline_seconds,
+        _STOP_HOOK_KILL_SECONDS,
+        "Stop",
+        "a kill skips the degraded status write and the controlled exit",
+    )
     items: list[SourceTranscriptIngestItemResult] = []
     batches = list(_iter_hosted_message_batches(messages))
-    for batch in batches:
+    for index, batch in enumerate(batches):
+        # One clock read per batch: the remaining deadline both gates the
+        # next POST and caps its in-call retry budget. Raising here, before
+        # the cursor write below, keeps the cursor all-or-nothing; the rerun
+        # re-posts from the start and the hosted ledger dedups.
+        remaining = args.deadline_seconds - (time.monotonic() - started)
+        if remaining <= 0:
+            raise HostedIngestTransportError(
+                f"hosted ingest deadline of {args.deadline_seconds:g}s "
+                f"exceeded: {index}/{len(batches)} batches posted"
+            )
         result = post_source_messages(
             config,
             messages=batch,
             forbidden_values=tuple(args.forbidden_value),
+            budget_seconds=remaining,
         )
         items.extend(_validated_ingest_items(result, batch))
     inserted = sum(item.status == "inserted" for item in items)
@@ -531,14 +585,12 @@ def _prime(args: argparse.Namespace) -> int:
                 phase="started",
             ),
         )
-        if args.deadline_seconds >= _SESSION_START_HOOK_KILL_SECONDS - 5:
-            print(
-                "warning: --deadline-seconds "
-                f"{args.deadline_seconds:g} leaves under 5s of margin before "
-                f"the SessionStart hook kill ({_SESSION_START_HOOK_KILL_SECONDS:g}s); "
-                "a kill discards the entire priming block",
-                file=sys.stderr,
-            )
+        _warn_hook_kill_margin(
+            args.deadline_seconds,
+            _SESSION_START_HOOK_KILL_SECONDS,
+            "SessionStart",
+            "a kill discards the entire priming block",
+        )
         result = fetch_prime_context(
             HostedPrimeConfig(
                 base_url=args.base_url,

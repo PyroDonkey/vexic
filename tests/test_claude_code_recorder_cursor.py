@@ -34,6 +34,7 @@ from vexic.hosted import HostedMemoryService
 from vexic.hosted_http import create_app
 from vexic.hosted_local import HostedApiKeyStore, HostedTenantCatalog
 from vexic.recorders.cli import main as recorder_main
+from vexic.recorders.hosted_ingest import HostedIngestTransportError
 from vexic.recorders.transcript_cursor import (
     TranscriptCursor,
     cursor_path,
@@ -124,7 +125,7 @@ class _RecorderHarness:
         response_factory: Callable[[list[SourceTranscriptMessage]], object]
         | None = None,
     ) -> int:
-        def fake_post(config, *, messages, forbidden_values):
+        def fake_post(config, *, messages, forbidden_values, budget_seconds=None):
             self.posted.append([message.source_message_id for message in messages])
             if post_error is not None:
                 raise post_error
@@ -456,6 +457,34 @@ class RecorderTranscriptCursorTests(unittest.TestCase):
             self.assertEqual(harness.run(), 0)
             self.assertEqual(harness.posted_ids(), ["uuid-1", "uuid-2"])
 
+    def test_transport_error_post_does_not_advance_the_cursor(self) -> None:
+        # The fail-open twin of the RuntimeError/exit-2 pin above: an exhausted
+        # transient fault degrades to exit 1, the cursor stays unwritten, and
+        # the next run re-posts every row (the hosted ledger dedups).
+        with tempfile.TemporaryDirectory() as temp:
+            harness = _RecorderHarness(Path(temp))
+            _write_transcript(
+                harness.transcript,
+                [
+                    _user_row("uuid-1", "remember cedar"),
+                    _user_row("uuid-2", "and orchid"),
+                ],
+            )
+
+            code = harness.run(
+                post_error=HostedIngestTransportError(
+                    "hosted ingest failed: HTTP 503"
+                )
+            )
+            self.assertEqual(code, 1)
+            self.assertEqual(harness.cursor_files(), [])
+            status = json.loads(harness.status_path.read_text(encoding="utf-8"))
+            self.assertFalse(status["ok"])
+            harness.posted.clear()
+
+            self.assertEqual(harness.run(), 0)
+            self.assertEqual(harness.posted_ids(), ["uuid-1", "uuid-2"])
+
     def test_duplicate_source_keys_with_matching_results_advance_cursor(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             harness = _RecorderHarness(Path(temp))
@@ -605,7 +634,7 @@ class RecorderCursorLedgerDedupTests(unittest.TestCase):
 
             class _Response:
                 def __init__(self, content: bytes) -> None:
-                    self._content = content
+                    self._body = io.BytesIO(content)
 
                 def __enter__(self):
                     return self
@@ -613,8 +642,8 @@ class RecorderCursorLedgerDedupTests(unittest.TestCase):
                 def __exit__(self, *_exc):
                     return False
 
-                def read(self) -> bytes:
-                    return self._content
+                def read(self, size: int = -1) -> bytes:
+                    return self._body.read(size)
 
             def fake_urlopen(request, timeout):
                 response = client.request(
