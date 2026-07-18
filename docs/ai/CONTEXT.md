@@ -158,3 +158,47 @@ recorders and ingest can recognize and exclude it from Tier 1 transcript,
 keeping injected memory context from re-entering memory as if it were new
 conversation.
 _Avoid_: Transcript marker, system message
+
+**Dream Phase**:
+One background memory-processing pass (Light, REM, Deep, or Summarize) run
+against a memory scope.
+_Avoid_: Cron job, batch job
+
+**Dream Sweeper**:
+The in-server scheduler that runs Dream Phases per tenant and agent scope on
+its own cadence, without an external trigger.
+_Avoid_: Dream cron, background worker
+
+**Phase Prelude**:
+The pre-phase tenant re-check and live-service construction step that precedes
+Dream Phase execution; the only part of a dream run eligible for in-process
+retry on transient storage faults.
+_Avoid_: Phase setup, connection warmup
+
+**Fail-Closed Dreaming**:
+The Dream Sweeper posture that a failed Dream Phase records a durable error and
+withholds the completion stamp, so no schedule or watermark advances over a
+failure and recovery happens on the failure backoff.
+_Avoid_: Silent skip, phase retry loop
+
+**Summarize Watermark**:
+The per-scope durable high-water marker of transcript rows a summarize sweep
+has already covered, advanced monotonically and only after a reported outcome.
+_Avoid_: Summary Frontier, progress counter
+
+**Fail-Open Ingest**:
+The Host Transcript Recorder posture that a transient hosted fault degrades to
+a non-blocking warning and a later re-post, never a blocking error in the host
+conversation; genuine auth or configuration faults stay loud.
+_Avoid_: Silent failure, best-effort write
+
+**Ingest Ledger**:
+The durable record of source transcript material already ingested, keyed by
+source identity, that makes re-posting the same transcript deduplicating and
+safe.
+_Avoid_: Write log, audit table
+
+**Transcript Cursor**:
+The recorder-local monotonic marker of how much of a host transcript file has
+already been posted, so a completed-turn hook rereads only new material.
+_Avoid_: File offset, checkpoint
