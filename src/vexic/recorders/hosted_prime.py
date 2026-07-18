@@ -206,17 +206,6 @@ def fetch_prime_context(
     return PrimeFetchResult(context=context, legs=final_legs)
 
 
-def _safe_post_search(
-    config: HostedPrimeConfig,
-    operation: str,
-    payload: dict[str, object],
-) -> dict[str, object]:
-    try:
-        return _post_search(config, operation, payload)
-    except RuntimeError:
-        return {}
-
-
 def _post_search(
     config: HostedPrimeConfig,
     operation: str,

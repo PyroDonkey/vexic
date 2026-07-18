@@ -4328,9 +4328,9 @@ class ClaudeCodeRecorderPrimeCommandTests(unittest.TestCase):
 class HostedPrimePostSearchNormalizationTests(unittest.TestCase):
     """_post_search must raise only RuntimeError for transport/decode failures.
 
-    Downstream degradation (_safe_post_search, fetch_fresh_context) filters on
-    RuntimeError; any other exception type escapes to the prime fail-open
-    catch-all and discards the whole context.
+    Downstream degradation (the fetch_prime_context workers, fetch_fresh_context)
+    filters on RuntimeError; any other exception type escapes to the prime
+    fail-open catch-all and discards the whole context.
     """
 
     def _config(self) -> HostedPrimeConfig:

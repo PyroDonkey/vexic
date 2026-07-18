@@ -781,7 +781,14 @@ exits `0` and never affects prime's own output or exit code.
   end-to-end deadline (`--deadline-seconds` on `recorder ingest`, default
   100s inside the async Stop hook's 120s kill) that stops posting, writes a
   degraded status, and fails open with exit 1 on expiry; the next run
-  re-posts from the start and the hosted source ledger dedups.
+  re-posts from the start and the hosted source ledger dedups. The bound is
+  best-effort, not a hard guarantee: an in-flight response read is not
+  preempted, so a single recv can block up to the per-attempt socket timeout
+  (itself capped to the remaining budget at attempt start) past the deadline
+  before the controlled exit runs. A slow response that drips bytes to the
+  budget edge and then stalls can therefore still reach the hook kill without
+  a degraded status write; the ledger dedup on the next run is the backstop
+  for that residual case.
 
 Revoke a throwaway key by key id, not by raw key:
 
