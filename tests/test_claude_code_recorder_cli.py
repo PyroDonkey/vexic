@@ -7,6 +7,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from http.client import IncompleteRead, RemoteDisconnected
 from pathlib import Path
@@ -2531,8 +2533,10 @@ class ClaudeCodeRecorderPrimeCommandTests(unittest.TestCase):
             self.assertIn("Durable cedar preference", context)
             self.assertIn("recent cedar note", context)
             self.assertNotIn("vx_secret", stdout.getvalue())
+            # Reads dispatch in parallel (ADR 0025 D4 follow-up), so arrival order is
+            # nondeterministic; assert the set of endpoints, not the order.
             self.assertEqual(
-                [urlsplit(call[0].full_url).path for call in calls],
+                sorted(urlsplit(call[0].full_url).path for call in calls),
                 ["/v1/fresh_context", "/v1/search_long_term", "/v1/search_transcript"],
             )
             for request, timeout in calls:
@@ -3683,7 +3687,7 @@ class ClaudeCodeRecorderPrimeSpawnsTriggerDreamTests(unittest.TestCase):
                 patch("vexic.recorders.cli.subprocess.Popen", fake_popen),
                 patch(
                     "vexic.recorders.cli.fetch_prime_context",
-                    return_value="",
+                    return_value=hosted_prime.PrimeFetchResult(context=""),
                 ),
                 contextlib.redirect_stdout(stdout),
             ):
@@ -3723,7 +3727,7 @@ class ClaudeCodeRecorderPrimeSpawnsTriggerDreamTests(unittest.TestCase):
                 patch("vexic.recorders.cli.subprocess.Popen", side_effect=fake_popen),
                 patch(
                     "vexic.recorders.cli.fetch_prime_context",
-                    return_value="",
+                    return_value=hosted_prime.PrimeFetchResult(context=""),
                 ),
                 contextlib.redirect_stdout(stdout),
                 contextlib.redirect_stderr(stderr),
@@ -3777,7 +3781,7 @@ class ClaudeCodeRecorderPrimeSpawnsTriggerDreamTests(unittest.TestCase):
                 patch("vexic.recorders.cli.subprocess.Popen", blocking_popen),
                 patch(
                     "vexic.recorders.cli.fetch_prime_context",
-                    return_value="some prime context",
+                    return_value=hosted_prime.PrimeFetchResult(context="some prime context"),
                 ),
                 contextlib.redirect_stdout(stdout),
             ):
@@ -3802,6 +3806,532 @@ class ClaudeCodeRecorderPrimeSpawnsTriggerDreamTests(unittest.TestCase):
                 release_marker.write_text("go", encoding="utf-8")
                 for process in spawned_processes:
                     process.wait(timeout=5)
+
+
+def _prime_endpoint_payload(url: str) -> dict[str, object]:
+    if url.endswith("/v1/fresh_context"):
+        return {"summaries": [], "recent": [], "text": "Prior recap text", "truncated": False}
+    if url.endswith("/v1/search_long_term"):
+        return {
+            "facts": [{"fact_text": "Durable cedar preference"}],
+            "candidate_notes": [],
+        }
+    return {"hits": [{"body": "User: recent cedar note"}]}
+
+
+class _PrimeFakeResponse:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self._payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def read(self) -> bytes:
+        return json.dumps(self._payload).encode("utf-8")
+
+
+class ClaudeCodeRecorderPrimeDeadlineTests(unittest.TestCase):
+    """Prime must exit cleanly inside the SessionStart hook budget (ADR 0025 D4).
+
+    The Claude Code harness discards hook stdout entirely on timeout
+    cancellation (verified empirically against the live harness), so the only
+    delivery path is a clean exit before the hook timeout. These tests pin the
+    client-side guarantees: parallel dispatch, an end-to-end deadline that
+    degrades sections instead of losing the block, and the ADR 0024 framing/footer
+    surviving partial assembly.
+    """
+
+    def _run_prime(
+        self,
+        fake_urlopen,
+        *,
+        extra_argv: list[str] | None = None,
+        config_overrides: dict[str, object] | None = None,
+    ) -> tuple[int, str, float, Path]:
+        entered: list[str] = []
+
+        def counting_urlopen(request, timeout):
+            entered.append(request.full_url)
+            return fake_urlopen(request, timeout)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = _write_trigger_config(root, **(config_overrides or {}))
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            stdout = io.StringIO()
+            started = time.monotonic()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", counting_urlopen),
+                patch("vexic.recorders.cli.subprocess.Popen") as _popen,
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        *(extra_argv or []),
+                    ]
+                )
+                elapsed = time.monotonic() - started
+                # Abandoned daemon workers must enter the fake before the
+                # patch is unwound, or a late-scheduled worker would hit the
+                # real urlopen after the test ends.
+                settle_deadline = time.monotonic() + 5.0
+                while len(entered) < 3 and time.monotonic() < settle_deadline:
+                    time.sleep(0.01)
+            return code, stdout.getvalue(), elapsed, root
+
+    def test_prime_reads_dispatch_in_parallel(self) -> None:
+        lock = threading.Lock()
+        active = 0
+        max_active = 0
+
+        def fake_urlopen(request, timeout):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.25)
+            with lock:
+                active -= 1
+            return _PrimeFakeResponse(_prime_endpoint_payload(request.full_url))
+
+        code, output, _elapsed, _root = self._run_prime(fake_urlopen)
+
+        self.assertEqual(code, 0)
+        self.assertIn("Durable cedar preference", output)
+        self.assertGreaterEqual(
+            max_active,
+            2,
+            "prime reads must overlap; serial dispatch re-opens the 45s-vs-30s budget",
+        )
+
+    def test_prime_emits_partial_block_when_one_read_outlives_deadline(self) -> None:
+        def fake_urlopen(request, timeout):
+            if request.full_url.endswith("/v1/search_transcript"):
+                time.sleep(3.0)
+            return _PrimeFakeResponse(_prime_endpoint_payload(request.full_url))
+
+        code, output, elapsed, _root = self._run_prime(
+            fake_urlopen, extra_argv=["--deadline-seconds", "1.0"]
+        )
+
+        self.assertEqual(code, 0)
+        self.assertLess(elapsed, 2.5, "prime must exit at the deadline, not the slow read")
+        payload = json.loads(output)
+        context = payload["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Durable cedar preference", context)
+        self.assertIn("Prior recap text", context)
+        self.assertNotIn("recent cedar note", context)
+        self.assertIn(hosted_prime.PRIME_FRAMING, context)
+        self.assertIn(hosted_prime.PRIME_FOOTER, context)
+
+    def test_prime_exits_clean_and_silent_when_all_reads_outlive_deadline(self) -> None:
+        def fake_urlopen(request, timeout):
+            time.sleep(3.0)
+            return _PrimeFakeResponse(_prime_endpoint_payload(request.full_url))
+
+        code, output, elapsed, _root = self._run_prime(
+            fake_urlopen, extra_argv=["--deadline-seconds", "0.5"]
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output, "")
+        self.assertLess(elapsed, 2.5)
+
+    def test_prime_writes_attempt_marker_before_reads_and_final_status(self) -> None:
+        seen_during_fetch: list[object] = []
+        status_holder: dict[str, Path] = {}
+
+        def fake_urlopen(request, timeout):
+            status_path = status_holder["path"]
+            if status_path.exists():
+                seen_during_fetch.append(json.loads(status_path.read_text(encoding="utf-8")))
+            else:
+                seen_during_fetch.append(None)
+            return _PrimeFakeResponse(_prime_endpoint_payload(request.full_url))
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            status_path = root / "status.json"
+            prime_status_path = root / "status-prime.json"
+            status_holder["path"] = prime_status_path
+            config_path = _write_trigger_config(root)
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            stdout = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                patch("vexic.recorders.cli.subprocess.Popen"),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--status-path",
+                        str(status_path),
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertTrue(seen_during_fetch)
+            for marker in seen_during_fetch:
+                self.assertIsNotNone(
+                    marker, "attempt marker must be on disk before any read starts"
+                )
+                self.assertEqual(marker["operation"], "prime")
+                self.assertEqual(marker["phase"], "started")
+            final = json.loads(prime_status_path.read_text(encoding="utf-8"))
+            self.assertEqual(final["operation"], "prime")
+            self.assertEqual(final["phase"], "finished")
+            self.assertTrue(final["ok"])
+            self.assertEqual(
+                set(final["legs"]),
+                {"fresh_context", "search_long_term", "search_transcript"},
+            )
+            for leg in final["legs"].values():
+                self.assertEqual(leg["outcome"], "ok")
+                self.assertIsInstance(leg["duration_ms"], int)
+
+    def test_prime_final_status_marks_deadline_expired_legs(self) -> None:
+        def fake_urlopen(request, timeout):
+            if request.full_url.endswith("/v1/search_transcript"):
+                time.sleep(3.0)
+            return _PrimeFakeResponse(_prime_endpoint_payload(request.full_url))
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            status_path = root / "status.json"
+            config_path = _write_trigger_config(root)
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                patch("vexic.recorders.cli.subprocess.Popen"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--status-path",
+                        str(status_path),
+                        "--deadline-seconds",
+                        "1.0",
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            final = json.loads((root / "status-prime.json").read_text(encoding="utf-8"))
+            self.assertTrue(final["ok"])
+            self.assertEqual(final["legs"]["search_transcript"]["outcome"], "deadline")
+            self.assertEqual(final["legs"]["fresh_context"]["outcome"], "ok")
+
+    def test_prime_spawns_trigger_dream_after_reads_finish(self) -> None:
+        events: list[str] = []
+        lock = threading.Lock()
+
+        def fake_urlopen(request, timeout):
+            with lock:
+                events.append("read")
+            return _PrimeFakeResponse(_prime_endpoint_payload(request.full_url))
+
+        def fake_popen(argv, **kwargs):
+            with lock:
+                events.append("spawn")
+
+            class _FakeProcess:
+                pass
+
+            return _FakeProcess()
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = _write_trigger_config(root)
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                patch("vexic.recorders.cli.subprocess.Popen", fake_popen),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(events[-1], "spawn", "dream trigger must not precede the reads")
+        self.assertEqual(events.count("spawn"), 1)
+        self.assertEqual(events.count("read"), 3)
+
+    def test_prime_prints_context_before_spawn_and_final_status(self) -> None:
+        # A stalled Popen or status write after a successful fetch must not be
+        # able to hold the block inside the hook kill window: stdout first.
+        stdout_at_spawn: list[str] = []
+        status_exists_at_spawn: list[bool] = []
+        stdout = io.StringIO()
+        status_holder: dict[str, Path] = {}
+
+        def fake_urlopen(request, timeout):
+            return _PrimeFakeResponse(_prime_endpoint_payload(request.full_url))
+
+        def fake_popen(argv, **kwargs):
+            stdout_at_spawn.append(stdout.getvalue())
+            status_path = status_holder["path"]
+            if status_path.exists():
+                payload = json.loads(status_path.read_text(encoding="utf-8"))
+                status_exists_at_spawn.append(payload.get("phase") == "finished")
+            else:
+                status_exists_at_spawn.append(False)
+
+            class _FakeProcess:
+                pass
+
+            return _FakeProcess()
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            status_path = root / "status.json"
+            status_holder["path"] = root / "status-prime.json"
+            config_path = _write_trigger_config(root)
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                patch("vexic.recorders.cli.subprocess.Popen", fake_popen),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--status-path",
+                        str(status_path),
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(stdout_at_spawn), 1)
+        emitted = json.loads(stdout_at_spawn[0])
+        self.assertIn(
+            "Durable cedar preference",
+            emitted["hookSpecificOutput"]["additionalContext"],
+            "hook JSON must be on stdout before the dream spawn runs",
+        )
+        self.assertEqual(
+            status_exists_at_spawn,
+            [True],
+            "finished status must be durable before the dream spawn runs",
+        )
+
+    def test_prime_deadline_flag_warns_when_at_or_above_hook_budget(self) -> None:
+        def fake_urlopen(request, timeout):
+            return _PrimeFakeResponse(_prime_endpoint_payload(request.full_url))
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = _write_trigger_config(root)
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            stderr = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                patch("vexic.recorders.cli.subprocess.Popen"),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--deadline-seconds",
+                        "30",
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        self.assertIn("hook", stderr.getvalue())
+        self.assertIn("30", stderr.getvalue())
+
+    def test_prime_deadline_flag_rejects_non_positive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = _write_trigger_config(root)
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--deadline-seconds",
+                        "0",
+                    ]
+                )
+            self.assertEqual(code, 2, "usage error must surface, not run the reads")
+            self.assertIn("positive", stderr.getvalue())
+
+    def test_prime_legs_frozen_at_deadline_decision_despite_late_worker(self) -> None:
+        # A worker that finishes shortly after the deadline decision must not
+        # rewrite its leg to "ok" or smuggle its section into the context: the
+        # emitted block and the status legs must describe the same snapshot.
+        def fake_urlopen(request, timeout):
+            if request.full_url.endswith("/v1/search_transcript"):
+                time.sleep(2.0)
+            return _PrimeFakeResponse(_prime_endpoint_payload(request.full_url))
+
+        config = hosted_prime.HostedPrimeConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+        with patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen):
+            result = hosted_prime.fetch_prime_context(config, deadline_seconds=0.5)
+            self.assertEqual(result.legs["search_transcript"]["outcome"], "deadline")
+            self.assertNotIn("recent cedar note", result.context)
+            time.sleep(2.5)
+            self.assertEqual(
+                result.legs["search_transcript"]["outcome"],
+                "deadline",
+                "late-finishing worker must not rewrite a decided leg",
+            )
+
+    def test_prime_status_lands_in_sibling_file_leaving_ingest_record_intact(self) -> None:
+        # Prime and ingest sharing one status file would let an async Stop
+        # ingest overwrite a killed prime's stale "started" marker — the very
+        # evidence the marker exists to preserve — and vice versa.
+        def fake_urlopen(request, timeout):
+            return _PrimeFakeResponse(_prime_endpoint_payload(request.full_url))
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            status_path = root / "status.json"
+            ingest_record = '{"ok": true, "operation": "ingest", "inserted": 7}\n'
+            status_path.write_text(ingest_record, encoding="utf-8")
+            config_path = _write_trigger_config(root)
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                patch("vexic.recorders.cli.subprocess.Popen"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--status-path",
+                        str(status_path),
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(
+                status_path.read_text(encoding="utf-8"),
+                ingest_record,
+                "prime must never touch the ingest status file",
+            )
+            prime_status = json.loads(
+                (root / "status-prime.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(prime_status["operation"], "prime")
+            self.assertEqual(prime_status["phase"], "finished")
+
+    def test_prime_deadline_flag_rejects_non_finite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = _write_trigger_config(root)
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--deadline-seconds",
+                        "inf",
+                    ]
+                )
+            self.assertEqual(code, 2, "inf must be a usage error, not join(inf)")
+            self.assertIn("finite", stderr.getvalue())
+
+    def test_prime_exits_within_hook_budget_when_post_print_work_stalls(self) -> None:
+        # The harness discards even flushed stdout unless the process exits
+        # cleanly before the hook kill, so a stalled dream spawn or status
+        # write after print must be abandoned, not waited on.
+        def fake_urlopen(request, timeout):
+            return _PrimeFakeResponse(_prime_endpoint_payload(request.full_url))
+
+        def stalling_popen(argv, **kwargs):
+            time.sleep(3.0)
+
+            class _FakeProcess:
+                pass
+
+            return _FakeProcess()
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = _write_trigger_config(root)
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            stdout = io.StringIO()
+            started = time.monotonic()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                patch("vexic.recorders.cli.subprocess.Popen", stalling_popen),
+                patch("vexic.recorders.cli._SESSION_START_HOOK_KILL_SECONDS", 5.0),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+            elapsed = time.monotonic() - started
+
+        self.assertEqual(code, 0)
+        self.assertLess(
+            elapsed,
+            2.0,
+            "post-print stall must be abandoned inside the hook budget",
+        )
+        emitted = json.loads(stdout.getvalue())
+        self.assertIn(
+            "Durable cedar preference",
+            emitted["hookSpecificOutput"]["additionalContext"],
+        )
 
 
 class _FakeSetupResult:

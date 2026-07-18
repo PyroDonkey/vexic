@@ -18,6 +18,13 @@ class RecorderStatus:
     rejected: int = 0
     ignored: int = 0
     error: str | None = None
+    # Prime-only fields. "started" is written before any hosted read so an
+    # external kill (the SessionStart hook timeout) leaves a stale started
+    # marker as durable evidence; "finished" replaces it with per-leg
+    # durations and outcomes (ADR 0025 D4 follow-up).
+    phase: str | None = None
+    legs: dict[str, dict[str, object]] | None = None
+    duration_ms: int | None = None
 
 
 def write_status(path: Path, status: RecorderStatus) -> None:

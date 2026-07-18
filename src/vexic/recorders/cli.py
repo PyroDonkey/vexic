@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import subprocess
 import sys
+import threading
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Iterator
@@ -24,6 +27,7 @@ from vexic.recorders.claude_setup import (
 )
 from vexic.recorders.hosted_prime import (
     DEFAULT_PRIME_MAX_CHARS,
+    PRIME_DEADLINE_SECONDS,
     HostedPrimeConfig,
     fetch_prime_context,
     post_trigger_dream_phase,
@@ -149,6 +153,31 @@ def _argv_status_path(argv: list[str]) -> Path | None:
     return None
 
 
+# The Claude Code SessionStart hook installed by claude_setup kills prime at
+# this many seconds; a fetch deadline at or beyond it silently recreates the
+# lost-block failure the deadline exists to prevent.
+_SESSION_START_HOOK_KILL_SECONDS = 30.0
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if not (parsed > 0 and math.isfinite(parsed)):
+        raise argparse.ArgumentTypeError(
+            "must be a positive, finite number of seconds"
+        )
+    return parsed
+
+
+def _prime_status_path(path: Path | None) -> Path | None:
+    # Prime records land in a sibling file, never the ingest status file: an
+    # async Stop ingest overwriting a killed prime's stale "started" marker
+    # would destroy the very evidence the marker exists to preserve, and a
+    # prime write would likewise erase ingest counts an operator needs.
+    if path is None:
+        return None
+    return path.with_name(f"{path.stem}-prime{path.suffix}")
+
+
 def _try_write_status(path: Path | None, status: RecorderStatus) -> str | None:
     if path is None:
         return None
@@ -184,6 +213,11 @@ def _parser() -> argparse.ArgumentParser:
     prime.add_argument("--session-id")
     prime.add_argument("--agent-id")
     prime.add_argument("--timeout-seconds", type=float, default=15.0)
+    prime.add_argument(
+        "--deadline-seconds",
+        type=_positive_float,
+        default=PRIME_DEADLINE_SECONDS,
+    )
     prime.add_argument("--max-chars", type=int, default=DEFAULT_PRIME_MAX_CHARS)
     prime.add_argument("--status-path", type=Path)
 
@@ -476,13 +510,36 @@ def _spawn_trigger_dream(config_path: Path) -> None:
 
 
 def _prime(args: argparse.Namespace) -> int:
+    started = time.monotonic()
+    status_session_id: str | None = None
     try:
         payload = _read_session_start_payload(args.hook_input)
         if payload.source not in {"startup", "clear"}:
             return 0
-        _spawn_trigger_dream(args.config)
         _apply_ingest_config(args)
-        context = fetch_prime_context(
+        status_session_id = args.session_id
+        # Attempt marker before any hosted read: the SessionStart hook kills
+        # this process at its timeout and no in-process handler can run, so a
+        # stale "started" record is the only durable evidence of a kill.
+        _try_write_status(
+            _prime_status_path(args.status_path),
+            RecorderStatus(
+                ok=False,
+                operation="prime",
+                source_session_id=status_session_id,
+                transcript_path=None,
+                phase="started",
+            ),
+        )
+        if args.deadline_seconds >= _SESSION_START_HOOK_KILL_SECONDS - 5:
+            print(
+                "warning: --deadline-seconds "
+                f"{args.deadline_seconds:g} leaves under 5s of margin before "
+                f"the SessionStart hook kill ({_SESSION_START_HOOK_KILL_SECONDS:g}s); "
+                "a kill discards the entire priming block",
+                file=sys.stderr,
+            )
+        result = fetch_prime_context(
             HostedPrimeConfig(
                 base_url=args.base_url,
                 api_key=args.api_key,
@@ -492,25 +549,72 @@ def _prime(args: argparse.Namespace) -> int:
                 timeout_seconds=args.timeout_seconds,
             ),
             max_chars=args.max_chars,
+            deadline_seconds=args.deadline_seconds,
+        )
+        # stdout first: the hook consumes it only on a clean pre-timeout
+        # exit, so nothing that can stall (status I/O, subprocess spawn) may
+        # sit between a successful fetch and the print.
+        if result.context:
+            print(
+                json.dumps(
+                    {
+                        "hookSpecificOutput": {
+                            "hookEventName": "SessionStart",
+                            "additionalContext": result.context,
+                        }
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        # The harness discards even flushed stdout unless the process exits
+        # cleanly before the hook kill, so the remaining work (status write,
+        # dream spawn) runs in a daemon thread joined against the leftover
+        # hook budget: a stall there is abandoned, never waited into the
+        # kill window. Spawn stays after the reads so prime's own dream
+        # trigger cannot compete with them for hosted capacity (ADR 0025 D4
+        # follow-up).
+        def _finish() -> None:
+            _try_write_status(
+                _prime_status_path(args.status_path),
+                RecorderStatus(
+                    ok=True,
+                    operation="prime",
+                    source_session_id=status_session_id,
+                    transcript_path=None,
+                    phase="finished",
+                    legs=result.legs,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                ),
+            )
+            _spawn_trigger_dream(args.config)
+
+        finisher = threading.Thread(target=_finish, daemon=True)
+        finisher.start()
+        finisher.join(
+            max(
+                0.0,
+                (_SESSION_START_HOOK_KILL_SECONDS - 5.0)
+                - (time.monotonic() - started),
+            )
         )
     except Exception as exc:
         # SessionStart priming is fail-open: stderr is the operator signal,
         # stdout stays empty so Claude Code receives no unsafe context.
         print(f"warning: {exc}", file=sys.stderr)
-        return 0
-    if not context:
-        return 0
-    print(
-        json.dumps(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "SessionStart",
-                    "additionalContext": context,
-                }
-            },
-            sort_keys=True,
+        _try_write_status(
+            _prime_status_path(getattr(args, "status_path", None)),
+            RecorderStatus(
+                ok=False,
+                operation="prime",
+                source_session_id=status_session_id,
+                transcript_path=None,
+                error=f"{type(exc).__name__}: {exc}",
+                phase="finished",
+                duration_ms=int((time.monotonic() - started) * 1000),
+            ),
         )
-    )
+        return 0
     return 0
 
 
