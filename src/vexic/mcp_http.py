@@ -16,6 +16,7 @@ from vexic.contract import (
     SearchTranscriptRequest,
     TrustBoundary,
 )
+from vexic.error_reporting import validation_error_message
 from vexic.hosted import HostedAuthContext, HostedMemoryService, HostedRateLimitExceeded
 from vexic.mcp_presentation import (
     RECALL_CONVERSATION_HISTORY,
@@ -283,6 +284,10 @@ async def _call_tool(
         # ValueErrors are safe JSON-RPC tool errors.
         if _is_storage_error(exc):
             raise
+        if isinstance(exc, ValidationError):
+            # str(ValidationError) embeds the offending input value and a
+            # pydantic docs URL; keep only the validator-authored messages.
+            return _tool_error(validation_error_message(exc))
         return _tool_error(str(exc))
     except Exception as exc:
         if _is_storage_error(exc):

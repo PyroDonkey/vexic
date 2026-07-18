@@ -606,7 +606,88 @@ class McpHttpTests(unittest.TestCase):
                     )
 
                 self.assertEqual(response.status_code, 200)
-                self.assertTrue(response.json()["result"]["isError"])
+                result = response.json()["result"]
+                self.assertTrue(result["isError"])
+                raw = response.text
+                self.assertNotIn("input_value", raw)
+                self.assertNotIn("errors.pydantic.dev", raw)
+                if isinstance(failure, ValidationError):
+                    # The offending input value must not be echoed; only the
+                    # validator-authored message is client-safe.
+                    self.assertNotIn("Hrana: UNIQUE constraint failed: secret", raw)
+                    self.assertIn(
+                        "Input should be a valid integer",
+                        result["content"][0]["text"],
+                    )
+
+    def test_mcp_tool_validation_error_does_not_echo_marker(self) -> None:
+        class _MarkerModel(BaseModel):
+            limit: int
+
+        try:
+            _MarkerModel.model_validate({"limit": "sekret-marker-value"})
+        except ValidationError as exc:
+            validation_error = exc
+
+        api_key = self._api_key()
+        with patch.object(
+            type(self.service),
+            "search_transcript",
+            side_effect=validation_error,
+        ):
+            response = self.client.post(
+                "/mcp",
+                headers=self._mcp_headers(api_key, session_id="session-a"),
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 16,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "recall_conversation_history",
+                        "arguments": {"query": "cedar"},
+                    },
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        result = response.json()["result"]
+        self.assertTrue(result["isError"])
+        text = result["content"][0]["text"]
+        self.assertIn("Input should be a valid integer", text)
+        raw = response.text
+        self.assertNotIn("sekret-marker-value", raw)
+        self.assertNotIn("input_value", raw)
+        self.assertNotIn("errors.pydantic.dev", raw)
+
+    def test_mcp_tool_real_argument_validation_error_does_not_echo_marker(self) -> None:
+        api_key = self._api_key()
+
+        response = self.client.post(
+            "/mcp",
+            headers=self._mcp_headers(api_key, session_id="session-a"),
+            json={
+                "jsonrpc": "2.0",
+                "id": 16,
+                "method": "tools/call",
+                "params": {
+                    "name": "recall_user_memory",
+                    "arguments": {
+                        "query": "cedar",
+                        "as_of": {"marker": "sekret-marker-value"},
+                    },
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        result = response.json()["result"]
+        self.assertTrue(result["isError"])
+        text = result["content"][0]["text"]
+        self.assertIn("Input should be a valid string", text)
+        raw = response.text
+        self.assertNotIn("sekret-marker-value", raw)
+        self.assertNotIn("input_value", raw)
+        self.assertNotIn("errors.pydantic.dev", raw)
 
     def test_search_transcript_hostile_query_stays_scoped(self) -> None:
         api_key = self._api_key(capabilities={MemoryCapability.WRITE, MemoryCapability.SEARCH})
