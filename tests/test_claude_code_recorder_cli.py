@@ -918,6 +918,60 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         sleep_mock.assert_not_called()
 
+    def test_post_source_messages_response_read_bounded_by_budget(self) -> None:
+        # A socket timeout bounds each recv, not the whole body: a proxy that
+        # drips bytes forever must not stretch the read past the retry budget
+        # and into the Stop hook kill.
+        from vexic.recorders.hosted_ingest import HostedIngestTransportError
+
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        class _DripResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self, size=-1) -> bytes:
+                return b"{"  # never finishes
+
+        calls: list[int] = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(1)
+            return _DripResponse()
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch("vexic.recorders.hosted_ingest.random.uniform", return_value=1.0),
+            patch(
+                "vexic.recorders.hosted_ingest.time.monotonic",
+                # started, attempt-1 pre-check, first chunk check (budget
+                # fine), second chunk check (budget spent mid-read), retry
+                # decision (spent, so no second attempt).
+                side_effect=[0.0, 0.0, 1.0, 12.0, 13.0],
+            ),
+        ):
+            with self.assertRaises(HostedIngestTransportError) as caught:
+                post_source_messages(
+                    config,
+                    messages=[],
+                    forbidden_values=(),
+                    budget_seconds=10.0,
+                )
+
+        self.assertEqual(str(caught.exception), "hosted ingest failed: TimeoutError")
+        self.assertEqual(len(calls), 1)
+        sleep_mock.assert_not_called()
+
     def test_post_source_messages_urlopen_timeout_capped_by_remaining_budget(
         self,
     ) -> None:
@@ -930,14 +984,17 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
         )
 
         class _Response:
+            def __init__(self) -> None:
+                self._body = io.BytesIO(b'{"items":[]}')
+
             def __enter__(self):
                 return self
 
             def __exit__(self, *_exc):
                 return False
 
-            def read(self) -> bytes:
-                return b'{"items":[]}'
+            def read(self, size: int = -1) -> bytes:
+                return self._body.read(size)
 
         timeouts: list[float] = []
 
@@ -949,9 +1006,10 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
             patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
             patch(
                 "vexic.recorders.hosted_ingest.time.monotonic",
-                # started, attempt-1 pre-check: 2s of budget left, so the
-                # 30s per-request timeout must shrink to the remaining 2s.
-                side_effect=[0.0, 8.0],
+                # started, attempt-1 pre-check (2s of budget left, so the
+                # 30s per-request timeout must shrink to the remaining 2s),
+                # then one budget check per body chunk read.
+                side_effect=[0.0, 8.0, 8.5, 8.5],
             ),
         ):
             result = post_source_messages(
@@ -1779,7 +1837,7 @@ class ClaudeCodeRecorderHostedRoundTripTests(unittest.TestCase):
 
             class _Response:
                 def __init__(self, content: bytes):
-                    self._content = content
+                    self._body = io.BytesIO(content)
 
                 def __enter__(self):
                     return self
@@ -1787,8 +1845,8 @@ class ClaudeCodeRecorderHostedRoundTripTests(unittest.TestCase):
                 def __exit__(self, *_exc):
                     return False
 
-                def read(self) -> bytes:
-                    return self._content
+                def read(self, size: int = -1) -> bytes:
+                    return self._body.read(size)
 
             def fake_urlopen(request, timeout):
                 target = urlsplit(request.full_url)

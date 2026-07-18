@@ -634,7 +634,7 @@ class RecorderCursorLedgerDedupTests(unittest.TestCase):
 
             class _Response:
                 def __init__(self, content: bytes) -> None:
-                    self._content = content
+                    self._body = io.BytesIO(content)
 
                 def __enter__(self):
                     return self
@@ -642,8 +642,8 @@ class RecorderCursorLedgerDedupTests(unittest.TestCase):
                 def __exit__(self, *_exc):
                     return False
 
-                def read(self) -> bytes:
-                    return self._content
+                def read(self, size: int = -1) -> bytes:
+                    return self._body.read(size)
 
             def fake_urlopen(request, timeout):
                 response = client.request(

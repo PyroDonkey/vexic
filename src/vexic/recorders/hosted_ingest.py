@@ -59,6 +59,28 @@ def _backoff_delay(attempt: int) -> float:
     return _TRANSPORT_RETRY_BACKOFF_SECONDS * attempt * random.uniform(0.5, 1.5)
 
 
+_RESPONSE_READ_CHUNK_BYTES = 64 * 1024
+
+
+def _read_with_budget(response, remaining_fn) -> bytes:
+    """Read the whole body, re-checking the retry budget between recvs.
+
+    The socket timeout bounds each recv, not the total read, so a proxy that
+    keeps dripping bytes could stretch a plain `response.read()` past the
+    budget and into the Stop hook kill. The raised `TimeoutError` is an
+    `OSError`, so it flows through the normal transport-retry classification.
+    """
+    chunks: list[bytes] = []
+    while True:
+        remaining = remaining_fn()
+        if remaining is not None and remaining <= 0:
+            raise TimeoutError("response body read exceeded the retry budget")
+        chunk = response.read(_RESPONSE_READ_CHUNK_BYTES)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
 def _sleep_before_retry(attempt: int, remaining: float | None, delay: float) -> bool:
     """Sleep ahead of one more attempt, or return False when retries are spent.
 
@@ -176,7 +198,12 @@ def post_source_messages(
         )
         try:
             with urlopen(request, timeout=timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
+                body = (
+                    response.read()
+                    if remaining is None
+                    else _read_with_budget(response, _remaining)
+                )
+                return json.loads(body.decode("utf-8"))
         except HTTPError as exc:
             if exc.code < 500 and exc.code not in _RETRYABLE_STATUS_CODES:
                 detail = _error_body_detail(exc)
