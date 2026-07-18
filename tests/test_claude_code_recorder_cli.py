@@ -641,8 +641,9 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
             patch(
                 "vexic.recorders.hosted_ingest.time.monotonic",
                 # started, attempt-1 pre-check, retry decision (5s left,
-                # which cannot fit the 30s-capped Retry-After wait).
-                side_effect=[0.0, 0.0, 5.0],
+                # which cannot fit the 30s-capped Retry-After wait),
+                # body-read guard.
+                side_effect=[0.0, 0.0, 5.0, 5.0],
             ),
         ):
             with self.assertRaises(HostedIngestTransportError) as caught:
@@ -851,10 +852,10 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
             patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
             patch(
                 "vexic.recorders.hosted_ingest.time.monotonic",
-                # started, attempt-1 pre-check, attempt-1 retry decision: the
+                # started, attempt-1 pre-check, attempt-1 retry decision (the
                 # budget is spent while the first attempt is in flight, so no
-                # second attempt and no sleep may happen.
-                side_effect=[0.0, 5.0, 12.0],
+                # second attempt and no sleep may happen), body-read guard.
+                side_effect=[0.0, 5.0, 12.0, 12.0],
             ),
         ):
             with self.assertRaises(HostedIngestTransportError) as caught:
@@ -867,6 +868,59 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
 
         self.assertRegex(str(caught.exception), "hosted ingest failed: HTTP 503")
         self.assertEqual(len(calls), 1)
+        sleep_mock.assert_not_called()
+
+    def test_post_source_messages_skips_error_body_read_when_budget_spent(self) -> None:
+        # The exhaustion raise normally reads the error body for detail, but a
+        # dripping body can block up to a socket timeout; with the budget
+        # already spent that delay would push the fail-open exit toward the
+        # Stop hook kill, so the read is skipped and the bare code surfaces.
+        from vexic.recorders.hosted_ingest import HostedIngestTransportError
+
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+        read_sizes: list[int | None] = []
+
+        class _TrackingBody(io.BytesIO):
+            def read(self, size: int | None = -1) -> bytes:
+                read_sizes.append(size)
+                return super().read(size)
+
+        def fake_urlopen(request, timeout):
+            raise HTTPError(
+                url="https://api.example.test/v1/ingest_source_transcript",
+                code=503,
+                msg="Service Unavailable",
+                hdrs={},
+                fp=_TrackingBody(b'{"error": {"code": "storage_unavailable"}}'),
+            )
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch("vexic.recorders.hosted_ingest.random.uniform", return_value=1.0),
+            patch(
+                "vexic.recorders.hosted_ingest.time.monotonic",
+                # started, attempt-1 pre-check, retry decision (budget spent),
+                # the body-read guard's own check.
+                side_effect=[0.0, 5.0, 12.0, 12.0],
+            ),
+        ):
+            with self.assertRaises(HostedIngestTransportError) as caught:
+                post_source_messages(
+                    config,
+                    messages=[],
+                    forbidden_values=(),
+                    budget_seconds=10.0,
+                )
+
+        self.assertEqual(str(caught.exception), "hosted ingest failed: HTTP 503")
+        self.assertEqual(read_sizes, [])
         sleep_mock.assert_not_called()
 
     def test_post_source_messages_skips_sleep_that_cannot_fit_the_budget(self) -> None:
@@ -900,10 +954,10 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
             patch("vexic.recorders.hosted_ingest.random.uniform", return_value=1.0),
             patch(
                 "vexic.recorders.hosted_ingest.time.monotonic",
-                # started, attempt-1 pre-check, attempt-1 retry decision:
-                # 0.25s of budget is left there, which cannot fit the 0.5s
-                # backoff.
-                side_effect=[0.0, 0.0, 9.75],
+                # started, attempt-1 pre-check, attempt-1 retry decision
+                # (0.25s of budget is left there, which cannot fit the 0.5s
+                # backoff), body-read guard.
+                side_effect=[0.0, 0.0, 9.75, 9.75],
             ),
         ):
             with self.assertRaises(HostedIngestTransportError) as caught:
@@ -2891,14 +2945,16 @@ class ClaudeCodeRecorderIngestCommandMoreTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
+            stderr = io.StringIO()
             with (
                 patch(
                     "vexic.recorders.cli.post_source_messages",
-                    side_effect=lambda _config, *, messages, forbidden_values: (
+                    side_effect=lambda _config, *, messages, forbidden_values, budget_seconds=None: (
                         _ingest_result(messages)
                     ),
                 ),
                 patch("vexic.recorders.cli.write_status", side_effect=OSError("disk full")),
+                contextlib.redirect_stderr(stderr),
             ):
                 code = recorder_main(
                     [
@@ -2919,6 +2975,10 @@ class ClaudeCodeRecorderIngestCommandMoreTests(unittest.TestCase):
                 )
 
             self.assertEqual(code, 2)
+            # The failure surfaced must be the status write itself, not an
+            # incidental error swallowed on the way there.
+            self.assertIn("status write failed: OSError", stderr.getvalue())
+            self.assertNotIn("Traceback", stderr.getvalue())
 
     def test_ingest_parse_error_writes_status_when_status_path_is_present(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

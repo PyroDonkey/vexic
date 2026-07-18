@@ -77,6 +77,12 @@ def _read_with_budget(
     keeps dripping bytes could stretch a plain `response.read()` past the
     budget and into the Stop hook kill. The raised `TimeoutError` is an
     `OSError`, so it flows through the normal transport-retry classification.
+
+    Best-effort bound: the last recv can still block up to the attempt's
+    socket timeout past the budget, because the stdlib exposes no supported
+    way to re-arm an `HTTPResponse` socket timeout mid-read. The overshoot is
+    capped by the per-attempt timeout (itself capped to the remaining budget
+    at attempt start), which is accepted.
     """
     chunks: list[bytes] = []
     while True:
@@ -227,8 +233,14 @@ def post_source_messages(
             if _sleep_before_retry(attempt, _remaining(), delay):
                 continue
             # Only the finally-raised error reads its body; retried attempts
-            # drop theirs so a per-attempt proxy body is never buffered.
-            detail = _error_body_detail(exc)
+            # drop theirs so a per-attempt proxy body is never buffered. With
+            # the budget already spent even that read is skipped: a dripping
+            # error body can block up to a socket timeout, delaying the
+            # fail-open exit toward the Stop hook kill.
+            left = _remaining()
+            detail = (
+                None if left is not None and left <= 0 else _error_body_detail(exc)
+            )
             suffix = f" ({detail})" if detail else ""
             raise HostedIngestTransportError(
                 f"hosted ingest failed: HTTP {exc.code}{suffix}"

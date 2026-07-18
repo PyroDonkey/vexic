@@ -427,6 +427,10 @@ def _try_write_cursor(
 
 
 def _ingest(args: argparse.Namespace) -> int:
+    # The deadline clock starts before the transcript scan: a large full
+    # reread eats hook-kill margin too, and "end-to-end" must mean the whole
+    # run, not just the posting loop.
+    started = time.monotonic()
     payload = _read_hook_payload(args.hook_input)
     transcript_path = payload.transcript_path
     source_session_id = payload.session_id
@@ -459,7 +463,6 @@ def _ingest(args: argparse.Namespace) -> int:
     )
     items: list[SourceTranscriptIngestItemResult] = []
     batches = list(_iter_hosted_message_batches(messages))
-    started = time.monotonic()
     for index, batch in enumerate(batches):
         # One clock read per batch: the remaining deadline both gates the
         # next POST and caps its in-call retry budget. Raising here, before
