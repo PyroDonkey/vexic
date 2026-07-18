@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from vexic import CONTRACT_VERSION
+from vexic.error_reporting import validation_error_message
 from vexic.contract import (
     DreamPhase,
     ExpandHistoryResult,
@@ -689,7 +690,7 @@ async def _handle_trigger_dream_phase(
             phase=phase,
         )
     except ValidationError as exc:
-        return _error_response(400, "invalid_request", _validation_error_message(exc))
+        return _error_response(400, "invalid_request", validation_error_message(exc))
     except ValueError as exc:
         return _value_error_response(exc)
 
@@ -743,28 +744,6 @@ def _authenticate_for_header_scope(
     return authenticate(api_key)
 
 
-def _validation_error_message(exc: ValidationError) -> str:
-    """Build a client-safe 400 message from a pydantic ``ValidationError``.
-
-    ``str(ValidationError)`` embeds the offending input value -- for the hosted
-    request models that input is the bound ``MemoryScope`` repr -- plus a
-    pydantic docs URL. Only the validator-authored ``msg`` text is client-safe,
-    so this drops the structured input, context, and URL and keeps the
-    deduplicated messages. This is safe only because the
-    contract validators feeding these callsites use static messages and never
-    interpolate client input into their own text; a validator that did would
-    have to be fixed at the validator, not masked here.
-    """
-    messages: list[str] = []
-    for error in exc.errors(include_url=False, include_input=False, include_context=False):
-        message = str(error["msg"]).removeprefix("Value error, ")
-        if message not in messages:
-            messages.append(message)
-    if not messages:
-        return "Invalid request."
-    return "; ".join(messages)
-
-
 def _value_error_response(exc: ValueError) -> JSONResponse:
     """Map a ``ValueError`` from a hosted operation to an HTTP response.
 
@@ -774,11 +753,11 @@ def _value_error_response(exc: ValueError) -> JSONResponse:
     subclasses ``ValueError`` and can embed marker-like client input in its
     message, so it is classified as a client fault before the storage
     classifiers run and its message is sanitized through
-    ``_validation_error_message`` rather than dumped raw. Storage detail is
+    ``validation_error_message`` rather than dumped raw. Storage detail is
     never logged, mirroring the sanitized control-plane logging convention.
     """
     if isinstance(exc, ValidationError):
-        return _error_response(400, "invalid_request", _validation_error_message(exc))
+        return _error_response(400, "invalid_request", validation_error_message(exc))
     storage_error = _storage_error_response(exc)
     if storage_error is not None:
         return storage_error
