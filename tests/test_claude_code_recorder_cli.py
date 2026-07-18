@@ -1216,7 +1216,7 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
             status_path = root / "status.json"
             calls = []
 
-            def fake_post(config, *, messages, forbidden_values):
+            def fake_post(config, *, messages, forbidden_values, budget_seconds=None):
                 calls.append((config, messages, forbidden_values))
                 return {
                     "items": [
@@ -1303,7 +1303,7 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
                     # Mirror real uv-run Windows stdin text decoding.
                     return self._data.decode("cp1252", "surrogateescape")
 
-            def fake_post(config, *, messages, forbidden_values):
+            def fake_post(config, *, messages, forbidden_values, budget_seconds=None):
                 return _ingest_result(messages)
 
             with (
@@ -1353,7 +1353,7 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
             status_path = root / "status.json"
             calls = []
 
-            def fake_post(config, *, messages, forbidden_values):
+            def fake_post(config, *, messages, forbidden_values, budget_seconds=None):
                 calls.append(messages)
                 if len(calls) == 1:
                     return _ingest_result(messages)
@@ -1400,6 +1400,154 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
             self.assertEqual(status["rejected"], 1)
             self.assertEqual(status["ignored"], 1)
 
+    def test_ingest_deadline_expiry_fails_open_between_batches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            transcript = root / "session.jsonl"
+            rows = [
+                {
+                    "type": "user",
+                    "sessionId": "claude-session",
+                    "uuid": f"uuid-{index}",
+                    "message": {"role": "user", "content": f"remember cedar {index}"},
+                }
+                for index in range(101)
+            ]
+            transcript.write_text(
+                "\n".join(json.dumps(row) for row in rows),
+                encoding="utf-8",
+            )
+            hook_payload = root / "hook.json"
+            hook_payload.write_text(
+                json.dumps(
+                    {
+                        "session_id": "claude-session",
+                        "transcript_path": str(transcript),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            status_path = root / "status.json"
+            calls = []
+            budgets: list[float | None] = []
+
+            def fake_post(config, *, messages, forbidden_values, budget_seconds=None):
+                calls.append(messages)
+                budgets.append(budget_seconds)
+                return _ingest_result(messages)
+
+            argv = [
+                "ingest",
+                "--hook-input",
+                str(hook_payload),
+                "--base-url",
+                "https://api.example.test",
+                "--api-key",
+                "vx_secret",
+                "--project-id",
+                "project-a",
+                "--session-id",
+                "vexic-session",
+                "--status-path",
+                str(status_path),
+            ]
+
+            stderr = io.StringIO()
+            with (
+                patch("vexic.recorders.cli.post_source_messages", fake_post),
+                patch(
+                    "vexic.recorders.cli.time.monotonic",
+                    # started, batch-1 deadline check, batch-2 deadline check:
+                    # the 100s default is spent while batch 1 posts, so batch 2
+                    # must never be attempted.
+                    side_effect=[0.0, 0.0, 150.0],
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = recorder_main(argv)
+
+            self.assertEqual(code, 1)
+            self.assertEqual([len(batch) for batch in calls], [100])
+            # The full remaining deadline flows into the batch as its retry
+            # budget.
+            self.assertEqual(budgets, [100.0])
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertFalse(status["ok"])
+            self.assertIn("deadline", status["error"])
+            self.assertIn("warning:", stderr.getvalue())
+
+            # A rerun with a live clock re-posts every row; the hosted ledger
+            # dedups the 100 rows batch 1 already delivered.
+            calls.clear()
+            with (
+                patch("vexic.recorders.cli.post_source_messages", fake_post),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(recorder_main(argv), 0)
+            self.assertEqual([len(batch) for batch in calls], [100, 1])
+
+    def test_ingest_deadline_flag_rejects_non_positive_values(self) -> None:
+        # recorder_main converts the argparse SystemExit into a return code.
+        for value in ("0", "-1"):
+            with self.subTest(deadline=value):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    code = recorder_main(
+                        [
+                            "ingest",
+                            "--deadline-seconds",
+                            value,
+                        ]
+                    )
+                self.assertEqual(code, 2)
+
+    def test_ingest_deadline_flag_warns_when_at_or_above_hook_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            transcript = root / "session.jsonl"
+            transcript.write_text("", encoding="utf-8")
+            hook_payload = root / "hook.json"
+            hook_payload.write_text(
+                json.dumps(
+                    {
+                        "session_id": "claude-session",
+                        "transcript_path": str(transcript),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            def fake_post(config, *, messages, forbidden_values, budget_seconds=None):
+                return _ingest_result(messages)
+
+            stderr = io.StringIO()
+            with (
+                patch("vexic.recorders.cli.post_source_messages", fake_post),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = recorder_main(
+                    [
+                        "ingest",
+                        "--hook-input",
+                        str(hook_payload),
+                        "--base-url",
+                        "https://api.example.test",
+                        "--api-key",
+                        "vx_secret",
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "vexic-session",
+                        "--deadline-seconds",
+                        "116",
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertIn("margin", stderr.getvalue())
+            self.assertIn("Stop hook kill", stderr.getvalue())
+
     def test_ingest_batches_hosted_posts_before_payload_char_cap(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -1436,7 +1584,7 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
             ]
             calls = []
 
-            def fake_post(config, *, messages, forbidden_values):
+            def fake_post(config, *, messages, forbidden_values, budget_seconds=None):
                 calls.append(messages)
                 return _ingest_result(messages)
 
@@ -2499,7 +2647,7 @@ class ClaudeCodeSetupTests(unittest.TestCase):
             )
             calls = []
 
-            def fake_post(config, *, messages, forbidden_values):
+            def fake_post(config, *, messages, forbidden_values, budget_seconds=None):
                 calls.append((config, messages, forbidden_values))
                 return _ingest_result(messages)
 
@@ -2814,7 +2962,7 @@ class ClaudeCodeRecorderIngestCommandMoreTests(unittest.TestCase):
 
             with patch(
                 "vexic.recorders.cli.post_source_messages",
-                side_effect=lambda _config, *, messages, forbidden_values: (
+                side_effect=lambda _config, *, messages, forbidden_values, budget_seconds=None: (
                     _ingest_result(messages)
                 ),
             ):

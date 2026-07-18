@@ -158,6 +158,17 @@ def _argv_status_path(argv: list[str]) -> Path | None:
 # lost-block failure the deadline exists to prevent.
 _SESSION_START_HOOK_KILL_SECONDS = 30.0
 
+# The async Stop hook installed by claude_setup kills ingest at this many
+# seconds, with no in-process handler able to run afterward.
+_STOP_HOOK_KILL_SECONDS = 120.0
+
+# End-to-end budget for the ingest posting loop. Without it a multi-batch
+# transcript is unbounded (each batch can burn ~91.5s of retries) and the Stop
+# hook kill lands mid-flight with no status write and no controlled exit. The
+# default leaves margin inside the 120s kill for the degraded status write and
+# the fail-open exit 1.
+INGEST_DEADLINE_SECONDS = 100.0
+
 
 def _positive_float(value: str) -> float:
     parsed = float(value)
@@ -201,6 +212,11 @@ def _parser() -> argparse.ArgumentParser:
     ingest.add_argument("--session-id")
     ingest.add_argument("--agent-id")
     ingest.add_argument("--timeout-seconds", type=float, default=30.0)
+    ingest.add_argument(
+        "--deadline-seconds",
+        type=_positive_float,
+        default=INGEST_DEADLINE_SECONDS,
+    )
     ingest.add_argument("--forbidden-value", action="append", default=[])
     ingest.add_argument("--status-path", type=Path)
 
@@ -418,13 +434,33 @@ def _ingest(args: argparse.Namespace) -> int:
         agent_id=args.agent_id,
         timeout_seconds=args.timeout_seconds,
     )
+    if args.deadline_seconds >= _STOP_HOOK_KILL_SECONDS - 5:
+        print(
+            "warning: --deadline-seconds "
+            f"{args.deadline_seconds:g} leaves under 5s of margin before "
+            f"the Stop hook kill ({_STOP_HOOK_KILL_SECONDS:g}s); a kill "
+            "skips the degraded status write and the controlled exit",
+            file=sys.stderr,
+        )
     items: list[SourceTranscriptIngestItemResult] = []
     batches = list(_iter_hosted_message_batches(messages))
-    for batch in batches:
+    started = time.monotonic()
+    for index, batch in enumerate(batches):
+        # One clock read per batch: the remaining deadline both gates the
+        # next POST and caps its in-call retry budget. Raising here, before
+        # the cursor write below, keeps the cursor all-or-nothing; the rerun
+        # re-posts from the start and the hosted ledger dedups.
+        remaining = args.deadline_seconds - (time.monotonic() - started)
+        if remaining <= 0:
+            raise HostedIngestTransportError(
+                f"hosted ingest deadline of {args.deadline_seconds:g}s "
+                f"exceeded: {index}/{len(batches)} batches posted"
+            )
         result = post_source_messages(
             config,
             messages=batch,
             forbidden_values=tuple(args.forbidden_value),
+            budget_seconds=remaining,
         )
         items.extend(_validated_ingest_items(result, batch))
     inserted = sum(item.status == "inserted" for item in items)

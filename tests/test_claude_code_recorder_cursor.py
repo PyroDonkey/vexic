@@ -125,7 +125,7 @@ class _RecorderHarness:
         response_factory: Callable[[list[SourceTranscriptMessage]], object]
         | None = None,
     ) -> int:
-        def fake_post(config, *, messages, forbidden_values):
+        def fake_post(config, *, messages, forbidden_values, budget_seconds=None):
             self.posted.append([message.source_message_id for message in messages])
             if post_error is not None:
                 raise post_error
