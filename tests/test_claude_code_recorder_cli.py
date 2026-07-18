@@ -440,6 +440,120 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         sleep_mock.assert_not_called()
 
+    def test_post_source_messages_retries_429_then_succeeds(self) -> None:
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self) -> bytes:
+                return b'{"items":[]}'
+
+        calls: list[int] = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(1)
+            if len(calls) == 1:
+                raise HTTPError(
+                    url="https://api.example.test/v1/ingest_source_transcript",
+                    code=429,
+                    msg="Too Many Requests",
+                    hdrs={},
+                    fp=None,
+                )
+            return _Response()
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch("vexic.recorders.hosted_ingest.random.uniform", return_value=1.0),
+        ):
+            result = post_source_messages(config, messages=[], forbidden_values=())
+
+        self.assertEqual(result, {"items": []})
+        self.assertEqual(len(calls), 2)
+        sleep_mock.assert_called_once_with(0.5)
+
+    def test_post_source_messages_408_exhausts_to_transport_error(self) -> None:
+        from vexic.recorders.hosted_ingest import HostedIngestTransportError
+
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+        calls: list[int] = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(1)
+            raise HTTPError(
+                url="https://api.example.test/v1/ingest_source_transcript",
+                code=408,
+                msg="Request Timeout",
+                hdrs={},
+                fp=None,
+            )
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch("vexic.recorders.hosted_ingest.random.uniform", return_value=1.0),
+        ):
+            with self.assertRaises(HostedIngestTransportError) as caught:
+                post_source_messages(config, messages=[], forbidden_values=())
+
+        self.assertRegex(str(caught.exception), "hosted ingest failed: HTTP 408")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleep_mock.call_args_list, [call(0.5), call(1.0)])
+
+    def test_post_source_messages_does_not_retry_unlisted_4xx(self) -> None:
+        # 413 is deliberately NOT in the retry allowlist: an oversized payload
+        # signals a config/batching bug, not transience, so it stays loud.
+        from vexic.recorders.hosted_ingest import HostedIngestTransportError
+
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+        calls: list[int] = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(1)
+            raise HTTPError(
+                url="https://api.example.test/v1/ingest_source_transcript",
+                code=413,
+                msg="Payload Too Large",
+                hdrs={},
+                fp=None,
+            )
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                post_source_messages(config, messages=[], forbidden_values=())
+
+        self.assertNotIsInstance(caught.exception, HostedIngestTransportError)
+        self.assertRegex(str(caught.exception), "hosted ingest failed: HTTP 413")
+        self.assertEqual(len(calls), 1)
+        sleep_mock.assert_not_called()
+
     def test_post_source_messages_exhausted_retries_raise_transport_error(self) -> None:
         from vexic.recorders.hosted_ingest import HostedIngestTransportError
 

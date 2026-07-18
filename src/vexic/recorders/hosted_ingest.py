@@ -21,6 +21,12 @@ from vexic.url_policy import require_http_url
 _TRANSPORT_RETRY_ATTEMPTS = 3
 _TRANSPORT_RETRY_BACKOFF_SECONDS = 0.5
 
+# The only 4xx codes treated as transient: 429 (rate limited) and 408 (request
+# timeout). An explicit allowlist, not "all non-auth 4xx" — an unexpected new
+# 4xx (e.g. 413) signals a config/batching bug rather than transience and must
+# stay loud.
+_RETRYABLE_STATUS_CODES = frozenset({408, 429})
+
 
 def _backoff_delay(attempt: int) -> float:
     # Jittered so overlapping async Stop hooks do not retry in lockstep
@@ -42,14 +48,15 @@ _RESPONSE_TRANSPORT_ERRORS = (
 class HostedIngestTransportError(RuntimeError):
     """Transient transport-layer ingest failure that is safe to fail open.
 
-    Raised for a hosted 5xx (`HTTPError` with `code >= 500`), a non-HTTP
-    connectivity fault (a `URLError` that is not an `HTTPError`: DNS, timeout,
-    connection refused), or a lost/garbled response (the POST reached the
-    server but reading or JSON-parsing its reply failed). A 4xx keeps the
-    plain `RuntimeError` so auth/config faults (rotated key, wrong project)
-    stay loud and surface on sync installs instead of silently killing
-    recording. Subclasses `RuntimeError` so existing callers that catch
-    `RuntimeError` still handle it.
+    Raised for a hosted 5xx (`HTTPError` with `code >= 500`), an allowlisted
+    transient 4xx (`_RETRYABLE_STATUS_CODES`: 429 rate limit, 408 request
+    timeout), a non-HTTP connectivity fault (a `URLError` that is not an
+    `HTTPError`: DNS, timeout, connection refused), or a lost/garbled response
+    (the POST reached the server but reading or JSON-parsing its reply
+    failed). Every other 4xx keeps the plain `RuntimeError` so auth/config
+    faults (rotated key, wrong project) stay loud and surface on sync installs
+    instead of silently killing recording. Subclasses `RuntimeError` so
+    existing callers that catch `RuntimeError` still handle it.
     """
 
 
@@ -94,17 +101,18 @@ def post_source_messages(
         headers=headers,
         method="POST",
     )
-    # HTTPError subclasses URLError, so it is caught first: a hosted 5xx is a
-    # transient transport fault and a 4xx is a caller/auth fault. The transport
-    # class (5xx, non-HTTP URLError, and read/parse failures on a POST that
-    # reached the server) is retried and, once exhausted, re-raised as
+    # HTTPError subclasses URLError, so it is caught first: a hosted 5xx or an
+    # allowlisted transient 4xx (429/408) is a transient transport fault; every
+    # other 4xx is a caller/auth fault. The transport class (5xx, 429/408,
+    # non-HTTP URLError, and read/parse failures on a POST that reached the
+    # server) is retried and, once exhausted, re-raised as
     # HostedIngestTransportError so the caller can fail open.
     for attempt in range(1, _TRANSPORT_RETRY_ATTEMPTS + 1):
         try:
             with urlopen(request, timeout=config.timeout_seconds) as response:
                 return json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
-            if exc.code < 500:
+            if exc.code < 500 and exc.code not in _RETRYABLE_STATUS_CODES:
                 detail = _error_body_detail(exc)
                 suffix = f" ({detail})" if detail else ""
                 raise RuntimeError(
