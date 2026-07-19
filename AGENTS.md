@@ -150,6 +150,12 @@ These rules define correctness for the memory core.
 10. Tenant isolation in the current local core is the opened SQLite database
     context plus `MemoryScope` validation. Do not add shared-storage assumptions
     without an explicit storage decision.
+11. Tier 3 `category="event"` facts must carry `occurred_at`. Promotion fails
+    loud on an undated event (`src/vexic/storage/promotion.py`), and Deep
+    selection skips undated event candidates so one cannot abort the cycle;
+    they stay in Tier 2 until dated. Never fabricate an event time to satisfy
+    this - partial precision (year or year-month) is allowed, invented
+    components are not.
 
 ### Closed Category Vocabulary
 
