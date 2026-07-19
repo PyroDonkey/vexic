@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -18,6 +19,19 @@ class RecorderStatus:
     rejected: int = 0
     ignored: int = 0
     error: str | None = None
+    # Prime-only fields. "started" is written before any hosted read so an
+    # external kill (the SessionStart hook timeout) leaves a stale started
+    # marker as durable evidence; "finished" replaces it with per-leg
+    # durations and outcomes (ADR 0025 D4 follow-up).
+    phase: str | None = None
+    legs: dict[str, dict[str, object]] | None = None
+    duration_ms: int | None = None
+    # Write attribution. The file stays last-writer-wins by design (status has
+    # no principled ordering key across overlapping runs); these fields exist
+    # so a human or tooling can tell which run wrote it. Stamped by
+    # write_status when left None.
+    written_at: str | None = None
+    pid: int | None = None
 
 
 def write_status(path: Path, status: RecorderStatus) -> None:
@@ -26,6 +40,13 @@ def write_status(path: Path, status: RecorderStatus) -> None:
     # write_cursor). os.replace is atomic on the same filesystem, so a reader
     # never sees a half-written file and a failed write leaves the prior status
     # intact instead of a truncated one.
+    if status.written_at is None:
+        status = replace(
+            status,
+            written_at=datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        )
+    if status.pid is None:
+        status = replace(status, pid=os.getpid())
     path.parent.mkdir(parents=True, exist_ok=True)
     text = json.dumps(asdict(status), sort_keys=True, indent=2) + "\n"
     temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")

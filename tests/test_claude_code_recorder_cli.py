@@ -7,6 +7,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from http.client import IncompleteRead, RemoteDisconnected
 from pathlib import Path
@@ -358,6 +360,7 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
         with (
             patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
             patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch("vexic.recorders.hosted_ingest.random.uniform", return_value=1.0),
         ):
             result = post_source_messages(config, messages=[], forbidden_values=())
 
@@ -395,6 +398,7 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
         with (
             patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
             patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch("vexic.recorders.hosted_ingest.random.uniform", return_value=1.0),
         ):
             result = post_source_messages(config, messages=[], forbidden_values=())
 
@@ -436,6 +440,382 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         sleep_mock.assert_not_called()
 
+    def test_post_source_messages_retries_429_then_succeeds(self) -> None:
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self) -> bytes:
+                return b'{"items":[]}'
+
+        calls: list[int] = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(1)
+            if len(calls) == 1:
+                raise HTTPError(
+                    url="https://api.example.test/v1/ingest_source_transcript",
+                    code=429,
+                    msg="Too Many Requests",
+                    hdrs={},
+                    fp=None,
+                )
+            return _Response()
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch("vexic.recorders.hosted_ingest.random.uniform", return_value=1.0),
+        ):
+            result = post_source_messages(config, messages=[], forbidden_values=())
+
+        self.assertEqual(result, {"items": []})
+        self.assertEqual(len(calls), 2)
+        sleep_mock.assert_called_once_with(0.5)
+
+    def test_post_source_messages_429_honors_retry_after_seconds(self) -> None:
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self) -> bytes:
+                return b'{"items":[]}'
+
+        calls: list[int] = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(1)
+            if len(calls) == 1:
+                raise HTTPError(
+                    url="https://api.example.test/v1/ingest_source_transcript",
+                    code=429,
+                    msg="Too Many Requests",
+                    hdrs={"Retry-After": "7"},
+                    fp=None,
+                )
+            return _Response()
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch("vexic.recorders.hosted_ingest.random.uniform") as uniform_mock,
+        ):
+            result = post_source_messages(config, messages=[], forbidden_values=())
+
+        # The server-directed wait replaces the jittered backoff outright:
+        # the server value already staggers clients.
+        self.assertEqual(result, {"items": []})
+        self.assertEqual(len(calls), 2)
+        sleep_mock.assert_called_once_with(7.0)
+        uniform_mock.assert_not_called()
+
+    def test_post_source_messages_bad_retry_after_falls_back_to_backoff(self) -> None:
+        # Malformed ("soon"), zero, and negative Retry-After values all fall
+        # back to the jittered backoff. int("-1") parses, and an honored
+        # negative would reach time.sleep(-1) -> ValueError -> loud exit 2,
+        # exactly the failure mode the 429 allowlist removes.
+        for raw in ("soon", "0", "-1"):
+            with self.subTest(retry_after=raw):
+                config = HostedIngestConfig(
+                    base_url="https://api.example.test",
+                    api_key="vx_secret",
+                    project_id="project-a",
+                    session_id="session-a",
+                    agent_id=None,
+                )
+
+                class _Response:
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *_exc):
+                        return False
+
+                    def read(self) -> bytes:
+                        return b'{"items":[]}'
+
+                calls: list[int] = []
+
+                def fake_urlopen(request, timeout):
+                    calls.append(1)
+                    if len(calls) == 1:
+                        raise HTTPError(
+                            url="https://api.example.test/v1/ingest_source_transcript",
+                            code=429,
+                            msg="Too Many Requests",
+                            hdrs={"Retry-After": raw},
+                            fp=None,
+                        )
+                    return _Response()
+
+                with (
+                    patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+                    patch(
+                        "vexic.recorders.hosted_ingest.time.sleep"
+                    ) as sleep_mock,
+                    patch(
+                        "vexic.recorders.hosted_ingest.random.uniform",
+                        return_value=1.0,
+                    ),
+                ):
+                    result = post_source_messages(
+                        config, messages=[], forbidden_values=()
+                    )
+
+                self.assertEqual(result, {"items": []})
+                sleep_mock.assert_called_once_with(0.5)
+
+    def test_post_source_messages_huge_retry_after_is_capped_not_loud(self) -> None:
+        # int() parses arbitrary precision, so a 400-digit Retry-After must
+        # cap at the constant instead of overflowing float() into a loud
+        # exit-2 ValueError path.
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self, size: int = -1) -> bytes:
+                return b'{"items":[]}'
+
+        calls: list[int] = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(1)
+            if len(calls) == 1:
+                raise HTTPError(
+                    url="https://api.example.test/v1/ingest_source_transcript",
+                    code=429,
+                    msg="Too Many Requests",
+                    hdrs={"Retry-After": "9" * 400},
+                    fp=None,
+                )
+            return _Response()
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+        ):
+            result = post_source_messages(config, messages=[], forbidden_values=())
+
+        self.assertEqual(result, {"items": []})
+        sleep_mock.assert_called_once_with(30.0)
+
+    def test_post_source_messages_retries_garbled_status_line_then_succeeds(
+        self,
+    ) -> None:
+        # A garbled status line is a lost/garbled reply like IncompleteRead:
+        # it belongs to the retried transport class, not the loud exit-2 path.
+        from http.client import BadStatusLine
+
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self, size: int = -1) -> bytes:
+                return b'{"items":[]}'
+
+        calls: list[int] = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(1)
+            if len(calls) == 1:
+                raise BadStatusLine("<garbage>")
+            return _Response()
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch("vexic.recorders.hosted_ingest.random.uniform", return_value=1.0),
+        ):
+            result = post_source_messages(config, messages=[], forbidden_values=())
+
+        self.assertEqual(result, {"items": []})
+        self.assertEqual(len(calls), 2)
+        sleep_mock.assert_called_once_with(0.5)
+
+    def test_post_source_messages_retry_after_capped(self) -> None:
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self) -> bytes:
+                return b'{"items":[]}'
+
+        def make_urlopen(calls: list[int]):
+            def fake_urlopen(request, timeout):
+                calls.append(1)
+                if len(calls) == 1:
+                    raise HTTPError(
+                        url="https://api.example.test/v1/ingest_source_transcript",
+                        code=429,
+                        msg="Too Many Requests",
+                        hdrs={"Retry-After": "120"},
+                        fp=None,
+                    )
+                return _Response()
+
+            return fake_urlopen
+
+        # Without a budget the defensive 30s constant caps the wait.
+        calls: list[int] = []
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", make_urlopen(calls)),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+        ):
+            post_source_messages(config, messages=[], forbidden_values=())
+        sleep_mock.assert_called_once_with(30.0)
+
+        # With a budget too small for the server-directed wait, the fault
+        # surfaces immediately instead of sleeping into certain exhaustion.
+        from vexic.recorders.hosted_ingest import HostedIngestTransportError
+
+        calls = []
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", make_urlopen(calls)),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch(
+                "vexic.recorders.hosted_ingest.time.monotonic",
+                # started, attempt-1 pre-check, retry decision (5s left,
+                # which cannot fit the 30s-capped Retry-After wait),
+                # body-read guard.
+                side_effect=[0.0, 0.0, 5.0, 5.0],
+            ),
+        ):
+            with self.assertRaises(HostedIngestTransportError) as caught:
+                post_source_messages(
+                    config,
+                    messages=[],
+                    forbidden_values=(),
+                    budget_seconds=10.0,
+                )
+        self.assertRegex(str(caught.exception), "hosted ingest failed: HTTP 429")
+        self.assertEqual(len(calls), 1)
+        sleep_mock.assert_not_called()
+
+    def test_post_source_messages_408_exhausts_to_transport_error(self) -> None:
+        from vexic.recorders.hosted_ingest import HostedIngestTransportError
+
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+        calls: list[int] = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(1)
+            raise HTTPError(
+                url="https://api.example.test/v1/ingest_source_transcript",
+                code=408,
+                msg="Request Timeout",
+                hdrs={},
+                fp=None,
+            )
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch("vexic.recorders.hosted_ingest.random.uniform", return_value=1.0),
+        ):
+            with self.assertRaises(HostedIngestTransportError) as caught:
+                post_source_messages(config, messages=[], forbidden_values=())
+
+        self.assertRegex(str(caught.exception), "hosted ingest failed: HTTP 408")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleep_mock.call_args_list, [call(0.5), call(1.0)])
+
+    def test_post_source_messages_does_not_retry_unlisted_4xx(self) -> None:
+        # 413 is deliberately NOT in the retry allowlist: an oversized payload
+        # signals a config/batching bug, not transience, so it stays loud.
+        from vexic.recorders.hosted_ingest import HostedIngestTransportError
+
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+        calls: list[int] = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(1)
+            raise HTTPError(
+                url="https://api.example.test/v1/ingest_source_transcript",
+                code=413,
+                msg="Payload Too Large",
+                hdrs={},
+                fp=None,
+            )
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                post_source_messages(config, messages=[], forbidden_values=())
+
+        self.assertNotIsInstance(caught.exception, HostedIngestTransportError)
+        self.assertRegex(str(caught.exception), "hosted ingest failed: HTTP 413")
+        self.assertEqual(len(calls), 1)
+        sleep_mock.assert_not_called()
+
     def test_post_source_messages_exhausted_retries_raise_transport_error(self) -> None:
         from vexic.recorders.hosted_ingest import HostedIngestTransportError
 
@@ -461,6 +841,7 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
         with (
             patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
             patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch("vexic.recorders.hosted_ingest.random.uniform", return_value=1.0),
         ):
             with self.assertRaises(HostedIngestTransportError) as caught:
                 post_source_messages(config, messages=[], forbidden_values=())
@@ -468,6 +849,321 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
         self.assertRegex(str(caught.exception), "hosted ingest failed: HTTP 503")
         self.assertEqual(len(calls), 3)
         self.assertEqual(sleep_mock.call_args_list, [call(0.5), call(1.0)])
+
+    def test_post_source_messages_backoff_is_jittered(self) -> None:
+        from vexic.recorders.hosted_ingest import HostedIngestTransportError
+
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        def fake_urlopen(request, timeout):
+            raise HTTPError(
+                url="https://api.example.test/v1/ingest_source_transcript",
+                code=503,
+                msg="Service Unavailable",
+                hdrs={},
+                fp=None,
+            )
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch(
+                "vexic.recorders.hosted_ingest.random.uniform", return_value=1.5
+            ) as uniform_mock,
+        ):
+            with self.assertRaises(HostedIngestTransportError):
+                post_source_messages(config, messages=[], forbidden_values=())
+
+        self.assertEqual(sleep_mock.call_args_list, [call(0.75), call(1.5)])
+        for args in uniform_mock.call_args_list:
+            self.assertEqual(args, call(0.5, 1.5))
+
+    def test_post_source_messages_budget_exhausted_before_first_attempt(self) -> None:
+        from vexic.recorders.hosted_ingest import HostedIngestTransportError
+
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen") as urlopen_mock,
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch(
+                "vexic.recorders.hosted_ingest.time.monotonic",
+                side_effect=[0.0, 12.0],
+            ),
+        ):
+            with self.assertRaisesRegex(HostedIngestTransportError, "budget"):
+                post_source_messages(
+                    config,
+                    messages=[],
+                    forbidden_values=(),
+                    budget_seconds=10.0,
+                )
+
+        urlopen_mock.assert_not_called()
+        sleep_mock.assert_not_called()
+
+    def test_post_source_messages_budget_exhausted_before_retry(self) -> None:
+        from vexic.recorders.hosted_ingest import HostedIngestTransportError
+
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+        calls: list[int] = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(1)
+            raise HTTPError(
+                url="https://api.example.test/v1/ingest_source_transcript",
+                code=503,
+                msg="Service Unavailable",
+                hdrs={},
+                fp=None,
+            )
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch(
+                "vexic.recorders.hosted_ingest.time.monotonic",
+                # started, attempt-1 pre-check, attempt-1 retry decision (the
+                # budget is spent while the first attempt is in flight, so no
+                # second attempt and no sleep may happen), body-read guard.
+                side_effect=[0.0, 5.0, 12.0, 12.0],
+            ),
+        ):
+            with self.assertRaises(HostedIngestTransportError) as caught:
+                post_source_messages(
+                    config,
+                    messages=[],
+                    forbidden_values=(),
+                    budget_seconds=10.0,
+                )
+
+        self.assertRegex(str(caught.exception), "hosted ingest failed: HTTP 503")
+        self.assertEqual(len(calls), 1)
+        sleep_mock.assert_not_called()
+
+    def test_post_source_messages_skips_error_body_read_when_budget_spent(self) -> None:
+        # The exhaustion raise normally reads the error body for detail, but a
+        # dripping body can block up to a socket timeout; with the budget
+        # already spent that delay would push the fail-open exit toward the
+        # Stop hook kill, so the read is skipped and the bare code surfaces.
+        from vexic.recorders.hosted_ingest import HostedIngestTransportError
+
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+        read_sizes: list[int | None] = []
+
+        class _TrackingBody(io.BytesIO):
+            def read(self, size: int | None = -1) -> bytes:
+                read_sizes.append(size)
+                return super().read(size)
+
+        def fake_urlopen(request, timeout):
+            raise HTTPError(
+                url="https://api.example.test/v1/ingest_source_transcript",
+                code=503,
+                msg="Service Unavailable",
+                hdrs={},
+                fp=_TrackingBody(b'{"error": {"code": "storage_unavailable"}}'),
+            )
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch("vexic.recorders.hosted_ingest.random.uniform", return_value=1.0),
+            patch(
+                "vexic.recorders.hosted_ingest.time.monotonic",
+                # started, attempt-1 pre-check, retry decision (budget spent),
+                # the body-read guard's own check.
+                side_effect=[0.0, 5.0, 12.0, 12.0],
+            ),
+        ):
+            with self.assertRaises(HostedIngestTransportError) as caught:
+                post_source_messages(
+                    config,
+                    messages=[],
+                    forbidden_values=(),
+                    budget_seconds=10.0,
+                )
+
+        self.assertEqual(str(caught.exception), "hosted ingest failed: HTTP 503")
+        self.assertEqual(read_sizes, [])
+        sleep_mock.assert_not_called()
+
+    def test_post_source_messages_skips_sleep_that_cannot_fit_the_budget(self) -> None:
+        # Sleeping into a guaranteed budget failure would only delay the
+        # fail-open exit: when the backoff cannot fit the remaining budget the
+        # underlying fault surfaces immediately, keeping its HTTP code.
+        from vexic.recorders.hosted_ingest import HostedIngestTransportError
+
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+        calls: list[int] = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(1)
+            raise HTTPError(
+                url="https://api.example.test/v1/ingest_source_transcript",
+                code=503,
+                msg="Service Unavailable",
+                hdrs={},
+                fp=None,
+            )
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch("vexic.recorders.hosted_ingest.random.uniform", return_value=1.0),
+            patch(
+                "vexic.recorders.hosted_ingest.time.monotonic",
+                # started, attempt-1 pre-check, attempt-1 retry decision
+                # (0.25s of budget is left there, which cannot fit the 0.5s
+                # backoff), body-read guard.
+                side_effect=[0.0, 0.0, 9.75, 9.75],
+            ),
+        ):
+            with self.assertRaises(HostedIngestTransportError) as caught:
+                post_source_messages(
+                    config,
+                    messages=[],
+                    forbidden_values=(),
+                    budget_seconds=10.0,
+                )
+
+        self.assertRegex(str(caught.exception), "hosted ingest failed: HTTP 503")
+        self.assertEqual(len(calls), 1)
+        sleep_mock.assert_not_called()
+
+    def test_post_source_messages_response_read_bounded_by_budget(self) -> None:
+        # A socket timeout bounds each recv, not the whole body: a proxy that
+        # drips bytes forever must not stretch the read past the retry budget
+        # and into the Stop hook kill.
+        from vexic.recorders.hosted_ingest import HostedIngestTransportError
+
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        class _DripResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self, size=-1) -> bytes:
+                return b"{"  # never finishes
+
+        calls: list[int] = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(1)
+            return _DripResponse()
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch("vexic.recorders.hosted_ingest.random.uniform", return_value=1.0),
+            patch(
+                "vexic.recorders.hosted_ingest.time.monotonic",
+                # started, attempt-1 pre-check, first chunk check (budget
+                # fine), second chunk check (budget spent mid-read), retry
+                # decision (spent, so no second attempt).
+                side_effect=[0.0, 0.0, 1.0, 12.0, 13.0],
+            ),
+        ):
+            with self.assertRaises(HostedIngestTransportError) as caught:
+                post_source_messages(
+                    config,
+                    messages=[],
+                    forbidden_values=(),
+                    budget_seconds=10.0,
+                )
+
+        self.assertEqual(str(caught.exception), "hosted ingest failed: TimeoutError")
+        self.assertEqual(len(calls), 1)
+        sleep_mock.assert_not_called()
+
+    def test_post_source_messages_urlopen_timeout_capped_by_remaining_budget(
+        self,
+    ) -> None:
+        config = HostedIngestConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+
+        class _Response:
+            def __init__(self) -> None:
+                self._body = io.BytesIO(b'{"items":[]}')
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self, size: int = -1) -> bytes:
+                return self._body.read(size)
+
+        timeouts: list[float] = []
+
+        def fake_urlopen(request, timeout):
+            timeouts.append(timeout)
+            return _Response()
+
+        with (
+            patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
+            patch(
+                "vexic.recorders.hosted_ingest.time.monotonic",
+                # started, attempt-1 pre-check (2s of budget left, so the
+                # 30s per-request timeout must shrink to the remaining 2s),
+                # then one budget check per body chunk read.
+                side_effect=[0.0, 8.0, 8.5, 8.5],
+            ),
+        ):
+            result = post_source_messages(
+                config,
+                messages=[],
+                forbidden_values=(),
+                budget_seconds=10.0,
+            )
+
+        self.assertEqual(result, {"items": []})
+        self.assertEqual(timeouts, [2.0])
 
     def test_post_source_messages_retries_response_read_timeout_then_succeeds(
         self,
@@ -504,6 +1200,7 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
         with (
             patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
             patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch("vexic.recorders.hosted_ingest.random.uniform", return_value=1.0),
         ):
             result = post_source_messages(config, messages=[], forbidden_values=())
 
@@ -544,6 +1241,7 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
         with (
             patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
             patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch("vexic.recorders.hosted_ingest.random.uniform", return_value=1.0),
         ):
             result = post_source_messages(config, messages=[], forbidden_values=())
 
@@ -584,6 +1282,7 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
         with (
             patch("vexic.recorders.hosted_ingest.urlopen", fake_urlopen),
             patch("vexic.recorders.hosted_ingest.time.sleep") as sleep_mock,
+            patch("vexic.recorders.hosted_ingest.random.uniform", return_value=1.0),
         ):
             with self.assertRaises(HostedIngestTransportError) as caught:
                 post_source_messages(config, messages=[], forbidden_values=())
@@ -593,6 +1292,45 @@ class ClaudeCodeRecorderCliTests(unittest.TestCase):
         self.assertEqual(str(caught.exception), "hosted ingest failed: JSONDecodeError")
         self.assertEqual(len(calls), 3)
         self.assertEqual(sleep_mock.call_args_list, [call(0.5), call(1.0)])
+
+    def test_write_status_stamps_written_at_and_pid(self) -> None:
+        from datetime import datetime
+
+        with tempfile.TemporaryDirectory() as temp:
+            status_path = Path(temp) / "status.json"
+            write_status(
+                status_path,
+                RecorderStatus(
+                    ok=True,
+                    operation="ingest",
+                    source_session_id="session-1",
+                    transcript_path=None,
+                ),
+            )
+
+            payload = json.loads(status_path.read_text(encoding="utf-8"))
+            written_at = datetime.fromisoformat(payload["written_at"])
+            self.assertIsNotNone(written_at.tzinfo)
+            self.assertEqual(payload["pid"], os.getpid())
+
+    def test_write_status_preserves_explicit_written_at_and_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            status_path = Path(temp) / "status.json"
+            write_status(
+                status_path,
+                RecorderStatus(
+                    ok=True,
+                    operation="ingest",
+                    source_session_id="session-1",
+                    transcript_path=None,
+                    written_at="2026-07-18T00:00:00+00:00",
+                    pid=12345,
+                ),
+            )
+
+            payload = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["written_at"], "2026-07-18T00:00:00+00:00")
+            self.assertEqual(payload["pid"], 12345)
 
     def test_write_status_does_not_leak_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -717,7 +1455,7 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
             status_path = root / "status.json"
             calls = []
 
-            def fake_post(config, *, messages, forbidden_values):
+            def fake_post(config, *, messages, forbidden_values, budget_seconds=None):
                 calls.append((config, messages, forbidden_values))
                 return {
                     "items": [
@@ -804,7 +1542,7 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
                     # Mirror real uv-run Windows stdin text decoding.
                     return self._data.decode("cp1252", "surrogateescape")
 
-            def fake_post(config, *, messages, forbidden_values):
+            def fake_post(config, *, messages, forbidden_values, budget_seconds=None):
                 return _ingest_result(messages)
 
             with (
@@ -854,7 +1592,7 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
             status_path = root / "status.json"
             calls = []
 
-            def fake_post(config, *, messages, forbidden_values):
+            def fake_post(config, *, messages, forbidden_values, budget_seconds=None):
                 calls.append(messages)
                 if len(calls) == 1:
                     return _ingest_result(messages)
@@ -901,6 +1639,230 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
             self.assertEqual(status["rejected"], 1)
             self.assertEqual(status["ignored"], 1)
 
+    def test_ingest_deadline_expiry_fails_open_between_batches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            transcript = root / "session.jsonl"
+            rows = [
+                {
+                    "type": "user",
+                    "sessionId": "claude-session",
+                    "uuid": f"uuid-{index}",
+                    "message": {"role": "user", "content": f"remember cedar {index}"},
+                }
+                for index in range(101)
+            ]
+            transcript.write_text(
+                "\n".join(json.dumps(row) for row in rows),
+                encoding="utf-8",
+            )
+            hook_payload = root / "hook.json"
+            hook_payload.write_text(
+                json.dumps(
+                    {
+                        "session_id": "claude-session",
+                        "transcript_path": str(transcript),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            status_path = root / "status.json"
+            calls = []
+            budgets: list[float | None] = []
+
+            def fake_post(config, *, messages, forbidden_values, budget_seconds=None):
+                calls.append(messages)
+                budgets.append(budget_seconds)
+                return _ingest_result(messages)
+
+            argv = [
+                "ingest",
+                "--hook-input",
+                str(hook_payload),
+                "--base-url",
+                "https://api.example.test",
+                "--api-key",
+                "vx_secret",
+                "--project-id",
+                "project-a",
+                "--session-id",
+                "vexic-session",
+                "--status-path",
+                str(status_path),
+            ]
+
+            stderr = io.StringIO()
+            with (
+                patch("vexic.recorders.cli.post_source_messages", fake_post),
+                patch(
+                    "vexic.recorders.cli.time.monotonic",
+                    # started, batch-1 deadline check, batch-2 deadline check:
+                    # the 100s default is spent while batch 1 posts, so batch 2
+                    # must never be attempted.
+                    side_effect=[0.0, 0.0, 150.0],
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = recorder_main(argv)
+
+            self.assertEqual(code, 1)
+            self.assertEqual([len(batch) for batch in calls], [100])
+            # The full remaining deadline flows into the batch as its retry
+            # budget.
+            self.assertEqual(budgets, [100.0])
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertFalse(status["ok"])
+            self.assertIn("deadline", status["error"])
+            self.assertIn("warning:", stderr.getvalue())
+
+            # A rerun with a live clock re-posts every row; the hosted ledger
+            # dedups the 100 rows batch 1 already delivered.
+            calls.clear()
+            with (
+                patch("vexic.recorders.cli.post_source_messages", fake_post),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(recorder_main(argv), 0)
+            self.assertEqual([len(batch) for batch in calls], [100, 1])
+
+    def test_ingest_deadline_flag_rejects_non_positive_values(self) -> None:
+        # recorder_main converts the argparse SystemExit into a return code.
+        for value in ("0", "-1"):
+            with self.subTest(deadline=value):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    code = recorder_main(
+                        [
+                            "ingest",
+                            "--deadline-seconds",
+                            value,
+                        ]
+                    )
+                self.assertEqual(code, 2)
+
+    def test_ingest_deadline_flag_warns_when_at_or_above_hook_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            transcript = root / "session.jsonl"
+            transcript.write_text("", encoding="utf-8")
+            hook_payload = root / "hook.json"
+            hook_payload.write_text(
+                json.dumps(
+                    {
+                        "session_id": "claude-session",
+                        "transcript_path": str(transcript),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            def fake_post(config, *, messages, forbidden_values, budget_seconds=None):
+                return _ingest_result(messages)
+
+            stderr = io.StringIO()
+            with (
+                patch("vexic.recorders.cli.post_source_messages", fake_post),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = recorder_main(
+                    [
+                        "ingest",
+                        "--hook-input",
+                        str(hook_payload),
+                        "--base-url",
+                        "https://api.example.test",
+                        "--api-key",
+                        "vx_secret",
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "vexic-session",
+                        "--deadline-seconds",
+                        "116",
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertIn("margin", stderr.getvalue())
+            self.assertIn("Stop hook kill", stderr.getvalue())
+
+    def test_ingest_default_timeout_and_deadline_compose_within_stop_kill(
+        self,
+    ) -> None:
+        # A single in-flight response read is not preempted, so the last recv
+        # can overshoot the deadline by up to the per-attempt socket timeout.
+        # The default deadline plus the default socket timeout must still land
+        # inside the Stop hook kill, with room for the degraded status write.
+        from vexic.recorders.cli import (
+            INGEST_DEADLINE_SECONDS,
+            INGEST_TIMEOUT_SECONDS,
+            _STOP_HOOK_KILL_SECONDS,
+        )
+
+        self.assertLessEqual(
+            INGEST_DEADLINE_SECONDS + INGEST_TIMEOUT_SECONDS,
+            _STOP_HOOK_KILL_SECONDS - 5,
+        )
+
+    def _run_ingest_capturing_stderr(self, *extra_args: str) -> tuple[int, str]:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            transcript = root / "session.jsonl"
+            transcript.write_text("", encoding="utf-8")
+            hook_payload = root / "hook.json"
+            hook_payload.write_text(
+                json.dumps(
+                    {
+                        "session_id": "claude-session",
+                        "transcript_path": str(transcript),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            def fake_post(config, *, messages, forbidden_values, budget_seconds=None):
+                return _ingest_result(messages)
+
+            stderr = io.StringIO()
+            with (
+                patch("vexic.recorders.cli.post_source_messages", fake_post),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = recorder_main(
+                    [
+                        "ingest",
+                        "--hook-input",
+                        str(hook_payload),
+                        "--base-url",
+                        "https://api.example.test",
+                        "--api-key",
+                        "vx_secret",
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "vexic-session",
+                        *extra_args,
+                    ]
+                )
+            return code, stderr.getvalue()
+
+    def test_ingest_default_timeout_does_not_warn_about_kill_margin(self) -> None:
+        code, stderr = self._run_ingest_capturing_stderr()
+        self.assertEqual(code, 0)
+        self.assertNotIn("hook kill", stderr)
+
+    def test_ingest_warns_when_socket_timeout_can_overshoot_stop_kill(self) -> None:
+        # Default deadline (100s) leaves 20s to the 120s kill; a 60s socket
+        # timeout means an un-preempted final read can overshoot into the kill,
+        # so the composition must warn even though the deadline alone is fine.
+        code, stderr = self._run_ingest_capturing_stderr("--timeout-seconds", "60")
+        self.assertEqual(code, 0)
+        self.assertIn("margin", stderr)
+        self.assertIn("Stop hook kill", stderr)
+        self.assertIn("overshoot", stderr)
+
     def test_ingest_batches_hosted_posts_before_payload_char_cap(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -937,7 +1899,7 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
             ]
             calls = []
 
-            def fake_post(config, *, messages, forbidden_values):
+            def fake_post(config, *, messages, forbidden_values, budget_seconds=None):
                 calls.append(messages)
                 return _ingest_result(messages)
 
@@ -1094,7 +2056,7 @@ class ClaudeCodeRecorderHostedRoundTripTests(unittest.TestCase):
 
             class _Response:
                 def __init__(self, content: bytes):
-                    self._content = content
+                    self._body = io.BytesIO(content)
 
                 def __enter__(self):
                     return self
@@ -1102,8 +2064,8 @@ class ClaudeCodeRecorderHostedRoundTripTests(unittest.TestCase):
                 def __exit__(self, *_exc):
                     return False
 
-                def read(self) -> bytes:
-                    return self._content
+                def read(self, size: int = -1) -> bytes:
+                    return self._body.read(size)
 
             def fake_urlopen(request, timeout):
                 target = urlsplit(request.full_url)
@@ -2000,7 +2962,7 @@ class ClaudeCodeSetupTests(unittest.TestCase):
             )
             calls = []
 
-            def fake_post(config, *, messages, forbidden_values):
+            def fake_post(config, *, messages, forbidden_values, budget_seconds=None):
                 calls.append((config, messages, forbidden_values))
                 return _ingest_result(messages)
 
@@ -2148,14 +3110,16 @@ class ClaudeCodeRecorderIngestCommandMoreTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
+            stderr = io.StringIO()
             with (
                 patch(
                     "vexic.recorders.cli.post_source_messages",
-                    side_effect=lambda _config, *, messages, forbidden_values: (
+                    side_effect=lambda _config, *, messages, forbidden_values, budget_seconds=None: (
                         _ingest_result(messages)
                     ),
                 ),
                 patch("vexic.recorders.cli.write_status", side_effect=OSError("disk full")),
+                contextlib.redirect_stderr(stderr),
             ):
                 code = recorder_main(
                     [
@@ -2176,6 +3140,10 @@ class ClaudeCodeRecorderIngestCommandMoreTests(unittest.TestCase):
                 )
 
             self.assertEqual(code, 2)
+            # The failure surfaced must be the status write itself, not an
+            # incidental error swallowed on the way there.
+            self.assertIn("status write failed: OSError", stderr.getvalue())
+            self.assertNotIn("Traceback", stderr.getvalue())
 
     def test_ingest_parse_error_writes_status_when_status_path_is_present(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -2315,7 +3283,7 @@ class ClaudeCodeRecorderIngestCommandMoreTests(unittest.TestCase):
 
             with patch(
                 "vexic.recorders.cli.post_source_messages",
-                side_effect=lambda _config, *, messages, forbidden_values: (
+                side_effect=lambda _config, *, messages, forbidden_values, budget_seconds=None: (
                     _ingest_result(messages)
                 ),
             ):
@@ -2531,8 +3499,10 @@ class ClaudeCodeRecorderPrimeCommandTests(unittest.TestCase):
             self.assertIn("Durable cedar preference", context)
             self.assertIn("recent cedar note", context)
             self.assertNotIn("vx_secret", stdout.getvalue())
+            # Reads dispatch in parallel (ADR 0025 D4 follow-up), so arrival order is
+            # nondeterministic; assert the set of endpoints, not the order.
             self.assertEqual(
-                [urlsplit(call[0].full_url).path for call in calls],
+                sorted(urlsplit(call[0].full_url).path for call in calls),
                 ["/v1/fresh_context", "/v1/search_long_term", "/v1/search_transcript"],
             )
             for request, timeout in calls:
@@ -3434,9 +4404,9 @@ class ClaudeCodeRecorderPrimeCommandTests(unittest.TestCase):
 class HostedPrimePostSearchNormalizationTests(unittest.TestCase):
     """_post_search must raise only RuntimeError for transport/decode failures.
 
-    Downstream degradation (_safe_post_search, fetch_fresh_context) filters on
-    RuntimeError; any other exception type escapes to the prime fail-open
-    catch-all and discards the whole context.
+    Downstream degradation (the fetch_prime_context workers, fetch_fresh_context)
+    filters on RuntimeError; any other exception type escapes to the prime
+    fail-open catch-all and discards the whole context.
     """
 
     def _config(self) -> HostedPrimeConfig:
@@ -3683,7 +4653,7 @@ class ClaudeCodeRecorderPrimeSpawnsTriggerDreamTests(unittest.TestCase):
                 patch("vexic.recorders.cli.subprocess.Popen", fake_popen),
                 patch(
                     "vexic.recorders.cli.fetch_prime_context",
-                    return_value="",
+                    return_value=hosted_prime.PrimeFetchResult(context=""),
                 ),
                 contextlib.redirect_stdout(stdout),
             ):
@@ -3723,7 +4693,7 @@ class ClaudeCodeRecorderPrimeSpawnsTriggerDreamTests(unittest.TestCase):
                 patch("vexic.recorders.cli.subprocess.Popen", side_effect=fake_popen),
                 patch(
                     "vexic.recorders.cli.fetch_prime_context",
-                    return_value="",
+                    return_value=hosted_prime.PrimeFetchResult(context=""),
                 ),
                 contextlib.redirect_stdout(stdout),
                 contextlib.redirect_stderr(stderr),
@@ -3777,7 +4747,7 @@ class ClaudeCodeRecorderPrimeSpawnsTriggerDreamTests(unittest.TestCase):
                 patch("vexic.recorders.cli.subprocess.Popen", blocking_popen),
                 patch(
                     "vexic.recorders.cli.fetch_prime_context",
-                    return_value="some prime context",
+                    return_value=hosted_prime.PrimeFetchResult(context="some prime context"),
                 ),
                 contextlib.redirect_stdout(stdout),
             ):
@@ -3802,6 +4772,532 @@ class ClaudeCodeRecorderPrimeSpawnsTriggerDreamTests(unittest.TestCase):
                 release_marker.write_text("go", encoding="utf-8")
                 for process in spawned_processes:
                     process.wait(timeout=5)
+
+
+def _prime_endpoint_payload(url: str) -> dict[str, object]:
+    if url.endswith("/v1/fresh_context"):
+        return {"summaries": [], "recent": [], "text": "Prior recap text", "truncated": False}
+    if url.endswith("/v1/search_long_term"):
+        return {
+            "facts": [{"fact_text": "Durable cedar preference"}],
+            "candidate_notes": [],
+        }
+    return {"hits": [{"body": "User: recent cedar note"}]}
+
+
+class _PrimeFakeResponse:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self._payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def read(self) -> bytes:
+        return json.dumps(self._payload).encode("utf-8")
+
+
+class ClaudeCodeRecorderPrimeDeadlineTests(unittest.TestCase):
+    """Prime must exit cleanly inside the SessionStart hook budget (ADR 0025 D4).
+
+    The Claude Code harness discards hook stdout entirely on timeout
+    cancellation (verified empirically against the live harness), so the only
+    delivery path is a clean exit before the hook timeout. These tests pin the
+    client-side guarantees: parallel dispatch, an end-to-end deadline that
+    degrades sections instead of losing the block, and the ADR 0024 framing/footer
+    surviving partial assembly.
+    """
+
+    def _run_prime(
+        self,
+        fake_urlopen,
+        *,
+        extra_argv: list[str] | None = None,
+        config_overrides: dict[str, object] | None = None,
+    ) -> tuple[int, str, float, Path]:
+        entered: list[str] = []
+
+        def counting_urlopen(request, timeout):
+            entered.append(request.full_url)
+            return fake_urlopen(request, timeout)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = _write_trigger_config(root, **(config_overrides or {}))
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            stdout = io.StringIO()
+            started = time.monotonic()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", counting_urlopen),
+                patch("vexic.recorders.cli.subprocess.Popen") as _popen,
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        *(extra_argv or []),
+                    ]
+                )
+                elapsed = time.monotonic() - started
+                # Abandoned daemon workers must enter the fake before the
+                # patch is unwound, or a late-scheduled worker would hit the
+                # real urlopen after the test ends.
+                settle_deadline = time.monotonic() + 5.0
+                while len(entered) < 3 and time.monotonic() < settle_deadline:
+                    time.sleep(0.01)
+            return code, stdout.getvalue(), elapsed, root
+
+    def test_prime_reads_dispatch_in_parallel(self) -> None:
+        lock = threading.Lock()
+        active = 0
+        max_active = 0
+
+        def fake_urlopen(request, timeout):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.25)
+            with lock:
+                active -= 1
+            return _PrimeFakeResponse(_prime_endpoint_payload(request.full_url))
+
+        code, output, _elapsed, _root = self._run_prime(fake_urlopen)
+
+        self.assertEqual(code, 0)
+        self.assertIn("Durable cedar preference", output)
+        self.assertGreaterEqual(
+            max_active,
+            2,
+            "prime reads must overlap; serial dispatch re-opens the 45s-vs-30s budget",
+        )
+
+    def test_prime_emits_partial_block_when_one_read_outlives_deadline(self) -> None:
+        def fake_urlopen(request, timeout):
+            if request.full_url.endswith("/v1/search_transcript"):
+                time.sleep(3.0)
+            return _PrimeFakeResponse(_prime_endpoint_payload(request.full_url))
+
+        code, output, elapsed, _root = self._run_prime(
+            fake_urlopen, extra_argv=["--deadline-seconds", "1.0"]
+        )
+
+        self.assertEqual(code, 0)
+        self.assertLess(elapsed, 2.5, "prime must exit at the deadline, not the slow read")
+        payload = json.loads(output)
+        context = payload["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Durable cedar preference", context)
+        self.assertIn("Prior recap text", context)
+        self.assertNotIn("recent cedar note", context)
+        self.assertIn(hosted_prime.PRIME_FRAMING, context)
+        self.assertIn(hosted_prime.PRIME_FOOTER, context)
+
+    def test_prime_exits_clean_and_silent_when_all_reads_outlive_deadline(self) -> None:
+        def fake_urlopen(request, timeout):
+            time.sleep(3.0)
+            return _PrimeFakeResponse(_prime_endpoint_payload(request.full_url))
+
+        code, output, elapsed, _root = self._run_prime(
+            fake_urlopen, extra_argv=["--deadline-seconds", "0.5"]
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output, "")
+        self.assertLess(elapsed, 2.5)
+
+    def test_prime_writes_attempt_marker_before_reads_and_final_status(self) -> None:
+        seen_during_fetch: list[object] = []
+        status_holder: dict[str, Path] = {}
+
+        def fake_urlopen(request, timeout):
+            status_path = status_holder["path"]
+            if status_path.exists():
+                seen_during_fetch.append(json.loads(status_path.read_text(encoding="utf-8")))
+            else:
+                seen_during_fetch.append(None)
+            return _PrimeFakeResponse(_prime_endpoint_payload(request.full_url))
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            status_path = root / "status.json"
+            prime_status_path = root / "status-prime.json"
+            status_holder["path"] = prime_status_path
+            config_path = _write_trigger_config(root)
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            stdout = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                patch("vexic.recorders.cli.subprocess.Popen"),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--status-path",
+                        str(status_path),
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertTrue(seen_during_fetch)
+            for marker in seen_during_fetch:
+                self.assertIsNotNone(
+                    marker, "attempt marker must be on disk before any read starts"
+                )
+                self.assertEqual(marker["operation"], "prime")
+                self.assertEqual(marker["phase"], "started")
+            final = json.loads(prime_status_path.read_text(encoding="utf-8"))
+            self.assertEqual(final["operation"], "prime")
+            self.assertEqual(final["phase"], "finished")
+            self.assertTrue(final["ok"])
+            self.assertEqual(
+                set(final["legs"]),
+                {"fresh_context", "search_long_term", "search_transcript"},
+            )
+            for leg in final["legs"].values():
+                self.assertEqual(leg["outcome"], "ok")
+                self.assertIsInstance(leg["duration_ms"], int)
+
+    def test_prime_final_status_marks_deadline_expired_legs(self) -> None:
+        def fake_urlopen(request, timeout):
+            if request.full_url.endswith("/v1/search_transcript"):
+                time.sleep(3.0)
+            return _PrimeFakeResponse(_prime_endpoint_payload(request.full_url))
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            status_path = root / "status.json"
+            config_path = _write_trigger_config(root)
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                patch("vexic.recorders.cli.subprocess.Popen"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--status-path",
+                        str(status_path),
+                        "--deadline-seconds",
+                        "1.0",
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            final = json.loads((root / "status-prime.json").read_text(encoding="utf-8"))
+            self.assertTrue(final["ok"])
+            self.assertEqual(final["legs"]["search_transcript"]["outcome"], "deadline")
+            self.assertEqual(final["legs"]["fresh_context"]["outcome"], "ok")
+
+    def test_prime_spawns_trigger_dream_after_reads_finish(self) -> None:
+        events: list[str] = []
+        lock = threading.Lock()
+
+        def fake_urlopen(request, timeout):
+            with lock:
+                events.append("read")
+            return _PrimeFakeResponse(_prime_endpoint_payload(request.full_url))
+
+        def fake_popen(argv, **kwargs):
+            with lock:
+                events.append("spawn")
+
+            class _FakeProcess:
+                pass
+
+            return _FakeProcess()
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = _write_trigger_config(root)
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                patch("vexic.recorders.cli.subprocess.Popen", fake_popen),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(events[-1], "spawn", "dream trigger must not precede the reads")
+        self.assertEqual(events.count("spawn"), 1)
+        self.assertEqual(events.count("read"), 3)
+
+    def test_prime_prints_context_before_spawn_and_final_status(self) -> None:
+        # A stalled Popen or status write after a successful fetch must not be
+        # able to hold the block inside the hook kill window: stdout first.
+        stdout_at_spawn: list[str] = []
+        status_exists_at_spawn: list[bool] = []
+        stdout = io.StringIO()
+        status_holder: dict[str, Path] = {}
+
+        def fake_urlopen(request, timeout):
+            return _PrimeFakeResponse(_prime_endpoint_payload(request.full_url))
+
+        def fake_popen(argv, **kwargs):
+            stdout_at_spawn.append(stdout.getvalue())
+            status_path = status_holder["path"]
+            if status_path.exists():
+                payload = json.loads(status_path.read_text(encoding="utf-8"))
+                status_exists_at_spawn.append(payload.get("phase") == "finished")
+            else:
+                status_exists_at_spawn.append(False)
+
+            class _FakeProcess:
+                pass
+
+            return _FakeProcess()
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            status_path = root / "status.json"
+            status_holder["path"] = root / "status-prime.json"
+            config_path = _write_trigger_config(root)
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                patch("vexic.recorders.cli.subprocess.Popen", fake_popen),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--status-path",
+                        str(status_path),
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(stdout_at_spawn), 1)
+        emitted = json.loads(stdout_at_spawn[0])
+        self.assertIn(
+            "Durable cedar preference",
+            emitted["hookSpecificOutput"]["additionalContext"],
+            "hook JSON must be on stdout before the dream spawn runs",
+        )
+        self.assertEqual(
+            status_exists_at_spawn,
+            [True],
+            "finished status must be durable before the dream spawn runs",
+        )
+
+    def test_prime_deadline_flag_warns_when_at_or_above_hook_budget(self) -> None:
+        def fake_urlopen(request, timeout):
+            return _PrimeFakeResponse(_prime_endpoint_payload(request.full_url))
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = _write_trigger_config(root)
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            stderr = io.StringIO()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                patch("vexic.recorders.cli.subprocess.Popen"),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--deadline-seconds",
+                        "30",
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        self.assertIn("hook", stderr.getvalue())
+        self.assertIn("30", stderr.getvalue())
+
+    def test_prime_deadline_flag_rejects_non_positive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = _write_trigger_config(root)
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--deadline-seconds",
+                        "0",
+                    ]
+                )
+            self.assertEqual(code, 2, "usage error must surface, not run the reads")
+            self.assertIn("positive", stderr.getvalue())
+
+    def test_prime_legs_frozen_at_deadline_decision_despite_late_worker(self) -> None:
+        # A worker that finishes shortly after the deadline decision must not
+        # rewrite its leg to "ok" or smuggle its section into the context: the
+        # emitted block and the status legs must describe the same snapshot.
+        def fake_urlopen(request, timeout):
+            if request.full_url.endswith("/v1/search_transcript"):
+                time.sleep(2.0)
+            return _PrimeFakeResponse(_prime_endpoint_payload(request.full_url))
+
+        config = hosted_prime.HostedPrimeConfig(
+            base_url="https://api.example.test",
+            api_key="vx_secret",
+            project_id="project-a",
+            session_id="session-a",
+            agent_id=None,
+        )
+        with patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen):
+            result = hosted_prime.fetch_prime_context(config, deadline_seconds=0.5)
+            self.assertEqual(result.legs["search_transcript"]["outcome"], "deadline")
+            self.assertNotIn("recent cedar note", result.context)
+            time.sleep(2.5)
+            self.assertEqual(
+                result.legs["search_transcript"]["outcome"],
+                "deadline",
+                "late-finishing worker must not rewrite a decided leg",
+            )
+
+    def test_prime_status_lands_in_sibling_file_leaving_ingest_record_intact(self) -> None:
+        # Prime and ingest sharing one status file would let an async Stop
+        # ingest overwrite a killed prime's stale "started" marker — the very
+        # evidence the marker exists to preserve — and vice versa.
+        def fake_urlopen(request, timeout):
+            return _PrimeFakeResponse(_prime_endpoint_payload(request.full_url))
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            status_path = root / "status.json"
+            ingest_record = '{"ok": true, "operation": "ingest", "inserted": 7}\n'
+            status_path.write_text(ingest_record, encoding="utf-8")
+            config_path = _write_trigger_config(root)
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                patch("vexic.recorders.cli.subprocess.Popen"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--status-path",
+                        str(status_path),
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(
+                status_path.read_text(encoding="utf-8"),
+                ingest_record,
+                "prime must never touch the ingest status file",
+            )
+            prime_status = json.loads(
+                (root / "status-prime.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(prime_status["operation"], "prime")
+            self.assertEqual(prime_status["phase"], "finished")
+
+    def test_prime_deadline_flag_rejects_non_finite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = _write_trigger_config(root)
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(config_path),
+                        "--hook-input",
+                        str(hook_payload),
+                        "--deadline-seconds",
+                        "inf",
+                    ]
+                )
+            self.assertEqual(code, 2, "inf must be a usage error, not join(inf)")
+            self.assertIn("finite", stderr.getvalue())
+
+    def test_prime_exits_within_hook_budget_when_post_print_work_stalls(self) -> None:
+        # The harness discards even flushed stdout unless the process exits
+        # cleanly before the hook kill, so a stalled dream spawn or status
+        # write after print must be abandoned, not waited on.
+        def fake_urlopen(request, timeout):
+            return _PrimeFakeResponse(_prime_endpoint_payload(request.full_url))
+
+        def stalling_popen(argv, **kwargs):
+            time.sleep(3.0)
+
+            class _FakeProcess:
+                pass
+
+            return _FakeProcess()
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = _write_trigger_config(root)
+            hook_payload = root / "session-start.json"
+            hook_payload.write_text(json.dumps({"source": "startup"}), encoding="utf-8")
+            stdout = io.StringIO()
+            started = time.monotonic()
+            with (
+                patch("vexic.recorders.hosted_prime.urlopen", fake_urlopen),
+                patch("vexic.recorders.cli.subprocess.Popen", stalling_popen),
+                patch("vexic.recorders.cli._SESSION_START_HOOK_KILL_SECONDS", 5.0),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = recorder_main(
+                    ["prime", "--config", str(config_path), "--hook-input", str(hook_payload)]
+                )
+            elapsed = time.monotonic() - started
+
+        self.assertEqual(code, 0)
+        self.assertLess(
+            elapsed,
+            2.0,
+            "post-print stall must be abandoned inside the hook budget",
+        )
+        emitted = json.loads(stdout.getvalue())
+        self.assertIn(
+            "Durable cedar preference",
+            emitted["hookSpecificOutput"]["additionalContext"],
+        )
 
 
 class _FakeSetupResult:

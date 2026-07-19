@@ -5,6 +5,41 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.7] - 2026-07-18
+
+Recorder deadline, retry, and error-reporting reliability for the async Stop
+and SessionStart hooks. No public memory contract change; `CONTRACT_VERSION`
+stays `0.1.0`.
+
+### Fixed
+
+- Session-start prime reads fan out across parallel daemon workers under a
+  single end-to-end deadline (default 20s), so a stalled hosted read is
+  abandoned rather than waited into the SessionStart hook kill window and
+  can no longer eat the whole injected block (#250).
+- Recorder ingest bounds retries end to end: transport failures, 408, and
+  429 responses retry with a capped, jittered backoff and honor a bounded
+  `Retry-After`, and the per-attempt socket timeout is capped to the
+  remaining budget so a dripping response cannot stretch a body read far
+  past the deadline. The default socket timeout composes with the ingest
+  deadline to stay inside the Stop hook kill even when an un-preempted
+  in-flight read overshoots the deadline (#252, #253).
+- MCP `tools/call` error path sanitizes pydantic `ValidationError` messages
+  through the client-safe builder instead of echoing raw input values
+  (#251).
+
+### Changed
+
+- `fetch_prime_context` returns a `PrimeFetchResult` (context plus per-leg
+  timing/outcome) instead of a bare `str`; `recorder prime` writes a
+  `phase: "started"` attempt marker and a `phase: "finished"` record with
+  per-leg durations into a sibling `-prime.json` status file so overlapping
+  Stop-hook ingests and prime cannot erase each other's records (#250).
+- Product glossary adds the dreaming and recorder terms; the hosted-mvp
+  sweeper section notes the bounded prelude retry (ADR 0030 amendment).
+
+[0.1.7]: https://github.com/PyroDonkey/vexic/releases/tag/v0.1.7
+
 ## [0.1.6] - 2026-07-17
 
 Session-start priming robustness plus recorder and hosted-layer reliability

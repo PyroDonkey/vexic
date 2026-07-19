@@ -713,7 +713,10 @@ active tenant in the catalog and, per recorded agent scope:
   shorter failure backoff (`VEXIC_DREAM_FAILURE_BACKOFF_SECONDS`, default
   3600): a transient storage-write fault recovers within ~one backoff window,
   while a persistent unrecorded failure retries at that cadence rather than
-  re-running the full chain every tick.
+  re-running the full chain every tick. Before any phase runs, the pre-phase
+  tenant/connection prelude retries in-process on `retryable_operational`
+  storage faults (bounded attempts, ADR 0030 amendment); phase execution
+  itself and `MutationOutcomeUnknown` are never retried and fail closed.
 
 Scheduling reuses the trigger endpoint's machinery through
 `HostedMemoryService.schedule_system_dream`: pre-bound, server-minted
@@ -732,9 +735,11 @@ database's `dream_sweep_state` table.
 ### Recorder-side backstop trigger
 
 `recorder prime` (invoked from the Claude Code SessionStart hook) spawns a
-detached, fire-and-forget `vexic recorder trigger-dream` subprocess before
-doing its normal priming work, as a backstop between in-server sweeper ticks (ADR 0030). This
-adds no serial latency to the hook: the subprocess is spawned with
+detached, fire-and-forget `vexic recorder trigger-dream` subprocess after its
+priming reads complete, as a backstop between in-server sweeper ticks (ADR
+0030; moved from before the reads by the ADR 0025 D4 follow-up so prime's own
+trigger cannot compete with its reads for hosted capacity inside the hook
+budget). This adds no serial latency to the hook: the subprocess is spawned with
 `stdin`/`stdout`/`stderr` all `DEVNULL` and `start_new_session=True` (an
 inherited stdout pipe would keep the hook's own stdout open until the child
 exits, which would defeat the "zero added latency" goal) and prime does not
@@ -756,10 +761,35 @@ exits `0` and never affects prime's own output or exit code.
   restart or redeploy mid-sweep. The next trigger (cron or prime) re-runs
   idempotently, so no data is lost, but an in-flight sweep at deploy time is
   simply abandoned rather than resumed.
-- Prime's pre-existing serial-timeout budget (up to three sequential 15s
+- ~~Prime's pre-existing serial-timeout budget (up to three sequential 15s
   `urlopen` calls against the SessionStart hook's 30s kill) is unchanged by
   this work and remains a known follow-up to tighten or parallelize
-  separately.
+  separately.~~ Resolved by the ADR 0025 D4 follow-up: the three reads now
+  fan out in parallel daemon threads under an end-to-end deadline
+  (`--deadline-seconds`, default 20s) inside `fetch_prime_context`; reads
+  that miss the deadline degrade to their empty fallbacks and prime always
+  exits cleanly before the hook kill; work remaining after the block is
+  printed (final status write, dream spawn) runs on a daemon thread joined
+  against the leftover hook budget so a stall there is abandoned rather than
+  waited into the kill window. `recorder prime` also writes a
+  `phase: "started"` attempt marker before its reads and a
+  `phase: "finished"` record with per-leg durations after, into a sibling
+  `<status-name>-prime.json` file (never the ingest status file, so
+  overlapping Stop-hook ingests and prime cannot erase each other's
+  records); a stale `started` marker is durable evidence of an external
+  kill. The Stop-hook ingest posting loop has the parallel bound: an
+  end-to-end deadline (`--deadline-seconds` on `recorder ingest`, default
+  100s inside the async Stop hook's 120s kill) that stops posting, writes a
+  degraded status, and fails open with exit 1 on expiry; the next run
+  re-posts from the start and the hosted source ledger dedups. An in-flight
+  response read is not preempted, so a single recv can block up to the
+  per-attempt socket timeout past the deadline before the controlled exit
+  runs; the default socket timeout (`--timeout-seconds`, 10s) is sized so
+  `deadline + timeout` stays inside the 120s kill with margin for the status
+  write, so even that overshoot lands before the kill. Raising
+  `--timeout-seconds` (or `--deadline-seconds`) far enough that
+  `deadline + timeout` crowds the kill warns on stderr; if the kill is still
+  reached, the ledger dedup on the next run is the backstop.
 
 Revoke a throwaway key by key id, not by raw key:
 

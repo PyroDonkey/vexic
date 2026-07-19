@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import subprocess
 import sys
+import threading
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Iterator
@@ -24,6 +27,7 @@ from vexic.recorders.claude_setup import (
 )
 from vexic.recorders.hosted_prime import (
     DEFAULT_PRIME_MAX_CHARS,
+    PRIME_DEADLINE_SECONDS,
     HostedPrimeConfig,
     fetch_prime_context,
     post_trigger_dream_phase,
@@ -149,6 +153,79 @@ def _argv_status_path(argv: list[str]) -> Path | None:
     return None
 
 
+# The Claude Code SessionStart hook installed by claude_setup kills prime at
+# this many seconds; a fetch deadline at or beyond it silently recreates the
+# lost-block failure the deadline exists to prevent.
+_SESSION_START_HOOK_KILL_SECONDS = 30.0
+
+# The async Stop hook installed by claude_setup kills ingest at this many
+# seconds, with no in-process handler able to run afterward.
+_STOP_HOOK_KILL_SECONDS = 120.0
+
+# End-to-end budget for the ingest posting loop. Without it a multi-batch
+# transcript is unbounded (each batch can burn ~91.5s of retries) and the Stop
+# hook kill lands mid-flight with no status write and no controlled exit. The
+# default leaves margin inside the 120s kill for the degraded status write and
+# the fail-open exit 1.
+INGEST_DEADLINE_SECONDS = 100.0
+
+# Per-request socket timeout for an ingest POST. A single in-flight response
+# read is not preempted (see hosted_ingest._read_with_budget), so the last
+# recv can block up to this long past the deadline. Kept small enough that
+# INGEST_DEADLINE_SECONDS + INGEST_TIMEOUT_SECONDS stays inside
+# _STOP_HOOK_KILL_SECONDS with room for the degraded status write, so even a
+# read that overshoots the deadline still lands before the Stop hook kill.
+INGEST_TIMEOUT_SECONDS = 10.0
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if not (parsed > 0 and math.isfinite(parsed)):
+        raise argparse.ArgumentTypeError(
+            "must be a positive, finite number of seconds"
+        )
+    return parsed
+
+
+def _warn_hook_kill_margin(
+    deadline_seconds: float,
+    kill_seconds: float,
+    hook_name: str,
+    consequence: str,
+    read_overshoot_seconds: float = 0.0,
+) -> None:
+    # A deadline crowding the hook kill silently recreates the uncontrolled
+    # mid-flight kill the deadline exists to prevent. An un-preempted in-flight
+    # read can overshoot the deadline by up to read_overshoot_seconds (the
+    # per-attempt socket timeout for the synchronous ingest path; 0 where a
+    # stalled read is abandoned rather than waited on, as in prime), so the
+    # effective worst-case completion is deadline + that overshoot.
+    if deadline_seconds + read_overshoot_seconds >= kill_seconds - 5:
+        crowder = (
+            f"--deadline-seconds {deadline_seconds:g}"
+            if read_overshoot_seconds <= 0
+            else (
+                f"--deadline-seconds {deadline_seconds:g} plus a "
+                f"{read_overshoot_seconds:g}s socket-read overshoot"
+            )
+        )
+        print(
+            f"warning: {crowder} leaves under 5s of margin before "
+            f"the {hook_name} hook kill ({kill_seconds:g}s); {consequence}",
+            file=sys.stderr,
+        )
+
+
+def _prime_status_path(path: Path | None) -> Path | None:
+    # Prime records land in a sibling file, never the ingest status file: an
+    # async Stop ingest overwriting a killed prime's stale "started" marker
+    # would destroy the very evidence the marker exists to preserve, and a
+    # prime write would likewise erase ingest counts an operator needs.
+    if path is None:
+        return None
+    return path.with_name(f"{path.stem}-prime{path.suffix}")
+
+
 def _try_write_status(path: Path | None, status: RecorderStatus) -> str | None:
     if path is None:
         return None
@@ -171,7 +248,14 @@ def _parser() -> argparse.ArgumentParser:
     ingest.add_argument("--project-id")
     ingest.add_argument("--session-id")
     ingest.add_argument("--agent-id")
-    ingest.add_argument("--timeout-seconds", type=float, default=30.0)
+    ingest.add_argument(
+        "--timeout-seconds", type=float, default=INGEST_TIMEOUT_SECONDS
+    )
+    ingest.add_argument(
+        "--deadline-seconds",
+        type=_positive_float,
+        default=INGEST_DEADLINE_SECONDS,
+    )
     ingest.add_argument("--forbidden-value", action="append", default=[])
     ingest.add_argument("--status-path", type=Path)
 
@@ -184,6 +268,11 @@ def _parser() -> argparse.ArgumentParser:
     prime.add_argument("--session-id")
     prime.add_argument("--agent-id")
     prime.add_argument("--timeout-seconds", type=float, default=15.0)
+    prime.add_argument(
+        "--deadline-seconds",
+        type=_positive_float,
+        default=PRIME_DEADLINE_SECONDS,
+    )
     prime.add_argument("--max-chars", type=int, default=DEFAULT_PRIME_MAX_CHARS)
     prime.add_argument("--status-path", type=Path)
 
@@ -360,6 +449,10 @@ def _try_write_cursor(
 
 
 def _ingest(args: argparse.Namespace) -> int:
+    # The deadline clock starts before the transcript scan: a large full
+    # reread eats hook-kill margin too, and "end-to-end" must mean the whole
+    # run, not just the posting loop.
+    started = time.monotonic()
     payload = _read_hook_payload(args.hook_input)
     transcript_path = payload.transcript_path
     source_session_id = payload.session_id
@@ -384,13 +477,31 @@ def _ingest(args: argparse.Namespace) -> int:
         agent_id=args.agent_id,
         timeout_seconds=args.timeout_seconds,
     )
+    _warn_hook_kill_margin(
+        args.deadline_seconds,
+        _STOP_HOOK_KILL_SECONDS,
+        "Stop",
+        "a kill skips the degraded status write and the controlled exit",
+        read_overshoot_seconds=args.timeout_seconds,
+    )
     items: list[SourceTranscriptIngestItemResult] = []
     batches = list(_iter_hosted_message_batches(messages))
-    for batch in batches:
+    for index, batch in enumerate(batches):
+        # One clock read per batch: the remaining deadline both gates the
+        # next POST and caps its in-call retry budget. Raising here, before
+        # the cursor write below, keeps the cursor all-or-nothing; the rerun
+        # re-posts from the start and the hosted ledger dedups.
+        remaining = args.deadline_seconds - (time.monotonic() - started)
+        if remaining <= 0:
+            raise HostedIngestTransportError(
+                f"hosted ingest deadline of {args.deadline_seconds:g}s "
+                f"exceeded: {index}/{len(batches)} batches posted"
+            )
         result = post_source_messages(
             config,
             messages=batch,
             forbidden_values=tuple(args.forbidden_value),
+            budget_seconds=remaining,
         )
         items.extend(_validated_ingest_items(result, batch))
     inserted = sum(item.status == "inserted" for item in items)
@@ -476,13 +587,34 @@ def _spawn_trigger_dream(config_path: Path) -> None:
 
 
 def _prime(args: argparse.Namespace) -> int:
+    started = time.monotonic()
+    status_session_id: str | None = None
     try:
         payload = _read_session_start_payload(args.hook_input)
         if payload.source not in {"startup", "clear"}:
             return 0
-        _spawn_trigger_dream(args.config)
         _apply_ingest_config(args)
-        context = fetch_prime_context(
+        status_session_id = args.session_id
+        # Attempt marker before any hosted read: the SessionStart hook kills
+        # this process at its timeout and no in-process handler can run, so a
+        # stale "started" record is the only durable evidence of a kill.
+        _try_write_status(
+            _prime_status_path(args.status_path),
+            RecorderStatus(
+                ok=False,
+                operation="prime",
+                source_session_id=status_session_id,
+                transcript_path=None,
+                phase="started",
+            ),
+        )
+        _warn_hook_kill_margin(
+            args.deadline_seconds,
+            _SESSION_START_HOOK_KILL_SECONDS,
+            "SessionStart",
+            "a kill discards the entire priming block",
+        )
+        result = fetch_prime_context(
             HostedPrimeConfig(
                 base_url=args.base_url,
                 api_key=args.api_key,
@@ -492,25 +624,72 @@ def _prime(args: argparse.Namespace) -> int:
                 timeout_seconds=args.timeout_seconds,
             ),
             max_chars=args.max_chars,
+            deadline_seconds=args.deadline_seconds,
+        )
+        # stdout first: the hook consumes it only on a clean pre-timeout
+        # exit, so nothing that can stall (status I/O, subprocess spawn) may
+        # sit between a successful fetch and the print.
+        if result.context:
+            print(
+                json.dumps(
+                    {
+                        "hookSpecificOutput": {
+                            "hookEventName": "SessionStart",
+                            "additionalContext": result.context,
+                        }
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        # The harness discards even flushed stdout unless the process exits
+        # cleanly before the hook kill, so the remaining work (status write,
+        # dream spawn) runs in a daemon thread joined against the leftover
+        # hook budget: a stall there is abandoned, never waited into the
+        # kill window. Spawn stays after the reads so prime's own dream
+        # trigger cannot compete with them for hosted capacity (ADR 0025 D4
+        # follow-up).
+        def _finish() -> None:
+            _try_write_status(
+                _prime_status_path(args.status_path),
+                RecorderStatus(
+                    ok=True,
+                    operation="prime",
+                    source_session_id=status_session_id,
+                    transcript_path=None,
+                    phase="finished",
+                    legs=result.legs,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                ),
+            )
+            _spawn_trigger_dream(args.config)
+
+        finisher = threading.Thread(target=_finish, daemon=True)
+        finisher.start()
+        finisher.join(
+            max(
+                0.0,
+                (_SESSION_START_HOOK_KILL_SECONDS - 5.0)
+                - (time.monotonic() - started),
+            )
         )
     except Exception as exc:
         # SessionStart priming is fail-open: stderr is the operator signal,
         # stdout stays empty so Claude Code receives no unsafe context.
         print(f"warning: {exc}", file=sys.stderr)
-        return 0
-    if not context:
-        return 0
-    print(
-        json.dumps(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "SessionStart",
-                    "additionalContext": context,
-                }
-            },
-            sort_keys=True,
+        _try_write_status(
+            _prime_status_path(getattr(args, "status_path", None)),
+            RecorderStatus(
+                ok=False,
+                operation="prime",
+                source_session_id=status_session_id,
+                transcript_path=None,
+                error=f"{type(exc).__name__}: {exc}",
+                phase="finished",
+                duration_ms=int((time.monotonic() - started) * 1000),
+            ),
         )
-    )
+        return 0
     return 0
 
 

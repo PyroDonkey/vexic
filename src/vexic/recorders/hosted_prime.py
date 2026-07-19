@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
-from dataclasses import dataclass
+import threading
+import time
+from dataclasses import dataclass, field
 from http.client import HTTPException
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
@@ -15,6 +18,14 @@ from vexic.url_policy import require_http_url
 LONG_TERM_PRIME_QUERY = "preference fact goal decision project context remember"
 TRANSCRIPT_PRIME_QUERY = "remember"
 DEFAULT_PRIME_MAX_CHARS = 6_000
+
+# The SessionStart hook kills the prime process at 30s and the harness
+# discards hook stdout on timeout cancellation even if it was flushed
+# earlier, so the only way to deliver context is a clean exit before the
+# kill. This end-to-end budget bounds all reads together; reads that miss
+# it degrade to their empty fallbacks instead of losing the whole block
+# (ADR 0025 D4 follow-up).
+PRIME_DEADLINE_SECONDS = 20.0
 
 PRIME_FRAMING = (
     "Memory snapshot from prior sessions — use it silently.\n"
@@ -87,53 +98,112 @@ def fetch_fresh_context(
         return None
 
 
+@dataclass(frozen=True)
+class PrimeFetchResult:
+    context: str
+    legs: dict[str, dict[str, object]] = field(default_factory=dict)
+
+
 def fetch_prime_context(
     config: HostedPrimeConfig,
     *,
     max_chars: int = DEFAULT_PRIME_MAX_CHARS,
     long_term_limit: int = 5,
     transcript_limit: int = 5,
-) -> str:
+    deadline_seconds: float = PRIME_DEADLINE_SECONDS,
+) -> PrimeFetchResult:
     # The recap is one of several prime sections (long-term facts, transcript
     # hits, and the trailing footer also need room). Cap the token_budget we
     # request AND the char budget we accept for the recap to ~1/4 of
     # max_chars, so a hosted endpoint that ignores token_budget (or whose
     # token estimate undershoots ours) can't crowd out the other sections.
-    fresh_context = fetch_fresh_context(config, token_budget=max_chars // 16)
+    reads: dict[str, tuple[str, dict[str, object]]] = {
+        "fresh_context": ("fresh_context", {"token_budget": max_chars // 16}),
+        "search_long_term": (
+            "search_long_term",
+            {"query": LONG_TERM_PRIME_QUERY, "limit": long_term_limit},
+        ),
+        "search_transcript": (
+            "search_transcript",
+            {"query": TRANSCRIPT_PRIME_QUERY, "limit": transcript_limit},
+        ),
+    }
+    # Validate before fanning out so a bad base_url raises synchronously to
+    # the caller instead of dying inside worker threads. Non-finite deadlines
+    # would turn thread.join into OverflowError (inf) or timing-dependent
+    # no-waits (nan).
+    if not (deadline_seconds > 0 and math.isfinite(deadline_seconds)):
+        raise ValueError("deadline_seconds must be a positive, finite number")
+    require_http_url("base_url", config.base_url)
+    results: dict[str, dict[str, object]] = {}
+    legs: dict[str, dict[str, object]] = {}
+    started = time.monotonic()
+
+    def _worker(name: str, operation: str, payload: dict[str, object]) -> None:
+        leg_started = time.monotonic()
+        try:
+            results[name] = _post_search(config, operation, payload)
+            outcome = "ok"
+        except RuntimeError as exc:
+            if name == "fresh_context":
+                print(f"warning: {exc}", file=sys.stderr)
+            outcome = "error"
+        legs[name] = {
+            "duration_ms": int((time.monotonic() - leg_started) * 1000),
+            "outcome": outcome,
+        }
+
+    # Daemon threads so an abandoned read can never block interpreter exit:
+    # a lingering socket past the deadline must not push the process into the
+    # hook kill window.
+    threads = {
+        name: threading.Thread(
+            target=_worker, args=(name, operation, payload), daemon=True
+        )
+        for name, (operation, payload) in reads.items()
+    }
+    for thread in threads.values():
+        thread.start()
+    # Freeze one snapshot per leg at the join decision. Workers abandoned at
+    # the deadline keep running (daemon) and keep writing into `legs` and
+    # `results`; without the snapshot a late finisher could rewrite its leg
+    # to "ok" or smuggle its section into the context, making the emitted
+    # block and the reported status describe different states.
+    final_legs: dict[str, dict[str, object]] = {}
+    final_results: dict[str, dict[str, object]] = {}
+    for name, thread in threads.items():
+        remaining = deadline_seconds - (time.monotonic() - started)
+        if remaining > 0:
+            thread.join(remaining)
+        if thread.is_alive():
+            final_legs[name] = {
+                "duration_ms": int((time.monotonic() - started) * 1000),
+                "outcome": "deadline",
+            }
+        else:
+            # join() returned because the worker finished, so its writes to
+            # legs/results are complete and visible.
+            final_legs[name] = legs[name]
+            if name in results:
+                final_results[name] = results[name]
+
+    fresh_context = final_results.get("fresh_context")
     recap_text = None
     if fresh_context is not None:
         recap_text = _str(fresh_context.get("text"))
         if recap_text is not None:
             recap_text = _cap_item(recap_text, max_chars // 4)
-    long_term = _safe_post_search(
-        config,
-        "search_long_term",
-        {"query": LONG_TERM_PRIME_QUERY, "limit": long_term_limit},
-    )
-    transcript = _safe_post_search(
-        config,
-        "search_transcript",
-        {"query": TRANSCRIPT_PRIME_QUERY, "limit": transcript_limit},
-    )
     context = build_prime_context(
-        long_term, transcript, recap_text=recap_text, max_chars=max_chars
+        final_results.get("search_long_term", {}),
+        final_results.get("search_transcript", {}),
+        recap_text=recap_text,
+        max_chars=max_chars,
     )
     try:
         assert_no_forbidden_secret_values((config.api_key,), context)
     except ValueError:
         raise RuntimeError("hosted prime failed: forbidden secret in response") from None
-    return context
-
-
-def _safe_post_search(
-    config: HostedPrimeConfig,
-    operation: str,
-    payload: dict[str, object],
-) -> dict[str, object]:
-    try:
-        return _post_search(config, operation, payload)
-    except RuntimeError:
-        return {}
+    return PrimeFetchResult(context=context, legs=final_legs)
 
 
 def _post_search(
