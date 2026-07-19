@@ -1566,6 +1566,42 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
 
             self.assertEqual(code, 0)
 
+    def test_read_hook_input_rejects_interactive_tty_instead_of_blocking(
+        self,
+    ) -> None:
+        # Run by hand with no --hook-input and no piped stdin, the reader used
+        # to block forever on sys.stdin.buffer.read() waiting for a payload
+        # that never comes. An interactive tty must fail fast with an
+        # actionable message instead.
+        from vexic.recorders.cli import _read_hook_input_bytes
+
+        class _TtyStdin:
+            def __init__(self) -> None:
+                self.buffer = self
+
+            def isatty(self) -> bool:
+                return True
+
+            def read(self) -> bytes:  # pragma: no cover - must never run
+                raise AssertionError("read() must not be reached for a tty")
+
+        with patch("vexic.recorders.cli.sys.stdin", _TtyStdin()):
+            with self.assertRaises(ValueError) as ctx:
+                _read_hook_input_bytes(None)
+        self.assertIn("stdin", str(ctx.exception))
+
+    def test_read_hook_input_reads_piped_stdin_bytes(self) -> None:
+        # A non-tty stdin (piped hook payload, the real invocation) still
+        # reads raw bytes unchanged.
+        from vexic.recorders.cli import _read_hook_input_bytes
+
+        class _PipedStdin:
+            def __init__(self, data: bytes) -> None:
+                self.buffer = io.BytesIO(data)
+
+        with patch("vexic.recorders.cli.sys.stdin", _PipedStdin(b'{"ok": 1}')):
+            self.assertEqual(_read_hook_input_bytes(None), b'{"ok": 1}')
+
     def test_ingest_batches_hosted_posts_at_one_hundred_messages(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
