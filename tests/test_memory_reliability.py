@@ -2091,6 +2091,7 @@ class UndatedEventPromotionSelectionTests(unittest.TestCase):
             self._promotion_candidate(2, category="event", occurred_at=""),
             self._promotion_candidate(3, category="event", occurred_at="2026-03"),
             self._promotion_candidate(4, category="fact"),
+            self._promotion_candidate(5, category="event", occurred_at="   "),
         ]
 
         selected = select_promotions(
@@ -2100,6 +2101,40 @@ class UndatedEventPromotionSelectionTests(unittest.TestCase):
         )
 
         self.assertEqual({c.candidate_id for c in selected}, {3, 4})
+
+    def test_undated_event_candidates_do_not_consume_top_n_slots(self) -> None:
+        # The filter must run before scoring/slicing: an undated event that
+        # would have out-scored everyone cannot eat the only top-N slot.
+        undated = self._promotion_candidate(1, category="event", occurred_at=None)
+        undated = PromotionCandidate(
+            **{**undated.__dict__, "hit_count": 1000, "importance": 10}
+        )
+        fact = self._promotion_candidate(2, category="fact")
+
+        selected = select_promotions(
+            [undated, fact],
+            now=datetime(2026, 6, 2, tzinfo=timezone.utc),
+            top_n=1,
+        )
+
+        self.assertEqual([c.candidate_id for c in selected], [2])
+
+    def test_all_undated_event_candidates_select_nothing(self) -> None:
+        # The literal deadlock shape: every eligible candidate is an undated
+        # event. Selection must return empty (Deep no-ops) instead of handing
+        # promotion a candidate it will refuse.
+        candidates = [
+            self._promotion_candidate(1, category="event", occurred_at=None),
+            self._promotion_candidate(2, category="event", occurred_at=""),
+        ]
+
+        selected = select_promotions(
+            candidates,
+            now=datetime(2026, 6, 2, tzinfo=timezone.utc),
+            top_n=10,
+        )
+
+        self.assertEqual(selected, [])
 
 
 class UndatedEventDeepCycleReliabilityTests(unittest.IsolatedAsyncioTestCase):
