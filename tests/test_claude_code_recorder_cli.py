@@ -1787,6 +1787,82 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
             self.assertIn("margin", stderr.getvalue())
             self.assertIn("Stop hook kill", stderr.getvalue())
 
+    def test_ingest_default_timeout_and_deadline_compose_within_stop_kill(
+        self,
+    ) -> None:
+        # A single in-flight response read is not preempted, so the last recv
+        # can overshoot the deadline by up to the per-attempt socket timeout.
+        # The default deadline plus the default socket timeout must still land
+        # inside the Stop hook kill, with room for the degraded status write.
+        from vexic.recorders.cli import (
+            INGEST_DEADLINE_SECONDS,
+            INGEST_TIMEOUT_SECONDS,
+            _STOP_HOOK_KILL_SECONDS,
+        )
+
+        self.assertLessEqual(
+            INGEST_DEADLINE_SECONDS + INGEST_TIMEOUT_SECONDS,
+            _STOP_HOOK_KILL_SECONDS - 5,
+        )
+
+    def _run_ingest_capturing_stderr(self, *extra_args: str) -> tuple[int, str]:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            transcript = root / "session.jsonl"
+            transcript.write_text("", encoding="utf-8")
+            hook_payload = root / "hook.json"
+            hook_payload.write_text(
+                json.dumps(
+                    {
+                        "session_id": "claude-session",
+                        "transcript_path": str(transcript),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            def fake_post(config, *, messages, forbidden_values, budget_seconds=None):
+                return _ingest_result(messages)
+
+            stderr = io.StringIO()
+            with (
+                patch("vexic.recorders.cli.post_source_messages", fake_post),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = recorder_main(
+                    [
+                        "ingest",
+                        "--hook-input",
+                        str(hook_payload),
+                        "--base-url",
+                        "https://api.example.test",
+                        "--api-key",
+                        "vx_secret",
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "vexic-session",
+                        *extra_args,
+                    ]
+                )
+            return code, stderr.getvalue()
+
+    def test_ingest_default_timeout_does_not_warn_about_kill_margin(self) -> None:
+        code, stderr = self._run_ingest_capturing_stderr()
+        self.assertEqual(code, 0)
+        self.assertNotIn("hook kill", stderr)
+
+    def test_ingest_warns_when_socket_timeout_can_overshoot_stop_kill(self) -> None:
+        # Default deadline (100s) leaves 20s to the 120s kill; a 60s socket
+        # timeout means an un-preempted final read can overshoot into the kill,
+        # so the composition must warn even though the deadline alone is fine.
+        code, stderr = self._run_ingest_capturing_stderr("--timeout-seconds", "60")
+        self.assertEqual(code, 0)
+        self.assertIn("margin", stderr)
+        self.assertIn("Stop hook kill", stderr)
+        self.assertIn("overshoot", stderr)
+
     def test_ingest_batches_hosted_posts_before_payload_char_cap(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

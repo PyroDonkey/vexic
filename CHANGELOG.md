@@ -16,16 +16,17 @@ stays `0.1.0`.
 - Session-start prime reads fan out across parallel daemon workers under a
   single end-to-end deadline (default 20s), so a stalled hosted read is
   abandoned rather than waited into the SessionStart hook kill window and
-  can no longer eat the whole injected block (COA-407, #250).
+  can no longer eat the whole injected block (#250).
 - Recorder ingest bounds retries end to end: transport failures, 408, and
   429 responses retry with a capped, jittered backoff and honor a bounded
   `Retry-After`, and the per-attempt socket timeout is capped to the
   remaining budget so a dripping response cannot stretch a body read far
-  past the deadline. Best-effort: a single in-flight recv is not preempted
-  (COA-400, COA-406, #252).
+  past the deadline. The default socket timeout composes with the ingest
+  deadline to stay inside the Stop hook kill even when an un-preempted
+  in-flight read overshoots the deadline (#252, #253).
 - MCP `tools/call` error path sanitizes pydantic `ValidationError` messages
   through the client-safe builder instead of echoing raw input values
-  (COA-399, #251).
+  (#251).
 
 ### Changed
 
@@ -33,8 +34,7 @@ stays `0.1.0`.
   timing/outcome) instead of a bare `str`; `recorder prime` writes a
   `phase: "started"` attempt marker and a `phase: "finished"` record with
   per-leg durations into a sibling `-prime.json` status file so overlapping
-  Stop-hook ingests and prime cannot erase each other's records (COA-407,
-  #250).
+  Stop-hook ingests and prime cannot erase each other's records (#250).
 - Product glossary adds the dreaming and recorder terms; the hosted-mvp
   sweeper section notes the bounded prelude retry (ADR 0030 amendment).
 

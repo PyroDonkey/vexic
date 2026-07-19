@@ -169,6 +169,14 @@ _STOP_HOOK_KILL_SECONDS = 120.0
 # the fail-open exit 1.
 INGEST_DEADLINE_SECONDS = 100.0
 
+# Per-request socket timeout for an ingest POST. A single in-flight response
+# read is not preempted (see hosted_ingest._read_with_budget), so the last
+# recv can block up to this long past the deadline. Kept small enough that
+# INGEST_DEADLINE_SECONDS + INGEST_TIMEOUT_SECONDS stays inside
+# _STOP_HOOK_KILL_SECONDS with room for the degraded status write, so even a
+# read that overshoots the deadline still lands before the Stop hook kill.
+INGEST_TIMEOUT_SECONDS = 10.0
+
 
 def _positive_float(value: str) -> float:
     parsed = float(value)
@@ -184,13 +192,25 @@ def _warn_hook_kill_margin(
     kill_seconds: float,
     hook_name: str,
     consequence: str,
+    read_overshoot_seconds: float = 0.0,
 ) -> None:
     # A deadline crowding the hook kill silently recreates the uncontrolled
-    # mid-flight kill the deadline exists to prevent.
-    if deadline_seconds >= kill_seconds - 5:
+    # mid-flight kill the deadline exists to prevent. An un-preempted in-flight
+    # read can overshoot the deadline by up to read_overshoot_seconds (the
+    # per-attempt socket timeout for the synchronous ingest path; 0 where a
+    # stalled read is abandoned rather than waited on, as in prime), so the
+    # effective worst-case completion is deadline + that overshoot.
+    if deadline_seconds + read_overshoot_seconds >= kill_seconds - 5:
+        crowder = (
+            f"--deadline-seconds {deadline_seconds:g}"
+            if read_overshoot_seconds <= 0
+            else (
+                f"--deadline-seconds {deadline_seconds:g} plus a "
+                f"{read_overshoot_seconds:g}s socket-read overshoot"
+            )
+        )
         print(
-            "warning: --deadline-seconds "
-            f"{deadline_seconds:g} leaves under 5s of margin before "
+            f"warning: {crowder} leaves under 5s of margin before "
             f"the {hook_name} hook kill ({kill_seconds:g}s); {consequence}",
             file=sys.stderr,
         )
@@ -228,7 +248,9 @@ def _parser() -> argparse.ArgumentParser:
     ingest.add_argument("--project-id")
     ingest.add_argument("--session-id")
     ingest.add_argument("--agent-id")
-    ingest.add_argument("--timeout-seconds", type=float, default=30.0)
+    ingest.add_argument(
+        "--timeout-seconds", type=float, default=INGEST_TIMEOUT_SECONDS
+    )
     ingest.add_argument(
         "--deadline-seconds",
         type=_positive_float,
@@ -460,6 +482,7 @@ def _ingest(args: argparse.Namespace) -> int:
         _STOP_HOOK_KILL_SECONDS,
         "Stop",
         "a kill skips the degraded status write and the controlled exit",
+        read_overshoot_seconds=args.timeout_seconds,
     )
     items: list[SourceTranscriptIngestItemResult] = []
     batches = list(_iter_hosted_message_batches(messages))
