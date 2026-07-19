@@ -129,6 +129,15 @@ def select_promotions(
     Top-N self-normalizes against score-scale drift, so there is no absolute
     score floor (see the Deep section of docs/architecture.md).
     """
+    # Undated event candidates never reach promotion: Invariant 11 refuses
+    # category="event" without occurred_at, and one refused candidate aborts
+    # the whole Deep cycle — a permanent dream deadlock, since retries
+    # re-select it. Extraction legitimately leaves occurred_at null ("" is
+    # missing too, matching the promotion guard), so drop them here and let
+    # them stay in Tier 2 like ADR 0031 drops miscited candidates.
+    candidates = [
+        c for c in candidates if not (c.category == "event" and not c.occurred_at)
+    ]
     if not candidates:
         return []
 

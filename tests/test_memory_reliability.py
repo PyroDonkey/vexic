@@ -2,13 +2,14 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
-from vexic.deep import run_deep_phase
+from vexic.deep import run_deep_phase, select_promotions
 from vexic.embeddings import EMBEDDING_DIM
 from vexic.models import ContradictionJudgment, FactCandidate
 from vexic.pipeline import run_light_phase
@@ -23,6 +24,7 @@ from vexic.storage import (
     save_messages,
 )
 from vexic.storage.candidates import (
+    PromotionCandidate,
     _load_candidate_by_id,
     keyword_candidate_ids,
     nearest_candidate_ids,
@@ -2053,6 +2055,111 @@ class CandidateSearchEventRangeFilterTests(unittest.TestCase):
         )
 
         self.assertNotIn(candidate_id, ids)
+
+
+class UndatedEventPromotionSelectionTests(unittest.TestCase):
+    # Invariant 11 makes promotion refuse category="event" candidates without
+    # occurred_at, but extraction legitimately emits them ("leave occurred_at
+    # null when no temporal reference exists"). Selection must not hand them to
+    # promotion: one undated event in the top-N aborts the whole Deep cycle and
+    # deadlocks dreaming for the scope.
+
+    def _promotion_candidate(
+        self,
+        candidate_id: int,
+        *,
+        category: str = "fact",
+        occurred_at: str | None = None,
+    ) -> PromotionCandidate:
+        return PromotionCandidate(
+            candidate_id=candidate_id,
+            fact_text=f"fact {candidate_id}",
+            subject="Ryan",
+            category=category,
+            confidence=0.9,
+            importance=8,
+            hit_count=3,
+            last_seen_at=datetime(2026, 6, 1, tzinfo=timezone.utc),
+            rem_boost=0.0,
+            embedding=_unit_vector(1.0),
+            occurred_at=occurred_at,
+        )
+
+    def test_select_promotions_skips_event_candidates_without_occurred_at(self) -> None:
+        candidates = [
+            self._promotion_candidate(1, category="event", occurred_at=None),
+            self._promotion_candidate(2, category="event", occurred_at=""),
+            self._promotion_candidate(3, category="event", occurred_at="2026-03"),
+            self._promotion_candidate(4, category="fact"),
+        ]
+
+        selected = select_promotions(
+            candidates,
+            now=datetime(2026, 6, 2, tzinfo=timezone.utc),
+            top_n=10,
+        )
+
+        self.assertEqual({c.candidate_id for c in selected}, {3, 4})
+
+
+class UndatedEventDeepCycleReliabilityTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.temp_dir.name) / "memory.db")
+        init_db(self.db_path)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    async def test_deep_cycle_survives_undated_event_candidate_and_promotes_the_rest(
+        self,
+    ) -> None:
+        commit_dream_cycle(
+            self.db_path,
+            [
+                _candidate(
+                    "Ryan attended a conference.",
+                    message_ids=[1],
+                    category="event",
+                ),
+                _candidate("Ryan uses uv.", message_ids=[2]),
+            ],
+            candidate_embeddings=[_unit_vector(1.0), _unit_vector(0.0, 1.0)],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=2,
+            last_processed_message_id=2,
+        )
+
+        await run_deep_phase(
+            self.db_path,
+            "glm",
+            contradiction_agent_factory=lambda *_args, **_kwargs: _ContradictionAgent(
+                contradicts=False
+            ),
+        )
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            facts = conn.execute(
+                "SELECT fact_text FROM long_term_memory WHERE retired = 0"
+            ).fetchall()
+            event_row = conn.execute(
+                """
+                SELECT promoted, retired, stale, needs_review
+                FROM memory_candidates
+                WHERE category = 'event'
+                """
+            ).fetchone()
+
+        self.assertEqual(facts, [("Ryan uses uv.",)])
+        self.assertEqual(
+            event_row,
+            (0, 0, 0, 0),
+            "undated event candidate must stay eligible Tier 2 staging, not "
+            "crash the cycle or get retired",
+        )
 
 
 if __name__ == "__main__":
