@@ -396,6 +396,15 @@ def _read_hook_input_bytes(path: Path | None) -> bytes:
     # surrogate and makes model_validate_json fail with string_unicode.
     if path is not None:
         return path.read_bytes()
+    # Reading stdin interactively blocks forever waiting for a hook payload
+    # the hook harness always pipes but a hand-run invocation never sends.
+    # Fail fast with an actionable message instead of hanging silently.
+    if sys.stdin.buffer.isatty():
+        raise ValueError(
+            "no hook input on stdin: pass --hook-input PATH or pipe the "
+            "Claude Code hook JSON; this command is not meant to be run "
+            "interactively"
+        )
     return sys.stdin.buffer.read()
 
 
