@@ -376,6 +376,35 @@ flagged `needs_manual_review`, including answers that appear verbatim nowhere
 in the transcript). Every `memory.db` is opened read-only; the output is
 `analysis_report.json` in the run directory plus a stdout summary.
 
+### Extraction-Prompt Ablation
+
+`scripts/ablate_extraction_prompts.py` is a window-faithful ablation over the
+Light extraction instructions. It reconstructs the exact persisted Light windows
+from prior LongMemEval run databases (slicing the shared-scope history at the
+`dream_runs` watermarks each Light cycle recorded), binds a fixed set of target
+cases to their
+answer-bearing windows through declarative locator substrings, and runs a
+four-condition factorial over additions appended to the adapter's
+`EXTRACTION_INSTRUCTIONS`: control (shipped instructions), a granularity/table
+addition, an update-scanning addition, and both combined. Each target is scored
+against an explicit CNF keyword rubric as a binary HIT or miss per repeat, and
+the run reports per-condition recall with variance (mean and sample standard
+deviation), candidate volume as a Tier 2 cost proxy, and token-usage deltas.
+
+```bash
+uv run python scripts/ablate_extraction_prompts.py \
+  --db .eval-runs/<run>/<timestamp>/<case-id>/memory.db \
+  --allow-live --repeats 5 --out .eval-runs/extraction-ablation
+```
+
+`--db` is repeatable and points at machine-local `.eval-runs/` databases (they
+are gitignored, not vendored). The run is gated behind `--allow-live` with a
+provider-call budget cap (`--max-provider-calls`, default 140); without
+`--allow-live` it prints a skip notice and exits. The `--out` directory receives
+`ablation_metrics.json` and `ablation_audit.jsonl`. Pass `--bind-only` to print
+the target-to-window binding table and exit before any provider call, which
+validates binding without `--allow-live` or budget.
+
 ## Hosted MVP Shell
 
 The dependency-free hosted shell in `vexic.hosted` binds authenticated tenant
