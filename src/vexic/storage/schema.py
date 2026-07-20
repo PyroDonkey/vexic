@@ -109,12 +109,15 @@ def _earliest_date_from_timestamps(values: Iterable[object]) -> str | None:
             continue
         try:
             parsed = datetime.fromisoformat(text)
-        except ValueError:
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            else:
+                # astimezone can raise OverflowError for parseable boundary
+                # values like "0001-01-01T00:00:00+23:59" — fail-soft covers
+                # the whole normalization, not just parsing.
+                parsed = parsed.astimezone(timezone.utc)
+        except (ValueError, OverflowError):
             continue
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        else:
-            parsed = parsed.astimezone(timezone.utc)
         if earliest is None or parsed < earliest:
             earliest = parsed
     if earliest is None:
@@ -133,10 +136,12 @@ def _earliest_mention_date(
     ids = sorted({int(value) for value in source_message_ids})
     if not ids:
         return None
-    placeholders = ", ".join("?" for _ in ids)
+    # Ids ride a single JSON parameter (the purge.py json_each precedent) so
+    # an IN (?, ?, ...) clause can never blow SQLITE_MAX_VARIABLE_NUMBER on a
+    # row citing many messages.
     rows = conn.execute(
-        f"SELECT timestamp FROM messages WHERE id IN ({placeholders})",
-        ids,
+        "SELECT timestamp FROM messages WHERE id IN (SELECT value FROM json_each(?))",
+        (json.dumps(ids),),
     ).fetchall()
     return _earliest_date_from_timestamps(row[0] for row in rows)
 
@@ -165,12 +170,11 @@ def _backfill_mentioned_at(conn: sqlite3.Connection, table_name: str) -> None:
         cited.update(ids)
     if not cited:
         return
-    ordered = sorted(cited)
-    placeholders = ", ".join("?" for _ in ordered)
+    # Single JSON parameter, not one `?` per id — see _earliest_mention_date.
     timestamp_by_id = dict(
         conn.execute(
-            f"SELECT id, timestamp FROM messages WHERE id IN ({placeholders})",
-            ordered,
+            "SELECT id, timestamp FROM messages WHERE id IN (SELECT value FROM json_each(?))",
+            (json.dumps(sorted(cited)),),
         ).fetchall()
     )
     updates = []
@@ -181,8 +185,13 @@ def _backfill_mentioned_at(conn: sqlite3.Connection, table_name: str) -> None:
         if derived is not None:
             updates.append((derived, row_id))
     if updates:
+        # Conditional on the row still being NULL: on hosted libSQL each
+        # statement auto-commits, so a concurrent merge can land a fresher
+        # union-derived value between the snapshot above and this write. The
+        # merge value is computed over a superset of sources and always wins.
         conn.executemany(
-            f"UPDATE {table_name} SET mentioned_at = ? WHERE id = ?",
+            f"UPDATE {table_name} SET mentioned_at = ? "
+            "WHERE id = ? AND mentioned_at IS NULL",
             updates,
         )
 

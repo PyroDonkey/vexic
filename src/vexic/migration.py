@@ -406,6 +406,17 @@ def import_canonical_migration(
             raise
         conn.commit()
 
+        # ADR 0037: rows from a pre-mentioned_at artifact arrive NULL, and
+        # this process already memoized init_db for the target before the
+        # rows landed, so the ensure backfill will not run again here. Heal
+        # explicitly so imported undated events do not stay sunk in Tier 2
+        # until a process restart.
+        from vexic.storage.schema import _backfill_mentioned_at
+
+        _backfill_mentioned_at(conn, "memory_candidates")
+        _backfill_mentioned_at(conn, "long_term_memory")
+        conn.commit()
+
     repair_report = repair_memory_projections(
         target_db_path,
         forbidden_secret_values=forbidden_secret_values,

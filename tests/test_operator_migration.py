@@ -635,6 +635,43 @@ class OperatorMigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({row[0] for row in dropped}, {0})
         self.assertEqual({row[0] for row in occurred}, {None})
 
+    def test_import_backfills_mentioned_at_for_pre_adr0037_artifacts(self) -> None:
+        # codex audit F3: import init_db-and-memoizes the target before rows
+        # land, so the ensure backfill cannot heal pre-ADR-0037 rows in this
+        # process. The import path must run the targeted backfill explicitly
+        # after inserting rows, or imported undated events stay sunk in
+        # Tier 2 until a process restart.
+        from vexic.migration import import_canonical_migration
+
+        payload = self._export_artifact_payload()
+        for row in payload["tables"]["memory_candidates"]:
+            del row["mentioned_at"]
+        for row in payload["tables"]["long_term_memory"]:
+            del row["mentioned_at"]
+        self.artifact.write_text(json.dumps(payload))
+
+        report = import_canonical_migration(
+            self.artifact,
+            str(self.target_db),
+            tenant_id="tenant-a",
+            project_id="project-a",
+        )
+
+        self.assertGreater(report.rows_imported, 0)
+        with closing(sqlite3.connect(self.target_db)) as conn:
+            expected = conn.execute(
+                "SELECT DATE(MIN(timestamp)) FROM messages"
+            ).fetchone()[0]
+            candidate_dates = conn.execute(
+                "SELECT mentioned_at FROM memory_candidates"
+            ).fetchall()
+            fact_dates = conn.execute(
+                "SELECT mentioned_at FROM long_term_memory"
+            ).fetchall()
+        self.assertIsNotNone(expected)
+        self.assertEqual({row[0] for row in candidate_dates}, {expected})
+        self.assertEqual({row[0] for row in fact_dates}, {expected})
+
     def test_import_of_column_stripped_artifact_is_idempotent(self) -> None:
         from vexic.migration import import_canonical_migration
 

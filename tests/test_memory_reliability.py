@@ -38,6 +38,8 @@ from vexic.storage.longterm import (
 )
 from vexic.storage.promotion import PromotionDecision
 from vexic.storage.schema import (
+    _backfill_mentioned_at,
+    _earliest_mention_date,
     _ensure_vector_memory_schema,
     _reset_init_memo,
     init_vector_memory,
@@ -1337,6 +1339,25 @@ class MentionedAtDerivationTests(unittest.TestCase):
         mentioned_at, _ = self._mentioned_at(candidate_id)
         self.assertEqual(mentioned_at, "2026-01-15")
 
+    def test_derivation_skips_timestamps_that_overflow_utc_conversion(self) -> None:
+        # Regression (codex audit F4): "0001-01-01T00:00:00+23:59" parses via
+        # fromisoformat but astimezone(utc) raises OverflowError. Fail-soft
+        # must cover the whole normalization, not just parsing.
+        overflow = self._save_message(
+            "Ancient clock.", timestamp="0001-01-01T00:00:00+23:59"
+        )
+        good = self._save_message("Good clock.", timestamp="2026-01-15T00:00:00+00:00")
+
+        candidate_id = self._commit_candidate(
+            _candidate(
+                "Ryan visited Yellowstone.",
+                message_ids=[overflow, good],
+                category="event",
+            )
+        )
+        mentioned_at, _ = self._mentioned_at(candidate_id)
+        self.assertEqual(mentioned_at, "2026-01-15")
+
     def test_derivation_returns_null_when_all_timestamps_unparseable(self) -> None:
         garbage = self._save_message("Garbage clock.", timestamp="not-a-date")
         blank = self._save_message("Blank clock.", timestamp="")
@@ -1395,6 +1416,35 @@ class MentionedAtDerivationTests(unittest.TestCase):
         self.assertEqual(len(facts), 1)
         self.assertIsNone(facts[0].occurred_at)
         self.assertEqual(facts[0].mentioned_at, "2026-03-05")
+
+    def test_derivation_and_backfill_survive_low_bind_parameter_limits(self) -> None:
+        # codex audit F1: an IN (?, ?, ...) clause with one bound parameter
+        # per cited message can blow SQLITE_MAX_VARIABLE_NUMBER (999 on older
+        # SQLite) on a legacy DB with many cited messages. Ids must ride a
+        # single JSON parameter (json_each, the purge.py precedent).
+        message_ids = [
+            self._save_message(f"note {index}", timestamp="2026-01-15T00:00:00+00:00")
+            for index in range(8)
+        ]
+        candidate_id = self._commit_candidate(
+            _candidate("Ryan wrote many notes.", message_ids=message_ids, category="event")
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE memory_candidates SET mentioned_at = NULL WHERE id = ?",
+                (candidate_id,),
+            )
+            conn.commit()
+
+        with closing(connect(self.db_path)) as conn:
+            conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 5)
+            derived = _earliest_mention_date(conn, message_ids)
+            _backfill_mentioned_at(conn, "memory_candidates")
+            conn.commit()
+
+        self.assertEqual(derived, "2026-01-15")
+        mentioned_at, _ = self._mentioned_at(candidate_id)
+        self.assertEqual(mentioned_at, "2026-01-15")
 
     def test_merge_recomputes_mentioned_at_from_merged_source_union(self) -> None:
         # mentioned_at is a pure function of source_message_ids, so a merge
@@ -1511,6 +1561,55 @@ class MentionedAtDerivationTests(unittest.TestCase):
         self.assertIsNone(orphan_value)
         self.assertEqual(fact_value, "2026-03-05")
 
+    def test_backfill_does_not_overwrite_a_value_written_after_its_snapshot(self) -> None:
+        # codex audit F2: on hosted libSQL each statement auto-commits, so a
+        # concurrent merge can land a (correct, union-derived) mentioned_at
+        # between the backfill's NULL-row snapshot and its UPDATE. The UPDATE
+        # must be conditional on the row still being NULL so the stale
+        # snapshot value never overwrites the fresher merge write.
+        late = self._save_message(
+            "The Yellowstone trip was amazing.",
+            timestamp="2026-04-10T09:30:00+00:00",
+        )
+        candidate_id = self._commit_candidate(
+            _candidate("Ryan visited Yellowstone.", message_ids=[late], category="event")
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE memory_candidates SET mentioned_at = NULL WHERE id = ?",
+                (candidate_id,),
+            )
+            conn.commit()
+
+        import vexic.storage.schema as schema_module
+
+        real_derive = schema_module._earliest_date_from_timestamps
+
+        with closing(connect(self.db_path)) as conn:
+            def concurrent_merge_lands(values: object) -> str | None:
+                # Simulates the merge write landing between snapshot and
+                # UPDATE: an earlier mention from the merged source union.
+                conn.execute(
+                    "UPDATE memory_candidates SET mentioned_at = '2026-03-05' WHERE id = ?",
+                    (candidate_id,),
+                )
+                return real_derive(values)
+
+            with patch.object(
+                schema_module,
+                "_earliest_date_from_timestamps",
+                side_effect=concurrent_merge_lands,
+            ):
+                _backfill_mentioned_at(conn, "memory_candidates")
+            conn.commit()
+
+        mentioned_at, _ = self._mentioned_at(candidate_id)
+        self.assertEqual(
+            mentioned_at,
+            "2026-03-05",
+            "backfill must not clobber a value written after its snapshot",
+        )
+
     def test_merge_does_not_clobber_known_mentioned_at_when_recompute_yields_null(self) -> None:
         # After a physical purge the source ids can dangle; recompute then
         # yields NULL, which must not wipe provenance already known
@@ -1533,12 +1632,15 @@ class MentionedAtDerivationTests(unittest.TestCase):
 
 
 class LongTermSearchAsOfFilterTests(unittest.TestCase):
-    # `as_of` restricts keyword (FTS) and vector (KNN) Tier 3 search
-    # to facts whose COALESCE(NULLIF(occurred_at, ''), created_at) <= as_of.
-    # Facts are seeded directly via insert_long_term_fact rather than a full
-    # dream->deep promotion cycle -- cheaper, and keeps this search-filtering
-    # behavior decoupled from promotion's separately-tested occurred_at
-    # carry-through (OccurredAtRoundTripTests, above).
+    # `as_of` restricts keyword (FTS) and vector (KNN) Tier 3 search to facts
+    # whose COALESCE(NULLIF(occurred_at, ''), NULLIF(mentioned_at, ''),
+    # created_at) <= as_of (ADR 0037). Facts are seeded directly via
+    # insert_long_term_fact rather than a full dream->deep promotion cycle --
+    # cheaper, and keeps this search-filtering behavior decoupled from
+    # promotion's separately-tested occurred_at carry-through
+    # (OccurredAtRoundTripTests, above). Seeded facts cite unsaved message
+    # ids and get no mentioned_at unless a test sets one, keeping the
+    # created_at fallback exercised (load-bearing convention).
 
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -2078,9 +2180,10 @@ class CandidateSearchAsOfFilterTests(unittest.TestCase):
 
 class LongTermSearchEventRangeFilterTests(unittest.TestCase):
     # `event_after`/`event_before` bound Tier 3 keyword (FTS) and vector (KNN)
-    # search to facts whose COALESCE(NULLIF(occurred_at, ''), created_at) is
-    # >= event_after and/or <= event_before -- the same fallback the `as_of`
-    # upper bound uses. Bounds are independent (either/both/neither) and
+    # search to facts whose COALESCE(NULLIF(occurred_at, ''),
+    # NULLIF(mentioned_at, ''), created_at) is >= event_after and/or
+    # <= event_before -- the same ladder the `as_of` upper bound uses
+    # (ADR 0037). Bounds are independent (either/both/neither) and
     # `event_before` may coexist with `as_of`.
 
     def setUp(self) -> None:
