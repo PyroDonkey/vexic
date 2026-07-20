@@ -777,7 +777,7 @@ def load_messages_since(
     agent_id: str | None = None,
     exclude_session_prefixes: tuple[str, ...] = (),
     content_codec: ContentCodec | None = None,
-) -> list[tuple[int, ModelMessage]]:
+) -> list[tuple[int, str | None, ModelMessage]]:
     with closing(connect(db_path)) as conn:
         filters = ["id > ?", "agent_id IS ?"]
         params: list[object] = [after_id, agent_id]
@@ -788,14 +788,14 @@ def load_messages_since(
 
         if limit is None:
             rows = conn.execute(
-                f"SELECT id, message_json FROM messages WHERE {where_clause} ORDER BY id ASC",
+                f"SELECT id, timestamp, message_json FROM messages WHERE {where_clause} ORDER BY id ASC",
                 params,
             ).fetchall()
         else:
             params.append(limit)
             rows = conn.execute(
                 f"""
-                SELECT id, message_json
+                SELECT id, timestamp, message_json
                 FROM messages
                 WHERE {where_clause}
                 ORDER BY id ASC
@@ -807,9 +807,10 @@ def load_messages_since(
         return [
             (
                 row[0],
+                row[1],
                 strip_prompt_payloads(
                     single_message_adapter.validate_python(
-                        json.loads(_decode_stored(content_codec, row[1]))
+                        json.loads(_decode_stored(content_codec, row[2]))
                     )
                 ),
             )

@@ -61,19 +61,19 @@ def _ensure_embedding_adapter(embedder: EmbedTexts) -> None:
         ensure_local_embeddings_available()
 
 
-def render_transcript(rows: list[tuple[int, ModelMessage]]) -> str:
+def render_transcript(rows: list[tuple[int, str | None, ModelMessage]]) -> str:
     """Render user/assistant text parts as ``[message_id=N] Role: text`` lines."""
     lines: list[str] = []
-    for message_id, msg in rows:
+    for message_id, _timestamp, msg in rows:
         lines.extend(_render_message_lines(message_id, msg))
     return "\n".join(lines)
 
 
-def rendered_message_ids(rows: list[tuple[int, ModelMessage]]) -> list[int]:
+def rendered_message_ids(rows: list[tuple[int, str | None, ModelMessage]]) -> list[int]:
     """Ids of messages that produce at least one rendered transcript line."""
     return [
         message_id
-        for message_id, msg in rows
+        for message_id, _timestamp, msg in rows
         if _render_message_lines(message_id, msg)
     ]
 
@@ -202,7 +202,7 @@ async def run_light_phase(
             print("Light phase: no new messages. No-op.")
             return LightPhaseOutcome(usage=UsageSummary())
 
-        window_ids = [msg_id for msg_id, _ in rows]
+        window_ids = [msg_id for msg_id, _, _ in rows]
         transcript = render_transcript(rows)
         evidence_ids = rendered_message_ids(rows)
         assert_no_forbidden_secret_values(forbidden, transcript)

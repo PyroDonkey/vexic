@@ -30,6 +30,7 @@ from vexic.storage import (
     get_watermark,
     init_db,
     load_candidates_missing_embeddings,
+    load_messages_since,
     load_rem_candidates,
     save_messages,
 )
@@ -2673,6 +2674,32 @@ class PipelineCorrectnessRegressionTests(unittest.TestCase):
             self.assertEqual(
                 embedding_rows, 0, "a staled candidate must not be re-embedded"
             )
+
+
+class LoadMessagesSinceTimestampTests(unittest.TestCase):
+    """load_messages_since must surface each message's stored ISO-8601
+    timestamp so the Light phase can eventually give the extraction agent
+    per-message observed-time context, instead of the bare (id, message)
+    pairs it returned before."""
+
+    def test_load_messages_since_returns_iso_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            save_messages(
+                db_path,
+                [ModelRequest(parts=[UserPromptPart(content="I ran the race last Sunday")])],
+                session_id="s1",
+                agent_id=None,
+                timestamp="2023-11-17T09:30:00+00:00",
+            )
+
+            rows = load_messages_since(db_path, 0)
+
+            self.assertEqual(len(rows), 1)
+            message_id, timestamp, msg = rows[0]
+            self.assertIsInstance(message_id, int)
+            self.assertEqual(timestamp, "2023-11-17T09:30:00+00:00")
 
 
 if __name__ == "__main__":
