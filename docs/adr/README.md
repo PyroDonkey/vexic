@@ -53,6 +53,7 @@ index (and the reverse).
 | 0035 | Hosted dreaming runs on per-tenant provisioned provider keys | accepted (not yet implemented; hosted dreaming still reads the single `OPENROUTER_API_KEY` until COA-381 lands) |
 | 0036 | Transcript recall uses any-token OR FTS semantics | accepted |
 | 0037 | Undated events promote on deterministic mention-time provenance | accepted |
+| 0038 | Light render carries transient observed time                   | accepted |
 
 Notes:
 
@@ -165,6 +166,16 @@ Notes:
   retrieval windowing ladder between `occurred_at` and `created_at`. Amends
   Memory Invariant 11 in `AGENTS.md`; extends the COA-410 selection skip into
   a residual guard.
+- 0038 settles COA-412's `occurred_at` fabrication fix: `load_messages_since`
+  carries each message's timestamp, `render_transcript` labels its existing
+  `[message_id=N]` marker with a per-message, day-precision `observed=`
+  date and code-computed weekday (transient prompt scaffolding, never
+  persisted -- Invariant 2, ADR 0034), the extraction prompt gets guarded
+  absolute/relative resolution rules keyed off that label, and
+  `apply_occurred_at_guards` plus the `FactCandidate.occurred_at` validator
+  deterministically degrade a fabricated or ungrounded date to undated (the
+  ADR 0037 sink) rather than blocking the candidate. Amends Memory Invariant
+  11 in `AGENTS.md`.
 - These numbers are the Vexic `docs/adr/` series and are self-contained.
   `src/vexic` source no longer carries any `upstream ADR-00NN` extraction-source
   labels (they were removed when the COA boundary policy was clarified), so there

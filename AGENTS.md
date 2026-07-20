@@ -158,7 +158,11 @@ These rules define correctness for the memory core.
     fabricate either value: `occurred_at` is event time only and partial
     precision (year or year-month) is allowed but invented components are
     not; `mentioned_at` is derived provenance, never model output, and never
-    substituted into `occurred_at`.
+    substituted into `occurred_at`. A fabricated or ungrounded `occurred_at`
+    year degrades the candidate to undated rather than blocking promotion,
+    an in-text date copies only at the precision it is stated in, and Light
+    render's per-message `observed=` time label is transient prompt
+    scaffolding under Invariant 2 - never persisted (ADR 0038).
 
 ### Closed Category Vocabulary
 

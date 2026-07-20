@@ -2875,6 +2875,35 @@ class UndatedEventPromotionSelectionTests(unittest.TestCase):
 
         self.assertEqual({c.candidate_id for c in selected}, {1})
 
+    def test_select_promotions_skips_event_whose_occurred_at_canonicalizes_null(
+        self,
+    ) -> None:
+        # The skip must use the SAME canonicalization the promotion path uses.
+        # A nonblank-but-invalid occurred_at ("not-a-date") passes a bare
+        # `.strip()` gate, gets selected, then promotion nulls it via
+        # canonical_partial_date and fails loud -- aborting the Deep cycle, and
+        # retries re-select the same row (a permanent dream deadlock). Positive
+        # controls: a partial-precision date, a datetime-shaped value that
+        # canonicalizes to a date, and mentioned_at-only all stay eligible.
+        candidates = [
+            self._promotion_candidate(1, category="event", occurred_at="not-a-date"),
+            self._promotion_candidate(2, category="event", occurred_at="2023-09"),
+            self._promotion_candidate(
+                3, category="event", occurred_at="2026-07-05T00:00:00Z"
+            ),
+            self._promotion_candidate(
+                4, category="event", occurred_at=None, mentioned_at="2023-11-17"
+            ),
+        ]
+
+        selected = select_promotions(
+            candidates,
+            now=datetime(2026, 8, 1, tzinfo=timezone.utc),
+            top_n=10,
+        )
+
+        self.assertEqual({c.candidate_id for c in selected}, {2, 3, 4})
+
 
 class UndatedEventDeepCycleReliabilityTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:

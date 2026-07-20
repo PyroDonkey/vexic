@@ -8,8 +8,10 @@ extraction agent itself is a host port: callers must inject an
 """
 
 import asyncio
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import date
 from typing import Any
 
 from pydantic_ai.messages import (
@@ -47,6 +49,47 @@ from vexic.usage import UsageSummary, summarize_agent_usage
 LIGHT_PHASE_BATCH_SIZE = 50
 _LOCAL_EMBEDDER = embed_texts
 
+_MARKER_RE = re.compile(r"\[\s*message_id\s*=\s*\d+[^\]]*\]")
+# Bare (unbracketed) observed=YYYY-MM-DD Day echo -- the exact label body
+# _observed_label emits. Stripped so an extractor that copies the label
+# without its brackets cannot leave the token in fact_text/subject or have its
+# date misread as an in-text event date. Whitespace around ``=`` is tolerated
+# in both patterns: an extractor that reformats the label (``message_id = 3``,
+# ``observed = 2023-11-17``) must not slip the scaffolding past the strip.
+_OBSERVED_TOKEN_RE = re.compile(r"observed\s*=\s*\d{4}-\d{2}-\d{2}\s+\w{3}\b")
+_YEAR_RE = re.compile(r"\b(1\d{3}|20\d{2})\b")
+_ISO_FULL_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+_ISO_YM_RE = re.compile(r"\b(\d{4})-(\d{2})\b(?!-)")
+_MONTHS = {
+    m.lower(): i
+    for i, m in enumerate(
+        (
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+        ),
+        start=1,
+    )
+}
+# Case-sensitive by design: month names in fact_text are virtually always
+# capitalized as month usage. Dropping IGNORECASE stops modal lowercase words
+# ("...they may 2024 relocate") from being read as a month-year date; a genuine
+# lowercase month reference degrades safely to undated rather than backfilling
+# a fabricated month (ADR 0038).
+_MONTH_DATE_RE = re.compile(
+    r"\b(January|February|March|April|May|June|July|August|September|October|November|December)"
+    r"\s+(?:(\d{1,2})(?:st|nd|rd|th)?,?\s+)?(\d{4})\b",
+)
+
 
 def build_extraction_agent(
     model_group: str,
@@ -61,33 +104,56 @@ def _ensure_embedding_adapter(embedder: EmbedTexts) -> None:
         ensure_local_embeddings_available()
 
 
-def render_transcript(rows: list[tuple[int, ModelMessage]]) -> str:
-    """Render user/assistant text parts as ``[message_id=N] Role: text`` lines."""
+_WEEKDAY_ABBR = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def _observed_label(timestamp: str | None) -> str:
+    """Transient prompt scaffolding only: never persisted into message text,
+    FTS, or replay (Memory Invariant 2, ADR 0034/0038)."""
+    # Fail soft on non-string timestamps: SQLite can yield int/bytes from
+    # foreign writers, and an unlabeled marker is correct where a valid
+    # observed date is not available.
+    if not isinstance(timestamp, str) or not timestamp:
+        return ""
+    try:
+        observed = date.fromisoformat(timestamp[:10])
+    except ValueError:
+        return ""
+    return f" observed={observed.isoformat()} {_WEEKDAY_ABBR[observed.weekday()]}"
+
+
+def render_transcript(rows: list[tuple[int, str | None, ModelMessage]]) -> str:
+    """Render user/assistant text parts as ``[message_id=N] Role: text`` lines,
+    labeled with the message's observed date and weekday when a valid
+    timestamp is available."""
     lines: list[str] = []
-    for message_id, msg in rows:
-        lines.extend(_render_message_lines(message_id, msg))
+    for message_id, timestamp, msg in rows:
+        lines.extend(_render_message_lines(message_id, timestamp, msg))
     return "\n".join(lines)
 
 
-def rendered_message_ids(rows: list[tuple[int, ModelMessage]]) -> list[int]:
+def rendered_message_ids(rows: list[tuple[int, str | None, ModelMessage]]) -> list[int]:
     """Ids of messages that produce at least one rendered transcript line."""
     return [
         message_id
-        for message_id, msg in rows
-        if _render_message_lines(message_id, msg)
+        for message_id, timestamp, msg in rows
+        if _render_message_lines(message_id, timestamp, msg)
     ]
 
 
-def _render_message_lines(message_id: int, msg: ModelMessage) -> list[str]:
+def _render_message_lines(
+    message_id: int, timestamp: str | None, msg: ModelMessage
+) -> list[str]:
+    marker = f"[message_id={message_id}{_observed_label(timestamp)}]"
     lines: list[str] = []
     if isinstance(msg, ModelRequest):
         for part in msg.parts:
             if isinstance(part, UserPromptPart) and isinstance(part.content, str):
-                lines.append(f"[message_id={message_id}] User: {part.content}")
+                lines.append(f"{marker} User: {part.content}")
     elif isinstance(msg, ModelResponse):
         for part in msg.parts:
             if isinstance(part, TextPart):
-                lines.append(f"[message_id={message_id}] Assistant: {part.content}")
+                lines.append(f"{marker} Assistant: {part.content}")
     return lines
 
 
@@ -116,6 +182,142 @@ def keep_candidates_with_valid_source_ids(
         candidate.source_message_ids = sorted(candidate_ids)
         kept.append(candidate)
     return kept, dropped
+
+
+def _plausible_years(rows: list[tuple[int, str | None, ModelMessage]], transcript: str) -> set[int]:
+    """Years grounded in this Light window: each message's observed year (and
+    its neighbors), plus any 4-digit year literally present in the rendered
+    transcript text."""
+    years: set[int] = set()
+    for _, timestamp, _ in rows:
+        if isinstance(timestamp, str) and timestamp:
+            try:
+                y = date.fromisoformat(timestamp[:10]).year
+            except ValueError:
+                continue
+            years.update((y - 1, y, y + 1))
+    # Strip [message_id=... observed=...] markers before scanning for years:
+    # a 4-digit message_id or the observed= date is transient scaffolding, not
+    # transcript content, and must not ground an occurred_at year.
+    text = _MARKER_RE.sub(" ", transcript)
+    years.update(int(m.group(0)) for m in _YEAR_RE.finditer(text))
+    return years
+
+
+def _single_intext_date(fact_text: str) -> str | None:
+    """The one absolute date stated in fact_text, at stated precision, or
+    None. A calendar-invalid match (e.g. "February 30, 2023") still counts as
+    a match for the exactly-one-total rule, but is never itself returned --
+    it disqualifies the copy rather than producing a fabricated date."""
+    found: list[str | None] = []
+    for m in _ISO_FULL_RE.finditer(fact_text):
+        year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            date(year, month, day)
+        except ValueError:
+            found.append(None)
+        else:
+            found.append(m.group(0))
+    stripped = _ISO_FULL_RE.sub(" ", fact_text)
+    for m in _ISO_YM_RE.finditer(stripped):
+        year, month = int(m.group(1)), int(m.group(2))
+        try:
+            date(year, month, 1)
+        except ValueError:
+            found.append(None)
+        else:
+            found.append(m.group(0))
+    for m in _MONTH_DATE_RE.finditer(fact_text):
+        month = _MONTHS[m.group(1).lower()]
+        year = int(m.group(3))
+        if m.group(2):
+            day = int(m.group(2))
+            try:
+                date(year, month, day)
+            except ValueError:
+                found.append(None)
+            else:
+                found.append(f"{year}-{month:02d}-{day:02d}")
+        else:
+            try:
+                date(year, month, 1)
+            except ValueError:
+                found.append(None)
+            else:
+                found.append(f"{year}-{month:02d}")
+    return found[0] if len(found) == 1 else None
+
+
+def _strip_marker_echo(text: str) -> str:
+    """Remove any echoed ``[message_id=... observed=...]`` marker -- and any
+    bare ``observed=...`` token -- from ``text`` and collapse the resulting
+    whitespace.
+
+    The render marker is transient prompt scaffolding (Memory Invariant 2); an
+    extractor that copies it into fact_text or subject would persist it into
+    Tier 2 text and FTS, and its ``observed=`` date could be misread as an
+    in-text event date. Both bracketed markers (including whitespace-padded
+    variants) and unbracketed ``observed=`` tokens are stripped before the
+    date-copy logic and before embedding/commit.
+    """
+    without_markers = _MARKER_RE.sub(" ", text)
+    without_bare = _OBSERVED_TOKEN_RE.sub(" ", without_markers)
+    return re.sub(r"\s+", " ", without_bare).strip()
+
+
+def apply_occurred_at_guards(
+    candidates: list[FactCandidate],
+    rows: list[tuple[int, str | None, ModelMessage]],
+    transcript: str,
+) -> list[FactCandidate]:
+    """Deterministic occurred_at guards (ADR 0038).
+
+    Year plausibility runs first and only against a model-supplied
+    occurred_at: a year with no grounding in the window's observed dates or
+    the transcript text is dropped to None rather than trusted, killing the
+    class of fabricated far-future/far-past dates deterministically. The
+    in-text copy-backfill then runs only for event candidates still lacking
+    a date, and only copies when fact_text states exactly one absolute date.
+
+    Year plausibility is then re-checked against whatever occurred_at is left
+    standing, including a value the copy-backfill just supplied: fact_text is
+    itself model output and can carry a fabricated year, so a backfilled date
+    is never exempt from the same check a model-supplied date gets. Every
+    non-null occurred_at leaving this function has a year in ``plausible``.
+
+    Fabricated components degrade to undated (ADR 0037 Tier 2 sink) rather
+    than dropping the candidate; in-text dates copy at stated precision only.
+    """
+    plausible = _plausible_years(rows, transcript)
+    for candidate in candidates:
+        # Strip echoed render markers first: they carry an observed= date that
+        # _single_intext_date would otherwise misread as an event date, and
+        # must not survive into stored fact_text or subject (runs before
+        # embedding at the run_light_phase call site). subject is persisted and
+        # exported like fact_text, so it gets the same strip.
+        candidate.fact_text = _strip_marker_echo(candidate.fact_text)
+        candidate.subject = _strip_marker_echo(candidate.subject)
+        if candidate.occurred_at is not None:
+            if int(candidate.occurred_at[:4]) not in plausible:
+                candidate.occurred_at = None
+        if candidate.occurred_at is None and candidate.category == "event":
+            candidate.occurred_at = _single_intext_date(candidate.fact_text)
+        if candidate.occurred_at is not None:
+            if int(candidate.occurred_at[:4]) not in plausible:
+                candidate.occurred_at = None
+        # Ungrounded-precision cap: if fact_text states a single in-text date
+        # that is a strict, shorter prefix of the (model-supplied) occurred_at,
+        # truncate occurred_at to the in-text precision. Precision reduction
+        # only -- never extension (ADR 0038 day-invention mitigation).
+        if candidate.occurred_at is not None:
+            intext = _single_intext_date(candidate.fact_text)
+            if (
+                intext is not None
+                and candidate.occurred_at.startswith(intext)
+                and len(candidate.occurred_at) > len(intext)
+            ):
+                candidate.occurred_at = intext
+    return candidates
 
 
 def _forbidden_secret_values(
@@ -202,7 +404,7 @@ async def run_light_phase(
             print("Light phase: no new messages. No-op.")
             return LightPhaseOutcome(usage=UsageSummary())
 
-        window_ids = [msg_id for msg_id, _ in rows]
+        window_ids = [msg_id for msg_id, _, _ in rows]
         transcript = render_transcript(rows)
         evidence_ids = rendered_message_ids(rows)
         assert_no_forbidden_secret_values(forbidden, transcript)
@@ -214,6 +416,7 @@ async def run_light_phase(
         candidates, dropped = keep_candidates_with_valid_source_ids(
             result.output, evidence_ids
         )
+        apply_occurred_at_guards(candidates, rows, transcript)
 
         missing_embeddings = load_candidates_missing_embeddings(
             db_path,

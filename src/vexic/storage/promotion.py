@@ -4,6 +4,7 @@ from contextlib import closing
 from dataclasses import dataclass
 
 from vexic.embeddings import EMBEDDING_DIM
+from vexic.models import canonical_partial_date
 from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage.candidates import (
     _load_source_message_ids,
@@ -195,11 +196,14 @@ def _promote_candidate(
         occurred_at,
         mentioned_at,
     ) = row
-    # Normalize blank-ish dates from legacy or externally written candidate
-    # rows: Tier 3 must only ever hold NULL or a real date string, because the
-    # NULLIF('')-based retrieval ladder would treat "   " as a temporal key
-    # and no merge runs post-promotion to repair it (ADR 0037).
-    occurred_at = occurred_at if (occurred_at or "").strip() else None
+    # Normalize occurred_at from legacy or externally written candidate rows:
+    # Deep promotion reads candidates straight from SQL, bypassing the
+    # FactCandidate validator, so a datetime-shaped or junk value would reach
+    # Tier 3 unchanged. canonical_partial_date truncates a datetime to its date
+    # part and nulls junk (Memory Invariant 11: truncation, never invention),
+    # matching the validator exactly. mentioned_at is deterministic derived
+    # provenance; only its blank-ish normalization is needed here.
+    occurred_at = canonical_partial_date(occurred_at)
     mentioned_at = mentioned_at if (mentioned_at or "").strip() else None
 
     if retired or stale:

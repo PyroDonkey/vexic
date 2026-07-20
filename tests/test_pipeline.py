@@ -17,7 +17,14 @@ from vexic.embeddings import EMBEDDING_DIM
 from vexic.error_reporting import dream_failure_recorded
 from vexic.deep import run_deep_phase
 from vexic.models import ContradictionJudgment, FactCandidate
-from vexic.pipeline import _main, run_light_phase
+from vexic.pipeline import (
+    _main,
+    _plausible_years,
+    apply_occurred_at_guards,
+    render_transcript,
+    rendered_message_ids,
+    run_light_phase,
+)
 from vexic.ports import HostPortNotConfigured
 from vexic.rem import REM_TOP_K, compute_centrality_boosts, run_rem_phase
 from vexic.storage import (
@@ -30,6 +37,7 @@ from vexic.storage import (
     get_watermark,
     init_db,
     load_candidates_missing_embeddings,
+    load_messages_since,
     load_rem_candidates,
     save_messages,
 )
@@ -58,6 +66,10 @@ def _padded_vector(*components: float) -> list[float]:
 
 def _rem_candidate(candidate_id: int, embedding: list[float] | None) -> RemCandidate:
     return RemCandidate(candidate_id=candidate_id, embedding=embedding)
+
+
+def user_message(text: str) -> ModelRequest:
+    return ModelRequest(parts=[UserPromptPart(content=text)])
 
 
 def _fake_usage() -> SimpleNamespace:
@@ -193,6 +205,59 @@ class LightPhaseProvenanceTests(unittest.IsolatedAsyncioTestCase):
                 ]
 
         self.assertEqual(persisted, ["Ryan prefers compact reports."])
+
+    async def test_light_phase_applies_occurred_at_guards_before_commit(self) -> None:
+        """ADR 0038: apply_occurred_at_guards must run inside run_light_phase,
+        before commit. A candidate with a fabricated occurred_at year that has
+        no grounding in the window's observed dates or transcript text must
+        never reach memory_candidates -- it is caught before persistence, not
+        cleaned up afterward."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            message_id = save_messages(
+                db_path,
+                [ModelRequest(parts=[UserPromptPart(content="We shipped the release.")])],
+                timestamp="2023-11-15 12:00:00",
+            )[0]
+
+            class ExtractionAgent:
+                async def run(self, transcript: str) -> object:
+                    return SimpleNamespace(
+                        output=[
+                            FactCandidate(
+                                fact_text="Ryan shipped the release.",
+                                subject="Ryan",
+                                category="event",
+                                importance=6,
+                                confidence=0.9,
+                                source_message_ids=[message_id],
+                                occurred_at="2025-03-01",
+                            ),
+                        ],
+                        usage=_fake_usage(),
+                    )
+
+            def agent_factory(model_group: str, secrets: object = None) -> object:
+                return ExtractionAgent()
+
+            def embed(texts: list[str]) -> list[list[float]]:
+                return [_unit_vector(1.0) for _ in texts]
+
+            await run_light_phase(
+                db_path,
+                "glm",
+                extraction_agent_factory=agent_factory,
+                embed=embed,
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                row = conn.execute(
+                    "SELECT fact_text, occurred_at FROM memory_candidates ORDER BY id"
+                ).fetchone()
+
+        self.assertEqual(row[0], "Ryan shipped the release.")
+        self.assertIsNone(row[1])
 
     async def test_light_phase_advances_watermark_when_every_candidate_is_dropped(
         self,
@@ -1515,7 +1580,7 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                         importance=6,
                         confidence=0.9,
                         source_message_ids=[1],
-                        occurred_at="2026-07-05T00:00:00Z",
+                        occurred_at="2026-07-05",
                     )
                 ],
                 candidate_embeddings=[_unit_vector(1.0)],
@@ -1543,7 +1608,62 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                 ).fetchone()
 
         self.assertEqual(category, "event")
-        self.assertEqual(occurred_at, "2026-07-05T00:00:00Z")
+        self.assertEqual(occurred_at, "2026-07-05")
+
+    def test_deep_commit_normalizes_legacy_datetime_occurred_at(self) -> None:
+        # A legacy or foreign-written memory_candidates row can hold a
+        # datetime-shaped occurred_at that never passed the FactCandidate
+        # validator (Deep promotion loads rows straight from SQL). Promotion
+        # must canonicalize it to a partial-precision date, not copy the raw
+        # datetime into Tier 3 (Memory Invariant 11: truncation, never
+        # invention).
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            commit_dream_cycle(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="Ryan shipped the release.",
+                        subject="Ryan",
+                        category="fact",
+                        importance=6,
+                        confidence=0.9,
+                        source_message_ids=[1],
+                    )
+                ],
+                candidate_embeddings=[_unit_vector(1.0)],
+                agent_id=None,
+                status="ok",
+                started_at="2026-01-01T00:00:00Z",
+                finished_at="2026-01-01T00:00:01Z",
+                messages_processed=1,
+                last_processed_message_id=1,
+            )
+            # Write a datetime-shaped occurred_at directly, bypassing the
+            # validator (simulating a legacy/foreign writer).
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute(
+                    "UPDATE memory_candidates SET occurred_at = '2026-07-05T00:00:00Z' WHERE id = 1"
+                )
+                conn.commit()
+
+            commit_deep_cycle(
+                db_path,
+                [PromotionDecision(candidate_id=1, embedding=_unit_vector(1.0))],
+                started_at="2026-01-01T00:01:00Z",
+                finished_at="2026-01-01T00:01:01Z",
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                (occurred_at,) = conn.execute(
+                    """
+                    SELECT occurred_at FROM long_term_memory
+                    WHERE promoted_from_candidate_id = 1
+                    """
+                ).fetchone()
+
+        self.assertEqual(occurred_at, "2026-07-05")
 
     def test_deep_commit_promotes_event_candidate_via_mentioned_at(self) -> None:
         # ADR 0037: an undated event whose source messages carry timestamps
@@ -2673,6 +2793,414 @@ class PipelineCorrectnessRegressionTests(unittest.TestCase):
             self.assertEqual(
                 embedding_rows, 0, "a staled candidate must not be re-embedded"
             )
+
+
+class LoadMessagesSinceTimestampTests(unittest.TestCase):
+    """load_messages_since must surface each message's stored ISO-8601
+    timestamp so the Light phase can eventually give the extraction agent
+    per-message observed-time context, instead of the bare (id, message)
+    pairs it returned before."""
+
+    def test_load_messages_since_returns_iso_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            save_messages(
+                db_path,
+                [ModelRequest(parts=[UserPromptPart(content="I ran the race last Sunday")])],
+                session_id="s1",
+                agent_id=None,
+                timestamp="2023-11-17T09:30:00+00:00",
+            )
+
+            rows = load_messages_since(db_path, 0)
+
+            self.assertEqual(len(rows), 1)
+            message_id, timestamp, msg = rows[0]
+            self.assertIsInstance(message_id, int)
+            self.assertEqual(timestamp, "2023-11-17T09:30:00+00:00")
+
+
+class RenderTranscriptObservedTimeTests(unittest.TestCase):
+    """render_transcript must label each rendered line with the message's
+    observed date and weekday when a valid timestamp is available, and omit
+    the label entirely when the timestamp is missing or malformed. The label
+    is transient prompt scaffolding only (Memory Invariant 2)."""
+
+    def test_render_transcript_labels_observed_date_and_weekday(self) -> None:
+        rows = [(7, "2023-11-17T09:30:00+00:00", user_message("hello"))]
+        self.assertEqual(
+            render_transcript(rows),
+            "[message_id=7 observed=2023-11-17 Fri] User: hello",
+        )
+
+    def test_render_transcript_omits_observed_when_timestamp_missing_or_malformed(
+        self,
+    ) -> None:
+        rows = [
+            (7, None, user_message("a")),
+            (8, "not-a-date", user_message("b")),
+        ]
+        self.assertEqual(
+            render_transcript(rows),
+            "[message_id=7] User: a\n[message_id=8] User: b",
+        )
+
+    def test_rendered_message_ids_unchanged_semantics(self) -> None:
+        rows = [(7, "2023-11-17T09:30:00+00:00", user_message("hello"))]
+        self.assertEqual(rendered_message_ids(rows), [7])
+
+    def test_render_transcript_fail_soft_on_non_string_timestamp(self) -> None:
+        # SQLite can yield int/bytes timestamps from foreign writers; the
+        # observed-time label must render unlabeled rather than raise.
+        rows = [
+            (7, 20231117, user_message("a")),
+            (8, b"2023-11-17", user_message("b")),
+        ]
+        self.assertEqual(
+            render_transcript(rows),
+            "[message_id=7] User: a\n[message_id=8] User: b",
+        )
+
+    def test_plausible_years_fail_soft_on_non_string_timestamp(self) -> None:
+        # _plausible_years slices timestamp[:10]; a foreign int/bytes value
+        # must be skipped, not raise, so the year guard degrades to
+        # transcript-literal grounding only.
+        rows = [
+            (7, 20231117, user_message("we met")),
+            (8, b"2023-11-17", user_message("later")),
+        ]
+        self.assertEqual(_plausible_years(rows, "we met later"), set())
+        rows_with_year = [(9, None, user_message("back in 2019"))]
+        self.assertIn(2019, _plausible_years(rows_with_year, "back in 2019"))
+
+
+class FactCandidateOccurredAtValidatorTests(unittest.TestCase):
+    """FactCandidate.occurred_at validator accepts YYYY, YYYY-MM, YYYY-MM-DD
+    with real calendar values, strips whitespace, and degrades junk to None
+    (fail-safe; never drop a candidate for a bad date)."""
+
+    def test_occurred_at_validator_accepts_partial_iso_and_nulls_junk(self) -> None:
+        test_cases = [
+            ("2023-11-17", "2023-11-17"),
+            ("2023-11", "2023-11"),
+            ("2023", "2023"),
+            ("  2023-11 ", "2023-11"),
+            ("", None),
+            ("   ", None),
+            ("March 2023", None),
+            ("2023-13", None),
+            ("2023-02-30", None),
+            ("2023-11-17T09:00:00", "2023-11-17"),
+            ("2026-07-05T00:00:00Z", "2026-07-05"),
+            ("2026-07-05 09:30:00", "2026-07-05"),
+            ("2026-02-30T00:00:00Z", None),
+            ("9999-99-99T00:00:00", None),
+            # The separator must be followed by a digit: a date-shaped prefix
+            # with non-datetime trailing text is junk, not a truncatable value.
+            ("2023-09-24Tnot-a-datetime", None),
+            ("2023-09-24 not-a-datetime", None),
+            ("2023-09-24T", None),
+        ]
+        for raw, expected in test_cases:
+            with self.subTest(raw=raw):
+                c = FactCandidate(
+                    fact_text="x",
+                    subject="user",
+                    category="event",
+                    importance=5,
+                    confidence=0.9,
+                    occurred_at=raw,
+                )
+                self.assertEqual(c.occurred_at, expected)
+
+    def test_occurred_at_revalidated_on_assignment(self) -> None:
+        # validate_assignment: a post-construction assignment of an invalid
+        # date must re-run the validator and degrade to None, not smuggle the
+        # bad value onto the row.
+        c = FactCandidate(
+            fact_text="x",
+            subject="user",
+            category="event",
+            importance=5,
+            confidence=0.9,
+            occurred_at="2023-11-17",
+        )
+        c.occurred_at = "2023-02-30"
+        self.assertIsNone(c.occurred_at)
+        # A valid reassignment survives, and None (the guard's canonical
+        # "undated" assignment) is accepted.
+        c.occurred_at = "2024-01"
+        self.assertEqual(c.occurred_at, "2024-01")
+        c.occurred_at = None
+        self.assertIsNone(c.occurred_at)
+
+
+def _event_candidate(**overrides: object) -> FactCandidate:
+    fields: dict[str, object] = {
+        "fact_text": "Ryan did something.",
+        "subject": "Ryan",
+        "category": "event",
+        "importance": 5,
+        "confidence": 0.8,
+        "source_message_ids": [1],
+    }
+    fields.update(overrides)
+    return FactCandidate(**fields)
+
+
+def _rows_nov_2023() -> list[tuple[int, str, ModelRequest]]:
+    return [(1, "2023-11-17T09:00:00+00:00", user_message("we talked"))]
+
+
+class OccurredAtGuardTests(unittest.TestCase):
+    """apply_occurred_at_guards is the deterministic anti-fabrication layer
+    for Tier 2 event candidates (ADR 0038): a year-plausibility
+    check that nulls out occurred_at years unmoored from the transcript
+    window, and an in-text date copy-backfill for event candidates the model
+    left undated but which state exactly one absolute date in fact_text."""
+
+    def test_guard_nulls_year_not_grounded_in_window(self) -> None:
+        c = _event_candidate(occurred_at="2025-03-01")
+        apply_occurred_at_guards(
+            [c],
+            _rows_nov_2023(),
+            "[message_id=1 observed=2023-11-17 Fri] User: we talked",
+        )
+        self.assertIsNone(c.occurred_at)
+
+    def test_guard_keeps_observed_year_and_adjacent_years(self) -> None:
+        for kept in ("2023-03-01", "2022-12", "2024"):
+            with self.subTest(kept=kept):
+                c = _event_candidate(occurred_at=kept)
+                apply_occurred_at_guards([c], _rows_nov_2023(), "irrelevant")
+                self.assertEqual(c.occurred_at, kept)
+
+    def test_guard_keeps_year_stated_in_transcript(self) -> None:
+        c = _event_candidate(occurred_at="1999")
+        apply_occurred_at_guards(
+            [c], _rows_nov_2023(), "User: I graduated in 1999"
+        )
+        self.assertEqual(c.occurred_at, "1999")
+
+    def test_guard_copies_single_intext_absolute_date_into_occurred_at(self) -> None:
+        c = _event_candidate(
+            fact_text="User ran the Berlin half on 2023-09-24", occurred_at=None
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(c.occurred_at, "2023-09-24")
+
+    def test_guard_copies_month_year_at_stated_precision(self) -> None:
+        c = _event_candidate(
+            fact_text="User moved to Lisbon in March 2023", occurred_at=None
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(c.occurred_at, "2023-03")
+
+    def test_guard_skips_copy_when_multiple_or_zero_dates(self) -> None:
+        c = _event_candidate(
+            fact_text="Trips on 2023-05-01 and 2023-06-01", occurred_at=None
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertIsNone(c.occurred_at)
+
+    def test_guard_never_copies_for_non_event_categories(self) -> None:
+        c = _event_candidate(
+            fact_text="Prefers the 2023-09-24 build",
+            occurred_at=None,
+            category="preference",
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertIsNone(c.occurred_at)
+
+    def test_guard_copies_full_month_day_year_date(self) -> None:
+        c = _event_candidate(
+            fact_text="User ran the Berlin half on September 24, 2023",
+            occurred_at=None,
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(c.occurred_at, "2023-09-24")
+
+    def test_guard_rejects_calendar_invalid_intext_date(self) -> None:
+        c = _event_candidate(
+            fact_text="User claimed it happened on February 30, 2023",
+            occurred_at=None,
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertIsNone(c.occurred_at)
+
+    def test_guard_nulls_backfilled_date_with_implausible_year(self) -> None:
+        # fact_text is model output too: a fabricated year copied in by the
+        # backfill must not escape the same year-plausibility check a
+        # model-supplied occurred_at gets.
+        c = _event_candidate(
+            fact_text="User ran the Berlin race on March 1, 2025",
+            occurred_at=None,
+        )
+        apply_occurred_at_guards(
+            [c],
+            _rows_nov_2023(),
+            "[message_id=1 observed=2023-11-17 Fri] User: we talked",
+        )
+        self.assertIsNone(c.occurred_at)
+
+    def test_guard_keeps_backfilled_date_with_plausible_observed_year(self) -> None:
+        # Positive control: a legitimately copied date's year sits inside the
+        # observed window and must survive the re-check.
+        c = _event_candidate(
+            fact_text="User ran the Berlin race on September 24, 2023",
+            occurred_at=None,
+        )
+        apply_occurred_at_guards(
+            [c],
+            _rows_nov_2023(),
+            "[message_id=1 observed=2023-11-17 Fri] User: we talked",
+        )
+        self.assertEqual(c.occurred_at, "2023-09-24")
+
+    def test_guard_keeps_backfilled_date_with_year_literal_in_transcript(self) -> None:
+        # Positive control: a copied date's year grounded in the transcript
+        # text (not the observed window) must also survive the re-check.
+        c = _event_candidate(
+            fact_text="Graduated May 2019",
+            occurred_at=None,
+        )
+        apply_occurred_at_guards(
+            [c],
+            _rows_nov_2023(),
+            "[message_id=1 observed=2023-11-17 Fri] User: I mentioned 2019 before",
+        )
+        self.assertEqual(c.occurred_at, "2019-05")
+
+    def test_guard_ignores_marker_message_id_as_grounding_year(self) -> None:
+        # A 4-digit message_id inside a [message_id=...] marker must not
+        # ground a year: markers are transient scaffolding, not transcript
+        # text. Here observed=2024 grounds 2023-2025; 1999 (the marker id)
+        # must not.
+        c = _event_candidate(occurred_at="1999")
+        apply_occurred_at_guards(
+            [c],
+            [(1, "2024-01-10T09:00:00+00:00", user_message("we talked"))],
+            "[message_id=1999 observed=2024-01-10 Wed] User: we talked",
+        )
+        self.assertIsNone(c.occurred_at)
+
+    def test_guard_grounds_bare_year_in_user_text_despite_marker(self) -> None:
+        # Positive control for the marker strip: a bare year in the user's own
+        # text still grounds, even with a marker on the same line.
+        c = _event_candidate(occurred_at="1999")
+        apply_occurred_at_guards(
+            [c],
+            [(1, "2024-01-10T09:00:00+00:00", user_message("we talked"))],
+            "[message_id=5 observed=2024-01-10 Wed] User: I graduated in 1999",
+        )
+        self.assertEqual(c.occurred_at, "1999")
+
+    def test_guard_ignores_lowercase_modal_may_year(self) -> None:
+        # Modal "may 2024" is not a month reference; the month regex is
+        # case-sensitive so lowercase "may" degrades safely to undated.
+        c = _event_candidate(
+            fact_text="User said they may 2024 relocate", occurred_at=None
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertIsNone(c.occurred_at)
+
+    def test_guard_copies_capitalized_may_year(self) -> None:
+        # Capitalized month usage still backfills.
+        c = _event_candidate(
+            fact_text="User relocated in May 2024", occurred_at=None
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(c.occurred_at, "2024-05")
+
+    def test_guard_caps_occurred_at_to_intext_precision(self) -> None:
+        # Model emits a full date but fact_text only states month precision:
+        # truncate to the in-text precision (precision reduction, never
+        # extension).
+        c = _event_candidate(
+            fact_text="Ryan moved in March 2023", occurred_at="2023-03-01"
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(c.occurred_at, "2023-03")
+
+    def test_guard_keeps_equal_precision_intext_date(self) -> None:
+        # In-text date at equal precision: no cap.
+        c = _event_candidate(
+            fact_text="Ryan moved on March 14, 2023", occurred_at="2023-03-14"
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(c.occurred_at, "2023-03-14")
+
+    def test_guard_precision_cap_requires_intext_date(self) -> None:
+        # No in-text date to compare against: occurred_at is left untouched.
+        c = _event_candidate(
+            fact_text="Ryan did something.", occurred_at="2023-05-01"
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(c.occurred_at, "2023-05-01")
+
+    def test_guard_strips_marker_echo_from_fact_text(self) -> None:
+        # An extractor that echoes a [message_id=... observed=...] marker into
+        # fact_text must not persist it into Tier 2 text/FTS. The marker is
+        # stripped and whitespace collapsed before embedding/commit.
+        c = _event_candidate(
+            fact_text="[message_id=3 observed=2023-11-17 Fri] User prefers uv",
+            occurred_at=None,
+            category="preference",
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(c.fact_text, "User prefers uv")
+
+    def test_guard_strips_marker_echo_from_subject(self) -> None:
+        # The subject field is persisted to Tier 2/3 and export just like
+        # fact_text; an echoed marker there must be stripped too.
+        c = _event_candidate(
+            subject="[message_id=7 observed=2023-11-17 Fri] Ryan",
+            occurred_at=None,
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(c.subject, "Ryan")
+
+    def test_guard_strips_bare_observed_token_before_backfill(self) -> None:
+        # A bare (unbracketed) observed=YYYY-MM-DD Day token must be stripped,
+        # and critically removed BEFORE the in-text copy-backfill runs so its
+        # date can never be misread as an event date and copied into
+        # occurred_at.
+        c = _event_candidate(
+            fact_text="observed=2023-11-17 Fri User ran the race",
+            occurred_at=None,
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(c.fact_text, "User ran the race")
+        self.assertIsNone(c.occurred_at)
+
+    def test_guard_strips_whitespace_variant_marker(self) -> None:
+        # Optional inner leading/trailing whitespace inside the brackets must
+        # not leave bracket residue behind.
+        c = _event_candidate(
+            fact_text="[ message_id=3 observed=2023-11-17 Fri ] User: hi",
+            occurred_at=None,
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(c.fact_text, "User: hi")
+
+    def test_guard_strips_marker_with_whitespace_around_equals(self) -> None:
+        # An extractor that reformats the label with spaces around '='
+        # ("message_id = 3", "observed = ...") must not slip the scaffolding
+        # past the strip -- bracketed and bare forms both tolerate the spaces.
+        bracketed = _event_candidate(
+            fact_text="[message_id = 3 observed = 2023-11-17 Fri] User prefers uv",
+            occurred_at=None,
+            category="preference",
+        )
+        bare = _event_candidate(
+            fact_text="observed = 2023-11-17 Fri User ran the race",
+            occurred_at=None,
+        )
+        apply_occurred_at_guards([bracketed, bare], _rows_nov_2023(), "...")
+        self.assertEqual(bracketed.fact_text, "User prefers uv")
+        self.assertEqual(bare.fact_text, "User ran the race")
+        self.assertIsNone(bare.occurred_at)
 
 
 if __name__ == "__main__":
