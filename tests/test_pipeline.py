@@ -205,6 +205,59 @@ class LightPhaseProvenanceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(persisted, ["Ryan prefers compact reports."])
 
+    async def test_light_phase_applies_occurred_at_guards_before_commit(self) -> None:
+        """ADR 0038: apply_occurred_at_guards must run inside run_light_phase,
+        before commit. A candidate with a fabricated occurred_at year that has
+        no grounding in the window's observed dates or transcript text must
+        never reach memory_candidates -- it is caught before persistence, not
+        cleaned up afterward."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            message_id = save_messages(
+                db_path,
+                [ModelRequest(parts=[UserPromptPart(content="We shipped the release.")])],
+                timestamp="2023-11-15 12:00:00",
+            )[0]
+
+            class ExtractionAgent:
+                async def run(self, transcript: str) -> object:
+                    return SimpleNamespace(
+                        output=[
+                            FactCandidate(
+                                fact_text="Ryan shipped the release.",
+                                subject="Ryan",
+                                category="event",
+                                importance=6,
+                                confidence=0.9,
+                                source_message_ids=[message_id],
+                                occurred_at="2025-03-01",
+                            ),
+                        ],
+                        usage=_fake_usage(),
+                    )
+
+            def agent_factory(model_group: str, secrets: object = None) -> object:
+                return ExtractionAgent()
+
+            def embed(texts: list[str]) -> list[list[float]]:
+                return [_unit_vector(1.0) for _ in texts]
+
+            await run_light_phase(
+                db_path,
+                "glm",
+                extraction_agent_factory=agent_factory,
+                embed=embed,
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                row = conn.execute(
+                    "SELECT fact_text, occurred_at FROM memory_candidates ORDER BY id"
+                ).fetchone()
+
+        self.assertEqual(row[0], "Ryan shipped the release.")
+        self.assertIsNone(row[1])
+
     async def test_light_phase_advances_watermark_when_every_candidate_is_dropped(
         self,
     ) -> None:
