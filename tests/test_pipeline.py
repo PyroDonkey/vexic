@@ -2752,7 +2752,11 @@ class FactCandidateOccurredAtValidatorTests(unittest.TestCase):
             ("March 2023", None),
             ("2023-13", None),
             ("2023-02-30", None),
-            ("2023-11-17T09:00:00", None),
+            ("2023-11-17T09:00:00", "2023-11-17"),
+            ("2026-07-05T00:00:00Z", "2026-07-05"),
+            ("2026-07-05 09:30:00", "2026-07-05"),
+            ("2026-02-30T00:00:00Z", None),
+            ("9999-99-99T00:00:00", None),
         ]
         for raw, expected in test_cases:
             with self.subTest(raw=raw):

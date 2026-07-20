@@ -14,6 +14,19 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 _OCCURRED_AT_RE = re.compile(r"\d{4}(-\d{2}(-\d{2})?)?")
+_FULL_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _is_real_date(text: str) -> bool:
+    """True if `text` is a real calendar date in YYYY-MM-DD form."""
+    if not _FULL_DATE_RE.fullmatch(text):
+        return False
+    year, month, day = (int(part) for part in text.split("-"))
+    try:
+        date(year, month, day)
+    except ValueError:
+        return False
+    return True
 
 
 class FactCandidate(BaseModel):
@@ -46,14 +59,22 @@ class FactCandidate(BaseModel):
         if value is None:
             return None
         text = str(value).strip()
-        if not text or not _OCCURRED_AT_RE.fullmatch(text):
+        if not text:
             return None
-        parts = [int(p) for p in text.split("-")]
-        try:
-            date(parts[0], parts[1] if len(parts) > 1 else 1, parts[2] if len(parts) > 2 else 1)
-        except ValueError:
-            return None
-        return text
+        if _OCCURRED_AT_RE.fullmatch(text):
+            parts = [int(p) for p in text.split("-")]
+            try:
+                date(parts[0], parts[1] if len(parts) > 1 else 1, parts[2] if len(parts) > 2 else 1)
+            except ValueError:
+                return None
+            return text
+        # Rehydration from persisted rows (storage/candidates.py) can surface
+        # legacy datetime-shaped values, e.g. "2026-07-05T00:00:00Z". Truncate
+        # to the date part instead of nulling it out: truncation only reduces
+        # precision, it never invents components (Memory Invariant 11).
+        if len(text) > 10 and text[10] in "T " and _is_real_date(text[:10]):
+            return text[:10]
+        return None
 
 
 class ContradictionJudgment(BaseModel):
