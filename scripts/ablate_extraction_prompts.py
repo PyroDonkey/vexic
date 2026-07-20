@@ -1,4 +1,4 @@
-"""Repeated extraction-prompt ablation runner (COA-413).
+"""Repeated extraction-prompt ablation runner.
 
 Reconstructs the *exact* persisted Light windows of one or more LongMemEval
 Vexic databases and runs a 4-condition factorial over two additive extraction
@@ -13,7 +13,7 @@ ablation: one rendered transcript per window is shared by all four conditions.
 
 This is a live, opt-in evidence harness gated behind ``--allow-live`` and a
 provider-call budget cap, mirroring ``src/vexic/live_retrieval_baseline.py`` and
-the COA-412 sibling ``scripts/ablate_light_time_context.py``. It is not Vexic
+its sibling ``scripts/ablate_light_time_context.py``. It is not Vexic
 runtime: it lives under ``scripts/`` and imports only public ``vexic.*`` and the
 repo-local ``adapters.*`` consumer. ``docs/ai/REVIEW.md`` flags live harnesses
 as do-not-run during review; only the deterministic surface is unit-tested (see
@@ -96,7 +96,7 @@ class AblationConfigError(ValueError):
 
 CONDITIONS = ("control", "G", "U", "G+U")
 
-# U_ADDITION is V1_ADDITION from the COA-413 extraction experiment verbatim: an
+# U_ADDITION is V1_ADDITION from the prior extraction experiment verbatim: an
 # update-scanning paragraph, with its original leading newline so it appends
 # cleanly onto the base instructions.
 U_ADDITION = """\
@@ -126,11 +126,12 @@ contains a table or schedule, extract each answer-bearing cell assignment
 as a distinct fact rather than only describing the table's overall shape.\
 """
 
-# The sentence deliberately dropped from the tail of V2_ADDITION. It is COA-411
+# The sentence deliberately dropped from the tail of V2_ADDITION. It is
 # promotion policy (a completed past occurrence with no date becomes category
-# "fact"), which the COA-413 issue excludes from this ablation as a Memory
-# Invariant 11 bypass. Kept as a named, testable constant so the exclusion is
-# pinned: no built condition may contain it.
+# "fact"), deliberately excluded from this ablation as a Memory Invariant 11
+# bypass (ADR 0037 owns the undated-event promotion path). Kept as a named,
+# testable constant so the exclusion is pinned: no built condition may
+# contain it.
 EXCLUDED_PROMOTION_SENTENCE = """\
 A completed past occurrence whose outcome remains true (an approval amount,
 a purchase, a redemption) should be categorized as "fact" when the
@@ -142,7 +143,7 @@ an undatable event.\
 def normalize(value: str) -> str:
     """Lowercase and collapse every run of whitespace (newlines and tabs
     included) to a single space, then strip. Shared by the locator/rubric
-    matcher and every drift guard; mirrors the COA-349 score.py norm."""
+    matcher and every drift guard; mirrors the prior experiment's score.py norm."""
     return re.sub(r"\s+", " ", value.lower()).strip()
 
 
@@ -182,7 +183,7 @@ def build_condition_instructions(
     else:
         # "G+U": canonical order is base, then G, then U.
         built = base + G_ADDITION + U_ADDITION
-    # Runtime twin of the test pin: the COA-411 promotion sentence must never
+    # Runtime twin of the test pin: the promotion-policy sentence must never
     # ship in any built condition, even if a future base prompt absorbs it.
     if normalize(EXCLUDED_PROMOTION_SENTENCE) in normalize(built):
         raise AblationConfigError(
@@ -332,7 +333,7 @@ class ProviderBudgetExhausted(RuntimeError):
 
 
 class ProviderBudget:
-    # Copied from scripts/ablate_light_time_context.py (COA-412); scripts stay standalone.
+    # Copied from scripts/ablate_light_time_context.py; scripts stay standalone.
     def __init__(self, max_calls: int) -> None:
         self.max_calls = max_calls
         self.used = 0
@@ -353,7 +354,7 @@ def _paired_variant_schedule(
     variants: Sequence[str],
     budget_remaining: int,
 ) -> list[tuple[int, str]]:
-    # Copied from scripts/ablate_light_time_context.py (COA-412); scripts stay standalone.
+    # Copied from scripts/ablate_light_time_context.py; scripts stay standalone.
     """Interleaved ``(repeat_idx, variant)`` call plan that fits within
     ``budget_remaining``. Each repeat runs every variant in order before the
     next repeat starts, and the plan stops the moment the next call would
@@ -375,7 +376,7 @@ def _drop_out_of_window_candidates(
     candidates: list[FactCandidate],
     rows: list[tuple[int, str | None, Any]],
 ) -> tuple[list[FactCandidate], int]:
-    # Copied from scripts/ablate_light_time_context.py (COA-412); scripts stay standalone.
+    # Copied from scripts/ablate_light_time_context.py; scripts stay standalone.
     """Mirror production's Light candidate drop (ADR 0031): keep only
     candidates whose source_message_ids sit inside this window's rendered
     evidence ids (``rendered_message_ids``). Out-of-window-cited candidates
@@ -764,7 +765,7 @@ def _print_binding_table(bindings: dict[str, BindingResult]) -> None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run the opt-in live extraction-prompt ablation (COA-413)."
+        description="Run the opt-in live extraction-prompt ablation."
     )
     parser.add_argument("--db", action="append", default=[])
     parser.add_argument("--allow-live", action="store_true")

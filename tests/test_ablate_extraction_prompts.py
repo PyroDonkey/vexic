@@ -110,7 +110,7 @@ class BuildConditionInstructionsTests(unittest.TestCase):
         self.assertIn("completed past occurrence", sentence)
 
     def test_excluded_promotion_sentence_absent_from_every_built_condition(self) -> None:
-        # COA-411 promotion policy must not leak in as an invariant bypass: no
+        # The promotion-policy sentence must not leak in as an invariant bypass: no
         # condition -- not even G+U -- may contain the excluded sentence.
         excluded_norm = self.module.normalize(self.module.EXCLUDED_PROMOTION_SENTENCE)
         for condition in self.module.CONDITIONS:
@@ -272,7 +272,7 @@ class BindingTests(unittest.TestCase):
 
 
 class PairedVariantScheduleTests(unittest.TestCase):
-    """Copied verbatim from the COA-412 sibling; verify it interleaves the four
+    """Copied verbatim from the sibling runner; verify it interleaves the four
     conditions per repeat under a tight budget."""
 
     def setUp(self) -> None:
