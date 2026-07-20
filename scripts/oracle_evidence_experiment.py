@@ -443,22 +443,40 @@ async def _judge_texts(
 ) -> dict[str, Any]:
     """Judge one evidence set `repeats` times and aggregate. A single-shot LLM
     verdict is noisy even at temperature 0, so headroom is read off the pass
-    fraction, not one verdict."""
+    fraction, not one verdict.
+
+    A transient judge failure (rate limit, unparseable structured output) on one
+    repeat must not abort the whole budgeted run and discard every completed
+    question: the error is recorded and the loop continues, mirroring the
+    per-call resilience in scripts/ablate_extraction_prompts.py. Pass/partial
+    fractions are computed over the graded (non-error) repeats -- all-error means
+    no signal (None), like production's judge_error -> judged_recall_pass None.
+    The budget call is still counted; the provider may have charged for it.
+    """
     judge_input = LongMemEvalRecallJudgeInput(
         question=question,
         gold_answer=gold_answer,
         retrieved_fact_texts=tuple(fact_texts),
     )
     verdicts: list[str] = []
+    errors = 0
     for _ in range(repeats):
         budget.take()
-        verdict = await judge_fn(judge_input)
-        verdicts.append(verdict.verdict)
+        try:
+            verdict = await judge_fn(judge_input)
+            verdicts.append(verdict.verdict)
+        except ProviderBudgetExhausted:
+            raise
+        except Exception:  # noqa: BLE001 - live judge boundary
+            errors += 1
+            verdicts.append("error")
+    graded = [v for v in verdicts if v != "error"]
     return {
         "verdicts": verdicts,
-        "pass_fraction": pass_fraction(verdicts),
-        "partial_fraction": partial_fraction(verdicts),
+        "pass_fraction": pass_fraction(graded),
+        "partial_fraction": partial_fraction(graded),
         "n": len(verdicts),
+        "errors": errors,
         "retrieved_count": len(fact_texts),
     }
 

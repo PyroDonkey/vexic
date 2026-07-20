@@ -461,6 +461,44 @@ class OracleFixtureTests(TestCase):
         self.assertEqual(budget.used, 15)
         self.assertEqual(result["capture"]["15"]["fraction"], 1.0)
 
+    def test_judge_error_is_recorded_and_does_not_abort_run(self) -> None:
+        # A judge that raises on every call must not crash the run: each repeat
+        # records "error", pass/partial are None (no graded signal), budget still
+        # spent, and run_experiment completes and yields a result row.
+        self._seed_db(
+            "q1",
+            [("Only fact.", "fact", None)],
+            event={
+                "keyword_fact_ids": [1],
+                "vector_fact_ids": [1],
+                "fused_fact_ids": [1],
+            },
+        )
+        entry = oee.load_oracle_fixture(
+            self._fixture(
+                [self._entry("q1", constituent_fact_ids=[1], expected_fact_texts=["Only fact."])]
+            )
+        )[0]
+
+        class _Boom:
+            calls = 0
+
+            async def __call__(self, judge_input):
+                _Boom.calls += 1
+                raise RuntimeError("unparseable structured output")
+
+        budget = oee.ProviderBudget(100)
+        doc = asyncio.run(
+            oee.run_experiment([entry], _Boom(), repeats=2, budget=budget)
+        )
+
+        self.assertEqual(len(doc["results"]), 1)
+        oracle = doc["results"][0]["oracle"]
+        self.assertIsNone(oracle["pass_fraction"])
+        self.assertEqual(oracle["errors"], 2)
+        self.assertEqual(oracle["verdicts"], ["error", "error"])
+        self.assertGreater(budget.used, 0)  # calls attempted -> budget spent
+
     def test_run_question_supported_only_partial_is_not_a_pass(self) -> None:
         self._seed_db(
             "q1",
