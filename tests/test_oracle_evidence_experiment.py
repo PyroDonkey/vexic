@@ -478,9 +478,10 @@ class OracleFixtureTests(TestCase):
         self.assertEqual(ceiling, [99])
 
     def test_build_headroom_reports_membership_sets_not_a_subtraction(self) -> None:
-        def result(qid, oracle_pass, sweep_pass):
+        def result(qid, oracle_pass, sweep_pass, oracle_complete=True):
             return {
                 "question_id": qid,
+                "oracle_complete": oracle_complete,
                 "oracle": {"pass_fraction": oracle_pass},
                 "sweep": {
                     str(k): {"pass_fraction": p}
@@ -492,14 +493,15 @@ class OracleFixtureTests(TestCase):
         results = [
             result("qA", 1.0, [0.0, 0.0, 0.0, 0.0]),  # oracle only -> derivation
             result("qB", 1.0, [0.0, 1.0, 1.0, 1.0]),  # widening (k>5) fixes it
-            result("qC", 0.0, [0.0, 0.0, 0.0, 0.0]),  # unrecoverable here
+            result("qC", 0.0, [0.0, 0.0, 0.0, 0.0]),  # complete evidence, still fails
             result("qD", 0.0, [0.0, 1.0, 0.0, 0.0]),  # k=8 passes, k=10/15 regress
             result("qE", 1.0, [1.0, 0.0, 0.0, 0.0]),  # only baseline k5 re-judges pass
+            result("qF", 0.0, [0.0, 0.0, 0.0, 0.0], oracle_complete=False),  # gap
         ]
 
         headroom = oee.build_headroom(results, threshold=0.5)
 
-        self.assertEqual(headroom["n"], 5)
+        self.assertEqual(headroom["n"], 6)
         # qE's only pass is at k=RETURN_K (baseline re-judge noise), so it is NOT
         # reachable-by-widening; it is derivation_needed (oracle passes, no k>5).
         self.assertEqual(set(headroom["set_completeness_reachable"]), {"qB", "qD"})
@@ -507,6 +509,13 @@ class OracleFixtureTests(TestCase):
         self.assertEqual(set(headroom["combined_ceiling"]), {"qA", "qB", "qE"})
         self.assertEqual(set(headroom["derivation_needed"]), {"qA", "qE"})
         self.assertIn("qD", headroom["nonmonotonic_regressions"])
+        # qF has no Tier-3 evidence -> upstream gap, not scored as derivation.
+        self.assertEqual(set(headroom["upstream_extraction_gap"]), {"qF"})
+        # qC: complete evidence, oracle still fails, no k passes -> genuine
+        # derivation ceiling. qF (incomplete) must NOT be counted here.
+        self.assertEqual(
+            set(headroom["derivation_ceiling_complete_evidence"]), {"qC"}
+        )
 
     def test_recorded_verdict_reads_diagnostics(self) -> None:
         self._write_diagnostics(

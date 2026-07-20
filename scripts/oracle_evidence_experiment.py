@@ -111,6 +111,11 @@ class OracleEntry(BaseModel):
     gold_answer: Any
     constituent_fact_ids: list[int] = Field(min_length=1)
     expected_fact_texts: list[str] = Field(min_length=1)
+    # False when the curated Tier-3 set does NOT fully cover the gold answer --
+    # a needed constituent was never promoted (undated Tier-2 candidate, or
+    # transcript/tabular-only). Such a miss is bounded by extraction/promotion,
+    # not retrieval or derivation, so headroom attributes it separately.
+    oracle_complete: bool = True
     note: str = ""
 
     def model_post_init(self, _context: Any) -> None:
@@ -487,6 +492,7 @@ async def run_question(
         "question_id": entry.question_id,
         "run_dir": entry.run_dir,
         "note": entry.note,
+        "oracle_complete": entry.oracle_complete,
         "oracle": oracle,
         "baseline": sweep[str(RETURN_K)],
         "sweep": sweep,
@@ -540,9 +546,14 @@ def build_headroom(
     combined: list[str] = []
     regressions: list[str] = []
     ceiling_bound: list[str] = []
+    upstream_gap: list[str] = []
 
     for result in results:
         qid = result["question_id"]
+        if not result.get("oracle_complete", True):
+            # Constituents missing from Tier-3 entirely: bounded by
+            # extraction/promotion, not retrieval or derivation.
+            upstream_gap.append(qid)
         sweep = _sweep_pass_fractions(result)
         # Widening = strictly past the run's returned top-k (RETURN_K); a pass at
         # k=RETURN_K is the baseline re-judge, tracked separately.
@@ -571,6 +582,17 @@ def build_headroom(
     def rate(subset: list[str]) -> float | None:
         return len(subset) / n if n else None
 
+    # Answer derivable from current Tier-3 by neither widening retrieval nor the
+    # judge given complete evidence, and evidence IS complete -> a genuine
+    # answer-time derivation ceiling (distinct from upstream_extraction_gap).
+    reached = reachable_set | set(combined)
+    derivation_ceiling = [
+        r["question_id"]
+        for r in results
+        if r.get("oracle_complete", True)
+        and r["question_id"] not in reached
+    ]
+
     return {
         "n": n,
         "threshold": threshold,
@@ -578,12 +600,15 @@ def build_headroom(
         "baseline_rejudge_pass": baseline_rejudge,
         "combined_ceiling": combined,
         "derivation_needed": derivation_needed,
+        "derivation_ceiling_complete_evidence": derivation_ceiling,
+        "upstream_extraction_gap": upstream_gap,
         "nonmonotonic_regressions": regressions,
         "retrieve_k_ceiling_bound": ceiling_bound,
         "rates": {
             "set_completeness_reachable": rate(set_completeness),
             "combined_ceiling": rate(combined),
             "derivation_needed": rate(derivation_needed),
+            "upstream_extraction_gap": rate(upstream_gap),
         },
     }
 
