@@ -113,7 +113,7 @@ run in `run_light_phase` after `keep_candidates_with_valid_source_ids`:
 
 1. **Year plausibility.** `_plausible_years` computes the set of years
    grounded in the current Light window: each source message's observed year
-   plus its immediate neighbors (year ± 1), unioned with every bare 4-digit
+   plus its immediate neighbors (year +/- 1), unioned with every bare 4-digit
    year that appears literally in the rendered transcript text. Any candidate's non-null `occurred_at` whose year
    falls outside that set is dropped to `None`. This check runs once before
    the copy-backfill (against a model-supplied date) and once after (against
