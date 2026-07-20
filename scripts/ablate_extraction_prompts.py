@@ -349,26 +349,31 @@ class ProviderBudget:
         self.used += 1
 
 
-def _paired_variant_schedule(
+def _global_paired_schedule(
     n_repeats: int,
-    variants: Sequence[str],
+    window_keys: Sequence[str],
+    conditions: Sequence[str],
     budget_remaining: int,
-) -> list[tuple[int, str]]:
-    # Copied from scripts/ablate_light_time_context.py; scripts stay standalone.
-    """Interleaved ``(repeat_idx, variant)`` call plan that fits within
-    ``budget_remaining``. Each repeat runs every variant in order before the
-    next repeat starts, and the plan stops the moment the next call would
-    exceed budget. This keeps the conditions paired under a tight cap: a budget
-    smaller than ``repeats * variants`` never starves the later conditions to
-    zero while still counting them attempted."""
-    plan: list[tuple[int, str]] = []
+) -> list[tuple[int, str, str]]:
+    """Repeat-major ``(repeat_idx, window_key, condition)`` call plan that fits
+    within ``budget_remaining``.
+
+    Adapted from the sibling runner's per-window paired schedule: pairing here
+    spans the whole bound-window panel, not one window at a time. Each repeat
+    runs every window's four conditions before the next repeat starts, so a
+    tight cap truncates at panel boundaries -- every completed repeat covers
+    every target -- instead of spending one window's full repeat budget while
+    later targets never run at all (which would make recall depend on DB and
+    window order rather than a balanced panel)."""
+    plan: list[tuple[int, str, str]] = []
     remaining = budget_remaining
     for repeat_idx in range(n_repeats):
-        for variant in variants:
-            if remaining <= 0:
-                return plan
-            plan.append((repeat_idx, variant))
-            remaining -= 1
+        for window_key in window_keys:
+            for condition in conditions:
+                if remaining <= 0:
+                    return plan
+                plan.append((repeat_idx, window_key, condition))
+                remaining -= 1
     return plan
 
 
@@ -488,9 +493,12 @@ async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
     attempts: dict[str, dict[str, list[int]]] = {c: defaultdict(list) for c in CONDITIONS}
     budget_exhausted = False
 
-    for window in windows:
-        if window.key not in bound_keys:
-            continue  # Extraction runs only on bound windows.
+    # Preserve the collect order but execute a repeat-major plan over the
+    # whole bound panel below; audit records are emitted for every bound
+    # window regardless of how far the budget reaches.
+    bound_windows = [window for window in windows if window.key in bound_keys]
+    windows_by_key = {window.key: window for window in bound_windows}
+    for window in bound_windows:
         sessions_spanned, contains_answer_session = _window_session_crosscheck(window)
         audit_records.append(
             {
@@ -507,61 +515,89 @@ async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
                 "contains_answer_session": contains_answer_session,
             }
         )
-        if budget_exhausted:
-            continue
-        plan = _paired_variant_schedule(args.repeats, CONDITIONS, budget.remaining())
-        if len(plan) < args.repeats * len(CONDITIONS):
-            budget_exhausted = True
-        for repeat_idx, condition in plan:
-            attempts[condition][window.key].append(repeat_idx)
+
+    plan = _global_paired_schedule(
+        args.repeats,
+        [window.key for window in bound_windows],
+        CONDITIONS,
+        budget.remaining(),
+    )
+    if len(plan) < args.repeats * len(bound_windows) * len(CONDITIONS):
+        budget_exhausted = True
+    provider_errors = 0
+    for repeat_idx, window_key, condition in plan:
+        window = windows_by_key[window_key]
+        # A transient provider failure (timeout, rate limit, structured-output
+        # error) must not discard every result already collected: record the
+        # error to the audit and move on. The call is NOT counted as attempted,
+        # so the affected repeat scores null for its targets, never a false
+        # miss. The budget call was still spent.
+        try:
             raw_candidates, usage = await _run_agent(
                 agents[condition], window.transcript, budget
             )
-            raw_count = len(raw_candidates)
-            kept_candidates, dropped = _drop_out_of_window_candidates(
-                raw_candidates, window.rows
-            )
-            input_tokens = getattr(usage, "input_tokens", None)
-            output_tokens = getattr(usage, "output_tokens", None)
-            call_records.append(
+        except ProviderBudgetExhausted:
+            budget_exhausted = True
+            break
+        except Exception as exc:  # noqa: BLE001 - live provider boundary
+            provider_errors += 1
+            audit_records.append(
                 {
-                    "record_type": "call",
+                    "record_type": "call_error",
                     "condition": condition,
                     "repeat": repeat_idx,
                     "window": window.key,
                     "db": window.db,
-                    "kept": len(kept_candidates),
-                    "raw": raw_count,
-                    "dropped": dropped,
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
+                    "error": f"{type(exc).__name__}: {exc}"[:500],
                 }
             )
-            # Production parity: run_light_phase applies the occurred_at
-            # guards before persisting, so the audit records both the model's
-            # raw value and what would actually reach Tier 2. Hit scoring uses
-            # fact_text only; the guards never touch it.
-            guarded_candidates = [
-                candidate.model_copy(deep=True) for candidate in kept_candidates
-            ]
-            apply_occurred_at_guards(guarded_candidates, window.rows, window.transcript)
-            for candidate, guarded in zip(
-                kept_candidates, guarded_candidates, strict=True
-            ):
-                record = {
-                    "condition": condition,
-                    "repeat": repeat_idx,
-                    "window": window.key,
-                    "db": window.db,
-                    "target_ids": targets_by_window[window.key],
-                    "fact_text": candidate.fact_text,
-                    "category": candidate.category,
-                    "occurred_at_raw": candidate.occurred_at,
-                    "occurred_at_guarded": guarded.occurred_at,
-                    "source_message_ids": list(candidate.source_message_ids),
-                }
-                candidate_records.append(record)
-                audit_records.append({"record_type": "candidate", **record})
+            continue
+        attempts[condition][window.key].append(repeat_idx)
+        raw_count = len(raw_candidates)
+        kept_candidates, dropped = _drop_out_of_window_candidates(
+            raw_candidates, window.rows
+        )
+        input_tokens = getattr(usage, "input_tokens", None)
+        output_tokens = getattr(usage, "output_tokens", None)
+        call_records.append(
+            {
+                "record_type": "call",
+                "condition": condition,
+                "repeat": repeat_idx,
+                "window": window.key,
+                "db": window.db,
+                "kept": len(kept_candidates),
+                "raw": raw_count,
+                "dropped": dropped,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+            }
+        )
+        # Production parity: run_light_phase applies the occurred_at
+        # guards before persisting, so the audit records both the model's
+        # raw value and what would actually reach Tier 2. Hit scoring uses
+        # fact_text only; the guards never touch it.
+        guarded_candidates = [
+            candidate.model_copy(deep=True) for candidate in kept_candidates
+        ]
+        apply_occurred_at_guards(guarded_candidates, window.rows, window.transcript)
+        for candidate, guarded in zip(
+            kept_candidates, guarded_candidates, strict=True
+        ):
+            record = {
+                "condition": condition,
+                "repeat": repeat_idx,
+                "window": window.key,
+                "db": window.db,
+                "target_ids": targets_by_window[window.key],
+                "fact_text": candidate.fact_text,
+                "category": candidate.category,
+                "occurred_at_raw": candidate.occurred_at,
+                "occurred_at_guarded": guarded.occurred_at,
+                "source_message_ids": list(candidate.source_message_ids),
+            }
+            candidate_records.append(record)
+            audit_records.append({"record_type": "candidate", **record})
 
     # Normalize the defaultdicts to plain dicts for the metrics builder.
     attempts_plain = {
@@ -576,6 +612,7 @@ async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
         attempts=attempts_plain,
         budget=budget,
         budget_exhausted=budget_exhausted,
+        provider_errors=provider_errors,
     )
     return {"metrics_document": metrics_document, "audit_records": audit_records}
 
@@ -608,6 +645,7 @@ def _build_metrics_document(
     attempts: dict[str, dict[str, list[int]]],
     budget: ProviderBudget,
     budget_exhausted: bool,
+    provider_errors: int = 0,
 ) -> dict[str, Any]:
     conditions_doc: dict[str, Any] = {}
     for condition in CONDITIONS:
@@ -727,6 +765,7 @@ def _build_metrics_document(
         },
         "provider_calls_used": budget.used,
         "budget_exhausted": budget_exhausted,
+        "provider_errors": provider_errors,
         "bindings": {
             target_id: {
                 "dbs": binding.dbs,

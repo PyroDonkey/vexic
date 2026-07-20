@@ -271,52 +271,67 @@ class BindingTests(unittest.TestCase):
         self.assertEqual(result.windows, ["db#w1"])
 
 
-class PairedVariantScheduleTests(unittest.TestCase):
-    """Copied verbatim from the sibling runner; verify it interleaves the four
-    conditions per repeat under a tight budget."""
+class GlobalPairedScheduleTests(unittest.TestCase):
+    """Repeat-major plan over the full bound-window panel: a tight budget must
+    truncate at panel boundaries (every earlier repeat covers every window and
+    condition) instead of spending one window's full plan before the next
+    window sees a single call."""
+
+    CONDS = ("control", "G", "U", "G+U")
 
     def setUp(self) -> None:
         self.module = _load_module()
 
-    def test_full_budget_runs_every_repeat_condition_in_order(self) -> None:
-        plan = self.module._paired_variant_schedule(
-            2, ("control", "G", "U", "G+U"), 100
-        )
+    def test_full_budget_covers_every_cell_repeat_major(self) -> None:
+        plan = self.module._global_paired_schedule(2, ["wA", "wB"], self.CONDS, 100)
         self.assertEqual(
             plan,
             [
-                (0, "control"),
-                (0, "G"),
-                (0, "U"),
-                (0, "G+U"),
-                (1, "control"),
-                (1, "G"),
-                (1, "U"),
-                (1, "G+U"),
+                (0, "wA", "control"),
+                (0, "wA", "G"),
+                (0, "wA", "U"),
+                (0, "wA", "G+U"),
+                (0, "wB", "control"),
+                (0, "wB", "G"),
+                (0, "wB", "U"),
+                (0, "wB", "G+U"),
+                (1, "wA", "control"),
+                (1, "wA", "G"),
+                (1, "wA", "U"),
+                (1, "wA", "G+U"),
+                (1, "wB", "control"),
+                (1, "wB", "G"),
+                (1, "wB", "U"),
+                (1, "wB", "G+U"),
             ],
         )
 
-    def test_tight_budget_interleaves(self) -> None:
-        # Budget 6 with 4 conditions: repeat0 all four, repeat1 first two.
-        plan = self.module._paired_variant_schedule(
-            3, ("control", "G", "U", "G+U"), 6
-        )
+    def test_budget_of_one_panel_gives_every_window_its_repeat_zero(self) -> None:
+        # Budget = windows x conditions: repeat 0 runs the complete panel and
+        # nothing else -- no window is starved by an earlier window's later
+        # repeats.
+        plan = self.module._global_paired_schedule(5, ["wA", "wB"], self.CONDS, 8)
+        self.assertEqual({r for r, _, _ in plan}, {0})
+        self.assertEqual({w for _, w, _ in plan}, {"wA", "wB"})
+        self.assertEqual(len(plan), 8)
+
+    def test_tight_budget_truncates_mid_panel_in_order(self) -> None:
+        plan = self.module._global_paired_schedule(3, ["wA", "wB"], self.CONDS, 6)
         self.assertEqual(
             plan,
             [
-                (0, "control"),
-                (0, "G"),
-                (0, "U"),
-                (0, "G+U"),
-                (1, "control"),
-                (1, "G"),
+                (0, "wA", "control"),
+                (0, "wA", "G"),
+                (0, "wA", "U"),
+                (0, "wA", "G+U"),
+                (0, "wB", "control"),
+                (0, "wB", "G"),
             ],
         )
 
     def test_zero_budget_plans_nothing(self) -> None:
         self.assertEqual(
-            self.module._paired_variant_schedule(3, ("control", "G", "U", "G+U"), 0),
-            [],
+            self.module._global_paired_schedule(3, ["wA"], self.CONDS, 0), []
         )
 
 
