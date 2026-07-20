@@ -290,6 +290,28 @@ class OracleFixtureTests(TestCase):
         )[0]
         self.assertEqual(oee.condition_fact_texts(entry, [1]), ["Retired fact."])
 
+    def test_condition_fact_texts_tolerate_pre_mentioned_at_schema(self) -> None:
+        # Frozen run DBs predate the mentioned_at migration (ADR 0037). The
+        # condition fetch must not assume the current schema.
+        db_path = self.run_dir / _question_path_component("q1") / "memory.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        init_db(str(db_path))
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute(
+                "INSERT INTO long_term_memory (fact_text, subject, category, "
+                "importance, confidence, source_message_ids, "
+                "promoted_from_candidate_id) "
+                "VALUES ('Old-schema fact.', 'user', 'event', 5, 0.9, '[1]', 1)"
+            )
+            conn.execute("ALTER TABLE long_term_memory DROP COLUMN mentioned_at")
+            conn.commit()
+        entry = oee.load_oracle_fixture(
+            self._fixture(
+                [self._entry("q1", constituent_fact_ids=[1], expected_fact_texts=["Old-schema fact."])]
+            )
+        )[0]
+        self.assertEqual(oee.condition_fact_texts(entry, [1]), ["Old-schema fact."])
+
     def test_event_sorted_matches_production_with_events_sorted(self) -> None:
         # The copied _event_sorted must stay byte-faithful to production's
         # _with_events_sorted (ADR 0037); compare both on the same rows.

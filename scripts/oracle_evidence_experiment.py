@@ -357,24 +357,37 @@ def _fetch_fact_rows(entry: OracleEntry, fact_ids: list[int]) -> list[_FactRow]:
     selects purely by id (storage/longterm.py), so a fused id pointing at a
     retired fact is still presented -- matching that keeps the judged evidence
     set faithful to what production would return. Ids with no row are dropped,
-    never fabricated."""
+    never fabricated.
+
+    Optional sort columns are probed rather than assumed: frozen run DBs are
+    pinned at whatever schema they were created with, and mentioned_at predates
+    only the ADR 0037 migration, so an older DB lacks it. A missing column reads
+    as None, which _event_sorted already treats as "fall through to the next
+    rung" -- exactly how production behaved before the column existed."""
     if not fact_ids:
         return []
     db_path = _memory_db_path(entry)
     with closing(_open_readonly(db_path)) as conn:
+        present = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(long_term_memory)")
+        }
+        optional = [c for c in ("occurred_at", "mentioned_at") if c in present]
+        columns = ["id", "fact_text", "category", *optional, "created_at"]
+        select = f"SELECT {', '.join(columns)} FROM long_term_memory WHERE id = ?"
         by_id: dict[int, _FactRow] = {}
         for fact_id in fact_ids:
-            row = conn.execute(
-                """
-                SELECT id, fact_text, category, occurred_at, mentioned_at,
-                       created_at
-                FROM long_term_memory
-                WHERE id = ?
-                """,
-                (fact_id,),
-            ).fetchone()
+            row = conn.execute(select, (fact_id,)).fetchone()
             if row is not None:
-                by_id[fact_id] = _FactRow(*row)
+                values = dict(zip(columns, row))
+                by_id[fact_id] = _FactRow(
+                    fact_id=values["id"],
+                    fact_text=values["fact_text"],
+                    category=values["category"],
+                    occurred_at=values.get("occurred_at"),
+                    mentioned_at=values.get("mentioned_at"),
+                    created_at=values["created_at"],
+                )
     return [by_id[fact_id] for fact_id in fact_ids if fact_id in by_id]
 
 
