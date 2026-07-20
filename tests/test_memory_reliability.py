@@ -1441,6 +1441,8 @@ class LongTermSearchAsOfFilterTests(unittest.TestCase):
         fact_text: str,
         *,
         occurred_at: str | None = None,
+        mentioned_at: str | None = None,
+        category: str = "event",
         embedding: list[float] | None = None,
     ) -> int:
         candidate_id = self._next_candidate_id
@@ -1452,7 +1454,7 @@ class LongTermSearchAsOfFilterTests(unittest.TestCase):
                     conn,
                     fact_text=fact_text,
                     subject="Ryan",
-                    category="event",
+                    category=category,
                     importance=6,
                     confidence=0.8,
                     source_message_ids=[1],
@@ -1463,6 +1465,7 @@ class LongTermSearchAsOfFilterTests(unittest.TestCase):
                     editable=True,
                     embedding=embedding if embedding is not None else _unit_vector(1.0),
                     occurred_at=occurred_at,
+                    mentioned_at=mentioned_at,
                 )
         return fact_id
 
@@ -1473,6 +1476,36 @@ class LongTermSearchAsOfFilterTests(unittest.TestCase):
                 (created_at, fact_id),
             )
             conn.commit()
+
+    def test_as_of_ladder_prefers_occurred_then_mentioned_then_created(self) -> None:
+        # ADR 0037 windowing ladder. The provenance row is deliberately a
+        # non-event category: the ladder carries no category predicate, so any
+        # row with resolvable mention time windows by it instead of created_at
+        # (retroactive-dating semantic, stated in the ADR).
+        provenance_id = self._insert_fact(
+            "Ryan mentioned the mortgage plan.",
+            mentioned_at="2025-01-01",
+            category="preference",
+        )
+        self._set_created_at(provenance_id, "2027-01-01 00:00:00")
+        dated_id = self._insert_fact(
+            "Ryan refinanced the mortgage.",
+            occurred_at="2025-06-01",
+            mentioned_at="2025-01-01",
+        )
+
+        ids = keyword_long_term_fact_ids(self.db_path, "mortgage", k=10, as_of="2025-03-01")
+        self.assertIn(provenance_id, ids, "mentioned_at must beat the created_at fallback")
+        self.assertNotIn(dated_id, ids, "occurred_at must beat mentioned_at")
+
+        neighbor_ids = {
+            neighbor.fact_id
+            for neighbor in nearest_long_term_facts(
+                self.db_path, _unit_vector(1.0), k=10, as_of="2025-03-01"
+            )
+        }
+        self.assertIn(provenance_id, neighbor_ids)
+        self.assertNotIn(dated_id, neighbor_ids)
 
     def test_keyword_filters_by_as_of_via_occurred_at(self) -> None:
         earlier_id = self._insert_fact("Ryan started a new job.", occurred_at="2025-01-01")
@@ -1688,10 +1721,15 @@ class RetrieveLongTermFactsAsOfThreadThroughTests(unittest.IsolatedAsyncioTestCa
 class CandidateSearchAsOfFilterTests(unittest.TestCase):
     # `as_of` restricts keyword (FTS) and vector (KNN) Tier 2
     # candidate-fallback search to candidates whose
-    # COALESCE(NULLIF(occurred_at, ''), created_at) <= as_of. Candidates are
-    # seeded via commit_dream_cycle (the existing dedup-aware insert path),
-    # not a private insert helper, since candidates.py has no direct-insert
-    # equivalent to insert_long_term_fact.
+    # COALESCE(NULLIF(occurred_at, ''), NULLIF(mentioned_at, ''), created_at)
+    # <= as_of. Candidates are seeded via commit_dream_cycle (the existing
+    # dedup-aware insert path), not a private insert helper, since
+    # candidates.py has no direct-insert equivalent to insert_long_term_fact.
+    #
+    # Load-bearing convention: seeded candidates cite message ids that were
+    # never save_messages'd, so mentioned_at derives NULL and the created_at
+    # fallback stays exercised. Saving those messages in a helper would flip
+    # the windowing behavior suite-wide (ADR 0037).
 
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -1716,6 +1754,58 @@ class CandidateSearchAsOfFilterTests(unittest.TestCase):
                 (created_at, candidate_id),
             )
             conn.commit()
+
+    def _set_mentioned_at(self, candidate_id: int, mentioned_at: str) -> None:
+        # Windowing tests set mentioned_at directly; derivation-from-messages
+        # is pinned separately in MentionedAtDerivationTests.
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE memory_candidates SET mentioned_at = ? WHERE id = ?",
+                (mentioned_at, candidate_id),
+            )
+            conn.commit()
+
+    def test_candidate_as_of_ladder_prefers_occurred_then_mentioned_then_created(self) -> None:
+        # ADR 0037 windowing ladder on Tier 2; non-event categories window by
+        # mentioned_at too (no category predicate in the ladder).
+        embedding = _unit_vector(1.0)
+        commit_dream_cycle(
+            self.db_path,
+            [
+                _candidate(
+                    "Ryan mentioned the mortgage plan.",
+                    message_ids=[1],
+                    category="preference",
+                ),
+                _candidate(
+                    "Ryan refinanced the mortgage.",
+                    message_ids=[2],
+                    category="event",
+                    occurred_at="2025-06-01",
+                ),
+            ],
+            candidate_embeddings=[embedding, embedding],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+        provenance_id, dated_id = self._seeded_candidate_ids()
+        self._set_mentioned_at(provenance_id, "2025-01-01")
+        self._set_created_at(provenance_id, "2027-01-01 00:00:00")
+        self._set_mentioned_at(dated_id, "2025-01-01")
+
+        ids = keyword_candidate_ids(self.db_path, "mortgage", k=10, as_of="2025-03-01")
+        self.assertIn(provenance_id, ids, "mentioned_at must beat the created_at fallback")
+        self.assertNotIn(dated_id, ids, "occurred_at must beat mentioned_at")
+
+        nearest = nearest_candidate_ids(
+            self.db_path, _unit_vector(1.0), k=10, as_of="2025-03-01"
+        )
+        self.assertIn(provenance_id, nearest)
+        self.assertNotIn(dated_id, nearest)
 
     def test_keyword_candidate_ids_filters_by_as_of_via_occurred_at(self) -> None:
         embedding = _unit_vector(1.0)
@@ -1894,6 +1984,7 @@ class LongTermSearchEventRangeFilterTests(unittest.TestCase):
         fact_text: str,
         *,
         occurred_at: str | None = None,
+        mentioned_at: str | None = None,
         embedding: list[float] | None = None,
     ) -> int:
         candidate_id = self._next_candidate_id
@@ -1916,6 +2007,7 @@ class LongTermSearchEventRangeFilterTests(unittest.TestCase):
                     editable=True,
                     embedding=embedding if embedding is not None else _unit_vector(1.0),
                     occurred_at=occurred_at,
+                    mentioned_at=mentioned_at,
                 )
         return fact_id
 
@@ -1926,6 +2018,26 @@ class LongTermSearchEventRangeFilterTests(unittest.TestCase):
                 (created_at, fact_id),
             )
             conn.commit()
+
+    def test_event_range_windows_on_mentioned_at_fallback(self) -> None:
+        # ADR 0037: mentioned_at slots between occurred_at and created_at in
+        # the event-range ladder too.
+        fact_id = self._insert_fact("Ryan hiked a volcano.", mentioned_at="2025-03-01")
+        self._set_created_at(fact_id, "2027-01-01 00:00:00")
+
+        inside = keyword_long_term_fact_ids(
+            self.db_path,
+            "volcano",
+            k=10,
+            event_after="2025-02-01",
+            event_before="2025-04-01",
+        )
+        self.assertIn(fact_id, inside)
+
+        outside = keyword_long_term_fact_ids(
+            self.db_path, "volcano", k=10, event_after="2025-04-01"
+        )
+        self.assertNotIn(fact_id, outside)
 
     def test_keyword_event_range_keeps_only_in_window_facts(self) -> None:
         before_id = self._insert_fact("Ryan started early.", occurred_at="2025-01-01")
@@ -2178,8 +2290,11 @@ class RetrieveLongTermFactsEventRangeThreadThroughTests(
 class CandidateSearchEventRangeFilterTests(unittest.TestCase):
     # event_after/event_before bound Tier 2 candidate-fallback keyword (FTS)
     # and vector (KNN) search to candidates whose
-    # COALESCE(NULLIF(occurred_at, ''), created_at) is >= event_after and/or
-    # <= event_before, mirroring the Tier 3 event-range filter.
+    # COALESCE(NULLIF(occurred_at, ''), NULLIF(mentioned_at, ''), created_at)
+    # is >= event_after and/or <= event_before, mirroring the Tier 3
+    # event-range filter. Seeded candidates cite unsaved message ids so
+    # mentioned_at derives NULL and the created_at fallback stays exercised
+    # (load-bearing convention, see CandidateSearchAsOfFilterTests).
 
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -2195,6 +2310,33 @@ class CandidateSearchEventRangeFilterTests(unittest.TestCase):
                 "SELECT id FROM memory_candidates ORDER BY id ASC"
             ).fetchall()
         return [int(row[0]) for row in rows]
+
+    def _set_mentioned_at(self, candidate_id: int, mentioned_at: str) -> None:
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE memory_candidates SET mentioned_at = ? WHERE id = ?",
+                (mentioned_at, candidate_id),
+            )
+            conn.commit()
+
+    def test_candidate_event_range_windows_on_mentioned_at_fallback(self) -> None:
+        (candidate_id,) = self._seed([("Ryan hiked a volcano.", None)])
+        self._set_mentioned_at(candidate_id, "2025-03-01")
+        self._set_created_at(candidate_id, "2027-01-01 00:00:00")
+
+        inside = keyword_candidate_ids(
+            self.db_path,
+            "volcano",
+            k=10,
+            event_after="2025-02-01",
+            event_before="2025-04-01",
+        )
+        self.assertIn(candidate_id, inside)
+
+        outside = keyword_candidate_ids(
+            self.db_path, "volcano", k=10, event_after="2025-04-01"
+        )
+        self.assertNotIn(candidate_id, outside)
 
     def _set_created_at(self, candidate_id: int, created_at: str) -> None:
         with closing(sqlite3.connect(self.db_path)) as conn:
