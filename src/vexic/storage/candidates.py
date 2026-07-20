@@ -71,6 +71,7 @@ class PromotionCandidate:
     rem_boost: float
     embedding: list[float]
     occurred_at: str | None = None
+    mentioned_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -963,7 +964,7 @@ def load_promotion_candidates(
             """
             SELECT c.id, c.fact_text, c.subject, c.category, c.confidence,
                    c.importance, c.hit_count, c.last_seen_at, c.rem_boost,
-                   e.embedding, c.occurred_at
+                   e.embedding, c.occurred_at, c.mentioned_at
             FROM memory_candidates AS c
             JOIN memory_candidate_embeddings AS e ON e.candidate_id = c.id
             WHERE c.promoted = 0
@@ -989,6 +990,7 @@ def load_promotion_candidates(
             rem_boost=float(row[8]),
             embedding=_embedding_blob_to_list(row[9]),
             occurred_at=row[10],
+            mentioned_at=row[11],
         )
         for row in rows
     ]
@@ -1248,12 +1250,13 @@ def read_candidate_for_promotion(
     # Conn-scoped read the promotion module uses inside its cross-tier
     # transaction. Returns the full eligibility row, or None when the candidate
     # is missing. Column order is the promotion module's contract; occurred_at
-    # is appended last so the module's fixed-arity unpack keeps working.
+    # then mentioned_at are appended last so the module's fixed-arity unpack
+    # keeps working.
     return conn.execute(
         """
         SELECT fact_text, subject, category, importance, confidence,
                source_message_ids, agent_id, editable, retrieved_count, used_count,
-               promoted, retired, stale, occurred_at
+               promoted, retired, stale, occurred_at, mentioned_at
         FROM memory_candidates
         WHERE id = ?
         """,

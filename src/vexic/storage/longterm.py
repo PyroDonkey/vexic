@@ -49,6 +49,7 @@ class LongTermFact:
     editable: bool = True
     created_at: str = ""
     occurred_at: str | None = None
+    mentioned_at: str | None = None
 
 
 def keyword_long_term_fact_ids(
@@ -141,7 +142,7 @@ def fetch_long_term_facts(
             f"""
             SELECT id, fact_text, subject, category, importance, confidence,
                    source_message_ids, retrieved_count, used_count, editable, created_at,
-                   occurred_at
+                   occurred_at, mentioned_at
             FROM long_term_memory
             WHERE id IN ({placeholders})
                 AND agent_id IS ?
@@ -163,6 +164,7 @@ def fetch_long_term_facts(
             editable=bool(row[9]),
             created_at=str(row[10]),
             occurred_at=row[11],
+            mentioned_at=row[12],
         )
         for row in rows
     }
@@ -445,6 +447,7 @@ def insert_long_term_fact(
     editable: bool,
     embedding: list[float],
     occurred_at: str | None = None,
+    mentioned_at: str | None = None,
 ) -> int:
     # Conn-scoped Tier 3 write used by the promotion transaction. Inserts the
     # durable fact and its embedding in the caller's connection so the whole
@@ -455,8 +458,8 @@ def insert_long_term_fact(
         INSERT INTO long_term_memory
             (fact_text, subject, category, importance, confidence,
              source_message_ids, agent_id, promoted_from_candidate_id,
-             retrieved_count, used_count, editable, occurred_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             retrieved_count, used_count, editable, occurred_at, mentioned_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             fact_text,
@@ -471,6 +474,7 @@ def insert_long_term_fact(
             used_count,
             editable,
             occurred_at,
+            mentioned_at,
         ),
     )
     fact_id = int(cursor.lastrowid)

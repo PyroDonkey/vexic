@@ -193,6 +193,7 @@ def _promote_candidate(
         retired,
         stale,
         occurred_at,
+        mentioned_at,
     ) = row
 
     if retired or stale:
@@ -258,6 +259,7 @@ def _promote_candidate(
         editable=editable,
         embedding=decision.embedding,
         occurred_at=occurred_at,
+        mentioned_at=mentioned_at,
     )
     link_candidate_to_promoted_fact(conn, decision.candidate_id, fact_id)
 

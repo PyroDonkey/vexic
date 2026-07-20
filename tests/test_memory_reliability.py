@@ -922,8 +922,8 @@ class OccurredAtRoundTripTests(unittest.TestCase):
 
         with closing(connect(self.db_path)) as conn:
             row = read_candidate_for_promotion(conn, candidate_id)
-        self.assertEqual(len(row), 14, "occurred_at must be appended as the last column")
-        self.assertEqual(row[-1], "2025-03-14")
+        self.assertEqual(len(row), 15, "mentioned_at must be appended as the last column")
+        self.assertEqual(row[-2], "2025-03-14", "occurred_at is the second-to-last column")
 
     def test_merge_backfills_missing_occurred_at_without_clobbering_known_date(self) -> None:
         fact_text = "Ryan started a new job."
@@ -1236,6 +1236,51 @@ class MentionedAtDerivationTests(unittest.TestCase):
         )
         mentioned_at, _ = self._mentioned_at(candidate_id)
         self.assertIsNone(mentioned_at)
+
+    def test_loaders_round_trip_mentioned_at(self) -> None:
+        dated = self._save_message(
+            "We finally visited Yellowstone.",
+            timestamp="2026-03-05T10:00:00+00:00",
+        )
+        candidate_id = self._commit_candidate(
+            _candidate("Ryan visited Yellowstone.", message_ids=[dated], category="event")
+        )
+
+        loaded = load_promotion_candidates(self.db_path)
+        self.assertEqual(loaded[0].mentioned_at, "2026-03-05")
+
+        with closing(connect(self.db_path)) as conn:
+            row = read_candidate_for_promotion(conn, candidate_id)
+        self.assertEqual(len(row), 15, "mentioned_at must be appended as the last column")
+        self.assertEqual(row[-1], "2026-03-05")
+
+    def test_insert_long_term_fact_round_trips_mentioned_at(self) -> None:
+        init_vector_memory(self.db_path)
+        with closing(connect(self.db_path)) as conn:
+            with conn:
+                _ensure_vector_memory_schema(conn)
+                fact_id = insert_long_term_fact(
+                    conn,
+                    fact_text="Ryan visited Yellowstone.",
+                    subject="Ryan",
+                    category="event",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[1],
+                    agent_id=None,
+                    promoted_from_candidate_id=1,
+                    retrieved_count=0,
+                    used_count=0,
+                    editable=True,
+                    embedding=_unit_vector(1.0),
+                    occurred_at=None,
+                    mentioned_at="2026-03-05",
+                )
+
+        facts = fetch_long_term_facts(self.db_path, [fact_id])
+        self.assertEqual(len(facts), 1)
+        self.assertIsNone(facts[0].occurred_at)
+        self.assertEqual(facts[0].mentioned_at, "2026-03-05")
 
     def test_merge_recomputes_mentioned_at_from_merged_source_union(self) -> None:
         # mentioned_at is a pure function of source_message_ids, so a merge
