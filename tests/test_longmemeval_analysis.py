@@ -405,6 +405,34 @@ class LongMemEvalAnalysisTests(unittest.TestCase):
         # Canonical label is the most frequent raw variant ("User", n=2 > "user").
         self.assertEqual(hist.top_subjects, [("User", 4)])
 
+    def test_subject_histogram_fold_matches_dedup_gate_semantics(self) -> None:
+        # The histogram fold must use the SAME key as the dedup gate --
+        # SQLite lower(trim(...)), which strips only spaces, not tabs. A
+        # tab-suffixed variant is a DISTINCT dedup bucket, so it must stay a
+        # distinct histogram subject too; folding it (Python's broader
+        # str.strip()) would overstate the fix by under-counting entities
+        # relative to real dedup behavior.
+        self._write_run([_diagnostics_row("q-a", judged_recall_pass=True)])
+        dataset = self._write_dataset([self._dataset_row("q-a", "unused")])
+        self._seed_question_db(
+            "q-a",
+            [
+                ("Fact one.", "User"),
+                ("Fact two.", "user"),
+                ("Fact three.", "User\t"),
+            ],
+        )
+
+        report = analyze_run(self.run_dir, dataset)
+
+        hist = report.subject_histograms[0]
+        self.assertEqual(hist.total_facts, 3)
+        self.assertEqual(
+            hist.distinct_subjects,
+            2,
+            "tab-suffixed subject must stay separate, matching space-only SQL trim",
+        )
+
     def test_aggregate_histogram_pools_all_subjects_not_just_top_n(self) -> None:
         # 10 subjects with 3 facts each + 11 subjects with 1 fact each. The
         # top-10 display list holds only the 3s; the aggregate median must be

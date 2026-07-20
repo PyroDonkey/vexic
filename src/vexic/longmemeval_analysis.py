@@ -300,37 +300,37 @@ def _classify_miss(
 def _subject_counts(db_path: Path) -> list[tuple[str, int]] | None:
     if not db_path.exists():
         return None
+    # Subject is stored verbatim, so one entity is case-split across
+    # exact-string keys ("User"/"user"/"  User "). Fold case/whitespace variants
+    # of the same token into one bucket, keyed by the SAME `lower(trim(subject))`
+    # the dedup gate uses (`_nearest_candidate`), so parity is exact -- SQLite
+    # ASCII-fold / space-strip, not Python's broader Unicode `.strip().lower()`.
+    # distinct_subjects then counts entities, not spellings. The display label
+    # is the most frequent raw variant (correlated subquery; ties broken
+    # lexicographically for determinism).
     with closing(_open_readonly(db_path)) as conn:
         rows = conn.execute(
             """
-            SELECT subject, COUNT(*) AS n
-            FROM long_term_memory
-            WHERE retired = 0
-            GROUP BY subject
-            ORDER BY n DESC, subject
+            SELECT
+                (
+                    SELECT v.subject
+                    FROM long_term_memory AS v
+                    WHERE v.retired = 0
+                        AND lower(trim(v.subject)) = lower(trim(o.subject))
+                    GROUP BY v.subject
+                    ORDER BY COUNT(*) DESC, v.subject
+                    LIMIT 1
+                ) AS label,
+                COUNT(*) AS n
+            FROM long_term_memory AS o
+            WHERE o.retired = 0
+            GROUP BY lower(trim(o.subject))
+            ORDER BY n DESC, label
             """
         ).fetchall()
     # An empty list is a real observation (the DB exists but holds zero live
     # facts -- itself a diagnostic signal); ``None`` means the DB is absent.
-    #
-    # Subject is stored verbatim, so one entity is case-split across
-    # exact-string keys ("User"/"user"/"  User "). Fold case/whitespace variants
-    # of the same token into one bucket -- matching the dedup gate's
-    # lower(trim(subject)) key -- so distinct_subjects counts entities, not
-    # spellings. The canonical display label is the most frequent raw variant
-    # (ties broken lexicographically for determinism).
-    folded: dict[str, dict[str, int]] = {}
-    for subject, count in rows:
-        key = subject.strip().lower()
-        folded.setdefault(key, {})
-        folded[key][subject] = folded[key].get(subject, 0) + int(count)
-    merged: list[tuple[str, int]] = []
-    for variants in folded.values():
-        total = sum(variants.values())
-        label = min(variants, key=lambda raw: (-variants[raw], raw))
-        merged.append((label, total))
-    merged.sort(key=lambda item: (-item[1], item[0]))
-    return merged
+    return [(label, int(count)) for label, count in rows]
 
 
 def _subject_histogram(
