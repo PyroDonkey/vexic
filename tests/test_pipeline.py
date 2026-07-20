@@ -19,6 +19,7 @@ from vexic.deep import run_deep_phase
 from vexic.models import ContradictionJudgment, FactCandidate
 from vexic.pipeline import (
     _main,
+    _plausible_years,
     apply_occurred_at_guards,
     render_transcript,
     rendered_message_ids,
@@ -2860,6 +2861,18 @@ class RenderTranscriptObservedTimeTests(unittest.TestCase):
             render_transcript(rows),
             "[message_id=7] User: a\n[message_id=8] User: b",
         )
+
+    def test_plausible_years_fail_soft_on_non_string_timestamp(self) -> None:
+        # _plausible_years slices timestamp[:10]; a foreign int/bytes value
+        # must be skipped, not raise, so the year guard degrades to
+        # transcript-literal grounding only.
+        rows = [
+            (7, 20231117, user_message("we met")),
+            (8, b"2023-11-17", user_message("later")),
+        ]
+        self.assertEqual(_plausible_years(rows, "we met later"), set())
+        rows_with_year = [(9, None, user_message("back in 2019"))]
+        self.assertIn(2019, _plausible_years(rows_with_year, "back in 2019"))
 
 
 class FactCandidateOccurredAtValidatorTests(unittest.TestCase):

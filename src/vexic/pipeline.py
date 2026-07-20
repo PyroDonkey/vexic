@@ -183,7 +183,7 @@ def _plausible_years(rows: list[tuple[int, str | None, ModelMessage]], transcrip
     transcript text."""
     years: set[int] = set()
     for _, timestamp, _ in rows:
-        if timestamp:
+        if isinstance(timestamp, str) and timestamp:
             try:
                 y = date.fromisoformat(timestamp[:10]).year
             except ValueError:
