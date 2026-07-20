@@ -889,6 +889,57 @@ class LocalMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result.facts), 1)
         self.assertEqual(result.facts[0].occurred_at, "2025-03")
 
+    async def test_search_long_term_contract_fact_exposes_mentioned_at(self) -> None:
+        # ADR 0037: an undated event promoted on mention-time provenance
+        # surfaces mentioned_at through the contract, with occurred_at None.
+        from vexic.service import LocalMemoryService
+
+        service = LocalMemoryService(
+            db_path=self.db_path,
+            tenant_id="tenant-a",
+            embed=lambda texts: [_unit_vector(1.0) for _ in texts],
+        )
+        service.init_schema()
+        message_id = save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="We moved to Vancouver.")])],
+            timestamp="2025-03-14T10:00:00+00:00",
+        )[0]
+        commit_dream_cycle(
+            self.db_path,
+            [
+                FactCandidate(
+                    fact_text="Ryan moved to Vancouver.",
+                    subject="Ryan",
+                    category="event",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[message_id],
+                )
+            ],
+            candidate_embeddings=[_unit_vector(1.0)],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=message_id,
+        )
+        commit_deep_cycle(
+            self.db_path,
+            [PromotionDecision(candidate_id=1, embedding=_unit_vector(1.0))],
+            started_at="2026-06-01T00:01:00+00:00",
+            finished_at="2026-06-01T00:01:01+00:00",
+        )
+
+        result = await service.search_long_term(
+            SearchLongTermRequest(scope=_scope(), query="Vancouver")
+        )
+
+        self.assertEqual(len(result.facts), 1)
+        self.assertIsNone(result.facts[0].occurred_at)
+        self.assertEqual(result.facts[0].mentioned_at, "2025-03-14")
+
     async def test_search_long_term_orders_event_facts_by_occurred_at(self) -> None:
         from vexic.service import LocalMemoryService
 
@@ -3288,6 +3339,7 @@ class WithEventsSortedTests(unittest.TestCase):
         category: str,
         *,
         occurred_at: str | None = None,
+        mentioned_at: str | None = None,
         created_at: str = "",
     ):
         from vexic.storage import LongTermFact
@@ -3305,6 +3357,35 @@ class WithEventsSortedTests(unittest.TestCase):
             editable=True,
             created_at=created_at,
             occurred_at=occurred_at,
+            mentioned_at=mentioned_at,
+        )
+
+    def test_event_sort_falls_back_to_mentioned_at_before_created_at(self) -> None:
+        # ADR 0037: the sort key ladder is occurred_at -> mentioned_at ->
+        # created_at. An undated event with mention-time provenance must
+        # order by it, not by its (dream-run) created_at.
+        from vexic.subagents.retrieval import _with_events_sorted
+
+        facts = [
+            self._fact(1, "event", occurred_at="2024-01"),
+            # created_at deliberately OLDEST: if the sort key wrongly fell
+            # through to created_at, this fact would sort last instead of
+            # first.
+            self._fact(
+                2,
+                "event",
+                mentioned_at="2025-06-01",
+                created_at="2023-01-01 00:00:00",
+            ),
+            self._fact(3, "event", occurred_at="2024-09"),
+        ]
+
+        result = _with_events_sorted(facts)
+
+        self.assertEqual(
+            [fact.fact_id for fact in result],
+            [2, 3, 1],
+            "mentioned_at must outrank created_at as the event sort key",
         )
 
     def test_events_sort_in_place_non_events_keep_slots(self) -> None:

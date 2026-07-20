@@ -37,7 +37,13 @@ from vexic.storage.longterm import (
     nearest_long_term_facts,
 )
 from vexic.storage.promotion import PromotionDecision
-from vexic.storage.schema import _ensure_vector_memory_schema, init_vector_memory
+from vexic.storage.schema import (
+    _backfill_mentioned_at,
+    _earliest_mention_date,
+    _ensure_vector_memory_schema,
+    _reset_init_memo,
+    init_vector_memory,
+)
 from vexic.subagents.retrieval import retrieve_long_term_facts
 from vexic.tools import expand_history, search_long_term, search_memory
 
@@ -513,6 +519,120 @@ class ContradictionSupersessionReliabilityTests(unittest.IsolatedAsyncioTestCase
         self.assertEqual(candidates, [(1, 1, 1, 0), (2, 1, 2, 0)])
 
 
+class KnowledgeUpdateSupersessionTests(unittest.IsolatedAsyncioTestCase):
+    # ADR 0037 acceptance, the 852ce960 eval shape: a knowledge update
+    # extracted as an undated event ("mortgage is $400k now") must escape the
+    # Tier 2 sink via mentioned_at, reach Tier 3, and retire the stale fact
+    # through the contradiction path — with occurred_at never fabricated.
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.temp_dir.name) / "memory.db")
+        init_db(self.db_path)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    async def test_undated_event_update_reaches_tier3_and_retires_stale_fact(self) -> None:
+        old_message_id = save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="My mortgage is $350k.")])],
+            timestamp="2026-01-10T09:00:00+00:00",
+        )[0]
+        new_message_id = save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="The mortgage is $400k now.")])],
+            timestamp="2026-03-05T10:00:00+00:00",
+        )[0]
+
+        # Stage and promote the stale fact at lower confidence, so the
+        # incoming higher-confidence update wins the contradiction instead of
+        # being blocked by the neighbor rule.
+        commit_dream_cycle(
+            self.db_path,
+            [
+                _candidate(
+                    "Ryan's mortgage is $350k.",
+                    message_ids=[old_message_id],
+                    confidence=0.6,
+                )
+            ],
+            candidate_embeddings=[_unit_vector(1.0)],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=old_message_id,
+        )
+        commit_deep_cycle(
+            self.db_path,
+            [PromotionDecision(candidate_id=1, embedding=_unit_vector(1.0))],
+            started_at="2026-06-01T00:01:00+00:00",
+            finished_at="2026-06-01T00:01:01+00:00",
+        )
+
+        update_candidate = _candidate(
+            "Ryan's mortgage is $400k.",
+            message_ids=[new_message_id],
+            category="event",
+            confidence=0.9,
+            occurred_at=None,
+        )
+
+        class _UpdateExtractionAgent:
+            async def run(self, transcript: str) -> _FakeResult:
+                return _FakeResult([update_candidate])
+
+        # Same unit embedding as the stale fact so the nearest-neighbor scan
+        # surfaces it for the contradiction judge.
+        with patch(
+            "vexic.pipeline.build_extraction_agent",
+            return_value=_UpdateExtractionAgent(),
+        ):
+            await run_light_phase(
+                self.db_path,
+                "glm",
+                embed=lambda texts: [_unit_vector(1.0) for _ in texts],
+            )
+        await run_deep_phase(
+            self.db_path,
+            "glm",
+            contradiction_agent_factory=lambda *_args, **_kwargs: _ContradictionAgent(
+                contradicts=True
+            ),
+        )
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            new_fact = conn.execute(
+                """
+                SELECT id, occurred_at, mentioned_at, retired
+                FROM long_term_memory
+                WHERE fact_text = 'Ryan''s mortgage is $400k.'
+                """
+            ).fetchone()
+            old_fact = conn.execute(
+                """
+                SELECT retired, retired_by_fact_id
+                FROM long_term_memory
+                WHERE fact_text = 'Ryan''s mortgage is $350k.'
+                """
+            ).fetchone()
+            message_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+
+        self.assertIsNotNone(new_fact, "the $400k update must reach Tier 3")
+        new_fact_id, occurred_at, mentioned_at, new_retired = new_fact
+        self.assertEqual(new_retired, 0)
+        self.assertIsNone(occurred_at, "occurred_at must never be fabricated from mention time")
+        self.assertEqual(mentioned_at, "2026-03-05")
+        self.assertEqual(
+            old_fact,
+            (1, new_fact_id),
+            "supersession must retire the stale fact in place (Invariant 6)",
+        )
+        self.assertEqual(message_count, 2, "Tier 1 transcript stays append-only")
+
+
 class MemoryIsolationAndRedactionReliabilityTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -918,8 +1038,8 @@ class OccurredAtRoundTripTests(unittest.TestCase):
 
         with closing(connect(self.db_path)) as conn:
             row = read_candidate_for_promotion(conn, candidate_id)
-        self.assertEqual(len(row), 14, "occurred_at must be appended as the last column")
-        self.assertEqual(row[-1], "2025-03-14")
+        self.assertEqual(len(row), 15, "mentioned_at must be appended as the last column")
+        self.assertEqual(row[-2], "2025-03-14", "occurred_at is the second-to-last column")
 
     def test_merge_backfills_missing_occurred_at_without_clobbering_known_date(self) -> None:
         fact_text = "Ryan started a new job."
@@ -1054,6 +1174,52 @@ class OccurredAtRoundTripTests(unittest.TestCase):
             "a blank occurred_at from the first observation must not block backfill",
         )
 
+    def test_merge_backfills_over_whitespace_occurred_at_first_observation(self) -> None:
+        # Grok 4.5 audit: NULLIF(occurred_at, '') does not treat "   " as
+        # missing, so a whitespace first observation would permanently block
+        # merge backfill. Blank-ish occurred_at is normalized to NULL at
+        # insert so the existing COALESCE backfill works.
+        fact_text = "Ryan started a new job."
+        embedding = _unit_vector(1.0)
+        commit_dream_cycle(
+            self.db_path,
+            [_candidate(fact_text, message_ids=[1], occurred_at="   ")],
+            candidate_embeddings=[embedding],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+        candidate_id = self._committed_candidate_id()
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            stored = conn.execute(
+                "SELECT occurred_at FROM memory_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()[0]
+        self.assertIsNone(stored, "whitespace occurred_at must be stored as NULL")
+
+        commit_dream_cycle(
+            self.db_path,
+            [_candidate(fact_text, message_ids=[2], occurred_at="2025-03")],
+            candidate_embeddings=[embedding],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:01:00+00:00",
+            finished_at="2026-06-01T00:01:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=2,
+        )
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            occurred_at = conn.execute(
+                "SELECT occurred_at FROM memory_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()[0]
+        self.assertEqual(occurred_at, "2025-03")
+
     def test_insert_long_term_fact_and_fetch_round_trip_occurred_at(self) -> None:
         init_vector_memory(self.db_path)
         with closing(connect(self.db_path)) as conn:
@@ -1106,13 +1272,421 @@ class OccurredAtRoundTripTests(unittest.TestCase):
         self.assertIsNone(facts[0].occurred_at)
 
 
+class MentionedAtDerivationTests(unittest.TestCase):
+    # `mentioned_at` is deterministic provenance: the earliest UTC calendar
+    # date (date-only ISO string) of a candidate's source messages, derived
+    # from messages.timestamp at insert. Never LLM-derived, never fabricated;
+    # occurred_at stays event-time-only (ADR 0037).
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.temp_dir.name) / "memory.db")
+        init_db(self.db_path)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _save_message(self, text: str, *, timestamp: str | None = None) -> int:
+        return save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content=text)])],
+            timestamp=timestamp,
+        )[0]
+
+    def _commit_candidate(
+        self, candidate: FactCandidate, *, embedding: list[float] | None = None
+    ) -> int:
+        commit_dream_cycle(
+            self.db_path,
+            [candidate],
+            candidate_embeddings=[embedding if embedding is not None else _unit_vector(1.0)],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=max(candidate.source_message_ids, default=1),
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT id FROM memory_candidates ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        return int(row[0])
+
+    def _mentioned_at(self, candidate_id: int) -> tuple[object, str]:
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            return conn.execute(
+                "SELECT mentioned_at, typeof(mentioned_at) FROM memory_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()
+
+    def test_insert_derives_mentioned_at_from_earliest_source_message(self) -> None:
+        first = self._save_message(
+            "We finally visited Yellowstone.",
+            timestamp="2026-03-05T10:00:00+00:00",
+        )
+        second = self._save_message(
+            "The Yellowstone trip was amazing.",
+            timestamp="2026-04-10T09:30:00+00:00",
+        )
+        candidate_id = self._commit_candidate(
+            _candidate(
+                "Ryan visited Yellowstone.",
+                message_ids=[second, first],
+                category="event",
+            )
+        )
+
+        mentioned_at, type_name = self._mentioned_at(candidate_id)
+        self.assertEqual(mentioned_at, "2026-03-05")
+        self.assertEqual(type_name, "text")
+
+    def test_insert_handles_mixed_timestamp_formats(self) -> None:
+        # messages.timestamp arrives in two shapes: naive
+        # 'YYYY-MM-DD HH:MM:SS' (SQLite CURRENT_TIMESTAMP default) and
+        # offset-aware ISO from ingest. Both parse; naive is treated as UTC.
+        naive = self._save_message(
+            "Booked the trip.", timestamp="2026-02-01 08:00:00"
+        )
+        aware = self._save_message(
+            "Trip photos are up.", timestamp="2026-05-20T12:00:00+00:00"
+        )
+        candidate_id = self._commit_candidate(
+            _candidate("Ryan booked a trip.", message_ids=[aware, naive], category="event")
+        )
+
+        mentioned_at, _ = self._mentioned_at(candidate_id)
+        self.assertEqual(mentioned_at, "2026-02-01")
+
+    def test_insert_leaves_mentioned_at_null_when_source_messages_missing(self) -> None:
+        candidate_id = self._commit_candidate(
+            _candidate("Ryan visited Yellowstone.", message_ids=[999], category="event")
+        )
+
+        mentioned_at, _ = self._mentioned_at(candidate_id)
+        self.assertIsNone(mentioned_at)
+
+    def test_derivation_is_fail_soft_on_bad_timestamps(self) -> None:
+        # save_messages stores host-supplied timestamp strings unvalidated, so
+        # the derivation must skip garbage rather than raise: a raise would
+        # abort the whole Light batch (against ADR 0031 fail-soft) or brick
+        # init_db via the ensure backfill.
+        garbage = self._save_message("Garbage clock.", timestamp="not-a-date")
+        blank = self._save_message("Blank clock.", timestamp="")
+        good = self._save_message("Good clock.", timestamp="2026-01-15T00:00:00+00:00")
+
+        candidate_id = self._commit_candidate(
+            _candidate(
+                "Ryan visited Yellowstone.",
+                message_ids=[garbage, blank, good],
+                category="event",
+            )
+        )
+        mentioned_at, _ = self._mentioned_at(candidate_id)
+        self.assertEqual(mentioned_at, "2026-01-15")
+
+    def test_derivation_skips_timestamps_that_overflow_utc_conversion(self) -> None:
+        # Regression (codex audit F4): "0001-01-01T00:00:00+23:59" parses via
+        # fromisoformat but astimezone(utc) raises OverflowError. Fail-soft
+        # must cover the whole normalization, not just parsing.
+        overflow = self._save_message(
+            "Ancient clock.", timestamp="0001-01-01T00:00:00+23:59"
+        )
+        good = self._save_message("Good clock.", timestamp="2026-01-15T00:00:00+00:00")
+
+        candidate_id = self._commit_candidate(
+            _candidate(
+                "Ryan visited Yellowstone.",
+                message_ids=[overflow, good],
+                category="event",
+            )
+        )
+        mentioned_at, _ = self._mentioned_at(candidate_id)
+        self.assertEqual(mentioned_at, "2026-01-15")
+
+    def test_derivation_returns_null_when_all_timestamps_unparseable(self) -> None:
+        garbage = self._save_message("Garbage clock.", timestamp="not-a-date")
+        blank = self._save_message("Blank clock.", timestamp="")
+
+        candidate_id = self._commit_candidate(
+            _candidate(
+                "Ryan visited Yellowstone.",
+                message_ids=[garbage, blank],
+                category="event",
+            )
+        )
+        mentioned_at, _ = self._mentioned_at(candidate_id)
+        self.assertIsNone(mentioned_at)
+
+    def test_loaders_round_trip_mentioned_at(self) -> None:
+        dated = self._save_message(
+            "We finally visited Yellowstone.",
+            timestamp="2026-03-05T10:00:00+00:00",
+        )
+        candidate_id = self._commit_candidate(
+            _candidate("Ryan visited Yellowstone.", message_ids=[dated], category="event")
+        )
+
+        loaded = load_promotion_candidates(self.db_path)
+        self.assertEqual(loaded[0].mentioned_at, "2026-03-05")
+
+        with closing(connect(self.db_path)) as conn:
+            row = read_candidate_for_promotion(conn, candidate_id)
+        self.assertEqual(len(row), 15, "mentioned_at must be appended as the last column")
+        self.assertEqual(row[-1], "2026-03-05")
+
+    def test_insert_long_term_fact_round_trips_mentioned_at(self) -> None:
+        init_vector_memory(self.db_path)
+        with closing(connect(self.db_path)) as conn:
+            with conn:
+                _ensure_vector_memory_schema(conn)
+                fact_id = insert_long_term_fact(
+                    conn,
+                    fact_text="Ryan visited Yellowstone.",
+                    subject="Ryan",
+                    category="event",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[1],
+                    agent_id=None,
+                    promoted_from_candidate_id=1,
+                    retrieved_count=0,
+                    used_count=0,
+                    editable=True,
+                    embedding=_unit_vector(1.0),
+                    occurred_at=None,
+                    mentioned_at="2026-03-05",
+                )
+
+        facts = fetch_long_term_facts(self.db_path, [fact_id])
+        self.assertEqual(len(facts), 1)
+        self.assertIsNone(facts[0].occurred_at)
+        self.assertEqual(facts[0].mentioned_at, "2026-03-05")
+
+    def test_derivation_and_backfill_survive_low_bind_parameter_limits(self) -> None:
+        # codex audit F1: an IN (?, ?, ...) clause with one bound parameter
+        # per cited message can blow SQLITE_MAX_VARIABLE_NUMBER (999 on older
+        # SQLite) on a legacy DB with many cited messages. Ids must ride a
+        # single JSON parameter (json_each, the purge.py precedent).
+        message_ids = [
+            self._save_message(f"note {index}", timestamp="2026-01-15T00:00:00+00:00")
+            for index in range(8)
+        ]
+        candidate_id = self._commit_candidate(
+            _candidate("Ryan wrote many notes.", message_ids=message_ids, category="event")
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE memory_candidates SET mentioned_at = NULL WHERE id = ?",
+                (candidate_id,),
+            )
+            conn.commit()
+
+        with closing(connect(self.db_path)) as conn:
+            conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 5)
+            derived = _earliest_mention_date(conn, message_ids)
+            _backfill_mentioned_at(conn, "memory_candidates")
+            conn.commit()
+
+        self.assertEqual(derived, "2026-01-15")
+        mentioned_at, _ = self._mentioned_at(candidate_id)
+        self.assertEqual(mentioned_at, "2026-01-15")
+
+    def test_merge_recomputes_mentioned_at_from_merged_source_union(self) -> None:
+        # mentioned_at is a pure function of source_message_ids, so a merge
+        # recomputes it over the union — an earlier mention discovered by a
+        # duplicate observation moves the date back (earliest-mention wins).
+        later = self._save_message(
+            "The Yellowstone trip was amazing.",
+            timestamp="2026-04-10T09:30:00+00:00",
+        )
+        earlier = self._save_message(
+            "We finally visited Yellowstone.",
+            timestamp="2026-03-05T10:00:00+00:00",
+        )
+        fact_text = "Ryan visited Yellowstone."
+        candidate_id = self._commit_candidate(
+            _candidate(fact_text, message_ids=[later], category="event")
+        )
+        mentioned_at, _ = self._mentioned_at(candidate_id)
+        self.assertEqual(mentioned_at, "2026-04-10")
+
+        merged_id = self._commit_candidate(
+            _candidate(fact_text, message_ids=[earlier], category="event")
+        )
+        self.assertEqual(merged_id, candidate_id, "duplicate must merge, not insert")
+        mentioned_at, _ = self._mentioned_at(candidate_id)
+        self.assertEqual(mentioned_at, "2026-03-05")
+
+    def test_merge_heals_legacy_null_mentioned_at(self) -> None:
+        first = self._save_message(
+            "We finally visited Yellowstone.",
+            timestamp="2026-03-05T10:00:00+00:00",
+        )
+        second = self._save_message(
+            "The Yellowstone trip was amazing.",
+            timestamp="2026-04-10T09:30:00+00:00",
+        )
+        fact_text = "Ryan visited Yellowstone."
+        candidate_id = self._commit_candidate(
+            _candidate(fact_text, message_ids=[first], category="event")
+        )
+        # Simulate a pre-column legacy row.
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE memory_candidates SET mentioned_at = NULL WHERE id = ?",
+                (candidate_id,),
+            )
+            conn.commit()
+
+        self._commit_candidate(_candidate(fact_text, message_ids=[second], category="event"))
+        mentioned_at, _ = self._mentioned_at(candidate_id)
+        self.assertEqual(mentioned_at, "2026-03-05")
+
+    def test_init_db_backfills_mentioned_at_for_legacy_rows(self) -> None:
+        # Pre-column rows (the eval-DB sink: 371 stuck undated events) heal on
+        # the next init_db, same pattern as the last_seen_at ensure backfill.
+        # Rows whose sources are missing or unparseable stay NULL.
+        dated = self._save_message(
+            "We finally visited Yellowstone.",
+            timestamp="2026-03-05T10:00:00+00:00",
+        )
+        candidate_id = self._commit_candidate(
+            _candidate("Ryan visited Yellowstone.", message_ids=[dated], category="event")
+        )
+        orphan_id = self._commit_candidate(
+            _candidate("Ryan met a bear.", message_ids=[999], category="event"),
+            embedding=_unit_vector(0.0, 1.0),
+        )
+        self.assertNotEqual(orphan_id, candidate_id)
+
+        init_vector_memory(self.db_path)
+        with closing(connect(self.db_path)) as conn:
+            with conn:
+                _ensure_vector_memory_schema(conn)
+                fact_id = insert_long_term_fact(
+                    conn,
+                    fact_text="Ryan visited Yellowstone.",
+                    subject="Ryan",
+                    category="event",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[dated],
+                    agent_id=None,
+                    promoted_from_candidate_id=candidate_id,
+                    retrieved_count=0,
+                    used_count=0,
+                    editable=True,
+                    embedding=_unit_vector(1.0),
+                    occurred_at="2026-03-01",
+                )
+
+        # Simulate pre-column rows.
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("UPDATE memory_candidates SET mentioned_at = NULL")
+            conn.execute("UPDATE long_term_memory SET mentioned_at = NULL")
+            conn.commit()
+
+        _reset_init_memo()
+        init_db(self.db_path)
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            candidate_value = conn.execute(
+                "SELECT mentioned_at FROM memory_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()[0]
+            orphan_value = conn.execute(
+                "SELECT mentioned_at FROM memory_candidates WHERE id = ?",
+                (orphan_id,),
+            ).fetchone()[0]
+            fact_value = conn.execute(
+                "SELECT mentioned_at FROM long_term_memory WHERE id = ?",
+                (fact_id,),
+            ).fetchone()[0]
+        self.assertEqual(candidate_value, "2026-03-05")
+        self.assertIsNone(orphan_value)
+        self.assertEqual(fact_value, "2026-03-05")
+
+    def test_backfill_does_not_overwrite_a_value_written_after_its_snapshot(self) -> None:
+        # codex audit F2: on hosted libSQL each statement auto-commits, so a
+        # concurrent merge can land a (correct, union-derived) mentioned_at
+        # between the backfill's NULL-row snapshot and its UPDATE. The UPDATE
+        # must be conditional on the row still being NULL so the stale
+        # snapshot value never overwrites the fresher merge write.
+        late = self._save_message(
+            "The Yellowstone trip was amazing.",
+            timestamp="2026-04-10T09:30:00+00:00",
+        )
+        candidate_id = self._commit_candidate(
+            _candidate("Ryan visited Yellowstone.", message_ids=[late], category="event")
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE memory_candidates SET mentioned_at = NULL WHERE id = ?",
+                (candidate_id,),
+            )
+            conn.commit()
+
+        import vexic.storage.schema as schema_module
+
+        real_derive = schema_module._earliest_date_from_timestamps
+
+        with closing(connect(self.db_path)) as conn:
+            def concurrent_merge_lands(values: object) -> str | None:
+                # Simulates the merge write landing between snapshot and
+                # UPDATE: an earlier mention from the merged source union.
+                conn.execute(
+                    "UPDATE memory_candidates SET mentioned_at = '2026-03-05' WHERE id = ?",
+                    (candidate_id,),
+                )
+                return real_derive(values)
+
+            with patch.object(
+                schema_module,
+                "_earliest_date_from_timestamps",
+                side_effect=concurrent_merge_lands,
+            ):
+                _backfill_mentioned_at(conn, "memory_candidates")
+            conn.commit()
+
+        mentioned_at, _ = self._mentioned_at(candidate_id)
+        self.assertEqual(
+            mentioned_at,
+            "2026-03-05",
+            "backfill must not clobber a value written after its snapshot",
+        )
+
+    def test_merge_does_not_clobber_known_mentioned_at_when_recompute_yields_null(self) -> None:
+        # After a physical purge the source ids can dangle; recompute then
+        # yields NULL, which must not wipe provenance already known
+        # (COALESCE mirror of the occurred_at no-clobber rule).
+        first = self._save_message(
+            "We finally visited Yellowstone.",
+            timestamp="2026-03-05T10:00:00+00:00",
+        )
+        fact_text = "Ryan visited Yellowstone."
+        candidate_id = self._commit_candidate(
+            _candidate(fact_text, message_ids=[first], category="event")
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("DELETE FROM messages WHERE id = ?", (first,))
+            conn.commit()
+
+        self._commit_candidate(_candidate(fact_text, message_ids=[first], category="event"))
+        mentioned_at, _ = self._mentioned_at(candidate_id)
+        self.assertEqual(mentioned_at, "2026-03-05")
+
+
 class LongTermSearchAsOfFilterTests(unittest.TestCase):
-    # `as_of` restricts keyword (FTS) and vector (KNN) Tier 3 search
-    # to facts whose COALESCE(NULLIF(occurred_at, ''), created_at) <= as_of.
-    # Facts are seeded directly via insert_long_term_fact rather than a full
-    # dream->deep promotion cycle -- cheaper, and keeps this search-filtering
-    # behavior decoupled from promotion's separately-tested occurred_at
-    # carry-through (OccurredAtRoundTripTests, above).
+    # `as_of` restricts keyword (FTS) and vector (KNN) Tier 3 search to facts
+    # whose COALESCE(NULLIF(occurred_at, ''), NULLIF(mentioned_at, ''),
+    # created_at) <= as_of (ADR 0037). Facts are seeded directly via
+    # insert_long_term_fact rather than a full dream->deep promotion cycle --
+    # cheaper, and keeps this search-filtering behavior decoupled from
+    # promotion's separately-tested occurred_at carry-through
+    # (OccurredAtRoundTripTests, above). Seeded facts cite unsaved message
+    # ids and get no mentioned_at unless a test sets one, keeping the
+    # created_at fallback exercised (load-bearing convention).
 
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -1129,6 +1703,8 @@ class LongTermSearchAsOfFilterTests(unittest.TestCase):
         fact_text: str,
         *,
         occurred_at: str | None = None,
+        mentioned_at: str | None = None,
+        category: str = "event",
         embedding: list[float] | None = None,
     ) -> int:
         candidate_id = self._next_candidate_id
@@ -1140,7 +1716,7 @@ class LongTermSearchAsOfFilterTests(unittest.TestCase):
                     conn,
                     fact_text=fact_text,
                     subject="Ryan",
-                    category="event",
+                    category=category,
                     importance=6,
                     confidence=0.8,
                     source_message_ids=[1],
@@ -1151,6 +1727,7 @@ class LongTermSearchAsOfFilterTests(unittest.TestCase):
                     editable=True,
                     embedding=embedding if embedding is not None else _unit_vector(1.0),
                     occurred_at=occurred_at,
+                    mentioned_at=mentioned_at,
                 )
         return fact_id
 
@@ -1161,6 +1738,36 @@ class LongTermSearchAsOfFilterTests(unittest.TestCase):
                 (created_at, fact_id),
             )
             conn.commit()
+
+    def test_as_of_ladder_prefers_occurred_then_mentioned_then_created(self) -> None:
+        # ADR 0037 windowing ladder. The provenance row is deliberately a
+        # non-event category: the ladder carries no category predicate, so any
+        # row with resolvable mention time windows by it instead of created_at
+        # (retroactive-dating semantic, stated in the ADR).
+        provenance_id = self._insert_fact(
+            "Ryan mentioned the mortgage plan.",
+            mentioned_at="2025-01-01",
+            category="preference",
+        )
+        self._set_created_at(provenance_id, "2027-01-01 00:00:00")
+        dated_id = self._insert_fact(
+            "Ryan refinanced the mortgage.",
+            occurred_at="2025-06-01",
+            mentioned_at="2025-01-01",
+        )
+
+        ids = keyword_long_term_fact_ids(self.db_path, "mortgage", k=10, as_of="2025-03-01")
+        self.assertIn(provenance_id, ids, "mentioned_at must beat the created_at fallback")
+        self.assertNotIn(dated_id, ids, "occurred_at must beat mentioned_at")
+
+        neighbor_ids = {
+            neighbor.fact_id
+            for neighbor in nearest_long_term_facts(
+                self.db_path, _unit_vector(1.0), k=10, as_of="2025-03-01"
+            )
+        }
+        self.assertIn(provenance_id, neighbor_ids)
+        self.assertNotIn(dated_id, neighbor_ids)
 
     def test_keyword_filters_by_as_of_via_occurred_at(self) -> None:
         earlier_id = self._insert_fact("Ryan started a new job.", occurred_at="2025-01-01")
@@ -1376,10 +1983,15 @@ class RetrieveLongTermFactsAsOfThreadThroughTests(unittest.IsolatedAsyncioTestCa
 class CandidateSearchAsOfFilterTests(unittest.TestCase):
     # `as_of` restricts keyword (FTS) and vector (KNN) Tier 2
     # candidate-fallback search to candidates whose
-    # COALESCE(NULLIF(occurred_at, ''), created_at) <= as_of. Candidates are
-    # seeded via commit_dream_cycle (the existing dedup-aware insert path),
-    # not a private insert helper, since candidates.py has no direct-insert
-    # equivalent to insert_long_term_fact.
+    # COALESCE(NULLIF(occurred_at, ''), NULLIF(mentioned_at, ''), created_at)
+    # <= as_of. Candidates are seeded via commit_dream_cycle (the existing
+    # dedup-aware insert path), not a private insert helper, since
+    # candidates.py has no direct-insert equivalent to insert_long_term_fact.
+    #
+    # Load-bearing convention: seeded candidates cite message ids that were
+    # never save_messages'd, so mentioned_at derives NULL and the created_at
+    # fallback stays exercised. Saving those messages in a helper would flip
+    # the windowing behavior suite-wide (ADR 0037).
 
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -1404,6 +2016,58 @@ class CandidateSearchAsOfFilterTests(unittest.TestCase):
                 (created_at, candidate_id),
             )
             conn.commit()
+
+    def _set_mentioned_at(self, candidate_id: int, mentioned_at: str) -> None:
+        # Windowing tests set mentioned_at directly; derivation-from-messages
+        # is pinned separately in MentionedAtDerivationTests.
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE memory_candidates SET mentioned_at = ? WHERE id = ?",
+                (mentioned_at, candidate_id),
+            )
+            conn.commit()
+
+    def test_candidate_as_of_ladder_prefers_occurred_then_mentioned_then_created(self) -> None:
+        # ADR 0037 windowing ladder on Tier 2; non-event categories window by
+        # mentioned_at too (no category predicate in the ladder).
+        embedding = _unit_vector(1.0)
+        commit_dream_cycle(
+            self.db_path,
+            [
+                _candidate(
+                    "Ryan mentioned the mortgage plan.",
+                    message_ids=[1],
+                    category="preference",
+                ),
+                _candidate(
+                    "Ryan refinanced the mortgage.",
+                    message_ids=[2],
+                    category="event",
+                    occurred_at="2025-06-01",
+                ),
+            ],
+            candidate_embeddings=[embedding, embedding],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+        provenance_id, dated_id = self._seeded_candidate_ids()
+        self._set_mentioned_at(provenance_id, "2025-01-01")
+        self._set_created_at(provenance_id, "2027-01-01 00:00:00")
+        self._set_mentioned_at(dated_id, "2025-01-01")
+
+        ids = keyword_candidate_ids(self.db_path, "mortgage", k=10, as_of="2025-03-01")
+        self.assertIn(provenance_id, ids, "mentioned_at must beat the created_at fallback")
+        self.assertNotIn(dated_id, ids, "occurred_at must beat mentioned_at")
+
+        nearest = nearest_candidate_ids(
+            self.db_path, _unit_vector(1.0), k=10, as_of="2025-03-01"
+        )
+        self.assertIn(provenance_id, nearest)
+        self.assertNotIn(dated_id, nearest)
 
     def test_keyword_candidate_ids_filters_by_as_of_via_occurred_at(self) -> None:
         embedding = _unit_vector(1.0)
@@ -1562,9 +2226,10 @@ class CandidateSearchAsOfFilterTests(unittest.TestCase):
 
 class LongTermSearchEventRangeFilterTests(unittest.TestCase):
     # `event_after`/`event_before` bound Tier 3 keyword (FTS) and vector (KNN)
-    # search to facts whose COALESCE(NULLIF(occurred_at, ''), created_at) is
-    # >= event_after and/or <= event_before -- the same fallback the `as_of`
-    # upper bound uses. Bounds are independent (either/both/neither) and
+    # search to facts whose COALESCE(NULLIF(occurred_at, ''),
+    # NULLIF(mentioned_at, ''), created_at) is >= event_after and/or
+    # <= event_before -- the same ladder the `as_of` upper bound uses
+    # (ADR 0037). Bounds are independent (either/both/neither) and
     # `event_before` may coexist with `as_of`.
 
     def setUp(self) -> None:
@@ -1582,6 +2247,7 @@ class LongTermSearchEventRangeFilterTests(unittest.TestCase):
         fact_text: str,
         *,
         occurred_at: str | None = None,
+        mentioned_at: str | None = None,
         embedding: list[float] | None = None,
     ) -> int:
         candidate_id = self._next_candidate_id
@@ -1604,6 +2270,7 @@ class LongTermSearchEventRangeFilterTests(unittest.TestCase):
                     editable=True,
                     embedding=embedding if embedding is not None else _unit_vector(1.0),
                     occurred_at=occurred_at,
+                    mentioned_at=mentioned_at,
                 )
         return fact_id
 
@@ -1614,6 +2281,26 @@ class LongTermSearchEventRangeFilterTests(unittest.TestCase):
                 (created_at, fact_id),
             )
             conn.commit()
+
+    def test_event_range_windows_on_mentioned_at_fallback(self) -> None:
+        # ADR 0037: mentioned_at slots between occurred_at and created_at in
+        # the event-range ladder too.
+        fact_id = self._insert_fact("Ryan hiked a volcano.", mentioned_at="2025-03-01")
+        self._set_created_at(fact_id, "2027-01-01 00:00:00")
+
+        inside = keyword_long_term_fact_ids(
+            self.db_path,
+            "volcano",
+            k=10,
+            event_after="2025-02-01",
+            event_before="2025-04-01",
+        )
+        self.assertIn(fact_id, inside)
+
+        outside = keyword_long_term_fact_ids(
+            self.db_path, "volcano", k=10, event_after="2025-04-01"
+        )
+        self.assertNotIn(fact_id, outside)
 
     def test_keyword_event_range_keeps_only_in_window_facts(self) -> None:
         before_id = self._insert_fact("Ryan started early.", occurred_at="2025-01-01")
@@ -1866,8 +2553,11 @@ class RetrieveLongTermFactsEventRangeThreadThroughTests(
 class CandidateSearchEventRangeFilterTests(unittest.TestCase):
     # event_after/event_before bound Tier 2 candidate-fallback keyword (FTS)
     # and vector (KNN) search to candidates whose
-    # COALESCE(NULLIF(occurred_at, ''), created_at) is >= event_after and/or
-    # <= event_before, mirroring the Tier 3 event-range filter.
+    # COALESCE(NULLIF(occurred_at, ''), NULLIF(mentioned_at, ''), created_at)
+    # is >= event_after and/or <= event_before, mirroring the Tier 3
+    # event-range filter. Seeded candidates cite unsaved message ids so
+    # mentioned_at derives NULL and the created_at fallback stays exercised
+    # (load-bearing convention, see CandidateSearchAsOfFilterTests).
 
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -1883,6 +2573,33 @@ class CandidateSearchEventRangeFilterTests(unittest.TestCase):
                 "SELECT id FROM memory_candidates ORDER BY id ASC"
             ).fetchall()
         return [int(row[0]) for row in rows]
+
+    def _set_mentioned_at(self, candidate_id: int, mentioned_at: str) -> None:
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE memory_candidates SET mentioned_at = ? WHERE id = ?",
+                (mentioned_at, candidate_id),
+            )
+            conn.commit()
+
+    def test_candidate_event_range_windows_on_mentioned_at_fallback(self) -> None:
+        (candidate_id,) = self._seed([("Ryan hiked a volcano.", None)])
+        self._set_mentioned_at(candidate_id, "2025-03-01")
+        self._set_created_at(candidate_id, "2027-01-01 00:00:00")
+
+        inside = keyword_candidate_ids(
+            self.db_path,
+            "volcano",
+            k=10,
+            event_after="2025-02-01",
+            event_before="2025-04-01",
+        )
+        self.assertIn(candidate_id, inside)
+
+        outside = keyword_candidate_ids(
+            self.db_path, "volcano", k=10, event_after="2025-04-01"
+        )
+        self.assertNotIn(candidate_id, outside)
 
     def _set_created_at(self, candidate_id: int, created_at: str) -> None:
         with closing(sqlite3.connect(self.db_path)) as conn:
@@ -2070,6 +2787,7 @@ class UndatedEventPromotionSelectionTests(unittest.TestCase):
         *,
         category: str = "fact",
         occurred_at: str | None = None,
+        mentioned_at: str | None = None,
     ) -> PromotionCandidate:
         return PromotionCandidate(
             candidate_id=candidate_id,
@@ -2083,6 +2801,7 @@ class UndatedEventPromotionSelectionTests(unittest.TestCase):
             rem_boost=0.0,
             embedding=_unit_vector(1.0),
             occurred_at=occurred_at,
+            mentioned_at=mentioned_at,
         )
 
     def test_select_promotions_skips_event_candidates_without_occurred_at(self) -> None:
@@ -2135,6 +2854,26 @@ class UndatedEventPromotionSelectionTests(unittest.TestCase):
         )
 
         self.assertEqual(selected, [])
+
+    def test_select_promotions_keeps_event_candidate_with_mentioned_at_only(self) -> None:
+        # ADR 0037: mentioned_at is a promotable date for events, so an
+        # undated event with resolvable mention time is no longer sunk in
+        # Tier 2. Blank-ish mentioned_at values stay skipped, same .strip()
+        # semantics as occurred_at.
+        candidates = [
+            self._promotion_candidate(1, category="event", mentioned_at="2026-03-05"),
+            self._promotion_candidate(2, category="event", mentioned_at=""),
+            self._promotion_candidate(3, category="event", mentioned_at="   "),
+            self._promotion_candidate(4, category="event"),
+        ]
+
+        selected = select_promotions(
+            candidates,
+            now=datetime(2026, 6, 2, tzinfo=timezone.utc),
+            top_n=10,
+        )
+
+        self.assertEqual({c.candidate_id for c in selected}, {1})
 
 
 class UndatedEventDeepCycleReliabilityTests(unittest.IsolatedAsyncioTestCase):
@@ -2195,6 +2934,55 @@ class UndatedEventDeepCycleReliabilityTests(unittest.IsolatedAsyncioTestCase):
             "undated event candidate must stay eligible Tier 2 staging, not "
             "crash the cycle or get retired",
         )
+
+    async def test_deep_cycle_promotes_undated_event_with_resolvable_mention_time(
+        self,
+    ) -> None:
+        # ADR 0037 end-to-end: same undated-event shape, but the source
+        # message actually exists with a timestamp, so mentioned_at resolves
+        # at insert and the event escapes the Tier 2 sink through a full
+        # run_deep_phase cycle.
+        message_id = save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="I went to a conference.")])],
+            timestamp="2026-03-05T10:00:00+00:00",
+        )[0]
+        commit_dream_cycle(
+            self.db_path,
+            [
+                _candidate(
+                    "Ryan attended a conference.",
+                    message_ids=[message_id],
+                    category="event",
+                )
+            ],
+            candidate_embeddings=[_unit_vector(1.0)],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=message_id,
+        )
+
+        await run_deep_phase(
+            self.db_path,
+            "glm",
+            contradiction_agent_factory=lambda *_args, **_kwargs: _ContradictionAgent(
+                contradicts=False
+            ),
+        )
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            row = conn.execute(
+                """
+                SELECT occurred_at, mentioned_at FROM long_term_memory
+                WHERE retired = 0 AND category = 'event'
+                """
+            ).fetchone()
+        self.assertIsNotNone(row, "undated event with mention time must reach Tier 3")
+        self.assertIsNone(row[0], "occurred_at must stay NULL — never fabricated")
+        self.assertEqual(row[1], "2026-03-05")
 
 
 if __name__ == "__main__":

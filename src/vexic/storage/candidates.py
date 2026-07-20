@@ -11,6 +11,7 @@ from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.models import FactCandidate
 from vexic.storage.schema import (
     DreamStatus,
+    _earliest_mention_date,
     _embedding_blob_to_list,
     _ensure_vector_memory_schema,
     _fts_match_query,
@@ -70,6 +71,7 @@ class PromotionCandidate:
     rem_boost: float
     embedding: list[float]
     occurred_at: str | None = None
+    mentioned_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -189,6 +191,17 @@ def _merge_source_message_ids(existing_json: str, new_ids: list[int]) -> str:
     return json.dumps(merged)
 
 
+def _normalized_date(value: str | None) -> str | None:
+    # Blank-ish date strings ("" or whitespace-only extractor junk) become
+    # NULL at write time: the NULLIF(x, '')-based retrieval ladder and merge
+    # backfill only treat SQL NULL and '' as missing, so a stored "   " would
+    # become a bogus temporal key that merge could never repair (ADR 0037).
+    # Interior formatting of real values is preserved exactly as produced.
+    if value is None or not value.strip():
+        return None
+    return value
+
+
 def _insert_candidate(
     conn: sqlite3.Connection,
     candidate: FactCandidate,
@@ -204,8 +217,8 @@ def _insert_candidate(
         INSERT INTO memory_candidates
             (fact_text, subject, category, importance, confidence,
              source_message_ids, agent_id, editable, needs_review, review_neighbor_id,
-             best_similarity, occurred_at, last_seen_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+             best_similarity, occurred_at, mentioned_at, last_seen_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """,
         (
             candidate.fact_text,
@@ -219,7 +232,8 @@ def _insert_candidate(
             needs_review,
             review_neighbor_id,
             best_similarity,
-            candidate.occurred_at,
+            _normalized_date(candidate.occurred_at),
+            _earliest_mention_date(conn, candidate.source_message_ids),
         ),
     )
     candidate_id = int(cursor.lastrowid)
@@ -298,6 +312,14 @@ def _merge_candidate(
 
     current_hit_count = int(row[1])
     merged_source_ids = _merge_source_message_ids(row[0], candidate.source_message_ids)
+    # mentioned_at is recomputed over the merged source union so an earlier
+    # mention discovered by a duplicate moves the date back, but a NULL
+    # recompute (e.g. sources physically purged) never wipes a known date —
+    # the inverse COALESCE order from occurred_at, where the existing value
+    # wins because event time is extracted, not derived (ADR 0037).
+    merged_mentioned_at = _earliest_mention_date(
+        conn, _load_source_message_ids(merged_source_ids)
+    )
     conn.execute(
         """
         UPDATE memory_candidates
@@ -307,7 +329,8 @@ def _merge_candidate(
             importance = MAX(importance, ?),
             confidence = MAX(confidence, ?),
             best_similarity = ?,
-            occurred_at = COALESCE(NULLIF(occurred_at, ''), NULLIF(?, ''))
+            occurred_at = COALESCE(NULLIF(occurred_at, ''), NULLIF(?, '')),
+            mentioned_at = COALESCE(NULLIF(?, ''), mentioned_at)
         WHERE id = ?
         """,
         (
@@ -315,7 +338,8 @@ def _merge_candidate(
             candidate.importance,
             candidate.confidence,
             match.similarity,
-            candidate.occurred_at,
+            _normalized_date(candidate.occurred_at),
+            merged_mentioned_at,
             match.candidate_id,
         ),
     )
@@ -648,22 +672,23 @@ def keyword_candidate_ids(
     candidates never surface as unverified notes.
 
     `as_of`, if given, restricts results to rows where
-    `COALESCE(NULLIF(c.occurred_at, ''), c.created_at) <= as_of` — a plain
-    TEXT-affinity string comparison. `event_after`/`event_before`, if given,
-    are the lower/upper bounds of a temporal range over the same
-    `COALESCE(NULLIF(c.occurred_at, ''), c.created_at)` fallback:
-    `... >= event_after` and/or `... <= event_before`. All three are optional
-    and independent; `event_before` and `as_of` may coexist (both `<=` clauses
-    are emitted). `occurred_at` is a partial-precision ISO
-    string; a partial string is always lexicographically `<=` any of its own
-    completions, so a candidate with an unknown exact day always passes an
-    `as_of` or `event_before` check for any cutoff at or after that partial
-    period's start.
-    `created_at` is the full `"YYYY-MM-DD HH:MM:SS"` fallback used when
-    `occurred_at` is NULL or empty — callers must pass these bounds in a
-    directly comparable shape (matching separator/precision) or same-day
-    boundary comparisons will behave unexpectedly. This is a deliberate,
-    documented approximation, not a bug.
+    `COALESCE(NULLIF(c.occurred_at, ''), NULLIF(c.mentioned_at, ''),
+    c.created_at) <= as_of` — a plain TEXT-affinity string comparison.
+    `event_after`/`event_before`, if given, are the lower/upper bounds of a
+    temporal range over the same ladder: `... >= event_after` and/or
+    `... <= event_before`. All three are optional and independent;
+    `event_before` and `as_of` may coexist (both `<=` clauses are emitted).
+    `occurred_at` is a partial-precision ISO string; a partial string is
+    always lexicographically `<=` any of its own completions, so a candidate
+    with an unknown exact day always passes an `as_of` or `event_before`
+    check for any cutoff at or after that partial period's start.
+    `mentioned_at` (ADR 0037) is the date-only earliest-mention provenance
+    rung, used when `occurred_at` is NULL or empty; being date-only it
+    behaves like any other partial-precision value. `created_at` is the full
+    `"YYYY-MM-DD HH:MM:SS"` last-resort fallback — callers must pass these
+    bounds in a directly comparable shape (matching separator/precision) or
+    same-day boundary comparisons will behave unexpectedly. This is a
+    deliberate, documented approximation, not a bug.
     """
     safe_query = _fts_match_query(query)
     if safe_query is None:
@@ -671,11 +696,11 @@ def keyword_candidate_ids(
 
     date_clause = ""
     if as_of is not None:
-        date_clause += " AND COALESCE(NULLIF(c.occurred_at, ''), c.created_at) <= ?"
+        date_clause += " AND COALESCE(NULLIF(c.occurred_at, ''), NULLIF(c.mentioned_at, ''), c.created_at) <= ?"
     if event_after is not None:
-        date_clause += " AND COALESCE(NULLIF(c.occurred_at, ''), c.created_at) >= ?"
+        date_clause += " AND COALESCE(NULLIF(c.occurred_at, ''), NULLIF(c.mentioned_at, ''), c.created_at) >= ?"
     if event_before is not None:
-        date_clause += " AND COALESCE(NULLIF(c.occurred_at, ''), c.created_at) <= ?"
+        date_clause += " AND COALESCE(NULLIF(c.occurred_at, ''), NULLIF(c.mentioned_at, ''), c.created_at) <= ?"
 
     init_db(db_path)
     with closing(connect(db_path)) as conn:
@@ -836,22 +861,23 @@ def nearest_candidate_ids(
     keep the k nearest active candidates — same shape as nearest_long_term_facts.
 
     `as_of`, if given, restricts results to rows where
-    `COALESCE(NULLIF(c.occurred_at, ''), c.created_at) <= as_of` — a plain
-    TEXT-affinity string comparison. `event_after`/`event_before`, if given,
-    are the lower/upper bounds of a temporal range over the same
-    `COALESCE(NULLIF(c.occurred_at, ''), c.created_at)` fallback:
-    `... >= event_after` and/or `... <= event_before`. All three are optional
-    and independent; `event_before` and `as_of` may coexist (both `<=` clauses
-    are emitted). `occurred_at` is a partial-precision ISO
-    string; a partial string is always lexicographically `<=` any of its own
-    completions, so a candidate with an unknown exact day always passes an
-    `as_of` or `event_before` check for any cutoff at or after that partial
-    period's start.
-    `created_at` is the full `"YYYY-MM-DD HH:MM:SS"` fallback used when
-    `occurred_at` is NULL or empty — callers must pass these bounds in a
-    directly comparable shape (matching separator/precision) or same-day
-    boundary comparisons will behave unexpectedly. This is a deliberate,
-    documented approximation, not a bug.
+    `COALESCE(NULLIF(c.occurred_at, ''), NULLIF(c.mentioned_at, ''),
+    c.created_at) <= as_of` — a plain TEXT-affinity string comparison.
+    `event_after`/`event_before`, if given, are the lower/upper bounds of a
+    temporal range over the same ladder: `... >= event_after` and/or
+    `... <= event_before`. All three are optional and independent;
+    `event_before` and `as_of` may coexist (both `<=` clauses are emitted).
+    `occurred_at` is a partial-precision ISO string; a partial string is
+    always lexicographically `<=` any of its own completions, so a candidate
+    with an unknown exact day always passes an `as_of` or `event_before`
+    check for any cutoff at or after that partial period's start.
+    `mentioned_at` (ADR 0037) is the date-only earliest-mention provenance
+    rung, used when `occurred_at` is NULL or empty; being date-only it
+    behaves like any other partial-precision value. `created_at` is the full
+    `"YYYY-MM-DD HH:MM:SS"` last-resort fallback — callers must pass these
+    bounds in a directly comparable shape (matching separator/precision) or
+    same-day boundary comparisons will behave unexpectedly. This is a
+    deliberate, documented approximation, not a bug.
     """
     if len(embedding) != EMBEDDING_DIM:
         raise ValueError(f"Expected {EMBEDDING_DIM}-dim embedding; got {len(embedding)}.")
@@ -859,11 +885,11 @@ def nearest_candidate_ids(
 
     date_clause = ""
     if as_of is not None:
-        date_clause += " AND COALESCE(NULLIF(c.occurred_at, ''), c.created_at) <= ?"
+        date_clause += " AND COALESCE(NULLIF(c.occurred_at, ''), NULLIF(c.mentioned_at, ''), c.created_at) <= ?"
     if event_after is not None:
-        date_clause += " AND COALESCE(NULLIF(c.occurred_at, ''), c.created_at) >= ?"
+        date_clause += " AND COALESCE(NULLIF(c.occurred_at, ''), NULLIF(c.mentioned_at, ''), c.created_at) >= ?"
     if event_before is not None:
-        date_clause += " AND COALESCE(NULLIF(c.occurred_at, ''), c.created_at) <= ?"
+        date_clause += " AND COALESCE(NULLIF(c.occurred_at, ''), NULLIF(c.mentioned_at, ''), c.created_at) <= ?"
 
     fetch_k = max(k * 4, k + 10)
     init_vector_memory(db_path)
@@ -951,7 +977,7 @@ def load_promotion_candidates(
             """
             SELECT c.id, c.fact_text, c.subject, c.category, c.confidence,
                    c.importance, c.hit_count, c.last_seen_at, c.rem_boost,
-                   e.embedding, c.occurred_at
+                   e.embedding, c.occurred_at, c.mentioned_at
             FROM memory_candidates AS c
             JOIN memory_candidate_embeddings AS e ON e.candidate_id = c.id
             WHERE c.promoted = 0
@@ -977,6 +1003,7 @@ def load_promotion_candidates(
             rem_boost=float(row[8]),
             embedding=_embedding_blob_to_list(row[9]),
             occurred_at=row[10],
+            mentioned_at=row[11],
         )
         for row in rows
     ]
@@ -1236,12 +1263,13 @@ def read_candidate_for_promotion(
     # Conn-scoped read the promotion module uses inside its cross-tier
     # transaction. Returns the full eligibility row, or None when the candidate
     # is missing. Column order is the promotion module's contract; occurred_at
-    # is appended last so the module's fixed-arity unpack keeps working.
+    # then mentioned_at are appended last so the module's fixed-arity unpack
+    # keeps working.
     return conn.execute(
         """
         SELECT fact_text, subject, category, importance, confidence,
                source_message_ids, agent_id, editable, retrieved_count, used_count,
-               promoted, retired, stale, occurred_at
+               promoted, retired, stale, occurred_at, mentioned_at
         FROM memory_candidates
         WHERE id = ?
         """,

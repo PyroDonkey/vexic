@@ -1,8 +1,11 @@
+import json
 import re
 import sqlite3
 import struct
 import threading
+from collections.abc import Iterable
 from contextlib import closing
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Literal
 
 from vexic.embeddings import EMBEDDING_DIM, EMBEDDING_MODEL_NAME
@@ -92,6 +95,107 @@ def _ensure_column(
             raise
 
 
+def _earliest_date_from_timestamps(values: Iterable[object]) -> str | None:
+    # Shared parse core for mentioned_at derivation (ADR 0037). Fail-soft:
+    # messages.timestamp is stored host-supplied and unvalidated, so blank or
+    # unparseable values are skipped rather than raised on — a raise here would
+    # abort a Light batch or brick init_db via the ensure backfill.
+    earliest: datetime | None = None
+    for raw in values:
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text:
+            continue
+        try:
+            parsed = datetime.fromisoformat(text)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            else:
+                # astimezone can raise OverflowError for parseable boundary
+                # values like "0001-01-01T00:00:00+23:59" — fail-soft covers
+                # the whole normalization, not just parsing.
+                parsed = parsed.astimezone(timezone.utc)
+        except (ValueError, OverflowError):
+            continue
+        if earliest is None or parsed < earliest:
+            earliest = parsed
+    if earliest is None:
+        return None
+    return earliest.date().isoformat()
+
+
+def _earliest_mention_date(
+    conn: sqlite3.Connection,
+    source_message_ids: Iterable[int],
+) -> str | None:
+    # mentioned_at derivation (ADR 0037): the earliest UTC calendar date of the
+    # cited Tier 1 messages, as a date-only ISO string. Deterministic provenance
+    # — a pure function of source_message_ids over the append-only messages
+    # table — so insert, merge, and backfill all reproduce the same value.
+    ids = sorted({int(value) for value in source_message_ids})
+    if not ids:
+        return None
+    # Ids ride a single JSON parameter (the purge.py json_each precedent) so
+    # an IN (?, ?, ...) clause can never blow SQLITE_MAX_VARIABLE_NUMBER on a
+    # row citing many messages.
+    rows = conn.execute(
+        "SELECT timestamp FROM messages WHERE id IN (SELECT value FROM json_each(?))",
+        (json.dumps(ids),),
+    ).fetchall()
+    return _earliest_date_from_timestamps(row[0] for row in rows)
+
+
+def _backfill_mentioned_at(conn: sqlite3.Connection, table_name: str) -> None:
+    # Heal pre-column rows (the eval-DB undated-event sink) on init, following
+    # the last_seen_at ensure-backfill precedent. Batched: one read of the
+    # legacy rows, one read of every cited message, one executemany write —
+    # not a per-row round trip, which matters against hosted libSQL/Turso.
+    # Rows whose sources are missing/unparseable derive None and stay NULL;
+    # they are rescanned on later inits, a benign no-op at this row count.
+    rows = conn.execute(
+        f"SELECT id, source_message_ids FROM {table_name} WHERE mentioned_at IS NULL"
+    ).fetchall()
+    if not rows:
+        return
+    parsed_rows: list[tuple[int, list[int]]] = []
+    cited: set[int] = set()
+    for row_id, ids_json in rows:
+        try:
+            loaded = json.loads(ids_json)
+            ids = [int(value) for value in loaded]
+        except (TypeError, ValueError):
+            continue
+        parsed_rows.append((int(row_id), ids))
+        cited.update(ids)
+    if not cited:
+        return
+    # Single JSON parameter, not one `?` per id — see _earliest_mention_date.
+    timestamp_by_id = dict(
+        conn.execute(
+            "SELECT id, timestamp FROM messages WHERE id IN (SELECT value FROM json_each(?))",
+            (json.dumps(sorted(cited)),),
+        ).fetchall()
+    )
+    updates = []
+    for row_id, ids in parsed_rows:
+        derived = _earliest_date_from_timestamps(
+            timestamp_by_id.get(message_id) for message_id in ids
+        )
+        if derived is not None:
+            updates.append((derived, row_id))
+    if updates:
+        # Conditional on the row still being NULL: on hosted libSQL each
+        # statement auto-commits, so a concurrent merge can land a fresher
+        # union-derived value between the snapshot above and this write. The
+        # merge value is computed over a superset of sources and always wins.
+        conn.executemany(
+            f"UPDATE {table_name} SET mentioned_at = ? "
+            "WHERE id = ? AND mentioned_at IS NULL",
+            updates,
+        )
+
+
 def _load_vec_extension(conn: sqlite3.Connection) -> None:
     import sqlite_vec
 
@@ -149,6 +253,8 @@ def _ensure_memory_candidate_columns(conn: sqlite3.Connection) -> None:
     # precision ISO string) into an INTEGER on write. occurred_at must round-trip
     # as the exact string the extractor produced, at whatever precision it knew.
     _ensure_column(conn, "memory_candidates", "occurred_at", "occurred_at TEXT")
+    # TEXT for the same affinity reason; date-only provenance string (ADR 0037).
+    _ensure_column(conn, "memory_candidates", "mentioned_at", "mentioned_at TEXT")
 
     conn.execute(
         """
@@ -157,6 +263,7 @@ def _ensure_memory_candidate_columns(conn: sqlite3.Connection) -> None:
         WHERE last_seen_at IS NULL
         """
     )
+    _backfill_mentioned_at(conn, "memory_candidates")
 
 
 def _ensure_embedding_metadata(conn: sqlite3.Connection) -> None:
@@ -244,6 +351,8 @@ def _ensure_long_term_memory(conn: sqlite3.Connection) -> None:
     # TEXT, not DATETIME: see the matching comment on the memory_candidates
     # occurred_at column — NUMERIC affinity would mangle a bare-year string.
     _ensure_column(conn, "long_term_memory", "occurred_at", "occurred_at TEXT")
+    # Date-only provenance string, same TEXT-affinity reasoning (ADR 0037).
+    _ensure_column(conn, "long_term_memory", "mentioned_at", "mentioned_at TEXT")
     # Idempotency backstop for promotion: at most one Tier 3 fact per source
     # candidate. The atomic claim in _promote_candidate is the primary guard;
     # this UNIQUE index is the schema-level safety net so even a racy double
@@ -292,6 +401,12 @@ def _ensure_long_term_memory(conn: sqlite3.Connection) -> None:
             WHERE retired = 0
             """
         )
+    # After the duplicate preflight so a fail-loud init on hosted autocommit
+    # backends (where each statement commits individually) does not leave
+    # backfill writes behind the raise. On an already-migrated DB the FTS
+    # update trigger fires per backfilled row — a same-text delete+reinsert,
+    # consistent and one-time.
+    _backfill_mentioned_at(conn, "long_term_memory")
     # External-content FTS5 shadow over fact_text, kept in sync by triggers.
     # Retirement is an UPDATE (fact_text unchanged), but the update trigger
     # keeps the index consistent regardless.
@@ -756,7 +871,8 @@ def init_db(
                     needs_review BOOLEAN NOT NULL DEFAULT 0,
                     review_neighbor_id INTEGER,
                     best_similarity REAL,
-                    occurred_at TEXT
+                    occurred_at TEXT,
+                    mentioned_at TEXT
                 )
                 """
             )

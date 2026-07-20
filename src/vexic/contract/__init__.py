@@ -316,6 +316,9 @@ class LongTermFact(MemoryContractModel):
     used_count: int = 0
     # Event time (partial-precision ISO) for category="event" facts; None otherwise.
     occurred_at: str | None = None
+    # Earliest-mention provenance date (date-only ISO), derived deterministically
+    # from the fact's source messages; never model output (ADR 0037).
+    mentioned_at: str | None = None
 
 
 class CandidateNote(MemoryContractModel):

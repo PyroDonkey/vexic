@@ -52,6 +52,7 @@ index (and the reverse).
 | 0034 | Claude Code harness envelopes are filtered, not ingested | accepted |
 | 0035 | Hosted dreaming runs on per-tenant provisioned provider keys | accepted (not yet implemented; hosted dreaming still reads the single `OPENROUTER_API_KEY` until COA-381 lands) |
 | 0036 | Transcript recall uses any-token OR FTS semantics | accepted |
+| 0037 | Undated events promote on deterministic mention-time provenance | accepted |
 
 Notes:
 
@@ -158,6 +159,12 @@ Notes:
   retirement cut live access at binding time. Extends ADR 0022. Infra
   controls (PITR/backups, Railway SSH) and the `adapters/` credential-scoping
   work stay deferred to their own workstreams.
+- 0037 settles COA-411's undated-event Tier 2 sink: a derived, deterministic
+  `mentioned_at` provenance date (earliest source-message date) lets undated
+  events promote without fabricating `occurred_at`, and slots into the
+  retrieval windowing ladder between `occurred_at` and `created_at`. Amends
+  Memory Invariant 11 in `AGENTS.md`; extends the COA-410 selection skip into
+  a residual guard.
 - These numbers are the Vexic `docs/adr/` series and are self-contained.
   `src/vexic` source no longer carries any `upstream ADR-00NN` extraction-source
   labels (they were removed when the COA boundary policy was clarified), so there
