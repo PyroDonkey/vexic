@@ -17,7 +17,7 @@ from vexic.embeddings import EMBEDDING_DIM
 from vexic.error_reporting import dream_failure_recorded
 from vexic.deep import run_deep_phase
 from vexic.models import ContradictionJudgment, FactCandidate
-from vexic.pipeline import _main, run_light_phase
+from vexic.pipeline import _main, render_transcript, rendered_message_ids, run_light_phase
 from vexic.ports import HostPortNotConfigured
 from vexic.rem import REM_TOP_K, compute_centrality_boosts, run_rem_phase
 from vexic.storage import (
@@ -59,6 +59,10 @@ def _padded_vector(*components: float) -> list[float]:
 
 def _rem_candidate(candidate_id: int, embedding: list[float] | None) -> RemCandidate:
     return RemCandidate(candidate_id=candidate_id, embedding=embedding)
+
+
+def user_message(text: str) -> ModelRequest:
+    return ModelRequest(parts=[UserPromptPart(content=text)])
 
 
 def _fake_usage() -> SimpleNamespace:
@@ -2700,6 +2704,36 @@ class LoadMessagesSinceTimestampTests(unittest.TestCase):
             message_id, timestamp, msg = rows[0]
             self.assertIsInstance(message_id, int)
             self.assertEqual(timestamp, "2023-11-17T09:30:00+00:00")
+
+
+class RenderTranscriptObservedTimeTests(unittest.TestCase):
+    """render_transcript must label each rendered line with the message's
+    observed date and weekday when a valid timestamp is available, and omit
+    the label entirely when the timestamp is missing or malformed. The label
+    is transient prompt scaffolding only (Memory Invariant 2)."""
+
+    def test_render_transcript_labels_observed_date_and_weekday(self) -> None:
+        rows = [(7, "2023-11-17T09:30:00+00:00", user_message("hello"))]
+        self.assertEqual(
+            render_transcript(rows),
+            "[message_id=7 observed=2023-11-17 Fri] User: hello",
+        )
+
+    def test_render_transcript_omits_observed_when_timestamp_missing_or_malformed(
+        self,
+    ) -> None:
+        rows = [
+            (7, None, user_message("a")),
+            (8, "not-a-date", user_message("b")),
+        ]
+        self.assertEqual(
+            render_transcript(rows),
+            "[message_id=7] User: a\n[message_id=8] User: b",
+        )
+
+    def test_rendered_message_ids_unchanged_semantics(self) -> None:
+        rows = [(7, "2023-11-17T09:30:00+00:00", user_message("hello"))]
+        self.assertEqual(rendered_message_ids(rows), [7])
 
 
 if __name__ == "__main__":

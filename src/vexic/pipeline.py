@@ -10,6 +10,7 @@ extraction agent itself is a host port: callers must inject an
 import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import date
 from typing import Any
 
 from pydantic_ai.messages import (
@@ -61,11 +62,28 @@ def _ensure_embedding_adapter(embedder: EmbedTexts) -> None:
         ensure_local_embeddings_available()
 
 
+_WEEKDAY_ABBR = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def _observed_label(timestamp: str | None) -> str:
+    """Transient prompt scaffolding only: never persisted into message text,
+    FTS, or replay (Memory Invariant 2, ADR 0034/0038)."""
+    if not timestamp:
+        return ""
+    try:
+        observed = date.fromisoformat(timestamp[:10])
+    except ValueError:
+        return ""
+    return f" observed={observed.isoformat()} {_WEEKDAY_ABBR[observed.weekday()]}"
+
+
 def render_transcript(rows: list[tuple[int, str | None, ModelMessage]]) -> str:
-    """Render user/assistant text parts as ``[message_id=N] Role: text`` lines."""
+    """Render user/assistant text parts as ``[message_id=N] Role: text`` lines,
+    labeled with the message's observed date and weekday when a valid
+    timestamp is available."""
     lines: list[str] = []
-    for message_id, _timestamp, msg in rows:
-        lines.extend(_render_message_lines(message_id, msg))
+    for message_id, timestamp, msg in rows:
+        lines.extend(_render_message_lines(message_id, timestamp, msg))
     return "\n".join(lines)
 
 
@@ -73,21 +91,24 @@ def rendered_message_ids(rows: list[tuple[int, str | None, ModelMessage]]) -> li
     """Ids of messages that produce at least one rendered transcript line."""
     return [
         message_id
-        for message_id, _timestamp, msg in rows
-        if _render_message_lines(message_id, msg)
+        for message_id, timestamp, msg in rows
+        if _render_message_lines(message_id, timestamp, msg)
     ]
 
 
-def _render_message_lines(message_id: int, msg: ModelMessage) -> list[str]:
+def _render_message_lines(
+    message_id: int, timestamp: str | None, msg: ModelMessage
+) -> list[str]:
+    marker = f"[message_id={message_id}{_observed_label(timestamp)}]"
     lines: list[str] = []
     if isinstance(msg, ModelRequest):
         for part in msg.parts:
             if isinstance(part, UserPromptPart) and isinstance(part.content, str):
-                lines.append(f"[message_id={message_id}] User: {part.content}")
+                lines.append(f"{marker} User: {part.content}")
     elif isinstance(msg, ModelResponse):
         for part in msg.parts:
             if isinstance(part, TextPart):
-                lines.append(f"[message_id={message_id}] Assistant: {part.content}")
+                lines.append(f"{marker} Assistant: {part.content}")
     return lines
 
 
