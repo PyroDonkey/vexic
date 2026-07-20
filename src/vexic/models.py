@@ -68,7 +68,7 @@ class FactCandidate(BaseModel):
             except ValueError:
                 return None
             return text
-        # Rehydration from persisted rows (storage/candidates.py) can surface
+        # Rehydration from persisted rows (src/vexic/storage/candidates.py) can surface
         # legacy datetime-shaped values, e.g. "2026-07-05T00:00:00Z". Truncate
         # to the date part instead of nulling it out: truncation only reduces
         # precision, it never invents components (Memory Invariant 11).
