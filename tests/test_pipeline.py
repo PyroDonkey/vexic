@@ -1327,6 +1327,57 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                     finished_at="2026-01-01T00:01:01Z",
                 )
 
+    def test_deep_commit_rejects_event_candidate_with_whitespace_only_dates(self) -> None:
+        # Greptile P1 regression: a migrated or externally written row can
+        # carry whitespace-only date strings, which are truthy — the guard
+        # must .strip() both columns (matching the Deep selection filter) so
+        # a blank-ish date never reaches Tier 3, where the NULLIF('')-based
+        # retrieval ladder would treat it as a real temporal key.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            commit_dream_cycle(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="Ryan shipped the release on July 5.",
+                        subject="Ryan",
+                        category="event",
+                        importance=6,
+                        confidence=0.9,
+                        source_message_ids=[1],
+                        occurred_at="   ",
+                    )
+                ],
+                candidate_embeddings=[_unit_vector(1.0)],
+                agent_id=None,
+                status="ok",
+                started_at="2026-01-01T00:00:00Z",
+                finished_at="2026-01-01T00:00:01Z",
+                messages_processed=1,
+                last_processed_message_id=1,
+            )
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute(
+                    "UPDATE memory_candidates SET mentioned_at = '   ' WHERE id = 1"
+                )
+                conn.commit()
+
+            with self.assertRaisesRegex(ValueError, r"candidate 1.*'event'"):
+                commit_deep_cycle(
+                    db_path,
+                    [PromotionDecision(candidate_id=1, embedding=_unit_vector(1.0))],
+                    started_at="2026-01-01T00:01:00Z",
+                    finished_at="2026-01-01T00:01:01Z",
+                )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                fact_count = conn.execute(
+                    "SELECT COUNT(*) FROM long_term_memory"
+                ).fetchone()[0]
+
+        self.assertEqual(fact_count, 0)
+
     def test_deep_commit_is_idempotent_for_legacy_promoted_event_candidate(self) -> None:
         # Regression: the event/occurred_at check originally ran before the
         # `promoted` idempotency skip, so a candidate promoted before event-time support

@@ -19,13 +19,13 @@ Yellowstone last month" said in April describes a March event). Fabricating
 event time to satisfy the invariant is exactly what Invariant 11 forbids.
 
 Separately, the retrieval windowing fallback for rows without `occurred_at`
-was `created_at` — the dream-run wall clock. For replayed or imported
+was `created_at` - the dream-run wall clock. For replayed or imported
 transcripts that is the wrong signal entirely: a fact extracted today from a
 year-old conversation windowed as if it entered memory today.
 
 ## Decision
 
-**Add `mentioned_at` — a deterministic, derived provenance date — to both
+**Add `mentioned_at` - a deterministic, derived provenance date - to both
 `memory_candidates` and `long_term_memory`, and let events promote on it when
 `occurred_at` is unknown.**
 
@@ -34,7 +34,7 @@ Semantics and mechanics:
 - `mentioned_at` is the earliest UTC calendar date of the row's source
   messages: parse each cited `messages.timestamp`, take the minimum, emit a
   date-only ISO string (`YYYY-MM-DD`). It is a pure function of
-  `source_message_ids` over the append-only Tier 1 log — never model output,
+  `source_message_ids` over the append-only Tier 1 log - never model output,
   never fabricated.
 - Derivation is fail-soft (`_earliest_date_from_timestamps` in
   `src/vexic/storage/schema.py`): host-supplied message timestamps are stored
@@ -44,7 +44,7 @@ Semantics and mechanics:
   `init_db` via the ensure backfill.
 - Computed at candidate insert; recomputed over the merged source-id union on
   merge, where a NULL recompute never clobbers a known date
-  (`COALESCE(NULLIF(?, ''), mentioned_at)` — the inverse order from
+  (`COALESCE(NULLIF(?, ''), mentioned_at)` - the inverse order from
   `occurred_at`, whose existing extracted value always wins).
 - Legacy rows heal via a batched backfill inside the schema ensure functions
   (the `last_seen_at` precedent): rows with `mentioned_at` NULL are derived
@@ -53,8 +53,8 @@ Semantics and mechanics:
   accepts an event with `occurred_at` **or** `mentioned_at`, and still fails
   loud with neither. `occurred_at` stays event-time-only; the columns are
   never cross-assigned.
-- Deep selection keeps a residual skip for events with neither date — the
-  COA-410 no-deadlock property — now covering only legacy rows not yet healed
+- Deep selection keeps a residual skip for events with neither date - the
+  COA-410 no-deadlock property - now covering only legacy rows not yet healed
   and rows whose sources are missing or unparseable.
 - The retrieval windowing fallback becomes a three-rung ladder at every
   `as_of`/`event_after`/`event_before` site on both tiers, and in the
@@ -62,7 +62,7 @@ Semantics and mechanics:
   `COALESCE(NULLIF(occurred_at, ''), NULLIF(mentioned_at, ''), created_at)`.
 - The contract `LongTermFact` gains an optional `mentioned_at` field; the
   extraction model (`FactCandidate` in `src/vexic/models.py`) deliberately
-  does not — the extractor cannot be asked for a value the system derives.
+  does not - the extractor cannot be asked for a value the system derives.
 
 Options rejected: promoting undated events with no date at all (loses the
 temporal signal windowing needs and weakens the invariant for nothing), and
@@ -79,7 +79,7 @@ category-mutation machinery exists).
 - **Retroactive-dating semantic shift, all categories.** The windowing ladder
   carries no category predicate: any row with resolvable mention time now
   windows by it instead of ingest-time `created_at`. "Memory state at T"
-  becomes "mentioned at or before T". This is deliberate — mention time is
+  becomes "mentioned at or before T". This is deliberate - mention time is
   the honest upper bound for when knowledge entered the log, and `created_at`
   was simply wrong for replayed transcripts.
 - Same-day boundary loosening: a date-only `mentioned_at` passes any `<=`
@@ -88,9 +88,9 @@ category-mutation machinery exists).
 - Legacy databases heal on the next `init_db`; long-lived hosted containers
   heal on restart (the init memo runs the ensure once per process). Rows
   written by an older writer during a rolling-deploy overlap stay NULL until
-  then — transient, and the residual Deep filter keeps it deadlock-free.
+  then - transient, and the residual Deep filter keeps it deadlock-free.
 - Underivable rows (sources purged, timestamps garbage) keep `mentioned_at`
-  NULL and are rescanned by the backfill on each init — a benign no-op read.
+  NULL and are rescanned by the backfill on each init - a benign no-op read.
 - Additive contract field, no `CONTRACT_VERSION` bump (the `occurred_at`
   precedent). `export_scope` payloads omit `occurred_at` today and equally
   omit `mentioned_at`; stated here deliberately rather than inherited

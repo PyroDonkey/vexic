@@ -392,6 +392,18 @@ def import_canonical_migration(
         try:
             for table_name in CANONICAL_TABLES:
                 rows_imported += _insert_rows(conn, table_name, artifact.tables[table_name])
+
+            # ADR 0037: rows from a pre-mentioned_at artifact arrive NULL, and
+            # this process already memoized init_db for the target before the
+            # rows landed, so the ensure backfill will not run again here.
+            # Heal explicitly, inside the same transaction as the inserts, so
+            # a backfill failure rolls the whole import back instead of
+            # leaving durable half-backfilled rows with no projection repair
+            # or import-metadata record.
+            from vexic.storage.schema import _backfill_mentioned_at
+
+            _backfill_mentioned_at(conn, "memory_candidates")
+            _backfill_mentioned_at(conn, "long_term_memory")
         except BaseException:
             # The rollback must never replace the original failure: on a
             # deadline-poisoned remote connection the rollback round-trip
@@ -404,17 +416,6 @@ def import_canonical_migration(
             except Exception:
                 pass
             raise
-        conn.commit()
-
-        # ADR 0037: rows from a pre-mentioned_at artifact arrive NULL, and
-        # this process already memoized init_db for the target before the
-        # rows landed, so the ensure backfill will not run again here. Heal
-        # explicitly so imported undated events do not stay sunk in Tier 2
-        # until a process restart.
-        from vexic.storage.schema import _backfill_mentioned_at
-
-        _backfill_mentioned_at(conn, "memory_candidates")
-        _backfill_mentioned_at(conn, "long_term_memory")
         conn.commit()
 
     repair_report = repair_memory_projections(

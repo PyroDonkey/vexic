@@ -210,15 +210,21 @@ def _promote_candidate(
             "fact; refusing to skip a corrupt promotion state."
         )
 
-    if category == "event" and not occurred_at and not mentioned_at:
+    if (
+        category == "event"
+        and not (occurred_at or "").strip()
+        and not (mentioned_at or "").strip()
+    ):
         # Invariant 11 (as amended by ADR 0037): category "event" facts must
         # carry occurred_at or, failing that, the derived mentioned_at
         # provenance date. Fail loud here rather than write a dateless event to
         # Tier 3. Checked after the `promoted` skip above so a legacy
         # already-promoted event candidate (predating these columns) stays a
-        # benign idempotent no-op instead of raising on rerun. `not x` also
-        # treats "" as missing, matching the merge-side COALESCE(NULLIF(...))
-        # backfill semantics below.
+        # benign idempotent no-op instead of raising on rerun. `.strip()`
+        # treats "" and whitespace-only values as missing (same semantics as
+        # the Deep selection filter): a migrated or externally written
+        # blank-ish date is truthy but useless, and the NULLIF('')-based
+        # retrieval ladder downstream would treat it as a real temporal key.
         raise ValueError(
             f"Refusing to promote candidate {decision.candidate_id} with category "
             "'event' and no occurred_at or mentioned_at."

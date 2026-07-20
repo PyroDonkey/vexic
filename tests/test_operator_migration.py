@@ -672,6 +672,52 @@ class OperatorMigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({row[0] for row in candidate_dates}, {expected})
         self.assertEqual({row[0] for row in fact_dates}, {expected})
 
+    def test_import_rolls_back_entirely_when_backfill_fails(self) -> None:
+        # Greptile P1 regression: the post-import mentioned_at backfill must
+        # run inside the same explicit transaction as the row inserts. If it
+        # commits separately, a backfill failure leaves imported rows durable
+        # with no projection repair and no import-metadata record — a
+        # half-imported target that reports an error.
+        from unittest.mock import patch
+
+        from vexic.migration import import_canonical_migration
+        from vexic.storage.schema import init_vector_memory
+
+        payload = self._export_artifact_payload()
+        self.artifact.write_text(json.dumps(payload))
+
+        # Pre-initialize the target so the init memo is warm and the patched
+        # backfill is only reached through the import path, not through
+        # init_db's own ensure functions.
+        init_db(str(self.target_db))
+        init_vector_memory(str(self.target_db))
+
+        with patch(
+            "vexic.storage.schema._backfill_mentioned_at",
+            side_effect=ValueError("synthetic backfill failure"),
+        ):
+            with self.assertRaisesRegex(ValueError, "synthetic backfill failure"):
+                import_canonical_migration(
+                    self.artifact,
+                    str(self.target_db),
+                    tenant_id="tenant-a",
+                    project_id="project-a",
+                )
+
+        with closing(sqlite3.connect(self.target_db)) as conn:
+            message_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+            candidate_count = conn.execute(
+                "SELECT COUNT(*) FROM memory_candidates"
+            ).fetchone()[0]
+            fact_count = conn.execute(
+                "SELECT COUNT(*) FROM long_term_memory"
+            ).fetchone()[0]
+        self.assertEqual(
+            (message_count, candidate_count, fact_count),
+            (0, 0, 0),
+            "a failed import must leave no durable rows behind",
+        )
+
     def test_import_of_column_stripped_artifact_is_idempotent(self) -> None:
         from vexic.migration import import_canonical_migration
 
