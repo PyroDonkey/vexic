@@ -61,7 +61,7 @@ import json
 import statistics
 import sys
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -83,7 +83,9 @@ from vexic.pipeline import (  # noqa: E402
     _plausible_years,
     _single_intext_date,
     apply_occurred_at_guards,
+    keep_candidates_with_valid_source_ids,
     render_transcript,
+    rendered_message_ids,
 )
 from vexic.storage import load_messages_since  # noqa: E402
 
@@ -330,6 +332,49 @@ def _variant_transcript(rows: list[tuple[int, str | None, Any]], variant: str) -
     return render_transcript(rows) if variant == "treated" else render_transcript_unlabeled(rows)
 
 
+def _drop_out_of_window_candidates(
+    candidates: list[FactCandidate],
+    rows: list[tuple[int, str | None, Any]],
+) -> tuple[list[FactCandidate], int]:
+    """Mirror production's Light candidate drop (ADR 0031): keep only
+    candidates whose source_message_ids sit inside this window's rendered
+    evidence ids, using the same evidence-id computation the pipeline uses
+    (``rendered_message_ids``). Out-of-window-cited candidates never reach
+    Tier 2 in production, so scoring them here would skew the reported
+    fabrication rates against what actually ships.
+    """
+    evidence_ids = rendered_message_ids(rows)
+    return keep_candidates_with_valid_source_ids(candidates, evidence_ids)
+
+
+def _paired_variant_schedule(
+    n_repeats: int,
+    variants: Sequence[str],
+    budget_remaining: int,
+) -> list[tuple[int, str]]:
+    """Interleaved ``(repeat_idx, variant)`` call plan that fits within
+    ``budget_remaining``.
+
+    Each repeat runs every variant in order before the next repeat starts, and
+    the plan stops the moment the next call would exceed budget. This keeps the
+    variants paired under a tight cap: the old shape ran every baseline repeat
+    before any treated repeat, so a budget smaller than ``repeats * variants``
+    starved treated to zero while still counting ``repeats`` attempted treated
+    repeats. Here treated is never starved past a single-call asymmetry, and a
+    repeat a variant never reached is simply absent from the plan (so it is not
+    counted as attempted).
+    """
+    plan: list[tuple[int, str]] = []
+    remaining = budget_remaining
+    for repeat_idx in range(n_repeats):
+        for variant in variants:
+            if remaining <= 0:
+                return plan
+            plan.append((repeat_idx, variant))
+            remaining -= 1
+    return plan
+
+
 async def _run_agent(agent: Any, transcript: str, budget: ProviderBudget) -> list[FactCandidate]:
     budget.take()
     result = await agent.run(transcript)
@@ -352,13 +397,19 @@ async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
 
     candidate_records: list[dict[str, Any]] = []
     audit_records: list[dict[str, Any]] = []
+    attempted_repeats: dict[str, set[int]] = {variant: set() for variant in VARIANTS}
     budget_exhausted = False
 
     for job in jobs:
+        # Audit both variants first -- this consumes no budget and must be
+        # emitted for every window so plausible_years_by_window stays complete
+        # even for windows whose candidate generation was budget-truncated.
+        variant_ctx: dict[str, tuple[str, dict[int, str]]] = {}
         for variant in VARIANTS:
             transcript = _variant_transcript(job.rows, variant)
             plausible_years = sorted(_plausible_years(job.rows, transcript))
             message_lines = _line_by_message_id(job.rows, labeled=(variant == "treated"))
+            variant_ctx[variant] = (transcript, message_lines)
             audit_records.append(
                 {
                     "record_type": "window_transcript_hash",
@@ -371,41 +422,48 @@ async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
                     "plausible_years": plausible_years,
                 }
             )
-            if budget_exhausted:
-                continue
-            for repeat_idx in range(args.repeats):
-                if budget.remaining() <= 0:
-                    budget_exhausted = True
-                    break
-                raw_candidates = await _run_agent(agents[variant], transcript, budget)
-                guarded_candidates = [candidate.model_copy(deep=True) for candidate in raw_candidates]
-                apply_occurred_at_guards(guarded_candidates, job.rows, transcript)
-                for raw, guarded in zip(raw_candidates, guarded_candidates, strict=True):
-                    relative_reference_lines = [
-                        {"message_id": message_id, "text": message_lines[message_id]}
-                        for message_id in raw.source_message_ids
-                        if message_id in message_lines
-                        and _has_relative_reference(message_lines[message_id])
-                    ]
-                    record = {
-                        "window": job.window_key,
-                        "db": job.db,
-                        "variant": variant,
-                        "repeat": repeat_idx,
-                        "fact_text": raw.fact_text,
-                        "category": raw.category,
-                        "occurred_at_raw": raw.occurred_at,
-                        "occurred_at_guarded": guarded.occurred_at,
-                        "source_message_ids": list(raw.source_message_ids),
+        if budget_exhausted:
+            continue
+        # Interleave the variants per repeat so a tight budget cannot spend
+        # every call on baseline before treated runs at all. The plan is sized
+        # to the budget remaining at this window; a truncated plan means the
+        # cap is exhausted and no later window generates candidates.
+        plan = _paired_variant_schedule(args.repeats, VARIANTS, budget.remaining())
+        if len(plan) < args.repeats * len(VARIANTS):
+            budget_exhausted = True
+        for repeat_idx, variant in plan:
+            transcript, message_lines = variant_ctx[variant]
+            attempted_repeats[variant].add(repeat_idx)
+            raw_candidates = await _run_agent(agents[variant], transcript, budget)
+            raw_candidates, _dropped = _drop_out_of_window_candidates(raw_candidates, job.rows)
+            guarded_candidates = [candidate.model_copy(deep=True) for candidate in raw_candidates]
+            apply_occurred_at_guards(guarded_candidates, job.rows, transcript)
+            for raw, guarded in zip(raw_candidates, guarded_candidates, strict=True):
+                relative_reference_lines = [
+                    {"message_id": message_id, "text": message_lines[message_id]}
+                    for message_id in raw.source_message_ids
+                    if message_id in message_lines
+                    and _has_relative_reference(message_lines[message_id])
+                ]
+                record = {
+                    "window": job.window_key,
+                    "db": job.db,
+                    "variant": variant,
+                    "repeat": repeat_idx,
+                    "fact_text": raw.fact_text,
+                    "category": raw.category,
+                    "occurred_at_raw": raw.occurred_at,
+                    "occurred_at_guarded": guarded.occurred_at,
+                    "source_message_ids": list(raw.source_message_ids),
+                }
+                candidate_records.append(record)
+                audit_records.append(
+                    {
+                        "record_type": "candidate",
+                        **record,
+                        "relative_reference_lines": relative_reference_lines,
                     }
-                    candidate_records.append(record)
-                    audit_records.append(
-                        {
-                            "record_type": "candidate",
-                            **record,
-                            "relative_reference_lines": relative_reference_lines,
-                        }
-                    )
+                )
 
     metrics_document = _build_metrics_document(
         args=args,
@@ -414,6 +472,7 @@ async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
         audit_records=audit_records,
         budget=budget,
         budget_exhausted=budget_exhausted,
+        attempted_repeats={variant: len(seen) for variant, seen in attempted_repeats.items()},
     )
     return {"metrics_document": metrics_document, "audit_records": audit_records}
 
@@ -426,6 +485,7 @@ def _build_metrics_document(
     audit_records: list[dict[str, Any]],
     budget: ProviderBudget,
     budget_exhausted: bool,
+    attempted_repeats: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     variants_doc: dict[str, Any] = {}
     for variant in VARIANTS:
@@ -438,11 +498,18 @@ def _build_metrics_document(
         per_repeat: dict[int, list[dict[str, Any]]] = defaultdict(list)
         for record in variant_records:
             per_repeat[record["repeat"]].append(record)
-        # Iterate over every attempted repeat (range(args.repeats), bounded by
-        # budget truncation upstream), NOT sorted(per_repeat): a repeat that
-        # produced zero candidates must appear as a None-metric slot, not
-        # vanish and inflate the apparent denominator.
-        repeat_indices = range(args.repeats)
+        # Iterate over every repeat this variant actually attempted, NOT
+        # sorted(per_repeat): a repeat that produced zero candidates must appear
+        # as a None-metric slot, not vanish and inflate the apparent
+        # denominator. A budget-starved variant attempts fewer repeats than
+        # args.repeats (interleaved pairing upstream), so the attempted count is
+        # per-variant; it defaults to args.repeats when not supplied.
+        attempted = (
+            args.repeats
+            if attempted_repeats is None
+            else attempted_repeats.get(variant, 0)
+        )
+        repeat_indices = range(attempted)
 
         def _values(name: str) -> list[float | None]:
             if name == "fabricated_year_rate_raw":
@@ -486,7 +553,7 @@ def _build_metrics_document(
             "event_candidate_count": sum(
                 1 for record in variant_records if record["category"] == "event"
             ),
-            "repeats_attempted": args.repeats,
+            "repeats_attempted": attempted,
             "repeats_with_candidates": sum(1 for i in repeat_indices if per_repeat[i]),
             "metrics": metrics,
         }

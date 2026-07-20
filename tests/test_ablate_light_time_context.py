@@ -393,5 +393,117 @@ class FullDateFromPartialRateTests(unittest.TestCase):
         self.assertIsNone(self.module.full_date_from_partial_rate(records))
 
 
+class MirrorProductionCandidateDropTests(unittest.TestCase):
+    """3a: the ablation must mirror production's Light candidate drop
+    (keep_candidates_with_valid_source_ids over the window's rendered evidence
+    ids) so out-of-window-cited candidates do not skew reported metrics."""
+
+    def setUp(self) -> None:
+        self.module = _load_module()
+
+    def _candidate(self, fact_text: str, source_message_ids: list[int]):
+        from vexic.models import FactCandidate
+
+        return FactCandidate(
+            fact_text=fact_text,
+            subject="Ryan",
+            category="fact",
+            importance=5,
+            confidence=0.8,
+            source_message_ids=source_message_ids,
+        )
+
+    def test_drops_candidate_citing_out_of_window_id(self) -> None:
+        rows = [(1, None, user_message("hi")), (2, None, user_message("bye"))]
+        candidates = [
+            self._candidate("kept", [1]),
+            self._candidate("dropped", [99]),
+        ]
+        kept, dropped = self.module._drop_out_of_window_candidates(candidates, rows)
+        self.assertEqual([c.fact_text for c in kept], ["kept"])
+        self.assertEqual(dropped, 1)
+
+    def test_uses_rendered_evidence_ids_not_raw_ids(self) -> None:
+        # A candidate citing only a message that renders to no transcript line
+        # (no evidence id) is dropped, matching the pipeline's evidence-id gate.
+        rows = [(5, None, user_message("visible"))]
+        candidates = [self._candidate("miscited", [1])]
+        kept, dropped = self.module._drop_out_of_window_candidates(candidates, rows)
+        self.assertEqual(kept, [])
+        self.assertEqual(dropped, 1)
+
+
+class PairedVariantScheduleTests(unittest.TestCase):
+    """3b: under a tight budget the variants must interleave per repeat so one
+    does not starve the other, and per-variant attempted accounting must
+    reflect what actually ran."""
+
+    def setUp(self) -> None:
+        self.module = _load_module()
+
+    def test_full_budget_runs_every_repeat_variant(self) -> None:
+        plan = self.module._paired_variant_schedule(2, ("baseline", "treated"), 10)
+        self.assertEqual(
+            plan,
+            [(0, "baseline"), (0, "treated"), (1, "baseline"), (1, "treated")],
+        )
+
+    def test_tight_budget_interleaves_and_does_not_starve_treated(self) -> None:
+        # Budget 3 < repeats(3) * variants(2) = 6. The old shape ran all
+        # baseline repeats first, starving treated to zero; interleaving gives
+        # treated repeat 0 and stops before an unpaired treated repeat 1.
+        plan = self.module._paired_variant_schedule(3, ("baseline", "treated"), 3)
+        self.assertEqual(plan, [(0, "baseline"), (0, "treated"), (1, "baseline")])
+        baseline_repeats = {repeat for repeat, variant in plan if variant == "baseline"}
+        treated_repeats = {repeat for repeat, variant in plan if variant == "treated"}
+        self.assertEqual(baseline_repeats, {0, 1})
+        self.assertEqual(treated_repeats, {0})
+
+    def test_zero_budget_plans_nothing(self) -> None:
+        self.assertEqual(
+            self.module._paired_variant_schedule(3, ("baseline", "treated"), 0), []
+        )
+
+    def test_metrics_attempted_reflects_per_variant_count(self) -> None:
+        # treated was budget-starved to 1 attempted repeat; baseline got 2.
+        # repeats_attempted and the per_repeat slot count must reflect that,
+        # not args.repeats.
+        class _Args:
+            db = ["db.sqlite"]
+            model_group = "extraction"
+            repeats = 3
+            max_windows = 1
+            max_provider_calls = 3
+
+        audit_records = [
+            {
+                "record_type": "window_transcript_hash",
+                "window": "w1",
+                "variant": variant,
+                "plausible_years": [2022, 2023, 2024],
+            }
+            for variant in ("treated", "baseline")
+        ]
+        doc = self.module._build_metrics_document(
+            args=_Args(),
+            jobs=[object()],
+            candidate_records=[],
+            audit_records=audit_records,
+            budget=self.module.ProviderBudget(3),
+            budget_exhausted=True,
+            attempted_repeats={"baseline": 2, "treated": 1},
+        )
+        self.assertEqual(doc["variants"]["baseline"]["repeats_attempted"], 2)
+        self.assertEqual(doc["variants"]["treated"]["repeats_attempted"], 1)
+        self.assertEqual(
+            len(doc["variants"]["treated"]["metrics"]["dated_event_rate"]["per_repeat"]),
+            1,
+        )
+        self.assertEqual(
+            len(doc["variants"]["baseline"]["metrics"]["dated_event_rate"]["per_repeat"]),
+            2,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
