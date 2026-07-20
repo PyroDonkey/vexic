@@ -6,9 +6,14 @@ contradiction judging, query rewriting) plus the retrieval-side fact view.
 
 from __future__ import annotations
 
+import re
+from datetime import date
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+_OCCURRED_AT_RE = re.compile(r"\d{4}(-\d{2}(-\d{2})?)?")
 
 
 class FactCandidate(BaseModel):
@@ -32,6 +37,23 @@ class FactCandidate(BaseModel):
     source_message_ids: list[int] = Field(default_factory=list)
     editable: bool = True
     occurred_at: str | None = None
+
+    @field_validator("occurred_at", mode="before")
+    @classmethod
+    def _occurred_at_partial_iso_or_none(cls, value: object) -> str | None:
+        # Fail-safe, mirroring storage._normalized_date: a malformed date must
+        # never drop the candidate; it degrades to undated (ADR 0037 sink).
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text or not _OCCURRED_AT_RE.fullmatch(text):
+            return None
+        parts = [int(p) for p in text.split("-")]
+        try:
+            date(parts[0], parts[1] if len(parts) > 1 else 1, parts[2] if len(parts) > 2 else 1)
+        except ValueError:
+            return None
+        return text
 
 
 class ContradictionJudgment(BaseModel):

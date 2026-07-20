@@ -1520,7 +1520,7 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                         importance=6,
                         confidence=0.9,
                         source_message_ids=[1],
-                        occurred_at="2026-07-05T00:00:00Z",
+                        occurred_at="2026-07-05",
                     )
                 ],
                 candidate_embeddings=[_unit_vector(1.0)],
@@ -1548,7 +1548,7 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
                 ).fetchone()
 
         self.assertEqual(category, "event")
-        self.assertEqual(occurred_at, "2026-07-05T00:00:00Z")
+        self.assertEqual(occurred_at, "2026-07-05")
 
     def test_deep_commit_promotes_event_candidate_via_mentioned_at(self) -> None:
         # ADR 0037: an undated event whose source messages carry timestamps
@@ -2734,6 +2734,37 @@ class RenderTranscriptObservedTimeTests(unittest.TestCase):
     def test_rendered_message_ids_unchanged_semantics(self) -> None:
         rows = [(7, "2023-11-17T09:30:00+00:00", user_message("hello"))]
         self.assertEqual(rendered_message_ids(rows), [7])
+
+
+class FactCandidateOccurredAtValidatorTests(unittest.TestCase):
+    """FactCandidate.occurred_at validator accepts YYYY, YYYY-MM, YYYY-MM-DD
+    with real calendar values, strips whitespace, and degrades junk to None
+    (fail-safe; never drop a candidate for a bad date)."""
+
+    def test_occurred_at_validator_accepts_partial_iso_and_nulls_junk(self) -> None:
+        test_cases = [
+            ("2023-11-17", "2023-11-17"),
+            ("2023-11", "2023-11"),
+            ("2023", "2023"),
+            ("  2023-11 ", "2023-11"),
+            ("", None),
+            ("   ", None),
+            ("March 2023", None),
+            ("2023-13", None),
+            ("2023-02-30", None),
+            ("2023-11-17T09:00:00", None),
+        ]
+        for raw, expected in test_cases:
+            with self.subTest(raw=raw):
+                c = FactCandidate(
+                    fact_text="x",
+                    subject="user",
+                    category="event",
+                    importance=5,
+                    confidence=0.9,
+                    occurred_at=raw,
+                )
+                self.assertEqual(c.occurred_at, expected)
 
 
 if __name__ == "__main__":
