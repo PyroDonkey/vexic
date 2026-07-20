@@ -131,8 +131,9 @@ risk).
   `tests/test_memory_reliability.py`; storage runs `test_storage_conformance.py`
   plus `test_storage_*`; boundary runs `test_public_boundary.py`,
   `test_package_manager_policy.py`, `test_schema_ownership.py`.
-- Do not run the live provider harnesses (`vexic.live_retrieval_baseline`, `scripts/ablate_light_time_context.py`);
-  both are opt-in behind `--allow-live` with provider-call budget caps. Out of scope.
+- Do not run the live provider harnesses (`vexic.live_retrieval_baseline`,
+  `scripts/ablate_light_time_context.py`, `scripts/ablate_extraction_prompts.py`);
+  all are opt-in behind `--allow-live` with provider-call budget caps. Out of scope.
 - Hook awareness: Claude runtime hooks are local-only and are not committed.
   `scripts/check_doc_drift.py --ci` is the committed doc-drift gate: ADR-index
   and service-surface parity, plus path, CLI, ADR-id, test-count, and
