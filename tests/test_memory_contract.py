@@ -435,6 +435,7 @@ class MemoryContractModelTests(unittest.TestCase):
             created_at="2026-06-18T18:00:00Z",
             retrieved_count=3,
             used_count=2,
+            mentioned_at="2026-06-18",
         )
         note = CandidateNote(
             candidate_id=11,
