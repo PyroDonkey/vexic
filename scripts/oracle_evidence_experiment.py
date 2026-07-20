@@ -607,16 +607,39 @@ def build_headroom(
                 break
 
     reachable_set = set(set_completeness)
-    derivation_needed = [qid for qid in combined if qid not in reachable_set]
     n = len(results)
 
     def rate(subset: list[str]) -> float | None:
         return len(subset) / n if n else None
 
-    # Answer derivable from current Tier-3 by neither widening retrieval nor the
-    # judge given complete evidence, and evidence IS complete -> a genuine
-    # answer-time derivation ceiling (distinct from upstream_extraction_gap).
-    reached = reachable_set | set(combined)
+    # Split "oracle passes but no widened k does" by whether retrieval could even
+    # surface the full set in the tested k range: if the widest k captures every
+    # constituent yet the judge still misses, an answer-time fold over the
+    # assembled set is the gap (derivation); if the widest k never captures the
+    # set, the fact ranks beyond tested k -- a retrieval-depth limit, not
+    # derivation. Uses the deterministic capture, not another judge call.
+    widest_k = str(max(SWEEP_K_VALUES))
+
+    def full_capture(result: dict[str, Any]) -> bool:
+        return result.get("capture", {}).get(widest_k, {}).get("fraction") == 1.0
+
+    combined_set = set(combined)
+    derivation_needed = [
+        qid
+        for qid in combined
+        if qid not in reachable_set
+        and full_capture(next(r for r in results if r["question_id"] == qid))
+    ]
+    retrieval_depth_limited = [
+        qid
+        for qid in combined
+        if qid not in reachable_set
+        and not full_capture(next(r for r in results if r["question_id"] == qid))
+    ]
+
+    # Complete evidence, but neither widening nor the judge-with-oracle passes:
+    # a genuine answer-time derivation ceiling (distinct from upstream gaps).
+    reached = reachable_set | combined_set
     derivation_ceiling = [
         r["question_id"]
         for r in results
@@ -631,6 +654,7 @@ def build_headroom(
         "baseline_rejudge_pass": baseline_rejudge,
         "combined_ceiling": combined,
         "derivation_needed": derivation_needed,
+        "retrieval_depth_limited": retrieval_depth_limited,
         "derivation_ceiling_complete_evidence": derivation_ceiling,
         "upstream_extraction_gap": upstream_gap,
         "nonmonotonic_regressions": regressions,
@@ -639,6 +663,7 @@ def build_headroom(
             "set_completeness_reachable": rate(set_completeness),
             "combined_ceiling": rate(combined),
             "derivation_needed": rate(derivation_needed),
+            "retrieval_depth_limited": rate(retrieval_depth_limited),
             "upstream_extraction_gap": rate(upstream_gap),
         },
     }
