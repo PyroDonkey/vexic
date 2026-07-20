@@ -651,6 +651,29 @@ class OracleFixtureTests(TestCase):
         self.assertEqual(headroom["derivation_ceiling_complete_evidence"], [])
         self.assertEqual(headroom["combined_ceiling"], [])
 
+    def test_build_headroom_no_widened_signal_not_derivation_or_depth(self) -> None:
+        # Oracle passes, but every widened (k>5) sweep errored -> no graded
+        # widened data. Must NOT be labeled derivation_needed or
+        # retrieval_depth_limited from capture alone (Greptile P1 follow-up).
+        result = {
+            "question_id": "qX",
+            "oracle_complete": True,
+            "oracle": {"pass_fraction": 1.0},
+            "sweep": {
+                "5": {"pass_fraction": 0.0},
+                "8": {"pass_fraction": None},
+                "10": {"pass_fraction": None},
+                "15": {"pass_fraction": None},
+            },
+            "capture": {"15": {"fraction": 1.0}},
+            "pool_ceiling": [],
+        }
+        headroom = oee.build_headroom([result])
+        self.assertEqual(headroom["no_widened_signal"], ["qX"])
+        self.assertEqual(headroom["derivation_needed"], [])
+        self.assertEqual(headroom["retrieval_depth_limited"], [])
+        self.assertIn("qX", headroom["combined_ceiling"])  # oracle still graded
+
     def test_render_table_all_error_condition_not_selected_as_best_k(self) -> None:
         result = {
             "question_id": "qX",

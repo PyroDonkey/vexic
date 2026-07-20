@@ -625,22 +625,36 @@ def build_headroom(
     # set, the fact ranks beyond tested k -- a retrieval-depth limit, not
     # derivation. Uses the deterministic capture, not another judge call.
     widest_k = str(max(SWEEP_K_VALUES))
+    by_id = {r["question_id"]: r for r in results}
 
     def full_capture(result: dict[str, Any]) -> bool:
         return result.get("capture", {}).get(widest_k, {}).get("fraction") == 1.0
 
+    def has_graded_widened_sweep(result: dict[str, Any]) -> bool:
+        # At least one widened (k>RETURN_K) condition produced a real verdict.
+        return any(
+            frac is not None
+            for k, frac in _sweep_pass_fractions(result)
+            if k > RETURN_K
+        )
+
     combined_set = set(combined)
+    # A question the oracle passed but no widened k graded (every widened repeat
+    # errored) has no evidence either way: assigning derivation vs retrieval-depth
+    # from capture alone would turn unavailable judge data into a substantive
+    # result, so it is held out in no_widened_signal instead.
+    unreached = [qid for qid in combined if qid not in reachable_set]
+    no_widened_signal = [
+        qid for qid in unreached if not has_graded_widened_sweep(by_id[qid])
+    ]
+    graded_unreached = [
+        qid for qid in unreached if has_graded_widened_sweep(by_id[qid])
+    ]
     derivation_needed = [
-        qid
-        for qid in combined
-        if qid not in reachable_set
-        and full_capture(next(r for r in results if r["question_id"] == qid))
+        qid for qid in graded_unreached if full_capture(by_id[qid])
     ]
     retrieval_depth_limited = [
-        qid
-        for qid in combined
-        if qid not in reachable_set
-        and not full_capture(next(r for r in results if r["question_id"] == qid))
+        qid for qid in graded_unreached if not full_capture(by_id[qid])
     ]
 
     # Complete evidence, a graded oracle signal, but neither widening nor the
@@ -664,6 +678,7 @@ def build_headroom(
         "combined_ceiling": combined,
         "derivation_needed": derivation_needed,
         "retrieval_depth_limited": retrieval_depth_limited,
+        "no_widened_signal": no_widened_signal,
         "derivation_ceiling_complete_evidence": derivation_ceiling,
         "upstream_extraction_gap": upstream_gap,
         "no_oracle_signal": no_oracle_signal,
