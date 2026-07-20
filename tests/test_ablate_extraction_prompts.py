@@ -122,6 +122,14 @@ class BuildConditionInstructionsTests(unittest.TestCase):
         with self.assertRaises(self.module.AblationConfigError):
             self.module.build_condition_instructions("control", doctored)
 
+    def test_runtime_guard_rejects_excluded_sentence_in_built_condition(self) -> None:
+        # Not just test-pinned: build_condition_instructions itself must fail
+        # loudly if the excluded promotion sentence would ship in any built
+        # condition (e.g. a future base prompt absorbs it).
+        doctored = self.base + "\n" + self.module.EXCLUDED_PROMOTION_SENTENCE
+        with self.assertRaises(self.module.AblationConfigError):
+            self.module.build_condition_instructions("G", doctored)
+
     def test_live_drift_guard_real_base_contains_neither_addition(self) -> None:
         # Pins the additions against real adapter text: if a future prompt edit
         # ships either paragraph, the guard would fire in production, so this
@@ -343,7 +351,8 @@ class BuildMetricsDocumentTests(unittest.TestCase):
             "db": "db.sqlite",
             "fact_text": fact_text,
             "category": "fact",
-            "occurred_at": None,
+            "occurred_at_raw": None,
+            "occurred_at_guarded": None,
             "source_message_ids": [1],
             "target_ids": [],
         }
@@ -447,10 +456,12 @@ class BuildMetricsDocumentTests(unittest.TestCase):
         self.assertEqual(volume["raw"]["total"], 7)
         self.assertEqual(volume["dropped_out_of_window_total"], 1)
 
-    def test_token_totals_skip_missing_usage_but_count_calls(self) -> None:
+    def test_token_accounting_is_per_field_when_usage_partially_missing(self) -> None:
+        # A call reporting only one side of usage must not skew the other
+        # side's mean: each field carries its own denominator.
         bindings = {"t1": self._binding("t1", ["w0"], (("rachel",),))}
         call_records = [
-            self._call("control", 0, "w0", kept=1, raw=1, dropped=0, itok=10, otok=4),
+            self._call("control", 0, "w0", kept=1, raw=1, dropped=0, itok=10, otok=None),
             self._call("control", 1, "w0", kept=1, raw=1, dropped=0, itok=30, otok=6),
             self._call("control", 2, "w0", kept=0, raw=0, dropped=0, itok=None, otok=None),
         ]
@@ -467,10 +478,37 @@ class BuildMetricsDocumentTests(unittest.TestCase):
         )
         tokens = doc["conditions"]["control"]["tokens"]
         self.assertEqual(tokens["calls_total"], 3)
-        self.assertEqual(tokens["calls_with_usage"], 2)
+        self.assertEqual(tokens["calls_with_input"], 2)
+        self.assertEqual(tokens["calls_with_output"], 1)
         self.assertEqual(tokens["input_total"], 40)
-        self.assertEqual(tokens["output_total"], 10)
+        self.assertEqual(tokens["output_total"], 6)
         self.assertEqual(tokens["input_mean_per_call"], 20.0)
+        self.assertEqual(tokens["output_mean_per_call"], 6.0)
+
+    def test_token_totals_none_not_zero_when_no_call_reports_usage(self) -> None:
+        bindings = {"t1": self._binding("t1", ["w0"], (("rachel",),))}
+        call_records = [
+            self._call("control", 0, "w0", kept=1, raw=1, dropped=0, itok=None, otok=None),
+        ]
+        attempts = {c: {} for c in self.module.CONDITIONS}
+        attempts["control"] = {"w0": [0]}
+        doc = self.module._build_metrics_document(
+            args=self._args(repeats=1),
+            bindings=bindings,
+            candidate_records=[],
+            call_records=call_records,
+            attempts=attempts,
+            budget=self.module.ProviderBudget(100),
+            budget_exhausted=False,
+        )
+        tokens = doc["conditions"]["control"]["tokens"]
+        self.assertEqual(tokens["calls_total"], 1)
+        self.assertEqual(tokens["calls_with_input"], 0)
+        self.assertEqual(tokens["calls_with_output"], 0)
+        self.assertIsNone(tokens["input_total"])
+        self.assertIsNone(tokens["output_total"])
+        self.assertIsNone(tokens["input_mean_per_call"])
+        self.assertIsNone(tokens["output_mean_per_call"])
 
     def test_multi_window_bound_target_hits_if_any_bound_window_hits(self) -> None:
         bindings = {
@@ -497,6 +535,32 @@ class BuildMetricsDocumentTests(unittest.TestCase):
         per_target = doc["conditions"]["control"]["per_target"]["t1"]
         self.assertEqual(per_target["per_repeat_hits"], [True])
         self.assertTrue(doc["bindings"]["t1"]["multi_match"])
+
+    def test_multi_window_repeat_null_when_any_bound_window_unattempted(self) -> None:
+        # A repeat counts as attempted for a target only when EVERY bound
+        # window ran it. Budget truncation that reached wA but not wB leaves
+        # the panel incomplete: null, never a false miss.
+        bindings = {
+            "t1": self._binding(
+                "t1", ["wA", "wB"], (("admon",), ("sunday",)), multi_match=True
+            )
+        }
+        candidate_records = [self._cand("control", 0, "wA", "admon on monday")]
+        attempts = {c: {} for c in self.module.CONDITIONS}
+        attempts["control"] = {"wA": [0]}
+        doc = self.module._build_metrics_document(
+            args=self._args(repeats=1),
+            bindings=bindings,
+            candidate_records=candidate_records,
+            call_records=[],
+            attempts=attempts,
+            budget=self.module.ProviderBudget(100),
+            budget_exhausted=True,
+        )
+        per_target = doc["conditions"]["control"]["per_target"]["t1"]
+        self.assertEqual(per_target["per_repeat_hits"], [None])
+        self.assertEqual(per_target["repeats_attempted"], 0)
+        self.assertIsNone(per_target["hit_rate"])
 
 
 if __name__ == "__main__":

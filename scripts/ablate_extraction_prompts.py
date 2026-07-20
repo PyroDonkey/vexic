@@ -78,6 +78,7 @@ from adapters.openrouter_live_adapter import (  # noqa: E402
 from vexic.models import FactCandidate  # noqa: E402
 from vexic.pipeline import (  # noqa: E402
     LIGHT_PHASE_BATCH_SIZE,
+    apply_occurred_at_guards,
     keep_candidates_with_valid_source_ids,
     render_transcript,
     rendered_message_ids,
@@ -173,13 +174,22 @@ def build_condition_instructions(
             "the shipped prompt has drifted to include this experiment text."
         )
     if condition == "control":
-        return base
-    if condition == "G":
-        return base + G_ADDITION
-    if condition == "U":
-        return base + U_ADDITION
-    # "G+U": canonical order is base, then G, then U.
-    return base + G_ADDITION + U_ADDITION
+        built = base
+    elif condition == "G":
+        built = base + G_ADDITION
+    elif condition == "U":
+        built = base + U_ADDITION
+    else:
+        # "G+U": canonical order is base, then G, then U.
+        built = base + G_ADDITION + U_ADDITION
+    # Runtime twin of the test pin: the COA-411 promotion sentence must never
+    # ship in any built condition, even if a future base prompt absorbs it.
+    if normalize(EXCLUDED_PROMOTION_SENTENCE) in normalize(built):
+        raise AblationConfigError(
+            "the excluded promotion-policy sentence is present in the built "
+            f"{condition!r} instructions; it must never ship in any condition."
+        )
+    return built
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +243,7 @@ TARGETS: tuple[Target, ...] = (
     ),
     Target(
         target_id="7161e7e2",
-        window_locators=("agents names below:admon magdy ehab sara mostafa nemr adam",),
+        window_locators=("admon magdy ehab sara mostafa nemr adam",),
         rubric=(("admon",), ("sunday",)),
     ),
 )
@@ -526,7 +536,17 @@ async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
                     "output_tokens": output_tokens,
                 }
             )
-            for candidate in kept_candidates:
+            # Production parity: run_light_phase applies the occurred_at
+            # guards before persisting, so the audit records both the model's
+            # raw value and what would actually reach Tier 2. Hit scoring uses
+            # fact_text only; the guards never touch it.
+            guarded_candidates = [
+                candidate.model_copy(deep=True) for candidate in kept_candidates
+            ]
+            apply_occurred_at_guards(guarded_candidates, window.rows, window.transcript)
+            for candidate, guarded in zip(
+                kept_candidates, guarded_candidates, strict=True
+            ):
                 record = {
                     "condition": condition,
                     "repeat": repeat_idx,
@@ -535,7 +555,8 @@ async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
                     "target_ids": targets_by_window[window.key],
                     "fact_text": candidate.fact_text,
                     "category": candidate.category,
-                    "occurred_at": candidate.occurred_at,
+                    "occurred_at_raw": candidate.occurred_at,
+                    "occurred_at_guarded": guarded.occurred_at,
                     "source_message_ids": list(candidate.source_message_ids),
                 }
                 candidate_records.append(record)
@@ -598,9 +619,19 @@ def _build_metrics_document(
         # per_repeat_hits_by_target[target][repeat] -> True/False/None
         per_repeat_hits_by_target: dict[str, list[bool | None]] = {}
         for target_id, binding in bindings.items():
-            attempted_repeats: set[int] = set()
+            # A repeat counts as attempted for a target only when EVERY bound
+            # window ran it (intersection, not union): a budget-truncated
+            # panel is incomplete evidence and must score null, never a false
+            # miss from the windows that happened to run.
+            attempted_repeats: set[int] | None = None
             for window_key in binding.windows:
-                attempted_repeats.update(cond_attempts.get(window_key, []))
+                window_repeats = set(cond_attempts.get(window_key, []))
+                attempted_repeats = (
+                    window_repeats
+                    if attempted_repeats is None
+                    else attempted_repeats & window_repeats
+                )
+            attempted_repeats = attempted_repeats or set()
             per_repeat_hits: list[bool | None] = []
             for repeat in range(args.repeats):
                 if repeat not in attempted_repeats:
@@ -656,29 +687,26 @@ def _build_metrics_document(
         }
 
         # --- token cost ----------------------------------------------------
-        calls_total = len(cond_calls)
-        with_usage = [
-            r
-            for r in cond_calls
-            if r.get("input_tokens") is not None or r.get("output_tokens") is not None
-        ]
-        input_total = sum(
+        # Per-field accounting: a call reporting only one side of usage must
+        # not skew the other side's mean, so each field carries its own
+        # denominator, and a field nobody reported is None, never 0.
+        input_values = [
             r["input_tokens"] for r in cond_calls if r.get("input_tokens") is not None
-        )
-        output_total = sum(
+        ]
+        output_values = [
             r["output_tokens"] for r in cond_calls if r.get("output_tokens") is not None
-        )
-        calls_with_usage = len(with_usage)
+        ]
         tokens = {
-            "input_total": input_total,
-            "output_total": output_total,
-            "calls_total": calls_total,
-            "calls_with_usage": calls_with_usage,
-            "input_mean_per_call": (input_total / calls_with_usage)
-            if calls_with_usage
+            "calls_total": len(cond_calls),
+            "calls_with_input": len(input_values),
+            "calls_with_output": len(output_values),
+            "input_total": sum(input_values) if input_values else None,
+            "output_total": sum(output_values) if output_values else None,
+            "input_mean_per_call": statistics.fmean(input_values)
+            if input_values
             else None,
-            "output_mean_per_call": (output_total / calls_with_usage)
-            if calls_with_usage
+            "output_mean_per_call": statistics.fmean(output_values)
+            if output_values
             else None,
         }
 
