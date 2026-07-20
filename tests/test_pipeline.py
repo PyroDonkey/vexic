@@ -3184,6 +3184,24 @@ class OccurredAtGuardTests(unittest.TestCase):
         apply_occurred_at_guards([c], _rows_nov_2023(), "...")
         self.assertEqual(c.fact_text, "User: hi")
 
+    def test_guard_strips_marker_with_whitespace_around_equals(self) -> None:
+        # An extractor that reformats the label with spaces around '='
+        # ("message_id = 3", "observed = ...") must not slip the scaffolding
+        # past the strip -- bracketed and bare forms both tolerate the spaces.
+        bracketed = _event_candidate(
+            fact_text="[message_id = 3 observed = 2023-11-17 Fri] User prefers uv",
+            occurred_at=None,
+            category="preference",
+        )
+        bare = _event_candidate(
+            fact_text="observed = 2023-11-17 Fri User ran the race",
+            occurred_at=None,
+        )
+        apply_occurred_at_guards([bracketed, bare], _rows_nov_2023(), "...")
+        self.assertEqual(bracketed.fact_text, "User prefers uv")
+        self.assertEqual(bare.fact_text, "User ran the race")
+        self.assertIsNone(bare.occurred_at)
+
 
 if __name__ == "__main__":
     unittest.main()

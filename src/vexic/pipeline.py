@@ -49,12 +49,14 @@ from vexic.usage import UsageSummary, summarize_agent_usage
 LIGHT_PHASE_BATCH_SIZE = 50
 _LOCAL_EMBEDDER = embed_texts
 
-_MARKER_RE = re.compile(r"\[\s*message_id=\d+[^\]]*\]")
+_MARKER_RE = re.compile(r"\[\s*message_id\s*=\s*\d+[^\]]*\]")
 # Bare (unbracketed) observed=YYYY-MM-DD Day echo -- the exact label body
 # _observed_label emits. Stripped so an extractor that copies the label
 # without its brackets cannot leave the token in fact_text/subject or have its
-# date misread as an in-text event date.
-_OBSERVED_TOKEN_RE = re.compile(r"observed=\d{4}-\d{2}-\d{2}\s+\w{3}\b")
+# date misread as an in-text event date. Whitespace around ``=`` is tolerated
+# in both patterns: an extractor that reformats the label (``message_id = 3``,
+# ``observed = 2023-11-17``) must not slip the scaffolding past the strip.
+_OBSERVED_TOKEN_RE = re.compile(r"observed\s*=\s*\d{4}-\d{2}-\d{2}\s+\w{3}\b")
 _YEAR_RE = re.compile(r"\b(1\d{3}|20\d{2})\b")
 _ISO_FULL_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
 _ISO_YM_RE = re.compile(r"\b(\d{4})-(\d{2})\b(?!-)")
