@@ -199,6 +199,13 @@ class RubricHitTests(unittest.TestCase):
             self.module.rubric_hit(["pre-approved for $400,000"], (("400,000",),))
         )
 
+    def test_digit_edged_tokens_do_not_match_decimal_continuations(self) -> None:
+        # "$5.50" is a different amount than "$5"; "400,000.75" than "400,000".
+        self.assertFalse(self.module.rubric_hit(["a $5.50 latte"], (("$5",),)))
+        self.assertFalse(
+            self.module.rubric_hit(["exactly $400,000.75 owed"], (("400,000",),))
+        )
+
     def test_alpha_stem_tokens_keep_prefix_matching(self) -> None:
         # Stem tokens are intentional (score.py semantics): "suburb" matches
         # "suburbs", "pre-approv" matches "pre-approved", "sunday" matches
@@ -395,6 +402,32 @@ class GlobalPairedScheduleTests(unittest.TestCase):
         )
 
 
+class UserMessageTextsTests(unittest.TestCase):
+    """Locator binding sees USER messages only: an assistant echo of the
+    answer-bearing phrasing must not bind a window."""
+
+    def setUp(self) -> None:
+        self.module = _load_module()
+
+    @staticmethod
+    def _assistant_message(text: str):
+        from pydantic_ai.messages import ModelResponse, TextPart
+
+        return ModelResponse(parts=[TextPart(content=text)])
+
+    def test_returns_normalized_user_texts_only(self) -> None:
+        rows = [
+            (1, None, user_message("Rachel  MOVED to the suburb")),
+            (2, None, self._assistant_message("rachel moved to the suburb")),
+        ]
+        texts = self.module._user_message_texts(rows)
+        self.assertEqual(texts, ["rachel moved to the suburb"])
+
+    def test_no_user_messages_yields_empty(self) -> None:
+        rows = [(1, None, self._assistant_message("only assistant text"))]
+        self.assertEqual(self.module._user_message_texts(rows), [])
+
+
 class WindowSlicingTests(unittest.TestCase):
     """Windows are delimited by the persisted dream_runs Light watermarks, not
     by uniform LIGHT_PHASE_BATCH_SIZE chunks: production ran Light per
@@ -454,6 +487,21 @@ class ValidateDbsTests(unittest.TestCase):
             name = os.path.basename(handle.name)
             with self.assertRaises(self.module.AblationConfigError):
                 self.module._validate_dbs([name, f"./{name}"])
+
+    def test_hardlinked_duplicate_paths_are_a_config_error(self) -> None:
+        # A hard link is the same physical DB under a different resolved path;
+        # dedupe must key on identity (device, inode), not path spelling.
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            original = os.path.join(tmp, "a.db")
+            link = os.path.join(tmp, "b.db")
+            with open(original, "w") as handle:
+                handle.write("")
+            os.link(original, link)
+            with self.assertRaises(self.module.AblationConfigError):
+                self.module._validate_dbs([original, link])
 
 
 class BuildMetricsDocumentTests(unittest.TestCase):

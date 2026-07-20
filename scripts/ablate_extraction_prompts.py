@@ -78,6 +78,8 @@ from adapters.openrouter_live_adapter import (  # noqa: E402
     _agent as _build_agent,
     build_extraction_agent,
 )
+from pydantic_ai.messages import ModelRequest, UserPromptPart  # noqa: E402
+
 from vexic.models import FactCandidate  # noqa: E402
 from vexic.pipeline import (  # noqa: E402
     apply_occurred_at_guards,
@@ -259,13 +261,14 @@ def _token_in(norm_text: str, token: str) -> bool:
     Alpha tokens keep plain substring (stem) semantics -- "suburb" matches
     "suburbs", "pre-approv" matches "pre-approved" -- but a token that starts
     or ends with a digit must not match inside a larger number: "$5" must not
-    hit "$50", "3 times a week" must not hit "13 times a week", and "400,000"
-    must not hit "$1,400,000" (digit-comma prefix)."""
+    hit "$50" or "$5.50", "3 times a week" must not hit "13 times a week", and
+    "400,000" must not hit "$1,400,000" (digit-comma prefix) or "$400,000.75"
+    (decimal continuation)."""
     pattern = re.escape(token)
     if token[0].isdigit():
-        pattern = r"(?<!\d)(?<!\d,)" + pattern
+        pattern = r"(?<!\d)(?<!\d,)(?<!\d\.)" + pattern
     if token[-1].isdigit():
-        pattern = pattern + r"(?!\d)(?!,\d)"
+        pattern = pattern + r"(?!\d)(?!,\d)(?!\.\d)"
     return re.search(pattern, norm_text) is not None
 
 
@@ -284,7 +287,7 @@ def rubric_hit(fact_texts: Sequence[str], rubric: tuple[tuple[str, ...], ...]) -
 class Window:
     """One reconstructed Light window: the exact rows Light saw, plus the
     single shared rendered transcript (all four conditions see this) and the
-    per-message normalized renders used for locator binding."""
+    normalized USER-message texts used for locator binding."""
 
     db: str
     key: str
@@ -474,6 +477,24 @@ def _slice_rows_by_boundaries(
     return slices
 
 
+def _user_message_texts(rows: list[tuple[int, str | None, Any]]) -> list[str]:
+    """Normalized text of each USER message in the window. Locators are drawn
+    from answer-bearing user turns, so binding must not see assistant text --
+    an assistant echo of the phrasing in another window must not bind it."""
+    texts: list[str] = []
+    for _message_id, _timestamp, msg in rows:
+        if not isinstance(msg, ModelRequest):
+            continue
+        parts = [
+            part.content
+            for part in msg.parts
+            if isinstance(part, UserPromptPart) and isinstance(part.content, str)
+        ]
+        if parts:
+            texts.append(normalize(" ".join(parts)))
+    return texts
+
+
 def _collect_windows(dbs: list[str]) -> list[Window]:
     """Reconstruct every persisted Light window of every DB: load the shared
     scope history with production's ``onboarding:`` exclusion, then slice it at
@@ -501,9 +522,7 @@ def _collect_windows(dbs: list[str]) -> list[Window]:
                     rows=window_rows,
                     transcript=transcript,
                     normalized=normalize(transcript),
-                    normalized_messages=[
-                        normalize(render_transcript([row])) for row in window_rows
-                    ],
+                    normalized_messages=_user_message_texts(window_rows),
                 )
             )
     return windows
@@ -921,18 +940,22 @@ def _require(value: str | None, name: str) -> str:
 def _validate_dbs(dbs: list[str]) -> None:
     if not dbs:
         raise AblationConfigError("--db is required (repeatable).")
-    seen: dict[Path, str] = {}
+    seen: dict[tuple[int, int], str] = {}
     for db in dbs:
-        if not Path(db).exists():
+        path = Path(db)
+        if not path.exists():
             raise AblationConfigError(f"--db not found: {db}")
-        resolved = Path(db).resolve()
-        if resolved in seen:
+        # Identity is (device, inode), not path spelling: aliases AND hard
+        # links to the same physical DB would silently double every window,
+        # call, and metric.
+        stat = path.stat()
+        identity = (stat.st_dev, stat.st_ino)
+        if identity in seen:
             raise AblationConfigError(
-                f"duplicate --db: {db!r} and {seen[resolved]!r} are the same "
-                "database; a duplicate would silently double every window, "
-                "call, and metric."
+                f"duplicate --db: {db!r} and {seen[identity]!r} are the same "
+                "database."
             )
-        seen[resolved] = db
+        seen[identity] = db
 
 
 def _validate_args(args: argparse.Namespace) -> None:
