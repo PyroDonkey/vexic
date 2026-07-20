@@ -49,6 +49,7 @@ from vexic.usage import UsageSummary, summarize_agent_usage
 LIGHT_PHASE_BATCH_SIZE = 50
 _LOCAL_EMBEDDER = embed_texts
 
+_MARKER_RE = re.compile(r"\[message_id=\d+[^\]]*\]")
 _YEAR_RE = re.compile(r"\b(1\d{3}|20\d{2})\b")
 _ISO_FULL_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
 _ISO_YM_RE = re.compile(r"\b(\d{4})-(\d{2})\b(?!-)")
@@ -72,10 +73,14 @@ _MONTHS = {
         start=1,
     )
 }
+# Case-sensitive by design: month names in fact_text are virtually always
+# capitalized as month usage. Dropping IGNORECASE stops modal lowercase words
+# ("...they may 2024 relocate") from being read as a month-year date; a genuine
+# lowercase month reference degrades safely to undated rather than backfilling
+# a fabricated month (ADR 0038).
 _MONTH_DATE_RE = re.compile(
     r"\b(January|February|March|April|May|June|July|August|September|October|November|December)"
     r"\s+(?:(\d{1,2})(?:st|nd|rd|th)?,?\s+)?(\d{4})\b",
-    re.IGNORECASE,
 )
 
 
@@ -181,7 +186,11 @@ def _plausible_years(rows: list[tuple[int, str | None, ModelMessage]], transcrip
             except ValueError:
                 continue
             years.update((y - 1, y, y + 1))
-    years.update(int(m.group(0)) for m in _YEAR_RE.finditer(transcript))
+    # Strip [message_id=... observed=...] markers before scanning for years:
+    # a 4-digit message_id or the observed= date is transient scaffolding, not
+    # transcript content, and must not ground an occurred_at year.
+    text = _MARKER_RE.sub(" ", transcript)
+    years.update(int(m.group(0)) for m in _YEAR_RE.finditer(text))
     return years
 
 
@@ -229,6 +238,18 @@ def _single_intext_date(fact_text: str) -> str | None:
     return found[0] if len(found) == 1 else None
 
 
+def _strip_marker_echo(fact_text: str) -> str:
+    """Remove any echoed ``[message_id=... observed=...]`` marker from
+    fact_text and collapse the resulting whitespace.
+
+    The render marker is transient prompt scaffolding (Memory Invariant 2); an
+    extractor that copies it into fact_text would persist it into Tier 2 text
+    and FTS, and its ``observed=`` date could be misread as an in-text event
+    date. Stripped before the date-copy logic and before embedding/commit.
+    """
+    return re.sub(r"\s+", " ", _MARKER_RE.sub(" ", fact_text)).strip()
+
+
 def apply_occurred_at_guards(
     candidates: list[FactCandidate],
     rows: list[tuple[int, str | None, ModelMessage]],
@@ -254,6 +275,11 @@ def apply_occurred_at_guards(
     """
     plausible = _plausible_years(rows, transcript)
     for candidate in candidates:
+        # Strip echoed render markers first: they carry an observed= date that
+        # _single_intext_date would otherwise misread as an event date, and
+        # must not survive into stored fact_text (runs before embedding at the
+        # run_light_phase call site).
+        candidate.fact_text = _strip_marker_echo(candidate.fact_text)
         if candidate.occurred_at is not None:
             if int(candidate.occurred_at[:4]) not in plausible:
                 candidate.occurred_at = None
@@ -262,6 +288,18 @@ def apply_occurred_at_guards(
         if candidate.occurred_at is not None:
             if int(candidate.occurred_at[:4]) not in plausible:
                 candidate.occurred_at = None
+        # Ungrounded-precision cap: if fact_text states a single in-text date
+        # that is a strict, shorter prefix of the (model-supplied) occurred_at,
+        # truncate occurred_at to the in-text precision. Precision reduction
+        # only -- never extension (ADR 0038 day-invention mitigation).
+        if candidate.occurred_at is not None:
+            intext = _single_intext_date(candidate.fact_text)
+            if (
+                intext is not None
+                and candidate.occurred_at.startswith(intext)
+                and len(candidate.occurred_at) > len(intext)
+            ):
+                candidate.occurred_at = intext
     return candidates
 
 

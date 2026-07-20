@@ -2966,6 +2966,85 @@ class OccurredAtGuardTests(unittest.TestCase):
         )
         self.assertEqual(c.occurred_at, "2019-05")
 
+    def test_guard_ignores_marker_message_id_as_grounding_year(self) -> None:
+        # A 4-digit message_id inside a [message_id=...] marker must not
+        # ground a year: markers are transient scaffolding, not transcript
+        # text. Here observed=2024 grounds 2023-2025; 1999 (the marker id)
+        # must not.
+        c = _event_candidate(occurred_at="1999")
+        apply_occurred_at_guards(
+            [c],
+            [(1, "2024-01-10T09:00:00+00:00", user_message("we talked"))],
+            "[message_id=1999 observed=2024-01-10 Wed] User: we talked",
+        )
+        self.assertIsNone(c.occurred_at)
+
+    def test_guard_grounds_bare_year_in_user_text_despite_marker(self) -> None:
+        # Positive control for the marker strip: a bare year in the user's own
+        # text still grounds, even with a marker on the same line.
+        c = _event_candidate(occurred_at="1999")
+        apply_occurred_at_guards(
+            [c],
+            [(1, "2024-01-10T09:00:00+00:00", user_message("we talked"))],
+            "[message_id=5 observed=2024-01-10 Wed] User: I graduated in 1999",
+        )
+        self.assertEqual(c.occurred_at, "1999")
+
+    def test_guard_ignores_lowercase_modal_may_year(self) -> None:
+        # Modal "may 2024" is not a month reference; the month regex is
+        # case-sensitive so lowercase "may" degrades safely to undated.
+        c = _event_candidate(
+            fact_text="User said they may 2024 relocate", occurred_at=None
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertIsNone(c.occurred_at)
+
+    def test_guard_copies_capitalized_may_year(self) -> None:
+        # Capitalized month usage still backfills.
+        c = _event_candidate(
+            fact_text="User relocated in May 2024", occurred_at=None
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(c.occurred_at, "2024-05")
+
+    def test_guard_caps_occurred_at_to_intext_precision(self) -> None:
+        # Model emits a full date but fact_text only states month precision:
+        # truncate to the in-text precision (precision reduction, never
+        # extension).
+        c = _event_candidate(
+            fact_text="Ryan moved in March 2023", occurred_at="2023-03-01"
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(c.occurred_at, "2023-03")
+
+    def test_guard_keeps_equal_precision_intext_date(self) -> None:
+        # In-text date at equal precision: no cap.
+        c = _event_candidate(
+            fact_text="Ryan moved on March 14, 2023", occurred_at="2023-03-14"
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(c.occurred_at, "2023-03-14")
+
+    def test_guard_precision_cap_requires_intext_date(self) -> None:
+        # No in-text date to compare against: occurred_at is left untouched.
+        c = _event_candidate(
+            fact_text="Ryan did something.", occurred_at="2023-05-01"
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(c.occurred_at, "2023-05-01")
+
+    def test_guard_strips_marker_echo_from_fact_text(self) -> None:
+        # An extractor that echoes a [message_id=... observed=...] marker into
+        # fact_text must not persist it into Tier 2 text/FTS. The marker is
+        # stripped and whitespace collapsed before embedding/commit.
+        c = _event_candidate(
+            fact_text="[message_id=3 observed=2023-11-17 Fri] User prefers uv",
+            occurred_at=None,
+            category="preference",
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(c.fact_text, "User prefers uv")
+
 
 if __name__ == "__main__":
     unittest.main()
