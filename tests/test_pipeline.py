@@ -3151,6 +3151,39 @@ class OccurredAtGuardTests(unittest.TestCase):
         apply_occurred_at_guards([c], _rows_nov_2023(), "...")
         self.assertEqual(c.fact_text, "User prefers uv")
 
+    def test_guard_strips_marker_echo_from_subject(self) -> None:
+        # The subject field is persisted to Tier 2/3 and export just like
+        # fact_text; an echoed marker there must be stripped too.
+        c = _event_candidate(
+            subject="[message_id=7 observed=2023-11-17 Fri] Ryan",
+            occurred_at=None,
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(c.subject, "Ryan")
+
+    def test_guard_strips_bare_observed_token_before_backfill(self) -> None:
+        # A bare (unbracketed) observed=YYYY-MM-DD Day token must be stripped,
+        # and critically removed BEFORE the in-text copy-backfill runs so its
+        # date can never be misread as an event date and copied into
+        # occurred_at.
+        c = _event_candidate(
+            fact_text="observed=2023-11-17 Fri User ran the race",
+            occurred_at=None,
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(c.fact_text, "User ran the race")
+        self.assertIsNone(c.occurred_at)
+
+    def test_guard_strips_whitespace_variant_marker(self) -> None:
+        # Optional inner leading/trailing whitespace inside the brackets must
+        # not leave bracket residue behind.
+        c = _event_candidate(
+            fact_text="[ message_id=3 observed=2023-11-17 Fri ] User: hi",
+            occurred_at=None,
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(c.fact_text, "User: hi")
+
 
 if __name__ == "__main__":
     unittest.main()

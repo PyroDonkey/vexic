@@ -49,7 +49,12 @@ from vexic.usage import UsageSummary, summarize_agent_usage
 LIGHT_PHASE_BATCH_SIZE = 50
 _LOCAL_EMBEDDER = embed_texts
 
-_MARKER_RE = re.compile(r"\[message_id=\d+[^\]]*\]")
+_MARKER_RE = re.compile(r"\[\s*message_id=\d+[^\]]*\]")
+# Bare (unbracketed) observed=YYYY-MM-DD Day echo -- the exact label body
+# _observed_label emits. Stripped so an extractor that copies the label
+# without its brackets cannot leave the token in fact_text/subject or have its
+# date misread as an in-text event date.
+_OBSERVED_TOKEN_RE = re.compile(r"observed=\d{4}-\d{2}-\d{2}\s+\w{3}\b")
 _YEAR_RE = re.compile(r"\b(1\d{3}|20\d{2})\b")
 _ISO_FULL_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
 _ISO_YM_RE = re.compile(r"\b(\d{4})-(\d{2})\b(?!-)")
@@ -241,16 +246,21 @@ def _single_intext_date(fact_text: str) -> str | None:
     return found[0] if len(found) == 1 else None
 
 
-def _strip_marker_echo(fact_text: str) -> str:
-    """Remove any echoed ``[message_id=... observed=...]`` marker from
-    fact_text and collapse the resulting whitespace.
+def _strip_marker_echo(text: str) -> str:
+    """Remove any echoed ``[message_id=... observed=...]`` marker -- and any
+    bare ``observed=...`` token -- from ``text`` and collapse the resulting
+    whitespace.
 
     The render marker is transient prompt scaffolding (Memory Invariant 2); an
-    extractor that copies it into fact_text would persist it into Tier 2 text
-    and FTS, and its ``observed=`` date could be misread as an in-text event
-    date. Stripped before the date-copy logic and before embedding/commit.
+    extractor that copies it into fact_text or subject would persist it into
+    Tier 2 text and FTS, and its ``observed=`` date could be misread as an
+    in-text event date. Both bracketed markers (including whitespace-padded
+    variants) and unbracketed ``observed=`` tokens are stripped before the
+    date-copy logic and before embedding/commit.
     """
-    return re.sub(r"\s+", " ", _MARKER_RE.sub(" ", fact_text)).strip()
+    without_markers = _MARKER_RE.sub(" ", text)
+    without_bare = _OBSERVED_TOKEN_RE.sub(" ", without_markers)
+    return re.sub(r"\s+", " ", without_bare).strip()
 
 
 def apply_occurred_at_guards(
@@ -280,9 +290,11 @@ def apply_occurred_at_guards(
     for candidate in candidates:
         # Strip echoed render markers first: they carry an observed= date that
         # _single_intext_date would otherwise misread as an event date, and
-        # must not survive into stored fact_text (runs before embedding at the
-        # run_light_phase call site).
+        # must not survive into stored fact_text or subject (runs before
+        # embedding at the run_light_phase call site). subject is persisted and
+        # exported like fact_text, so it gets the same strip.
         candidate.fact_text = _strip_marker_echo(candidate.fact_text)
+        candidate.subject = _strip_marker_echo(candidate.subject)
         if candidate.occurred_at is not None:
             if int(candidate.occurred_at[:4]) not in plausible:
                 candidate.occurred_at = None
