@@ -2,7 +2,9 @@ import re
 import sqlite3
 import struct
 import threading
+from collections.abc import Iterable
 from contextlib import closing
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Literal
 
 from vexic.embeddings import EMBEDDING_DIM, EMBEDDING_MODEL_NAME
@@ -92,6 +94,47 @@ def _ensure_column(
             raise
 
 
+def _earliest_mention_date(
+    conn: sqlite3.Connection,
+    source_message_ids: Iterable[int],
+) -> str | None:
+    # mentioned_at derivation (ADR 0037): the earliest UTC calendar date of the
+    # cited Tier 1 messages, as a date-only ISO string. Deterministic provenance
+    # — a pure function of source_message_ids over the append-only messages
+    # table — so insert, merge, and backfill all reproduce the same value.
+    # Fail-soft: messages.timestamp is stored host-supplied and unvalidated, so
+    # blank or unparseable values are skipped rather than raised on — a raise
+    # here would abort a Light batch or brick init_db via the ensure backfill.
+    ids = sorted({int(value) for value in source_message_ids})
+    if not ids:
+        return None
+    placeholders = ", ".join("?" for _ in ids)
+    rows = conn.execute(
+        f"SELECT timestamp FROM messages WHERE id IN ({placeholders})",
+        ids,
+    ).fetchall()
+    earliest: datetime | None = None
+    for (raw,) in rows:
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text:
+            continue
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        else:
+            parsed = parsed.astimezone(timezone.utc)
+        if earliest is None or parsed < earliest:
+            earliest = parsed
+    if earliest is None:
+        return None
+    return earliest.date().isoformat()
+
+
 def _load_vec_extension(conn: sqlite3.Connection) -> None:
     import sqlite_vec
 
@@ -149,6 +192,8 @@ def _ensure_memory_candidate_columns(conn: sqlite3.Connection) -> None:
     # precision ISO string) into an INTEGER on write. occurred_at must round-trip
     # as the exact string the extractor produced, at whatever precision it knew.
     _ensure_column(conn, "memory_candidates", "occurred_at", "occurred_at TEXT")
+    # TEXT for the same affinity reason; date-only provenance string (ADR 0037).
+    _ensure_column(conn, "memory_candidates", "mentioned_at", "mentioned_at TEXT")
 
     conn.execute(
         """
@@ -756,7 +801,8 @@ def init_db(
                     needs_review BOOLEAN NOT NULL DEFAULT 0,
                     review_neighbor_id INTEGER,
                     best_similarity REAL,
-                    occurred_at TEXT
+                    occurred_at TEXT,
+                    mentioned_at TEXT
                 )
                 """
             )

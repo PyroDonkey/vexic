@@ -1106,6 +1106,132 @@ class OccurredAtRoundTripTests(unittest.TestCase):
         self.assertIsNone(facts[0].occurred_at)
 
 
+class MentionedAtDerivationTests(unittest.TestCase):
+    # `mentioned_at` is deterministic provenance: the earliest UTC calendar
+    # date (date-only ISO string) of a candidate's source messages, derived
+    # from messages.timestamp at insert. Never LLM-derived, never fabricated;
+    # occurred_at stays event-time-only (ADR 0037).
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.temp_dir.name) / "memory.db")
+        init_db(self.db_path)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _save_message(self, text: str, *, timestamp: str | None = None) -> int:
+        return save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content=text)])],
+            timestamp=timestamp,
+        )[0]
+
+    def _commit_candidate(self, candidate: FactCandidate) -> int:
+        commit_dream_cycle(
+            self.db_path,
+            [candidate],
+            candidate_embeddings=[_unit_vector(1.0)],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=max(candidate.source_message_ids, default=1),
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT id FROM memory_candidates ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        return int(row[0])
+
+    def _mentioned_at(self, candidate_id: int) -> tuple[object, str]:
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            return conn.execute(
+                "SELECT mentioned_at, typeof(mentioned_at) FROM memory_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()
+
+    def test_insert_derives_mentioned_at_from_earliest_source_message(self) -> None:
+        first = self._save_message(
+            "We finally visited Yellowstone.",
+            timestamp="2026-03-05T10:00:00+00:00",
+        )
+        second = self._save_message(
+            "The Yellowstone trip was amazing.",
+            timestamp="2026-04-10T09:30:00+00:00",
+        )
+        candidate_id = self._commit_candidate(
+            _candidate(
+                "Ryan visited Yellowstone.",
+                message_ids=[second, first],
+                category="event",
+            )
+        )
+
+        mentioned_at, type_name = self._mentioned_at(candidate_id)
+        self.assertEqual(mentioned_at, "2026-03-05")
+        self.assertEqual(type_name, "text")
+
+    def test_insert_handles_mixed_timestamp_formats(self) -> None:
+        # messages.timestamp arrives in two shapes: naive
+        # 'YYYY-MM-DD HH:MM:SS' (SQLite CURRENT_TIMESTAMP default) and
+        # offset-aware ISO from ingest. Both parse; naive is treated as UTC.
+        naive = self._save_message(
+            "Booked the trip.", timestamp="2026-02-01 08:00:00"
+        )
+        aware = self._save_message(
+            "Trip photos are up.", timestamp="2026-05-20T12:00:00+00:00"
+        )
+        candidate_id = self._commit_candidate(
+            _candidate("Ryan booked a trip.", message_ids=[aware, naive], category="event")
+        )
+
+        mentioned_at, _ = self._mentioned_at(candidate_id)
+        self.assertEqual(mentioned_at, "2026-02-01")
+
+    def test_insert_leaves_mentioned_at_null_when_source_messages_missing(self) -> None:
+        candidate_id = self._commit_candidate(
+            _candidate("Ryan visited Yellowstone.", message_ids=[999], category="event")
+        )
+
+        mentioned_at, _ = self._mentioned_at(candidate_id)
+        self.assertIsNone(mentioned_at)
+
+    def test_derivation_is_fail_soft_on_bad_timestamps(self) -> None:
+        # save_messages stores host-supplied timestamp strings unvalidated, so
+        # the derivation must skip garbage rather than raise: a raise would
+        # abort the whole Light batch (against ADR 0031 fail-soft) or brick
+        # init_db via the ensure backfill.
+        garbage = self._save_message("Garbage clock.", timestamp="not-a-date")
+        blank = self._save_message("Blank clock.", timestamp="")
+        good = self._save_message("Good clock.", timestamp="2026-01-15T00:00:00+00:00")
+
+        candidate_id = self._commit_candidate(
+            _candidate(
+                "Ryan visited Yellowstone.",
+                message_ids=[garbage, blank, good],
+                category="event",
+            )
+        )
+        mentioned_at, _ = self._mentioned_at(candidate_id)
+        self.assertEqual(mentioned_at, "2026-01-15")
+
+    def test_derivation_returns_null_when_all_timestamps_unparseable(self) -> None:
+        garbage = self._save_message("Garbage clock.", timestamp="not-a-date")
+        blank = self._save_message("Blank clock.", timestamp="")
+
+        candidate_id = self._commit_candidate(
+            _candidate(
+                "Ryan visited Yellowstone.",
+                message_ids=[garbage, blank],
+                category="event",
+            )
+        )
+        mentioned_at, _ = self._mentioned_at(candidate_id)
+        self.assertIsNone(mentioned_at)
+
+
 class LongTermSearchAsOfFilterTests(unittest.TestCase):
     # `as_of` restricts keyword (FTS) and vector (KNN) Tier 3 search
     # to facts whose COALESCE(NULLIF(occurred_at, ''), created_at) <= as_of.

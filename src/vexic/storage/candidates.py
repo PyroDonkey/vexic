@@ -11,6 +11,7 @@ from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.models import FactCandidate
 from vexic.storage.schema import (
     DreamStatus,
+    _earliest_mention_date,
     _embedding_blob_to_list,
     _ensure_vector_memory_schema,
     _fts_match_query,
@@ -204,8 +205,8 @@ def _insert_candidate(
         INSERT INTO memory_candidates
             (fact_text, subject, category, importance, confidence,
              source_message_ids, agent_id, editable, needs_review, review_neighbor_id,
-             best_similarity, occurred_at, last_seen_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+             best_similarity, occurred_at, mentioned_at, last_seen_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """,
         (
             candidate.fact_text,
@@ -220,6 +221,7 @@ def _insert_candidate(
             review_neighbor_id,
             best_similarity,
             candidate.occurred_at,
+            _earliest_mention_date(conn, candidate.source_message_ids),
         ),
     )
     candidate_id = int(cursor.lastrowid)
