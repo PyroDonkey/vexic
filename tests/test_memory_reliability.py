@@ -2382,6 +2382,7 @@ class UndatedEventPromotionSelectionTests(unittest.TestCase):
         *,
         category: str = "fact",
         occurred_at: str | None = None,
+        mentioned_at: str | None = None,
     ) -> PromotionCandidate:
         return PromotionCandidate(
             candidate_id=candidate_id,
@@ -2395,6 +2396,7 @@ class UndatedEventPromotionSelectionTests(unittest.TestCase):
             rem_boost=0.0,
             embedding=_unit_vector(1.0),
             occurred_at=occurred_at,
+            mentioned_at=mentioned_at,
         )
 
     def test_select_promotions_skips_event_candidates_without_occurred_at(self) -> None:
@@ -2447,6 +2449,26 @@ class UndatedEventPromotionSelectionTests(unittest.TestCase):
         )
 
         self.assertEqual(selected, [])
+
+    def test_select_promotions_keeps_event_candidate_with_mentioned_at_only(self) -> None:
+        # ADR 0037: mentioned_at is a promotable date for events, so an
+        # undated event with resolvable mention time is no longer sunk in
+        # Tier 2. Blank-ish mentioned_at values stay skipped, same .strip()
+        # semantics as occurred_at.
+        candidates = [
+            self._promotion_candidate(1, category="event", mentioned_at="2026-03-05"),
+            self._promotion_candidate(2, category="event", mentioned_at=""),
+            self._promotion_candidate(3, category="event", mentioned_at="   "),
+            self._promotion_candidate(4, category="event"),
+        ]
+
+        selected = select_promotions(
+            candidates,
+            now=datetime(2026, 6, 2, tzinfo=timezone.utc),
+            top_n=10,
+        )
+
+        self.assertEqual({c.candidate_id for c in selected}, {1})
 
 
 class UndatedEventDeepCycleReliabilityTests(unittest.IsolatedAsyncioTestCase):
@@ -2507,6 +2529,55 @@ class UndatedEventDeepCycleReliabilityTests(unittest.IsolatedAsyncioTestCase):
             "undated event candidate must stay eligible Tier 2 staging, not "
             "crash the cycle or get retired",
         )
+
+    async def test_deep_cycle_promotes_undated_event_with_resolvable_mention_time(
+        self,
+    ) -> None:
+        # ADR 0037 end-to-end: same undated-event shape, but the source
+        # message actually exists with a timestamp, so mentioned_at resolves
+        # at insert and the event escapes the Tier 2 sink through a full
+        # run_deep_phase cycle.
+        message_id = save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="I went to a conference.")])],
+            timestamp="2026-03-05T10:00:00+00:00",
+        )[0]
+        commit_dream_cycle(
+            self.db_path,
+            [
+                _candidate(
+                    "Ryan attended a conference.",
+                    message_ids=[message_id],
+                    category="event",
+                )
+            ],
+            candidate_embeddings=[_unit_vector(1.0)],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=message_id,
+        )
+
+        await run_deep_phase(
+            self.db_path,
+            "glm",
+            contradiction_agent_factory=lambda *_args, **_kwargs: _ContradictionAgent(
+                contradicts=False
+            ),
+        )
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            row = conn.execute(
+                """
+                SELECT occurred_at, mentioned_at FROM long_term_memory
+                WHERE retired = 0 AND category = 'event'
+                """
+            ).fetchone()
+        self.assertIsNotNone(row, "undated event with mention time must reach Tier 3")
+        self.assertIsNone(row[0], "occurred_at must stay NULL — never fabricated")
+        self.assertEqual(row[1], "2026-03-05")
 
 
 if __name__ == "__main__":
