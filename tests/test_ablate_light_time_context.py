@@ -144,9 +144,14 @@ class FabricatedYearRateTests(unittest.TestCase):
         rate = self.module.fabricated_year_rate(records, plausible)
         self.assertAlmostEqual(rate, 1 / 3)
 
-    def test_zero_dated_candidates_returns_zero_not_error(self) -> None:
+    def test_zero_dated_candidates_returns_none_not_zero(self) -> None:
+        # No dated candidates means no fabrication to measure -- None, not a
+        # spurious 0.0 that reads as evidence of "no fabrication observed".
         records = [{"window": "w1", "occurred_at_raw": None}]
-        self.assertEqual(self.module.fabricated_year_rate(records, {"w1": {2023}}), 0.0)
+        self.assertIsNone(self.module.fabricated_year_rate(records, {"w1": {2023}}))
+
+    def test_empty_records_returns_none(self) -> None:
+        self.assertIsNone(self.module.fabricated_year_rate([], {}))
 
     def test_all_plausible_is_zero_rate(self) -> None:
         records = [{"window": "w1", "occurred_at_raw": "2023-01-01"}]
@@ -168,7 +173,9 @@ class FabricatedYearRateTests(unittest.TestCase):
             records, plausible, field="occurred_at_guarded"
         )
         self.assertEqual(raw_rate, 1.0)
-        self.assertEqual(guarded_rate, 0.0)
+        # The guard nulled the only date, so there are zero dated guarded
+        # candidates: the guarded rate is None (no denominator), not 0.0.
+        self.assertIsNone(guarded_rate)
 
     def test_field_defaults_to_occurred_at_raw(self) -> None:
         records = [{"window": "w1", "occurred_at_raw": "1999-01-01", "occurred_at_guarded": "2023-01-01"}]
@@ -243,7 +250,63 @@ class BuildMetricsDocumentTests(unittest.TestCase):
             self.assertIn("fabricated_year_rate_raw", metrics)
             self.assertIn("fabricated_year_rate_guarded", metrics)
             self.assertEqual(metrics["fabricated_year_rate_raw"]["mean"], 1.0)
-            self.assertEqual(metrics["fabricated_year_rate_guarded"]["mean"], 0.0)
+            # The single candidate's guarded date was nulled, so no dated
+            # guarded candidates exist: the guarded mean is null, not 0.0.
+            self.assertIsNone(metrics["fabricated_year_rate_guarded"]["mean"])
+            self.assertEqual(metrics["fabricated_year_rate_guarded"]["repeats_with_data"], 0)
+
+    def test_aggregation_includes_attempted_repeat_with_zero_records(self) -> None:
+        # A repeat that produced zero candidates must still appear in
+        # per_repeat (as None), not vanish; repeats_with_data counts only the
+        # repeats that actually contributed a denominator.
+        class _Args:
+            db = ["db.sqlite"]
+            model_group = "extraction"
+            repeats = 3
+            max_windows = 1
+            max_provider_calls = 10
+
+        audit_records = [
+            {
+                "record_type": "window_transcript_hash",
+                "window": "w1",
+                "variant": variant,
+                "plausible_years": [2022, 2023, 2024],
+            }
+            for variant in ("treated", "baseline")
+        ]
+        # Only repeat 0 produced a candidate; repeats 1 and 2 were attempted
+        # but yielded nothing.
+        candidate_records = [
+            {
+                "window": "w1",
+                "variant": "treated",
+                "repeat": 0,
+                "category": "event",
+                "fact_text": "User ran the race on 2023-09-24",
+                "occurred_at_raw": "2023-09-24",
+                "occurred_at_guarded": "2023-09-24",
+            }
+        ]
+        doc = self.module._build_metrics_document(
+            args=_Args(),
+            jobs=[object()],
+            candidate_records=candidate_records,
+            audit_records=audit_records,
+            budget=self.module.ProviderBudget(10),
+            budget_exhausted=False,
+        )
+        metric = doc["variants"]["treated"]["metrics"]["fabricated_year_rate_raw"]
+        self.assertEqual(len(metric["per_repeat"]), 3)
+        self.assertEqual(metric["per_repeat"][0], 0.0)
+        self.assertIsNone(metric["per_repeat"][1])
+        self.assertIsNone(metric["per_repeat"][2])
+        self.assertEqual(metric["repeats_with_data"], 1)
+        self.assertEqual(metric["mean"], 0.0)
+        # dated_event_rate over the single event candidate is 1.0 for repeat 0.
+        dated = doc["variants"]["treated"]["metrics"]["dated_event_rate"]
+        self.assertEqual(dated["per_repeat"], [1.0, None, None])
+        self.assertEqual(dated["repeats_with_data"], 1)
 
 
 class IntextCopyRateTests(unittest.TestCase):
@@ -276,9 +339,9 @@ class IntextCopyRateTests(unittest.TestCase):
         rate = self.module.intext_copy_rate(records)
         self.assertAlmostEqual(rate, 1 / 2)
 
-    def test_no_intext_dates_returns_zero(self) -> None:
+    def test_no_intext_dates_returns_none(self) -> None:
         records = [{"category": "event", "fact_text": "no date here", "occurred_at_raw": None}]
-        self.assertEqual(self.module.intext_copy_rate(records), 0.0)
+        self.assertIsNone(self.module.intext_copy_rate(records))
 
 
 class DatedEventRateTests(unittest.TestCase):
@@ -294,9 +357,9 @@ class DatedEventRateTests(unittest.TestCase):
         rate = self.module.dated_event_rate(records)
         self.assertAlmostEqual(rate, 1 / 2)
 
-    def test_no_event_candidates_returns_zero(self) -> None:
+    def test_no_event_candidates_returns_none(self) -> None:
         records = [{"category": "preference", "occurred_at_guarded": "2023-09-24"}]
-        self.assertEqual(self.module.dated_event_rate(records), 0.0)
+        self.assertIsNone(self.module.dated_event_rate(records))
 
 
 class FullDateFromPartialRateTests(unittest.TestCase):
@@ -325,9 +388,9 @@ class FullDateFromPartialRateTests(unittest.TestCase):
         rate = self.module.full_date_from_partial_rate(records)
         self.assertAlmostEqual(rate, 1 / 3)
 
-    def test_no_intext_dates_returns_zero(self) -> None:
+    def test_no_intext_dates_returns_none(self) -> None:
         records = [{"fact_text": "no date here", "occurred_at_raw": "2023-03-14"}]
-        self.assertEqual(self.module.full_date_from_partial_rate(records), 0.0)
+        self.assertIsNone(self.module.full_date_from_partial_rate(records))
 
 
 if __name__ == "__main__":

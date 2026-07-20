@@ -23,6 +23,28 @@ flags live harnesses as do-not-run during review; only the deterministic
 metric functions are unit-tested (see
 ``tests/test_ablate_light_time_context.py``).
 
+Evidence caveats (what these numbers do and do not prove):
+
+- The "exact persisted Light windows" claim holds only when that database's
+  history was consumed with the default batch size (``LIGHT_PHASE_BATCH_SIZE``
+  = 50), the default (shared) agent scope, and full-batch consumption. A run
+  that used a different batch size, an agent-scoped history, or stopped
+  mid-batch reconstructs windows that differ from what Light actually saw.
+- ``occurred_at_raw`` is the model's output *after* the ``FactCandidate``
+  validator (which ships in both variants); it is not the pre-branch raw model
+  string. The prompt's effect therefore lives in the raw-vs-raw comparison
+  between variants, not in raw-vs-guarded within one variant.
+- ``fabricated_year_rate_guarded`` shares its year-plausibility predicate with
+  the shipped guard (``apply_occurred_at_guards``), so it is 0 (or None, with
+  no dated rows) by construction. It is an implementation-invariant check that
+  the guard did its job, not independent evidence that fabrication is absent.
+- The provider budget counts ``agent.run()`` calls; a provider's
+  structured-output retries may push actual upstream calls moderately above the
+  cap.
+
+Metric functions return None (not 0.0) on an empty denominator; aggregation
+skips None repeats and reports ``repeats_with_data`` per metric.
+
 Usage:
     uv run python scripts/ablate_light_time_context.py \\
         --db .eval-runs/<run>/<question-id>/memory.db \\
@@ -154,7 +176,7 @@ def fabricated_year_rate(
     plausible_years_by_window: dict[str, Iterable[int]],
     *,
     field: str = "occurred_at_raw",
-) -> float:
+) -> float | None:
     """Share of dated candidates (``field`` not null) whose year falls
     outside their window's plausible years (``_plausible_years``).
 
@@ -165,12 +187,13 @@ def fabricated_year_rate(
     guard can itself null a backfilled fabricated year, and that
     post-guard rate is not observable by only ever scoring the raw field.
 
-    0.0 when there are no dated candidates -- there is no fabrication to
-    measure, not "no fabrication observed".
+    None when there are no dated candidates -- there is no fabrication to
+    measure, and a 0.0 there would read as spurious evidence of "no
+    fabrication observed". Aggregation skips None repeats.
     """
     dated = [record for record in records if record.get(field)]
     if not dated:
-        return 0.0
+        return None
     fabricated = 0
     for record in dated:
         plausible = set(plausible_years_by_window.get(record["window"], ()))
@@ -180,12 +203,12 @@ def fabricated_year_rate(
     return fabricated / len(dated)
 
 
-def intext_copy_rate(records: list[dict[str, Any]]) -> float:
+def intext_copy_rate(records: list[dict[str, Any]]) -> float | None:
     """Share of event candidates with a single unambiguous in-text date
     (``_single_intext_date``) whose raw ``occurred_at`` copies that date
     exactly, at its stated precision.
 
-    0.0 when no event candidate has a resolvable single in-text date.
+    None when no event candidate has a resolvable single in-text date.
     """
     with_intext = [
         (record, _single_intext_date(str(record.get("fact_text", ""))))
@@ -194,30 +217,30 @@ def intext_copy_rate(records: list[dict[str, Any]]) -> float:
     ]
     with_intext = [(record, intext) for record, intext in with_intext if intext is not None]
     if not with_intext:
-        return 0.0
+        return None
     matches = sum(
         1 for record, intext in with_intext if record.get("occurred_at_raw") == intext
     )
     return matches / len(with_intext)
 
 
-def dated_event_rate(records: list[dict[str, Any]]) -> float:
+def dated_event_rate(records: list[dict[str, Any]]) -> float | None:
     """Share of event candidates carrying a non-null post-guard
-    ``occurred_at``. 0.0 when there are no event candidates."""
+    ``occurred_at``. None when there are no event candidates."""
     events = [record for record in records if record.get("category") == "event"]
     if not events:
-        return 0.0
+        return None
     dated = sum(1 for record in events if record.get("occurred_at_guarded"))
     return dated / len(events)
 
 
-def full_date_from_partial_rate(records: list[dict[str, Any]]) -> float:
+def full_date_from_partial_rate(records: list[dict[str, Any]]) -> float | None:
     """Share of candidates with a single in-text date where the raw
     ``occurred_at`` claims full-date precision but the in-text date itself
     only stated month or year granularity -- a precision-fabrication signal
     distinct from year fabrication.
 
-    0.0 when no candidate has a resolvable single in-text date.
+    None when no candidate has a resolvable single in-text date.
     """
     with_intext = [
         (record, _single_intext_date(str(record.get("fact_text", ""))))
@@ -225,7 +248,7 @@ def full_date_from_partial_rate(records: list[dict[str, Any]]) -> float:
     ]
     with_intext = [(record, intext) for record, intext in with_intext if intext is not None]
     if not with_intext:
-        return 0.0
+        return None
     mismatches = 0
     for record, intext in with_intext:
         raw = record.get("occurred_at_raw")
@@ -415,9 +438,13 @@ def _build_metrics_document(
         per_repeat: dict[int, list[dict[str, Any]]] = defaultdict(list)
         for record in variant_records:
             per_repeat[record["repeat"]].append(record)
-        repeat_indices = sorted(per_repeat)
+        # Iterate over every attempted repeat (range(args.repeats), bounded by
+        # budget truncation upstream), NOT sorted(per_repeat): a repeat that
+        # produced zero candidates must appear as a None-metric slot, not
+        # vanish and inflate the apparent denominator.
+        repeat_indices = range(args.repeats)
 
-        def _values(name: str) -> list[float]:
+        def _values(name: str) -> list[float | None]:
             if name == "fabricated_year_rate_raw":
                 return [
                     fabricated_year_rate(
@@ -442,10 +469,15 @@ def _build_metrics_document(
         metrics: dict[str, Any] = {}
         for name in _METRIC_NAMES:
             values = _values(name)
+            # A metric with an empty denominator in a repeat is None, not 0.0;
+            # aggregate over the repeats that actually carried data and report
+            # that count. All-None -> the metric is null in the JSON.
+            present = [value for value in values if value is not None]
             metrics[name] = {
-                "mean": statistics.fmean(values) if values else None,
-                "min": min(values) if values else None,
-                "max": max(values) if values else None,
+                "mean": statistics.fmean(present) if present else None,
+                "min": min(present) if present else None,
+                "max": max(present) if present else None,
+                "repeats_with_data": len(present),
                 "per_repeat": values,
             }
 
@@ -454,7 +486,8 @@ def _build_metrics_document(
             "event_candidate_count": sum(
                 1 for record in variant_records if record["category"] == "event"
             ),
-            "repeats_completed": len(repeat_indices),
+            "repeats_attempted": args.repeats,
+            "repeats_with_candidates": sum(1 for i in repeat_indices if per_repeat[i]),
             "metrics": metrics,
         }
 
