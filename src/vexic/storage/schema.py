@@ -353,7 +353,6 @@ def _ensure_long_term_memory(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "long_term_memory", "occurred_at", "occurred_at TEXT")
     # Date-only provenance string, same TEXT-affinity reasoning (ADR 0037).
     _ensure_column(conn, "long_term_memory", "mentioned_at", "mentioned_at TEXT")
-    _backfill_mentioned_at(conn, "long_term_memory")
     # Idempotency backstop for promotion: at most one Tier 3 fact per source
     # candidate. The atomic claim in _promote_candidate is the primary guard;
     # this UNIQUE index is the schema-level safety net so even a racy double
@@ -402,6 +401,12 @@ def _ensure_long_term_memory(conn: sqlite3.Connection) -> None:
             WHERE retired = 0
             """
         )
+    # After the duplicate preflight so a fail-loud init on hosted autocommit
+    # backends (where each statement commits individually) does not leave
+    # backfill writes behind the raise. On an already-migrated DB the FTS
+    # update trigger fires per backfilled row — a same-text delete+reinsert,
+    # consistent and one-time.
+    _backfill_mentioned_at(conn, "long_term_memory")
     # External-content FTS5 shadow over fact_text, kept in sync by triggers.
     # Retirement is an UPDATE (fact_text unchanged), but the update trigger
     # keeps the index consistent regardless.

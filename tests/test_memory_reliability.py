@@ -1174,6 +1174,52 @@ class OccurredAtRoundTripTests(unittest.TestCase):
             "a blank occurred_at from the first observation must not block backfill",
         )
 
+    def test_merge_backfills_over_whitespace_occurred_at_first_observation(self) -> None:
+        # Grok 4.5 audit: NULLIF(occurred_at, '') does not treat "   " as
+        # missing, so a whitespace first observation would permanently block
+        # merge backfill. Blank-ish occurred_at is normalized to NULL at
+        # insert so the existing COALESCE backfill works.
+        fact_text = "Ryan started a new job."
+        embedding = _unit_vector(1.0)
+        commit_dream_cycle(
+            self.db_path,
+            [_candidate(fact_text, message_ids=[1], occurred_at="   ")],
+            candidate_embeddings=[embedding],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+        )
+        candidate_id = self._committed_candidate_id()
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            stored = conn.execute(
+                "SELECT occurred_at FROM memory_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()[0]
+        self.assertIsNone(stored, "whitespace occurred_at must be stored as NULL")
+
+        commit_dream_cycle(
+            self.db_path,
+            [_candidate(fact_text, message_ids=[2], occurred_at="2025-03")],
+            candidate_embeddings=[embedding],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:01:00+00:00",
+            finished_at="2026-06-01T00:01:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=2,
+        )
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            occurred_at = conn.execute(
+                "SELECT occurred_at FROM memory_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()[0]
+        self.assertEqual(occurred_at, "2025-03")
+
     def test_insert_long_term_fact_and_fetch_round_trip_occurred_at(self) -> None:
         init_vector_memory(self.db_path)
         with closing(connect(self.db_path)) as conn:

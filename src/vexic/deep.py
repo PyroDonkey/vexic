@@ -136,9 +136,8 @@ def select_promotions(
     # With mentioned_at derived at insert and backfilled on init, this skip is
     # now the residual case (legacy rows not yet healed, or sources missing/
     # unparseable); such candidates stay in Tier 2 like ADR 0031 drops
-    # miscited candidates. Stricter than the guard's `not x`: a
-    # whitespace-only value would pass the guard into Tier 3 as a blank-ish
-    # date that merge backfill (NULLIF-based) could never repair.
+    # miscited candidates. Same `.strip()` blank-ish semantics as the
+    # promotion guard: whitespace-only dates count as missing on both gates.
     candidates = [
         c
         for c in candidates

@@ -81,7 +81,12 @@ category-mutation machinery exists).
   windows by it instead of ingest-time `created_at`. "Memory state at T"
   becomes "mentioned at or before T". This is deliberate - mention time is
   the honest upper bound for when knowledge entered the log, and `created_at`
-  was simply wrong for replayed transcripts.
+  was simply wrong for replayed transcripts. The same applies to
+  `event_after`/`event_before`: for an event that has only `mentioned_at`,
+  a range filter named for event time answers by mention time (a December
+  event first mentioned in February is excluded by
+  `event_before=<January>`). An undated event has no better signal, and
+  mention time strictly beats the old `created_at` fallback.
 - Same-day boundary loosening: a date-only `mentioned_at` passes any `<=`
   cutoff on its own day, per the documented partial-precision comparison
   convention. Callers already had to pass bounds in a comparable shape.

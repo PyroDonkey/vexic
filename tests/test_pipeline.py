@@ -1378,6 +1378,63 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(fact_count, 0)
 
+    def test_deep_commit_normalizes_whitespace_occurred_at_instead_of_poisoning_tier3(self) -> None:
+        # Grok 4.5 audit: with a real mentioned_at, a whitespace-only
+        # occurred_at passes the OR-guard — but the raw "   " must never
+        # reach Tier 3, where the NULLIF('')-based windowing ladder would
+        # treat it as the temporal key (space sorts before every digit).
+        # Blank-ish dates are normalized to NULL at write time.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            message_id = save_messages(
+                db_path,
+                [ModelRequest(parts=[UserPromptPart(content="We got the mortgage sorted.")])],
+                timestamp="2026-03-05T10:00:00+00:00",
+            )[0]
+            commit_dream_cycle(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="Ryan updated the mortgage.",
+                        subject="Ryan",
+                        category="event",
+                        importance=6,
+                        confidence=0.9,
+                        source_message_ids=[message_id],
+                        occurred_at="   ",
+                    )
+                ],
+                candidate_embeddings=[_unit_vector(1.0)],
+                agent_id=None,
+                status="ok",
+                started_at="2026-01-01T00:00:00Z",
+                finished_at="2026-01-01T00:00:01Z",
+                messages_processed=1,
+                last_processed_message_id=message_id,
+            )
+
+            commit_deep_cycle(
+                db_path,
+                [PromotionDecision(candidate_id=1, embedding=_unit_vector(1.0))],
+                started_at="2026-01-01T00:01:00Z",
+                finished_at="2026-01-01T00:01:01Z",
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                occurred_at, mentioned_at = conn.execute(
+                    """
+                    SELECT occurred_at, mentioned_at FROM long_term_memory
+                    WHERE promoted_from_candidate_id = 1
+                    """
+                ).fetchone()
+
+        self.assertIsNone(
+            occurred_at,
+            "whitespace occurred_at must be normalized to NULL, never stored",
+        )
+        self.assertEqual(mentioned_at, "2026-03-05")
+
     def test_deep_commit_is_idempotent_for_legacy_promoted_event_candidate(self) -> None:
         # Regression: the event/occurred_at check originally ran before the
         # `promoted` idempotency skip, so a candidate promoted before event-time support

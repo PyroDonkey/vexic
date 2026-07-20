@@ -195,6 +195,12 @@ def _promote_candidate(
         occurred_at,
         mentioned_at,
     ) = row
+    # Normalize blank-ish dates from legacy or externally written candidate
+    # rows: Tier 3 must only ever hold NULL or a real date string, because the
+    # NULLIF('')-based retrieval ladder would treat "   " as a temporal key
+    # and no merge runs post-promotion to repair it (ADR 0037).
+    occurred_at = occurred_at if (occurred_at or "").strip() else None
+    mentioned_at = mentioned_at if (mentioned_at or "").strip() else None
 
     if retired or stale:
         raise ValueError(

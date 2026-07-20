@@ -3339,6 +3339,7 @@ class WithEventsSortedTests(unittest.TestCase):
         category: str,
         *,
         occurred_at: str | None = None,
+        mentioned_at: str | None = None,
         created_at: str = "",
     ):
         from vexic.storage import LongTermFact
@@ -3356,6 +3357,35 @@ class WithEventsSortedTests(unittest.TestCase):
             editable=True,
             created_at=created_at,
             occurred_at=occurred_at,
+            mentioned_at=mentioned_at,
+        )
+
+    def test_event_sort_falls_back_to_mentioned_at_before_created_at(self) -> None:
+        # ADR 0037: the sort key ladder is occurred_at -> mentioned_at ->
+        # created_at. An undated event with mention-time provenance must
+        # order by it, not by its (dream-run) created_at.
+        from vexic.subagents.retrieval import _with_events_sorted
+
+        facts = [
+            self._fact(1, "event", occurred_at="2024-01"),
+            # created_at deliberately OLDEST: if the sort key wrongly fell
+            # through to created_at, this fact would sort last instead of
+            # first.
+            self._fact(
+                2,
+                "event",
+                mentioned_at="2025-06-01",
+                created_at="2023-01-01 00:00:00",
+            ),
+            self._fact(3, "event", occurred_at="2024-09"),
+        ]
+
+        result = _with_events_sorted(facts)
+
+        self.assertEqual(
+            [fact.fact_id for fact in result],
+            [2, 3, 1],
+            "mentioned_at must outrank created_at as the event sort key",
         )
 
     def test_events_sort_in_place_non_events_keep_slots(self) -> None:

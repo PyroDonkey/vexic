@@ -191,6 +191,17 @@ def _merge_source_message_ids(existing_json: str, new_ids: list[int]) -> str:
     return json.dumps(merged)
 
 
+def _normalized_date(value: str | None) -> str | None:
+    # Blank-ish date strings ("" or whitespace-only extractor junk) become
+    # NULL at write time: the NULLIF(x, '')-based retrieval ladder and merge
+    # backfill only treat SQL NULL and '' as missing, so a stored "   " would
+    # become a bogus temporal key that merge could never repair (ADR 0037).
+    # Interior formatting of real values is preserved exactly as produced.
+    if value is None or not value.strip():
+        return None
+    return value
+
+
 def _insert_candidate(
     conn: sqlite3.Connection,
     candidate: FactCandidate,
@@ -221,7 +232,7 @@ def _insert_candidate(
             needs_review,
             review_neighbor_id,
             best_similarity,
-            candidate.occurred_at,
+            _normalized_date(candidate.occurred_at),
             _earliest_mention_date(conn, candidate.source_message_ids),
         ),
     )
@@ -327,7 +338,7 @@ def _merge_candidate(
             candidate.importance,
             candidate.confidence,
             match.similarity,
-            candidate.occurred_at,
+            _normalized_date(candidate.occurred_at),
             merged_mentioned_at,
             match.candidate_id,
         ),
