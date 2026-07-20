@@ -21,11 +21,14 @@ as do-not-run during review; only the deterministic surface is unit-tested (see
 
 Evidence caveats (what these numbers do and do not prove):
 
-- The "exact persisted Light windows" claim holds only when that database's
-  history was consumed with the default batch size (``LIGHT_PHASE_BATCH_SIZE``
-  = 50), the default (shared) agent scope, full-batch consumption, and the same
-  ``onboarding:`` session exclusion. A run that used a different batch size, an
-  agent-scoped history, or stopped mid-batch reconstructs different windows.
+- Windows are reconstructed from the database's own ``dream_runs`` bookkeeping:
+  each Light cycle that consumed messages recorded its
+  ``last_processed_message_id`` watermark, and successive watermarks delimit
+  the exact rows each cycle saw (LongMemEval drains Light per ingested session
+  batch, so boundaries are irregular -- never a uniform batch-size walk).
+  Reconstruction assumes the default (shared) agent scope and production's
+  ``onboarding:`` session exclusion; messages never consumed by any Light
+  cycle form no window.
 - A rubric HIT means one single candidate's ``fact_text`` carried every
   answer-bearing token; it is not a semantic-equivalence judgment. A miss can
   be a real extraction failure or merely different phrasing than the rubric
@@ -77,13 +80,13 @@ from adapters.openrouter_live_adapter import (  # noqa: E402
 )
 from vexic.models import FactCandidate  # noqa: E402
 from vexic.pipeline import (  # noqa: E402
-    LIGHT_PHASE_BATCH_SIZE,
     apply_occurred_at_guards,
     keep_candidates_with_valid_source_ids,
     render_transcript,
     rendered_message_ids,
 )
 from vexic.storage import load_messages_since  # noqa: E402
+from vexic.usage import UsageSummary, summarize_agent_usage  # noqa: E402
 
 
 class AblationConfigError(ValueError):
@@ -250,13 +253,29 @@ TARGETS: tuple[Target, ...] = (
 )
 
 
+def _token_in(norm_text: str, token: str) -> bool:
+    """Substring match with numeric-boundary guards on digit-edged tokens.
+
+    Alpha tokens keep plain substring (stem) semantics -- "suburb" matches
+    "suburbs", "pre-approv" matches "pre-approved" -- but a token that starts
+    or ends with a digit must not match inside a larger number: "$5" must not
+    hit "$50", "3 times a week" must not hit "13 times a week", and "400,000"
+    must not hit "$1,400,000" (digit-comma prefix)."""
+    pattern = re.escape(token)
+    if token[0].isdigit():
+        pattern = r"(?<!\d)(?<!\d,)" + pattern
+    if token[-1].isdigit():
+        pattern = pattern + r"(?!\d)(?!,\d)"
+    return re.search(pattern, norm_text) is not None
+
+
 def rubric_hit(fact_texts: Sequence[str], rubric: tuple[tuple[str, ...], ...]) -> bool:
     """True when ONE SINGLE candidate's normalized ``fact_text`` satisfies
     every any_of group in the rubric. Two candidates each covering half is a
     miss -- the answer must survive as one durable fact, not be scattered."""
     for text in fact_texts:
         norm = normalize(text)
-        if all(any(token in norm for token in group) for group in rubric):
+        if all(any(_token_in(norm, token) for token in group) for group in rubric):
             return True
     return False
 
@@ -264,13 +283,15 @@ def rubric_hit(fact_texts: Sequence[str], rubric: tuple[tuple[str, ...], ...]) -
 @dataclass
 class Window:
     """One reconstructed Light window: the exact rows Light saw, plus the
-    single shared rendered transcript (all four conditions see this)."""
+    single shared rendered transcript (all four conditions see this) and the
+    per-message normalized renders used for locator binding."""
 
     db: str
     key: str
     rows: list[tuple[int, str | None, Any]] = field(default_factory=list, repr=False)
     transcript: str = ""
     normalized: str = ""
+    normalized_messages: list[str] = field(default_factory=list, repr=False)
 
 
 @dataclass
@@ -283,25 +304,41 @@ class BindingResult:
 
 
 def _bind_target(target: Target, windows: Sequence[Window]) -> BindingResult:
-    """Bind a target to every window whose normalized transcript contains all
-    of the target's locators. Zero matches is a hard config error naming the
-    target and, per window, the first locator that missed. >1 match binds all
-    windows and flags ``multi_match``."""
+    """Bind a target to every window where ONE SINGLE message contains all of
+    the target's locators (they are drawn from one answer-bearing user turn,
+    so co-occurrence scattered across different messages -- an assistant echo
+    plus an unrelated turn -- must not bind). Zero matches is a hard config
+    error naming the target and, per window, the first locator that missed.
+    >1 match binds all windows and flags ``multi_match``."""
     matched = [
         window
         for window in windows
-        if all(locator in window.normalized for locator in target.window_locators)
+        if any(
+            all(locator in message for locator in target.window_locators)
+            for message in window.normalized_messages
+        )
     ]
     if not matched:
         if windows:
             diagnostics = []
             for window in windows:
                 missing = next(
-                    locator
-                    for locator in target.window_locators
-                    if locator not in window.normalized
+                    (
+                        locator
+                        for locator in target.window_locators
+                        if not any(
+                            locator in message
+                            for message in window.normalized_messages
+                        )
+                    ),
+                    None,
                 )
-                diagnostics.append(f"{window.key} missing locator {missing!r}")
+                if missing is not None:
+                    diagnostics.append(f"{window.key} missing locator {missing!r}")
+                else:
+                    diagnostics.append(
+                        f"{window.key} has every locator but never in one message"
+                    )
             detail = "; ".join(diagnostics)
         else:
             detail = f"no windows collected; first locator {target.window_locators[0]!r}"
@@ -396,35 +433,79 @@ def _drop_out_of_window_candidates(
 # ---------------------------------------------------------------------------
 
 
+def _light_window_boundaries(db: str) -> list[int]:
+    """The persisted Light watermarks, in run order: every ``dream_runs`` row
+    that actually consumed messages (``messages_processed > 0``) in the shared
+    scope. These are the exact window boundaries production ran with --
+    LongMemEval ingests per session batch and drains Light after each, so
+    boundaries are irregular and never reconstructible from a uniform
+    ``LIGHT_PHASE_BATCH_SIZE`` walk over the final history."""
+    with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
+        rows = conn.execute(
+            "SELECT last_processed_message_id FROM dream_runs"
+            " WHERE status IN ('ok', 'partial')"
+            " AND COALESCE(messages_processed, 0) > 0"
+            " AND agent_id IS NULL"
+            " AND last_processed_message_id IS NOT NULL"
+            " ORDER BY id"
+        ).fetchall()
+    boundaries: list[int] = []
+    for (value,) in rows:
+        boundary = int(value)
+        if not boundaries or boundary > boundaries[-1]:
+            boundaries.append(boundary)
+    return boundaries
+
+
+def _slice_rows_by_boundaries(
+    rows: list[tuple[int, str | None, Any]], boundaries: Sequence[int]
+) -> list[list[tuple[int, str | None, Any]]]:
+    """Split loaded rows into the per-cycle windows delimited by successive
+    watermarks. Rows beyond the last boundary were never consumed by Light and
+    form no window; a boundary pair with no rows (e.g. only excluded sessions)
+    yields no window."""
+    slices: list[list[tuple[int, str | None, Any]]] = []
+    previous = 0
+    for boundary in boundaries:
+        window_rows = [row for row in rows if previous < row[0] <= boundary]
+        if window_rows:
+            slices.append(window_rows)
+        previous = boundary
+    return slices
+
+
 def _collect_windows(dbs: list[str]) -> list[Window]:
-    """Walk every DB's persisted history in ``LIGHT_PHASE_BATCH_SIZE`` batches,
-    excluding the ``onboarding:`` prefix exactly as production Light does, and
-    collect ALL windows (answer sessions sit mid-DB)."""
+    """Reconstruct every persisted Light window of every DB: load the shared
+    scope history with production's ``onboarding:`` exclusion, then slice it at
+    the recorded ``dream_runs`` watermarks. Fails loud when a DB recorded no
+    Light cycles -- there are no persisted windows to reconstruct."""
     windows: list[Window] = []
     for db in dbs:
-        after_id = 0
-        index = 0
-        while True:
-            rows = load_messages_since(
-                db,
-                after_id,
-                limit=LIGHT_PHASE_BATCH_SIZE,
-                exclude_session_prefixes=("onboarding:",),
+        boundaries = _light_window_boundaries(db)
+        if not boundaries:
+            raise AblationConfigError(
+                f"--db {db} has no completed Light cycles in dream_runs; "
+                "no persisted Light windows exist to reconstruct."
             )
-            if not rows:
-                break
-            transcript = render_transcript(rows)
+        rows = load_messages_since(
+            db, 0, exclude_session_prefixes=("onboarding:",)
+        )
+        for index, window_rows in enumerate(
+            _slice_rows_by_boundaries(rows, boundaries)
+        ):
+            transcript = render_transcript(window_rows)
             windows.append(
                 Window(
                     db=db,
                     key=f"{db}#w{index}",
-                    rows=rows,
+                    rows=window_rows,
                     transcript=transcript,
                     normalized=normalize(transcript),
+                    normalized_messages=[
+                        normalize(render_transcript([row])) for row in window_rows
+                    ],
                 )
             )
-            after_id = max(message_id for message_id, _, _ in rows)
-            index += 1
     return windows
 
 
@@ -438,7 +519,10 @@ def _window_session_crosscheck(window: Window) -> tuple[list[str], bool]:
     low, high = min(message_ids), max(message_ids)
     with sqlite3.connect(f"file:{window.db}?mode=ro", uri=True) as conn:
         rows = conn.execute(
-            "SELECT DISTINCT session_id FROM messages WHERE id BETWEEN ? AND ?",
+            "SELECT DISTINCT session_id FROM messages"
+            " WHERE id BETWEEN ? AND ?"
+            " AND agent_id IS NULL"
+            " AND session_id NOT LIKE 'onboarding:%'",
             (low, high),
         ).fetchall()
     sessions = sorted(str(row[0]) for row in rows)
@@ -468,10 +552,17 @@ def _build_condition_agents(model_group: str) -> dict[str, Any]:
 
 async def _run_agent(
     agent: Any, transcript: str, budget: ProviderBudget
-) -> tuple[list[FactCandidate], Any]:
+) -> tuple[list[FactCandidate], UsageSummary | None]:
     budget.take()
     result = await agent.run(transcript)
-    return list(result.output), result.usage()
+    # summarize_agent_usage handles the pydantic-ai >=1.102 usage deprecation
+    # shim; an unusable payload degrades to None (per-field token metrics
+    # already treat missing usage as None), never to a discarded call.
+    try:
+        usage = summarize_agent_usage(result)
+    except ValueError:
+        usage = None
+    return list(result.output), usage
 
 
 async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
@@ -525,6 +616,7 @@ async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
     if len(plan) < args.repeats * len(bound_windows) * len(CONDITIONS):
         budget_exhausted = True
     provider_errors = 0
+    error_counts: dict[str, int] = {condition: 0 for condition in CONDITIONS}
     for repeat_idx, window_key, condition in plan:
         window = windows_by_key[window_key]
         # A transient provider failure (timeout, rate limit, structured-output
@@ -541,6 +633,7 @@ async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
             break
         except Exception as exc:  # noqa: BLE001 - live provider boundary
             provider_errors += 1
+            error_counts[condition] += 1
             audit_records.append(
                 {
                     "record_type": "call_error",
@@ -557,8 +650,8 @@ async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
         kept_candidates, dropped = _drop_out_of_window_candidates(
             raw_candidates, window.rows
         )
-        input_tokens = getattr(usage, "input_tokens", None)
-        output_tokens = getattr(usage, "output_tokens", None)
+        input_tokens = usage.input_tokens if usage is not None else None
+        output_tokens = usage.output_tokens if usage is not None else None
         call_records.append(
             {
                 "record_type": "call",
@@ -613,6 +706,7 @@ async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
         budget=budget,
         budget_exhausted=budget_exhausted,
         provider_errors=provider_errors,
+        error_counts=error_counts,
     )
     return {"metrics_document": metrics_document, "audit_records": audit_records}
 
@@ -646,6 +740,7 @@ def _build_metrics_document(
     budget: ProviderBudget,
     budget_exhausted: bool,
     provider_errors: int = 0,
+    error_counts: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     conditions_doc: dict[str, Any] = {}
     for condition in CONDITIONS:
@@ -737,6 +832,7 @@ def _build_metrics_document(
         ]
         tokens = {
             "calls_total": len(cond_calls),
+            "calls_failed": (error_counts or {}).get(condition, 0),
             "calls_with_input": len(input_values),
             "calls_with_output": len(output_values),
             "input_total": sum(input_values) if input_values else None,
@@ -825,9 +921,18 @@ def _require(value: str | None, name: str) -> str:
 def _validate_dbs(dbs: list[str]) -> None:
     if not dbs:
         raise AblationConfigError("--db is required (repeatable).")
+    seen: dict[Path, str] = {}
     for db in dbs:
         if not Path(db).exists():
             raise AblationConfigError(f"--db not found: {db}")
+        resolved = Path(db).resolve()
+        if resolved in seen:
+            raise AblationConfigError(
+                f"duplicate --db: {db!r} and {seen[resolved]!r} are the same "
+                "database; a duplicate would silently double every window, "
+                "call, and metric."
+            )
+        seen[resolved] = db
 
 
 def _validate_args(args: argparse.Namespace) -> None:

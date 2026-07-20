@@ -177,6 +177,38 @@ class RubricHitTests(unittest.TestCase):
         rubric = (("rachel",), ("suburb",))
         self.assertFalse(self.module.rubric_hit(["Rachel moved to Miami"], rubric))
 
+    def test_digit_edged_tokens_do_not_match_inside_larger_numbers(self) -> None:
+        # "$5" must not match "$50", "3 times a week" must not match
+        # "13 times a week", "400,000" must not match "$1,400,000".
+        self.assertFalse(self.module.rubric_hit(["spent $50 at Target"], (("$5",),)))
+        self.assertFalse(
+            self.module.rubric_hit(
+                ["does yoga 13 times a week"], (("3 times a week",),)
+            )
+        )
+        self.assertFalse(
+            self.module.rubric_hit(["a $1,400,000 mortgage"], (("400,000",),))
+        )
+
+    def test_digit_edged_tokens_still_match_exact_amounts(self) -> None:
+        self.assertTrue(self.module.rubric_hit(["used a $5 coupon"], (("$5",),)))
+        self.assertTrue(
+            self.module.rubric_hit(["yoga 3 times a week now"], (("3 times a week",),))
+        )
+        self.assertTrue(
+            self.module.rubric_hit(["pre-approved for $400,000"], (("400,000",),))
+        )
+
+    def test_alpha_stem_tokens_keep_prefix_matching(self) -> None:
+        # Stem tokens are intentional (score.py semantics): "suburb" matches
+        # "suburbs", "pre-approv" matches "pre-approved", "sunday" matches
+        # "sundays". Numeric-boundary guards must not break them.
+        self.assertTrue(self.module.rubric_hit(["moved to the suburbs"], (("suburb",),)))
+        self.assertTrue(
+            self.module.rubric_hit(["got pre-approved yesterday"], (("pre-approv",),))
+        )
+        self.assertTrue(self.module.rubric_hit(["works sundays"], (("sunday",),)))
+
     def test_empty_candidate_list_is_a_miss(self) -> None:
         self.assertFalse(self.module.rubric_hit([], (("rachel",),)))
 
@@ -220,9 +252,15 @@ class BindingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.module = _load_module()
 
-    def _window(self, db: str, key: str, text: str):
+    def _window(self, db: str, key: str, text: str, messages: list[str] | None = None):
+        message_texts = messages if messages is not None else [text]
         return self.module.Window(
-            db=db, key=key, rows=[], transcript=text, normalized=self.module.normalize(text)
+            db=db,
+            key=key,
+            rows=[],
+            transcript=text,
+            normalized=self.module.normalize(text),
+            normalized_messages=[self.module.normalize(m) for m in message_texts],
         )
 
     def _target(self, locators, rubric=(("x",),)):
@@ -265,6 +303,28 @@ class BindingTests(unittest.TestCase):
         windows = [
             self._window("db", "db#w0", "rachel is here"),
             self._window("db", "db#w1", "rachel and the suburb"),
+        ]
+        target = self._target(["rachel", "suburb"])
+        result = self.module._bind_target(target, windows)
+        self.assertEqual(result.windows, ["db#w1"])
+
+    def test_locators_split_across_messages_do_not_bind(self) -> None:
+        # Locators are drawn from ONE answer-bearing user turn; a window where
+        # they only co-occur across different messages (e.g. an assistant echo
+        # plus an unrelated turn) must not bind.
+        windows = [
+            self._window(
+                "db",
+                "db#w0",
+                "rachel ... suburb",
+                messages=["rachel is a friend", "some suburb talk"],
+            ),
+            self._window(
+                "db",
+                "db#w1",
+                "rachel moved to the suburb",
+                messages=["hello", "rachel moved to the suburb"],
+            ),
         ]
         target = self._target(["rachel", "suburb"])
         result = self.module._bind_target(target, windows)
@@ -333,6 +393,67 @@ class GlobalPairedScheduleTests(unittest.TestCase):
         self.assertEqual(
             self.module._global_paired_schedule(3, ["wA"], self.CONDS, 0), []
         )
+
+
+class WindowSlicingTests(unittest.TestCase):
+    """Windows are delimited by the persisted dream_runs Light watermarks, not
+    by uniform LIGHT_PHASE_BATCH_SIZE chunks: production ran Light per
+    ingested session batch, so real window boundaries are irregular and a tail
+    never consumed by Light is not a window at all."""
+
+    def setUp(self) -> None:
+        self.module = _load_module()
+
+    @staticmethod
+    def _rows(ids):
+        return [(i, None, f"msg{i}") for i in ids]
+
+    def test_slices_rows_at_watermark_boundaries(self) -> None:
+        rows = self._rows([1, 2, 3, 4, 5, 6, 7])
+        slices = self.module._slice_rows_by_boundaries(rows, [3, 5, 7])
+        self.assertEqual(
+            [[row[0] for row in s] for s in slices], [[1, 2, 3], [4, 5], [6, 7]]
+        )
+
+    def test_unprocessed_tail_beyond_last_boundary_is_not_a_window(self) -> None:
+        rows = self._rows([1, 2, 3, 4, 5, 6])
+        slices = self.module._slice_rows_by_boundaries(rows, [4])
+        self.assertEqual([[row[0] for row in s] for s in slices], [[1, 2, 3, 4]])
+
+    def test_boundary_with_no_rows_is_skipped(self) -> None:
+        # e.g. a cycle that only consumed onboarding-excluded rows.
+        rows = self._rows([1, 2, 6, 7])
+        slices = self.module._slice_rows_by_boundaries(rows, [2, 5, 7])
+        self.assertEqual([[row[0] for row in s] for s in slices], [[1, 2], [6, 7]])
+
+    def test_no_boundaries_yields_no_windows(self) -> None:
+        self.assertEqual(
+            self.module._slice_rows_by_boundaries(self._rows([1, 2]), []), []
+        )
+
+
+class ValidateDbsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.module = _load_module()
+
+    def test_duplicate_db_paths_are_a_config_error(self) -> None:
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".db") as handle:
+            with self.assertRaises(self.module.AblationConfigError) as caught:
+                self.module._validate_dbs([handle.name, handle.name])
+            self.assertIn("duplicate", str(caught.exception).lower())
+
+    def test_aliased_duplicate_paths_are_a_config_error(self) -> None:
+        # The same physical DB reached via two spellings would double every
+        # window, call, and metric silently.
+        import os
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".db", dir=".") as handle:
+            name = os.path.basename(handle.name)
+            with self.assertRaises(self.module.AblationConfigError):
+                self.module._validate_dbs([name, f"./{name}"])
 
 
 class BuildMetricsDocumentTests(unittest.TestCase):
@@ -550,6 +671,30 @@ class BuildMetricsDocumentTests(unittest.TestCase):
         per_target = doc["conditions"]["control"]["per_target"]["t1"]
         self.assertEqual(per_target["per_repeat_hits"], [True])
         self.assertTrue(doc["bindings"]["t1"]["multi_match"])
+
+    def test_calls_failed_reported_per_condition(self) -> None:
+        # A failure-heavy condition must not silently look cheaper: failed
+        # calls appear as calls_failed alongside the successful-call stats.
+        bindings = {"t1": self._binding("t1", ["w0"], (("rachel",),))}
+        call_records = [
+            self._call("G", 0, "w0", kept=1, raw=1, dropped=0, itok=10, otok=4),
+        ]
+        attempts = {c: {} for c in self.module.CONDITIONS}
+        attempts["G"] = {"w0": [0]}
+        doc = self.module._build_metrics_document(
+            args=self._args(repeats=1),
+            bindings=bindings,
+            candidate_records=[],
+            call_records=call_records,
+            attempts=attempts,
+            budget=self.module.ProviderBudget(100),
+            budget_exhausted=False,
+            provider_errors=2,
+            error_counts={"G": 2},
+        )
+        self.assertEqual(doc["conditions"]["G"]["tokens"]["calls_failed"], 2)
+        self.assertEqual(doc["conditions"]["control"]["tokens"]["calls_failed"], 0)
+        self.assertEqual(doc["provider_errors"], 2)
 
     def test_multi_window_repeat_null_when_any_bound_window_unattempted(self) -> None:
         # A repeat counts as attempted for a target only when EVERY bound

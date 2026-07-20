@@ -380,8 +380,9 @@ in the transcript). Every `memory.db` is opened read-only; the output is
 
 `scripts/ablate_extraction_prompts.py` is a window-faithful ablation over the
 Light extraction instructions. It reconstructs the exact persisted Light windows
-from prior LongMemEval run databases (replaying `load_messages_since` in
-`LIGHT_PHASE_BATCH_SIZE` chunks), binds a fixed set of target cases to their
+from prior LongMemEval run databases (slicing the shared-scope history at the
+`dream_runs` watermarks each Light cycle recorded), binds a fixed set of target
+cases to their
 answer-bearing windows through declarative locator substrings, and runs a
 four-condition factorial over additions appended to the adapter's
 `EXTRACTION_INSTRUCTIONS`: control (shipped instructions), a granularity/table
