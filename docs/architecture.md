@@ -120,6 +120,29 @@ never as durable memory.
 - Retrieval returns facts with provenance and logs observations to
   `retrieval_events`.
 
+#### Event dating
+
+Rows on both memory tiers carry two optional dates plus the insert timestamp
+(ADR 0037):
+
+- `occurred_at` - event time, extracted by the Light model at whatever
+  partial ISO precision the transcript states (`2025`, `2025-03`,
+  `2025-03-14`). Never fabricated; `category="event"` facts need it or
+  `mentioned_at` to promote (Memory Invariant 11).
+- `mentioned_at` - derived provenance: the earliest UTC calendar date of the
+  row's source messages, computed deterministically from `messages.timestamp`
+  at candidate insert, recomputed over the union on merge, and backfilled for
+  legacy rows during schema init. Never model output, never copied into
+  `occurred_at`.
+- `created_at` - the row's own insert time (dream-run wall clock for
+  promoted facts).
+
+Temporal retrieval filters (`as_of`, `event_after`, `event_before`) and the
+event-timeline sort use the ladder
+`COALESCE(NULLIF(occurred_at, ''), NULLIF(mentioned_at, ''), created_at)`
+with plain TEXT string comparison, on all categories - a row with resolvable
+mention time windows by when it was said, not when it was ingested.
+
 ## Dream Pipeline
 
 The memory pipeline has four named phases. The phase functions exist in the
