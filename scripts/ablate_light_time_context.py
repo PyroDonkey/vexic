@@ -11,9 +11,12 @@ windows of one or more LongMemEval Vexic databases:
   ``adapters.openrouter_live_adapter.EXTRACTION_INSTRUCTIONS``.
 
 Every candidate's raw (pre-guard) and guarded (post
-``apply_occurred_at_guards``) ``occurred_at`` are recorded so the four
+``apply_occurred_at_guards``) ``occurred_at`` are recorded so the five
 deterministic metrics below can be computed per repeat and aggregated as
-mean/min/max across repeats. This is a live, opt-in evidence harness: it is
+mean/min/max across repeats. ``fabricated_year_rate`` is scored both ways --
+``fabricated_year_rate_raw`` and ``fabricated_year_rate_guarded`` -- since the
+acceptance-critical number is the post-guard rate, not the raw one. This is a
+live, opt-in evidence harness: it is
 gated behind ``--allow-live`` and a provider-call budget cap, mirroring
 ``src/vexic/live_retrieval_baseline.py`` conventions. `docs/ai/REVIEW.md`
 flags live harnesses as do-not-run during review; only the deterministic
@@ -149,20 +152,29 @@ def _has_relative_reference(line: str) -> bool:
 def fabricated_year_rate(
     records: list[dict[str, Any]],
     plausible_years_by_window: dict[str, Iterable[int]],
+    *,
+    field: str = "occurred_at_raw",
 ) -> float:
-    """Share of dated candidates (raw ``occurred_at`` not null) whose year
-    falls outside their window's plausible years (``_plausible_years``).
+    """Share of dated candidates (``field`` not null) whose year falls
+    outside their window's plausible years (``_plausible_years``).
+
+    ``field`` defaults to ``"occurred_at_raw"`` (pre-guard) but must also be
+    callable with ``"occurred_at_guarded"`` (post
+    ``apply_occurred_at_guards``) so the acceptance-critical "treated
+    post-guard fabricated year rate" number can actually be computed: the
+    guard can itself null a backfilled fabricated year, and that
+    post-guard rate is not observable by only ever scoring the raw field.
 
     0.0 when there are no dated candidates -- there is no fabrication to
     measure, not "no fabrication observed".
     """
-    dated = [record for record in records if record.get("occurred_at_raw")]
+    dated = [record for record in records if record.get(field)]
     if not dated:
         return 0.0
     fabricated = 0
     for record in dated:
         plausible = set(plausible_years_by_window.get(record["window"], ()))
-        year = int(str(record["occurred_at_raw"])[:4])
+        year = int(str(record[field])[:4])
         if year not in plausible:
             fabricated += 1
     return fabricated / len(dated)
@@ -223,7 +235,8 @@ def full_date_from_partial_rate(records: list[dict[str, Any]]) -> float:
 
 
 _METRIC_NAMES = (
-    "fabricated_year_rate",
+    "fabricated_year_rate_raw",
+    "fabricated_year_rate_guarded",
     "intext_copy_rate",
     "dated_event_rate",
     "full_date_from_partial_rate",
@@ -405,9 +418,18 @@ def _build_metrics_document(
         repeat_indices = sorted(per_repeat)
 
         def _values(name: str) -> list[float]:
-            if name == "fabricated_year_rate":
+            if name == "fabricated_year_rate_raw":
                 return [
-                    fabricated_year_rate(per_repeat[i], plausible_years_by_window)
+                    fabricated_year_rate(
+                        per_repeat[i], plausible_years_by_window, field="occurred_at_raw"
+                    )
+                    for i in repeat_indices
+                ]
+            if name == "fabricated_year_rate_guarded":
+                return [
+                    fabricated_year_rate(
+                        per_repeat[i], plausible_years_by_window, field="occurred_at_guarded"
+                    )
                     for i in repeat_indices
                 ]
             fn = {

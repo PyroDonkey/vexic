@@ -243,6 +243,12 @@ def apply_occurred_at_guards(
     in-text copy-backfill then runs only for event candidates still lacking
     a date, and only copies when fact_text states exactly one absolute date.
 
+    Year plausibility is then re-checked against whatever occurred_at is left
+    standing, including a value the copy-backfill just supplied: fact_text is
+    itself model output and can carry a fabricated year, so a backfilled date
+    is never exempt from the same check a model-supplied date gets. Every
+    non-null occurred_at leaving this function has a year in ``plausible``.
+
     Fabricated components degrade to undated (ADR 0037 Tier 2 sink) rather
     than dropping the candidate; in-text dates copy at stated precision only.
     """
@@ -253,6 +259,9 @@ def apply_occurred_at_guards(
                 candidate.occurred_at = None
         if candidate.occurred_at is None and candidate.category == "event":
             candidate.occurred_at = _single_intext_date(candidate.fact_text)
+        if candidate.occurred_at is not None:
+            if int(candidate.occurred_at[:4]) not in plausible:
+                candidate.occurred_at = None
     return candidates
 
 

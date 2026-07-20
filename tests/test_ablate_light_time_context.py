@@ -152,6 +152,99 @@ class FabricatedYearRateTests(unittest.TestCase):
         records = [{"window": "w1", "occurred_at_raw": "2023-01-01"}]
         self.assertEqual(self.module.fabricated_year_rate(records, {"w1": {2023}}), 0.0)
 
+    def test_field_param_computes_over_guarded_values(self) -> None:
+        # occurred_at_raw is fabricated but occurred_at_guarded was nulled by
+        # apply_occurred_at_guards -- field="occurred_at_guarded" must report
+        # the post-guard (zero) rate, not the raw one: the
+        # acceptance-critical "guarded fabrication rate = 0" number.
+        records = [
+            {"window": "w1", "occurred_at_raw": "2025-03-01", "occurred_at_guarded": None},
+        ]
+        plausible = {"w1": {2022, 2023, 2024}}
+        raw_rate = self.module.fabricated_year_rate(
+            records, plausible, field="occurred_at_raw"
+        )
+        guarded_rate = self.module.fabricated_year_rate(
+            records, plausible, field="occurred_at_guarded"
+        )
+        self.assertEqual(raw_rate, 1.0)
+        self.assertEqual(guarded_rate, 0.0)
+
+    def test_field_defaults_to_occurred_at_raw(self) -> None:
+        records = [{"window": "w1", "occurred_at_raw": "1999-01-01", "occurred_at_guarded": "2023-01-01"}]
+        plausible = {"w1": {2023}}
+        self.assertEqual(self.module.fabricated_year_rate(records, plausible), 1.0)
+
+
+class BuildMetricsDocumentTests(unittest.TestCase):
+    """The per-variant metrics dict assembled by _build_metrics_document must
+    surface both the raw and post-guard fabricated-year rate -- the guarded
+    number is the acceptance-critical one and must not be silently absent
+    from ablation_metrics.json."""
+
+    def setUp(self) -> None:
+        self.module = _load_module()
+
+    def _args(self) -> object:
+        class _Args:
+            db = ["db.sqlite"]
+            model_group = "extraction"
+            repeats = 1
+            max_windows = 1
+            max_provider_calls = 10
+
+        return _Args()
+
+    def test_metrics_include_both_raw_and_guarded_fabrication_rate_keys(self) -> None:
+        audit_records = [
+            {
+                "record_type": "window_transcript_hash",
+                "window": "w1",
+                "variant": "treated",
+                "plausible_years": [2022, 2023, 2024],
+            },
+            {
+                "record_type": "window_transcript_hash",
+                "window": "w1",
+                "variant": "baseline",
+                "plausible_years": [2022, 2023, 2024],
+            },
+        ]
+        candidate_records = [
+            {
+                "window": "w1",
+                "variant": "treated",
+                "repeat": 0,
+                "category": "event",
+                "fact_text": "User ran the race on March 1, 2025",
+                "occurred_at_raw": "2025-03-01",
+                "occurred_at_guarded": None,
+            },
+            {
+                "window": "w1",
+                "variant": "baseline",
+                "repeat": 0,
+                "category": "event",
+                "fact_text": "User ran the race on March 1, 2025",
+                "occurred_at_raw": "2025-03-01",
+                "occurred_at_guarded": None,
+            },
+        ]
+        doc = self.module._build_metrics_document(
+            args=self._args(),
+            jobs=[object()],
+            candidate_records=candidate_records,
+            audit_records=audit_records,
+            budget=self.module.ProviderBudget(10),
+            budget_exhausted=False,
+        )
+        for variant in ("treated", "baseline"):
+            metrics = doc["variants"][variant]["metrics"]
+            self.assertIn("fabricated_year_rate_raw", metrics)
+            self.assertIn("fabricated_year_rate_guarded", metrics)
+            self.assertEqual(metrics["fabricated_year_rate_raw"]["mean"], 1.0)
+            self.assertEqual(metrics["fabricated_year_rate_guarded"]["mean"], 0.0)
+
 
 class IntextCopyRateTests(unittest.TestCase):
     def setUp(self) -> None:

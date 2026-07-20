@@ -2870,6 +2870,49 @@ class OccurredAtGuardTests(unittest.TestCase):
         apply_occurred_at_guards([c], _rows_nov_2023(), "...")
         self.assertIsNone(c.occurred_at)
 
+    def test_guard_nulls_backfilled_date_with_implausible_year(self) -> None:
+        # fact_text is model output too: a fabricated year copied in by the
+        # backfill must not escape the same year-plausibility check a
+        # model-supplied occurred_at gets.
+        c = _event_candidate(
+            fact_text="User ran the Berlin race on March 1, 2025",
+            occurred_at=None,
+        )
+        apply_occurred_at_guards(
+            [c],
+            _rows_nov_2023(),
+            "[message_id=1 observed=2023-11-17 Fri] User: we talked",
+        )
+        self.assertIsNone(c.occurred_at)
+
+    def test_guard_keeps_backfilled_date_with_plausible_observed_year(self) -> None:
+        # Positive control: a legitimately copied date's year sits inside the
+        # observed window and must survive the re-check.
+        c = _event_candidate(
+            fact_text="User ran the Berlin race on September 24, 2023",
+            occurred_at=None,
+        )
+        apply_occurred_at_guards(
+            [c],
+            _rows_nov_2023(),
+            "[message_id=1 observed=2023-11-17 Fri] User: we talked",
+        )
+        self.assertEqual(c.occurred_at, "2023-09-24")
+
+    def test_guard_keeps_backfilled_date_with_year_literal_in_transcript(self) -> None:
+        # Positive control: a copied date's year grounded in the transcript
+        # text (not the observed window) must also survive the re-check.
+        c = _event_candidate(
+            fact_text="Graduated May 2019",
+            occurred_at=None,
+        )
+        apply_occurred_at_guards(
+            [c],
+            _rows_nov_2023(),
+            "[message_id=1 observed=2023-11-17 Fri] User: I mentioned 2019 before",
+        )
+        self.assertEqual(c.occurred_at, "2019-05")
+
 
 if __name__ == "__main__":
     unittest.main()
