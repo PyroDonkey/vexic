@@ -1609,6 +1609,61 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(category, "event")
         self.assertEqual(occurred_at, "2026-07-05")
 
+    def test_deep_commit_normalizes_legacy_datetime_occurred_at(self) -> None:
+        # A legacy or foreign-written memory_candidates row can hold a
+        # datetime-shaped occurred_at that never passed the FactCandidate
+        # validator (Deep promotion loads rows straight from SQL). Promotion
+        # must canonicalize it to a partial-precision date, not copy the raw
+        # datetime into Tier 3 (Memory Invariant 11: truncation, never
+        # invention).
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            commit_dream_cycle(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="Ryan shipped the release.",
+                        subject="Ryan",
+                        category="fact",
+                        importance=6,
+                        confidence=0.9,
+                        source_message_ids=[1],
+                    )
+                ],
+                candidate_embeddings=[_unit_vector(1.0)],
+                agent_id=None,
+                status="ok",
+                started_at="2026-01-01T00:00:00Z",
+                finished_at="2026-01-01T00:00:01Z",
+                messages_processed=1,
+                last_processed_message_id=1,
+            )
+            # Write a datetime-shaped occurred_at directly, bypassing the
+            # validator (simulating a legacy/foreign writer).
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute(
+                    "UPDATE memory_candidates SET occurred_at = '2026-07-05T00:00:00Z' WHERE id = 1"
+                )
+                conn.commit()
+
+            commit_deep_cycle(
+                db_path,
+                [PromotionDecision(candidate_id=1, embedding=_unit_vector(1.0))],
+                started_at="2026-01-01T00:01:00Z",
+                finished_at="2026-01-01T00:01:01Z",
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                (occurred_at,) = conn.execute(
+                    """
+                    SELECT occurred_at FROM long_term_memory
+                    WHERE promoted_from_candidate_id = 1
+                    """
+                ).fetchone()
+
+        self.assertEqual(occurred_at, "2026-07-05")
+
     def test_deep_commit_promotes_event_candidate_via_mentioned_at(self) -> None:
         # ADR 0037: an undated event whose source messages carry timestamps
         # promotes on mentioned_at provenance. occurred_at is never fabricated
