@@ -578,9 +578,15 @@ def build_headroom(
     regressions: list[str] = []
     ceiling_bound: list[str] = []
     upstream_gap: list[str] = []
+    no_oracle_signal: list[str] = []
 
     for result in results:
         qid = result["question_id"]
+        if result["oracle"].get("pass_fraction") is None:
+            # Every oracle repeat errored: no graded signal. Excluded from the
+            # combined ceiling AND the derivation ceiling so a provider outage is
+            # never reported as "complete facts still failed".
+            no_oracle_signal.append(qid)
         if not result.get("oracle_complete", True):
             # Constituents missing from Tier-3 entirely: bounded by
             # extraction/promotion, not retrieval or derivation.
@@ -637,14 +643,17 @@ def build_headroom(
         and not full_capture(next(r for r in results if r["question_id"] == qid))
     ]
 
-    # Complete evidence, but neither widening nor the judge-with-oracle passes:
-    # a genuine answer-time derivation ceiling (distinct from upstream gaps).
+    # Complete evidence, a graded oracle signal, but neither widening nor the
+    # judge-with-oracle passes: a genuine answer-time derivation ceiling (distinct
+    # from upstream gaps and from questions with no graded oracle verdict).
     reached = reachable_set | combined_set
+    no_signal_set = set(no_oracle_signal)
     derivation_ceiling = [
         r["question_id"]
         for r in results
         if r.get("oracle_complete", True)
         and r["question_id"] not in reached
+        and r["question_id"] not in no_signal_set
     ]
 
     return {
@@ -657,6 +666,7 @@ def build_headroom(
         "retrieval_depth_limited": retrieval_depth_limited,
         "derivation_ceiling_complete_evidence": derivation_ceiling,
         "upstream_extraction_gap": upstream_gap,
+        "no_oracle_signal": no_oracle_signal,
         "nonmonotonic_regressions": regressions,
         "retrieve_k_ceiling_bound": ceiling_bound,
         "rates": {
@@ -670,9 +680,17 @@ def build_headroom(
 
 
 def recorded_verdict(entry: OracleEntry) -> str | None:
-    """The judge verdict this question's run RECORDED in diagnostics.jsonl. N is
-    defined by this recorded value, never a fresh re-judge; the harness also uses
-    it to flag a curated question the run actually passed (curation error)."""
+    """The judge verdict this question's run RECORDED in diagnostics.jsonl, or
+    None when that outcome is unknown. N is defined by this recorded value, never
+    a fresh re-judge.
+
+    Returns None -- "unknown", not a miss -- unless the row completed a clean
+    judged run: a row whose status is not "ok", that carries a judge_error, or
+    whose judge_verdict is absent did not produce a trustworthy verdict, so a
+    stale judge_verdict on a failed run must not be read as the recorded outcome
+    (else a failed run could masquerade as a curation-error pass and drop a valid
+    miss from the denominator).
+    """
     diagnostics_path = Path(entry.run_dir) / "diagnostics.jsonl"
     if not diagnostics_path.exists():
         return None
@@ -684,6 +702,8 @@ def recorded_verdict(entry: OracleEntry) -> str | None:
         except json.JSONDecodeError:
             continue
         if isinstance(row, dict) and row.get("question_id") == entry.question_id:
+            if row.get("status") not in (None, "ok") or row.get("judge_error"):
+                return None
             return row.get("judge_verdict")
     return None
 
@@ -698,18 +718,27 @@ async def run_experiment(
     """Score every curated miss and assemble the metrics document.
 
     Pre-flights all entries first (no budget spent), so a fixture defect fails
-    loud before any provider call. A question the run RECORDED as supported is a
-    curation error -- it is not a miss, so it is NOT scored and NOT counted in
-    the headroom denominator N; it is surfaced under curation_warnings instead.
-    Budget is shared across questions; exhaustion stops the run and is recorded,
-    never raised past the last completed question.
+    loud before any provider call. Only a question the run RECORDED as a miss
+    (verdict "partial" or "not_supported") is scored and counted in the headroom
+    denominator N. A recorded "supported" is a curation error (curation_warnings)
+    and a None -- diagnostics missing/failed/absent -- is an unknown outcome
+    (unknown_recorded); neither is a confirmed miss, so both are excluded from N
+    rather than silently scored as one. Budget is shared across questions;
+    exhaustion stops the run and is recorded, never raised past the last
+    completed question.
     """
     preflight(entries)
     recorded = {entry.question_id: recorded_verdict(entry) for entry in entries}
     curation_warnings = [
         qid for qid, verdict in recorded.items() if verdict == "supported"
     ]
-    scored = [e for e in entries if recorded.get(e.question_id) != "supported"]
+    unknown_recorded = [
+        qid for qid, verdict in recorded.items() if verdict is None
+    ]
+    miss_verdicts = {"partial", "not_supported"}
+    scored = [
+        e for e in entries if recorded.get(e.question_id) in miss_verdicts
+    ]
 
     results: list[dict[str, Any]] = []
     budget_exhausted = False
@@ -729,6 +758,7 @@ async def run_experiment(
         "budget_exhausted": budget_exhausted,
         "sweep_k_values": list(SWEEP_K_VALUES),
         "curation_warnings": curation_warnings,
+        "unknown_recorded": unknown_recorded,
         "results": results,
         "headroom": build_headroom(results),
     }
@@ -749,10 +779,14 @@ def render_table(results: list[dict[str, Any]]) -> str:
     widest = str(max(SWEEP_K_VALUES))
     for result in results:
         sweep = result["sweep"]
-        best_k, best_frac = None, -1.0
+        # Only graded (non-None) conditions are eligible for best-k: an all-error
+        # sweep condition (pass_fraction None) must not masquerade as a real 0.00.
+        best_k, best_frac = None, None
         for k, cond in sweep.items():
-            frac = cond.get("pass_fraction") or 0.0
-            if frac > best_frac:
+            frac = cond.get("pass_fraction")
+            if frac is None:
+                continue
+            if best_frac is None or frac > best_frac:
                 best_frac, best_k = frac, k
         lines.append(
             "| {qid} | {rec} | {oracle} | {base} | {best} | {bk} | {cap} |".format(
@@ -760,7 +794,7 @@ def render_table(results: list[dict[str, Any]]) -> str:
                 rec=result.get("recorded_verdict") or "--",
                 oracle=_fmt(result["oracle"].get("pass_fraction")),
                 base=_fmt(result["baseline"].get("pass_fraction")),
-                best=_fmt(best_frac if best_frac >= 0 else None),
+                best=_fmt(best_frac),
                 bk=best_k or "--",
                 cap=_fmt(result["capture"].get(widest, {}).get("fraction")),
             )

@@ -330,9 +330,13 @@ class OracleFixtureTests(TestCase):
     def test_run_experiment_stops_and_records_on_budget_exhaustion(self) -> None:
         # Two questions, budget too small to finish both: exhaustion stops the
         # run, records budget_exhausted, keeps completed results.
+        self._write_diagnostics(
+            [
+                {"question_id": q, "judge_verdict": "not_supported", "status": "ok"}
+                for q in ("q1", "q2")
+            ]
+        )
         for qid in ("q1", "q2"):
-            # No diagnostics row -> recorded_verdict is None (not "supported"),
-            # so both questions are scored.
             self._seed_db(
                 qid,
                 [("Fact.", "fact", None)],
@@ -480,6 +484,10 @@ class OracleFixtureTests(TestCase):
             )
         )[0]
 
+        self._write_diagnostics(
+            [{"question_id": "q1", "judge_verdict": "not_supported", "status": "ok"}]
+        )
+
         class _Boom:
             calls = 0
 
@@ -581,12 +589,81 @@ class OracleFixtureTests(TestCase):
     def test_recorded_verdict_reads_diagnostics(self) -> None:
         self._write_diagnostics(
             [
-                {"question_id": "q1", "judge_verdict": "partial"},
-                {"question_id": "q2", "judge_verdict": "supported"},
+                {"question_id": "q1", "judge_verdict": "partial", "status": "ok"},
+                {"question_id": "q2", "judge_verdict": "supported", "status": "ok"},
             ]
         )
         entry = oee.load_oracle_fixture(self._fixture([self._entry("q1")]))[0]
         self.assertEqual(oee.recorded_verdict(entry), "partial")
+
+    def test_recorded_verdict_none_when_run_failed(self) -> None:
+        # A failed run's stale verdict must not be trusted (Greptile P1): status
+        # != ok, or a judge_error, means the recorded outcome is unknown.
+        self._write_diagnostics(
+            [
+                {"question_id": "q1", "judge_verdict": "supported", "status": "error"},
+            ]
+        )
+        entry = oee.load_oracle_fixture(self._fixture([self._entry("q1")]))[0]
+        self.assertIsNone(oee.recorded_verdict(entry))
+
+    def test_run_experiment_excludes_unknown_recorded_from_n(self) -> None:
+        # No diagnostics row -> unknown outcome -> not a confirmed miss, excluded
+        # from the denominator N rather than silently scored (Greptile P1).
+        self._seed_db(
+            "q1",
+            [("Only fact.", "fact", None)],
+            event={
+                "keyword_fact_ids": [1],
+                "vector_fact_ids": [1],
+                "fused_fact_ids": [1],
+            },
+        )
+        entry = oee.load_oracle_fixture(
+            self._fixture(
+                [self._entry("q1", constituent_fact_ids=[1], expected_fact_texts=["Only fact."])]
+            )
+        )[0]
+        judge = _StubJudge({})
+        budget = oee.ProviderBudget(100)
+        doc = asyncio.run(
+            oee.run_experiment([entry], judge, repeats=1, budget=budget)
+        )
+        self.assertIn("q1", doc["unknown_recorded"])
+        self.assertEqual(doc["headroom"]["n"], 0)
+        self.assertEqual(len(judge.calls), 0)
+
+    def test_build_headroom_no_oracle_signal_not_a_derivation_ceiling(self) -> None:
+        # All oracle repeats errored -> pass_fraction None -> no signal; must NOT
+        # be reported as a derivation ceiling (Greptile P1).
+        result = {
+            "question_id": "qX",
+            "oracle_complete": True,
+            "oracle": {"pass_fraction": None},
+            "sweep": {
+                str(k): {"pass_fraction": 0.0} for k in (5, 8, 10, 15)
+            },
+            "capture": {"15": {"fraction": 1.0}},
+            "pool_ceiling": [],
+        }
+        headroom = oee.build_headroom([result])
+        self.assertEqual(headroom["no_oracle_signal"], ["qX"])
+        self.assertEqual(headroom["derivation_ceiling_complete_evidence"], [])
+        self.assertEqual(headroom["combined_ceiling"], [])
+
+    def test_render_table_all_error_condition_not_selected_as_best_k(self) -> None:
+        result = {
+            "question_id": "qX",
+            "recorded_verdict": "partial",
+            "oracle": {"pass_fraction": None},
+            "baseline": {"pass_fraction": None},
+            "sweep": {str(k): {"pass_fraction": None} for k in (5, 8, 10, 15)},
+            "capture": {"15": {"fraction": 1.0}},
+        }
+        table = oee.render_table([result])
+        # best-k column and best-k@ must be "--", not a fake 0.00 / a k label.
+        row = table.splitlines()[-1]
+        self.assertIn("| -- | -- |", row)  # best-k and best-k@ both blank
 
     def test_run_experiment_excludes_curated_recorded_pass_from_n(self) -> None:
         # A curated question the run RECORDED as supported is a curation error --
