@@ -37,7 +37,11 @@ from vexic.storage.longterm import (
     nearest_long_term_facts,
 )
 from vexic.storage.promotion import PromotionDecision
-from vexic.storage.schema import _ensure_vector_memory_schema, init_vector_memory
+from vexic.storage.schema import (
+    _ensure_vector_memory_schema,
+    _reset_init_memo,
+    init_vector_memory,
+)
 from vexic.subagents.retrieval import retrieve_long_term_facts
 from vexic.tools import expand_history, search_long_term, search_memory
 
@@ -1127,11 +1131,13 @@ class MentionedAtDerivationTests(unittest.TestCase):
             timestamp=timestamp,
         )[0]
 
-    def _commit_candidate(self, candidate: FactCandidate) -> int:
+    def _commit_candidate(
+        self, candidate: FactCandidate, *, embedding: list[float] | None = None
+    ) -> int:
         commit_dream_cycle(
             self.db_path,
             [candidate],
-            candidate_embeddings=[_unit_vector(1.0)],
+            candidate_embeddings=[embedding if embedding is not None else _unit_vector(1.0)],
             agent_id=None,
             status="ok",
             started_at="2026-06-01T00:00:00+00:00",
@@ -1281,6 +1287,70 @@ class MentionedAtDerivationTests(unittest.TestCase):
         self._commit_candidate(_candidate(fact_text, message_ids=[second], category="event"))
         mentioned_at, _ = self._mentioned_at(candidate_id)
         self.assertEqual(mentioned_at, "2026-03-05")
+
+    def test_init_db_backfills_mentioned_at_for_legacy_rows(self) -> None:
+        # Pre-column rows (the eval-DB sink: 371 stuck undated events) heal on
+        # the next init_db, same pattern as the last_seen_at ensure backfill.
+        # Rows whose sources are missing or unparseable stay NULL.
+        dated = self._save_message(
+            "We finally visited Yellowstone.",
+            timestamp="2026-03-05T10:00:00+00:00",
+        )
+        candidate_id = self._commit_candidate(
+            _candidate("Ryan visited Yellowstone.", message_ids=[dated], category="event")
+        )
+        orphan_id = self._commit_candidate(
+            _candidate("Ryan met a bear.", message_ids=[999], category="event"),
+            embedding=_unit_vector(0.0, 1.0),
+        )
+        self.assertNotEqual(orphan_id, candidate_id)
+
+        init_vector_memory(self.db_path)
+        with closing(connect(self.db_path)) as conn:
+            with conn:
+                _ensure_vector_memory_schema(conn)
+                fact_id = insert_long_term_fact(
+                    conn,
+                    fact_text="Ryan visited Yellowstone.",
+                    subject="Ryan",
+                    category="event",
+                    importance=6,
+                    confidence=0.8,
+                    source_message_ids=[dated],
+                    agent_id=None,
+                    promoted_from_candidate_id=candidate_id,
+                    retrieved_count=0,
+                    used_count=0,
+                    editable=True,
+                    embedding=_unit_vector(1.0),
+                    occurred_at="2026-03-01",
+                )
+
+        # Simulate pre-column rows.
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("UPDATE memory_candidates SET mentioned_at = NULL")
+            conn.execute("UPDATE long_term_memory SET mentioned_at = NULL")
+            conn.commit()
+
+        _reset_init_memo()
+        init_db(self.db_path)
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            candidate_value = conn.execute(
+                "SELECT mentioned_at FROM memory_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()[0]
+            orphan_value = conn.execute(
+                "SELECT mentioned_at FROM memory_candidates WHERE id = ?",
+                (orphan_id,),
+            ).fetchone()[0]
+            fact_value = conn.execute(
+                "SELECT mentioned_at FROM long_term_memory WHERE id = ?",
+                (fact_id,),
+            ).fetchone()[0]
+        self.assertEqual(candidate_value, "2026-03-05")
+        self.assertIsNone(orphan_value)
+        self.assertEqual(fact_value, "2026-03-05")
 
     def test_merge_does_not_clobber_known_mentioned_at_when_recompute_yields_null(self) -> None:
         # After a physical purge the source ids can dangle; recompute then

@@ -1,3 +1,4 @@
+import json
 import re
 import sqlite3
 import struct
@@ -94,27 +95,13 @@ def _ensure_column(
             raise
 
 
-def _earliest_mention_date(
-    conn: sqlite3.Connection,
-    source_message_ids: Iterable[int],
-) -> str | None:
-    # mentioned_at derivation (ADR 0037): the earliest UTC calendar date of the
-    # cited Tier 1 messages, as a date-only ISO string. Deterministic provenance
-    # — a pure function of source_message_ids over the append-only messages
-    # table — so insert, merge, and backfill all reproduce the same value.
-    # Fail-soft: messages.timestamp is stored host-supplied and unvalidated, so
-    # blank or unparseable values are skipped rather than raised on — a raise
-    # here would abort a Light batch or brick init_db via the ensure backfill.
-    ids = sorted({int(value) for value in source_message_ids})
-    if not ids:
-        return None
-    placeholders = ", ".join("?" for _ in ids)
-    rows = conn.execute(
-        f"SELECT timestamp FROM messages WHERE id IN ({placeholders})",
-        ids,
-    ).fetchall()
+def _earliest_date_from_timestamps(values: Iterable[object]) -> str | None:
+    # Shared parse core for mentioned_at derivation (ADR 0037). Fail-soft:
+    # messages.timestamp is stored host-supplied and unvalidated, so blank or
+    # unparseable values are skipped rather than raised on — a raise here would
+    # abort a Light batch or brick init_db via the ensure backfill.
     earliest: datetime | None = None
-    for (raw,) in rows:
+    for raw in values:
         if raw is None:
             continue
         text = str(raw).strip()
@@ -133,6 +120,71 @@ def _earliest_mention_date(
     if earliest is None:
         return None
     return earliest.date().isoformat()
+
+
+def _earliest_mention_date(
+    conn: sqlite3.Connection,
+    source_message_ids: Iterable[int],
+) -> str | None:
+    # mentioned_at derivation (ADR 0037): the earliest UTC calendar date of the
+    # cited Tier 1 messages, as a date-only ISO string. Deterministic provenance
+    # — a pure function of source_message_ids over the append-only messages
+    # table — so insert, merge, and backfill all reproduce the same value.
+    ids = sorted({int(value) for value in source_message_ids})
+    if not ids:
+        return None
+    placeholders = ", ".join("?" for _ in ids)
+    rows = conn.execute(
+        f"SELECT timestamp FROM messages WHERE id IN ({placeholders})",
+        ids,
+    ).fetchall()
+    return _earliest_date_from_timestamps(row[0] for row in rows)
+
+
+def _backfill_mentioned_at(conn: sqlite3.Connection, table_name: str) -> None:
+    # Heal pre-column rows (the eval-DB undated-event sink) on init, following
+    # the last_seen_at ensure-backfill precedent. Batched: one read of the
+    # legacy rows, one read of every cited message, one executemany write —
+    # not a per-row round trip, which matters against hosted libSQL/Turso.
+    # Rows whose sources are missing/unparseable derive None and stay NULL;
+    # they are rescanned on later inits, a benign no-op at this row count.
+    rows = conn.execute(
+        f"SELECT id, source_message_ids FROM {table_name} WHERE mentioned_at IS NULL"
+    ).fetchall()
+    if not rows:
+        return
+    parsed_rows: list[tuple[int, list[int]]] = []
+    cited: set[int] = set()
+    for row_id, ids_json in rows:
+        try:
+            loaded = json.loads(ids_json)
+            ids = [int(value) for value in loaded]
+        except (TypeError, ValueError):
+            continue
+        parsed_rows.append((int(row_id), ids))
+        cited.update(ids)
+    if not cited:
+        return
+    ordered = sorted(cited)
+    placeholders = ", ".join("?" for _ in ordered)
+    timestamp_by_id = dict(
+        conn.execute(
+            f"SELECT id, timestamp FROM messages WHERE id IN ({placeholders})",
+            ordered,
+        ).fetchall()
+    )
+    updates = []
+    for row_id, ids in parsed_rows:
+        derived = _earliest_date_from_timestamps(
+            timestamp_by_id.get(message_id) for message_id in ids
+        )
+        if derived is not None:
+            updates.append((derived, row_id))
+    if updates:
+        conn.executemany(
+            f"UPDATE {table_name} SET mentioned_at = ? WHERE id = ?",
+            updates,
+        )
 
 
 def _load_vec_extension(conn: sqlite3.Connection) -> None:
@@ -202,6 +254,7 @@ def _ensure_memory_candidate_columns(conn: sqlite3.Connection) -> None:
         WHERE last_seen_at IS NULL
         """
     )
+    _backfill_mentioned_at(conn, "memory_candidates")
 
 
 def _ensure_embedding_metadata(conn: sqlite3.Connection) -> None:
@@ -289,6 +342,9 @@ def _ensure_long_term_memory(conn: sqlite3.Connection) -> None:
     # TEXT, not DATETIME: see the matching comment on the memory_candidates
     # occurred_at column — NUMERIC affinity would mangle a bare-year string.
     _ensure_column(conn, "long_term_memory", "occurred_at", "occurred_at TEXT")
+    # Date-only provenance string, same TEXT-affinity reasoning (ADR 0037).
+    _ensure_column(conn, "long_term_memory", "mentioned_at", "mentioned_at TEXT")
+    _backfill_mentioned_at(conn, "long_term_memory")
     # Idempotency backstop for promotion: at most one Tier 3 fact per source
     # candidate. The atomic claim in _promote_candidate is the primary guard;
     # this UNIQUE index is the schema-level safety net so even a racy double
