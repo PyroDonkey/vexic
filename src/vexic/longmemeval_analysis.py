@@ -312,7 +312,25 @@ def _subject_counts(db_path: Path) -> list[tuple[str, int]] | None:
         ).fetchall()
     # An empty list is a real observation (the DB exists but holds zero live
     # facts -- itself a diagnostic signal); ``None`` means the DB is absent.
-    return [(subject, int(count)) for subject, count in rows]
+    #
+    # Subject is stored verbatim, so one entity is case-split across
+    # exact-string keys ("User"/"user"/"  User "). Fold case/whitespace variants
+    # of the same token into one bucket -- matching the dedup gate's
+    # lower(trim(subject)) key -- so distinct_subjects counts entities, not
+    # spellings. The canonical display label is the most frequent raw variant
+    # (ties broken lexicographically for determinism).
+    folded: dict[str, dict[str, int]] = {}
+    for subject, count in rows:
+        key = subject.strip().lower()
+        folded.setdefault(key, {})
+        folded[key][subject] = folded[key].get(subject, 0) + int(count)
+    merged: list[tuple[str, int]] = []
+    for variants in folded.values():
+        total = sum(variants.values())
+        label = min(variants, key=lambda raw: (-variants[raw], raw))
+        merged.append((label, total))
+    merged.sort(key=lambda item: (-item[1], item[0]))
+    return merged
 
 
 def _subject_histogram(

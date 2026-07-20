@@ -2565,6 +2565,103 @@ class PipelineCorrectnessRegressionTests(unittest.TestCase):
             self.assertEqual(hit_count, 2, "merge must reinforce the existing candidate")
             self.assertEqual(source_ids, "[1, 2]")
 
+    def test_case_and_whitespace_subject_variant_merges(self) -> None:
+        # The dedup gate keys on subject, and real Tier-3 data splits
+        # the same entity across case variants ("User" 1,478 vs "user" 1,063).
+        # A subject that differs only by case/surrounding whitespace names the
+        # same entity and must fall in the SAME merge-eligible bucket, so an
+        # incoming near-identical fact reinforces rather than inserting a
+        # fragmented duplicate.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+
+            existing = FactCandidate(
+                fact_text="Ryan uses uv for all Python projects.",
+                subject="Ryan",
+                category="preference",
+                importance=5,
+                confidence=0.8,
+                source_message_ids=[1],
+            )
+            self._commit(
+                db_path,
+                [existing],
+                [_unit_vector(1.0)],
+                last_processed_message_id=1,
+            )
+
+            # Same entity, differing only by case + surrounding whitespace, with
+            # an identical vector (cosine 1.0 >= the 0.85 merge threshold).
+            incoming = FactCandidate(
+                fact_text="Ryan runs uv for every Python project.",
+                subject="  ryan ",
+                category="preference",
+                importance=5,
+                confidence=0.8,
+                source_message_ids=[2],
+            )
+            self._commit(
+                db_path,
+                [incoming],
+                [_unit_vector(1.0)],
+                last_processed_message_id=2,
+                started_at="2026-01-01T00:01:00Z",
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                total = conn.execute("SELECT COUNT(*) FROM memory_candidates").fetchone()[0]
+                subject, hit_count, source_ids = conn.execute(
+                    "SELECT subject, hit_count, source_message_ids FROM memory_candidates"
+                ).fetchone()
+
+            self.assertEqual(total, 1, "case/whitespace subject variant must merge, not insert")
+            self.assertEqual(hit_count, 2, "merge must reinforce the existing candidate")
+            self.assertEqual(source_ids, "[1, 2]")
+            self.assertEqual(subject, "Ryan", "stored subject must stay verbatim, not normalized")
+
+    def test_distinct_subjects_do_not_over_merge_after_normalization(self) -> None:
+        # Guard: normalizing the dedup key must collapse only case/
+        # whitespace variants of the SAME token, never distinct entities. Even
+        # with identical vectors (cosine 1.0), genuinely different subjects --
+        # an unrelated name and a near-spelled one -- must each insert their own
+        # candidate, proving the loosened predicate did not broaden the bucket.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+
+            candidates = [
+                FactCandidate(
+                    fact_text=f"{subject} note.",
+                    subject=subject,
+                    category="fact",
+                    importance=5,
+                    confidence=0.8,
+                    source_message_ids=[i + 1],
+                )
+                for i, subject in enumerate(("Ryan", "Bob", "Ryana"))
+            ]
+            self._commit(
+                db_path,
+                candidates,
+                [_unit_vector(1.0), _unit_vector(1.0), _unit_vector(1.0)],
+                last_processed_message_id=3,
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                subjects = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT subject FROM memory_candidates ORDER BY subject"
+                    ).fetchall()
+                ]
+
+            self.assertEqual(
+                subjects,
+                ["Bob", "Ryan", "Ryana"],
+                "distinct subjects must not merge even with identical vectors",
+            )
+
     def test_needs_review_candidate_cannot_win_promotion_claim(self) -> None:
         # Finding 3: a candidate flagged needs_review after selection must lose
         # the atomic promotion claim -- both at the claim primitive and end to

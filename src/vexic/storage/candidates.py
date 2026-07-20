@@ -118,7 +118,11 @@ def _nearest_candidate(
     # a fresh candidate — a staging duplicate, violating "reinforce/merge, don't
     # duplicate". The eligible set here is small by construction (same subject
     # AND category AND agent), so we filter first in plain SQL, then rank in
-    # Python. Both stored and incoming embeddings are normalized, so the dot
+    # Python. The subject match is case/whitespace-normalized
+    # (lower(trim(...)) on both sides) so trivial variants like "User"/"user"
+    # share one merge bucket instead of fragmenting; the stored subject stays
+    # verbatim (normalize the key, not the value). Both stored and incoming
+    # embeddings are normalized, so the dot
     # product IS cosine similarity and equals what both vector backends'
     # .similarity() would return (sqlite-vec: 1 - L2^2/2; libSQL: 1 - cos_dist)
     # — this keeps backend parity without touching the vector index and does not
@@ -129,7 +133,7 @@ def _nearest_candidate(
         FROM memory_candidate_embeddings AS e
         JOIN memory_candidates AS c
             ON c.id = e.candidate_id
-        WHERE c.subject = ?
+        WHERE lower(trim(c.subject)) = lower(trim(?))
             AND c.category = ?
             AND c.promoted = 0
             AND c.retired = 0

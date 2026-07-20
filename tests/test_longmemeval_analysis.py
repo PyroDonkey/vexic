@@ -374,6 +374,37 @@ class LongMemEvalAnalysisTests(unittest.TestCase):
         self.assertEqual(report.aggregate_histogram.median_facts_per_subject, 1)
         self.assertEqual(report.aggregate_histogram.max_facts_per_subject, 2)
 
+    def test_subject_histogram_folds_case_and_whitespace_variants(self) -> None:
+        # The real degeneracy is that one entity is case-split across
+        # exact-string keys ("User" 1,478 + "user" 1,063 + "the user" 10). The
+        # histogram must group case/whitespace variants of the same token as ONE
+        # subject so the "post-change histogram no longer case-split" acceptance
+        # holds -- otherwise distinct_subjects overcounts the same entity.
+        self._write_run([_diagnostics_row("q-a", judged_recall_pass=True)])
+        dataset = self._write_dataset([self._dataset_row("q-a", "unused")])
+        self._seed_question_db(
+            "q-a",
+            [
+                ("Fact one.", "User"),
+                ("Fact two.", "User"),
+                ("Fact three.", "user"),
+                ("Fact four.", "  User "),
+            ],
+        )
+
+        report = analyze_run(self.run_dir, dataset)
+
+        hist = report.subject_histograms[0]
+        self.assertEqual(hist.total_facts, 4)
+        self.assertEqual(
+            hist.distinct_subjects,
+            1,
+            "case/whitespace variants of one entity must fold into a single bucket",
+        )
+        self.assertEqual(hist.max_facts_per_subject, 4)
+        # Canonical label is the most frequent raw variant ("User", n=2 > "user").
+        self.assertEqual(hist.top_subjects, [("User", 4)])
+
     def test_aggregate_histogram_pools_all_subjects_not_just_top_n(self) -> None:
         # 10 subjects with 3 facts each + 11 subjects with 1 fact each. The
         # top-10 display list holds only the 3s; the aggregate median must be
