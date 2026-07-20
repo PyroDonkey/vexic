@@ -210,17 +210,18 @@ def _promote_candidate(
             "fact; refusing to skip a corrupt promotion state."
         )
 
-    if category == "event" and not occurred_at:
-        # Invariant 11: category "event" facts must carry occurred_at. Fail
-        # loud here rather than write an undated event to Tier 3. Checked after
-        # the `promoted` skip above so a legacy already-promoted event candidate
-        # (predating this column, occurred_at still NULL) stays a benign
-        # idempotent no-op instead of raising on rerun. `not occurred_at` also
+    if category == "event" and not occurred_at and not mentioned_at:
+        # Invariant 11 (as amended by ADR 0037): category "event" facts must
+        # carry occurred_at or, failing that, the derived mentioned_at
+        # provenance date. Fail loud here rather than write a dateless event to
+        # Tier 3. Checked after the `promoted` skip above so a legacy
+        # already-promoted event candidate (predating these columns) stays a
+        # benign idempotent no-op instead of raising on rerun. `not x` also
         # treats "" as missing, matching the merge-side COALESCE(NULLIF(...))
         # backfill semantics below.
         raise ValueError(
             f"Refusing to promote candidate {decision.candidate_id} with category "
-            "'event' and no occurred_at."
+            "'event' and no occurred_at or mentioned_at."
         )
 
     source_message_ids = sorted(set(_load_source_message_ids(source_ids_json)))

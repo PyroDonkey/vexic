@@ -1437,6 +1437,105 @@ class PipelineEmbeddingPortTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(category, "event")
         self.assertEqual(occurred_at, "2026-07-05T00:00:00Z")
 
+    def test_deep_commit_promotes_event_candidate_via_mentioned_at(self) -> None:
+        # ADR 0037: an undated event whose source messages carry timestamps
+        # promotes on mentioned_at provenance. occurred_at is never fabricated
+        # from mention time — it stays NULL on the Tier 3 row.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            message_id = save_messages(
+                db_path,
+                [ModelRequest(parts=[UserPromptPart(content="We got the mortgage sorted.")])],
+                timestamp="2026-03-05T10:00:00+00:00",
+            )[0]
+            commit_dream_cycle(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="Ryan updated the mortgage.",
+                        subject="Ryan",
+                        category="event",
+                        importance=6,
+                        confidence=0.9,
+                        source_message_ids=[message_id],
+                    )
+                ],
+                candidate_embeddings=[_unit_vector(1.0)],
+                agent_id=None,
+                status="ok",
+                started_at="2026-01-01T00:00:00Z",
+                finished_at="2026-01-01T00:00:01Z",
+                messages_processed=1,
+                last_processed_message_id=message_id,
+            )
+
+            commit_deep_cycle(
+                db_path,
+                [PromotionDecision(candidate_id=1, embedding=_unit_vector(1.0))],
+                started_at="2026-01-01T00:01:00Z",
+                finished_at="2026-01-01T00:01:01Z",
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                occurred_at, mentioned_at, category = conn.execute(
+                    """
+                    SELECT occurred_at, mentioned_at, category FROM long_term_memory
+                    WHERE promoted_from_candidate_id = 1
+                    """
+                ).fetchone()
+
+        self.assertEqual(category, "event")
+        self.assertIsNone(occurred_at, "mention time must never be written as event time")
+        self.assertEqual(mentioned_at, "2026-03-05")
+
+    def test_deep_commit_promotion_carries_mentioned_at_for_non_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            message_id = save_messages(
+                db_path,
+                [ModelRequest(parts=[UserPromptPart(content="I prefer dark mode.")])],
+                timestamp="2026-02-01T08:00:00+00:00",
+            )[0]
+            commit_dream_cycle(
+                db_path,
+                [
+                    FactCandidate(
+                        fact_text="Ryan prefers dark mode editors.",
+                        subject="Ryan",
+                        category="preference",
+                        importance=6,
+                        confidence=0.9,
+                        source_message_ids=[message_id],
+                    )
+                ],
+                candidate_embeddings=[_unit_vector(1.0)],
+                agent_id=None,
+                status="ok",
+                started_at="2026-01-01T00:00:00Z",
+                finished_at="2026-01-01T00:00:01Z",
+                messages_processed=1,
+                last_processed_message_id=message_id,
+            )
+
+            commit_deep_cycle(
+                db_path,
+                [PromotionDecision(candidate_id=1, embedding=_unit_vector(1.0))],
+                started_at="2026-01-01T00:01:00Z",
+                finished_at="2026-01-01T00:01:01Z",
+            )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                mentioned_at = conn.execute(
+                    """
+                    SELECT mentioned_at FROM long_term_memory
+                    WHERE promoted_from_candidate_id = 1
+                    """
+                ).fetchone()[0]
+
+        self.assertEqual(mentioned_at, "2026-02-01")
+
     def test_deep_commit_promotes_non_event_candidate_without_occurred_at(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = str(Path(temp_dir) / "memory.db")
