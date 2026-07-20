@@ -517,6 +517,120 @@ class ContradictionSupersessionReliabilityTests(unittest.IsolatedAsyncioTestCase
         self.assertEqual(candidates, [(1, 1, 1, 0), (2, 1, 2, 0)])
 
 
+class KnowledgeUpdateSupersessionTests(unittest.IsolatedAsyncioTestCase):
+    # ADR 0037 acceptance, the 852ce960 eval shape: a knowledge update
+    # extracted as an undated event ("mortgage is $400k now") must escape the
+    # Tier 2 sink via mentioned_at, reach Tier 3, and retire the stale fact
+    # through the contradiction path — with occurred_at never fabricated.
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.temp_dir.name) / "memory.db")
+        init_db(self.db_path)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    async def test_undated_event_update_reaches_tier3_and_retires_stale_fact(self) -> None:
+        old_message_id = save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="My mortgage is $350k.")])],
+            timestamp="2026-01-10T09:00:00+00:00",
+        )[0]
+        new_message_id = save_messages(
+            self.db_path,
+            [ModelRequest(parts=[UserPromptPart(content="The mortgage is $400k now.")])],
+            timestamp="2026-03-05T10:00:00+00:00",
+        )[0]
+
+        # Stage and promote the stale fact at lower confidence, so the
+        # incoming higher-confidence update wins the contradiction instead of
+        # being blocked by the neighbor rule.
+        commit_dream_cycle(
+            self.db_path,
+            [
+                _candidate(
+                    "Ryan's mortgage is $350k.",
+                    message_ids=[old_message_id],
+                    confidence=0.6,
+                )
+            ],
+            candidate_embeddings=[_unit_vector(1.0)],
+            agent_id=None,
+            status="ok",
+            started_at="2026-06-01T00:00:00+00:00",
+            finished_at="2026-06-01T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=old_message_id,
+        )
+        commit_deep_cycle(
+            self.db_path,
+            [PromotionDecision(candidate_id=1, embedding=_unit_vector(1.0))],
+            started_at="2026-06-01T00:01:00+00:00",
+            finished_at="2026-06-01T00:01:01+00:00",
+        )
+
+        update_candidate = _candidate(
+            "Ryan's mortgage is $400k.",
+            message_ids=[new_message_id],
+            category="event",
+            confidence=0.9,
+            occurred_at=None,
+        )
+
+        class _UpdateExtractionAgent:
+            async def run(self, transcript: str) -> _FakeResult:
+                return _FakeResult([update_candidate])
+
+        # Same unit embedding as the stale fact so the nearest-neighbor scan
+        # surfaces it for the contradiction judge.
+        with patch(
+            "vexic.pipeline.build_extraction_agent",
+            return_value=_UpdateExtractionAgent(),
+        ):
+            await run_light_phase(
+                self.db_path,
+                "glm",
+                embed=lambda texts: [_unit_vector(1.0) for _ in texts],
+            )
+        await run_deep_phase(
+            self.db_path,
+            "glm",
+            contradiction_agent_factory=lambda *_args, **_kwargs: _ContradictionAgent(
+                contradicts=True
+            ),
+        )
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            new_fact = conn.execute(
+                """
+                SELECT id, occurred_at, mentioned_at, retired
+                FROM long_term_memory
+                WHERE fact_text = 'Ryan''s mortgage is $400k.'
+                """
+            ).fetchone()
+            old_fact = conn.execute(
+                """
+                SELECT retired, retired_by_fact_id
+                FROM long_term_memory
+                WHERE fact_text = 'Ryan''s mortgage is $350k.'
+                """
+            ).fetchone()
+            message_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+
+        self.assertIsNotNone(new_fact, "the $400k update must reach Tier 3")
+        new_fact_id, occurred_at, mentioned_at, new_retired = new_fact
+        self.assertEqual(new_retired, 0)
+        self.assertIsNone(occurred_at, "occurred_at must never be fabricated from mention time")
+        self.assertEqual(mentioned_at, "2026-03-05")
+        self.assertEqual(
+            old_fact,
+            (1, new_fact_id),
+            "supersession must retire the stale fact in place (Invariant 6)",
+        )
+        self.assertEqual(message_count, 2, "Tier 1 transcript stays append-only")
+
+
 class MemoryIsolationAndRedactionReliabilityTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
