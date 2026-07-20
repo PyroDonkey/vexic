@@ -15,6 +15,7 @@ from math import log
 from typing import Any
 
 from vexic.error_reporting import format_error_detail, mark_dream_recorded
+from vexic.models import canonical_partial_date
 from vexic.ports import AgentFactory, missing_host_port
 from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage import (
@@ -136,14 +137,19 @@ def select_promotions(
     # With mentioned_at derived at insert and backfilled on init, this skip is
     # now the residual case (legacy rows not yet healed, or sources missing/
     # unparseable); such candidates stay in Tier 2 like ADR 0031 drops
-    # miscited candidates. Same `.strip()` blank-ish semantics as the
-    # promotion guard: whitespace-only dates count as missing on both gates.
+    # miscited candidates. The occurred_at gate runs the SAME
+    # `canonical_partial_date` the promotion path uses: a nonblank-but-invalid
+    # value ("not-a-date") that a bare `.strip()` would pass gets selected,
+    # then canonicalizes to None in promotion and fails loud -- aborting the
+    # cycle, with retries re-selecting the same row (a permanent deadlock).
+    # mentioned_at stays blank-strip semantics: it is deterministically
+    # derived provenance, always canonical or blank.
     candidates = [
         c
         for c in candidates
         if not (
             c.category == "event"
-            and not (c.occurred_at or "").strip()
+            and canonical_partial_date(c.occurred_at) is None
             and not (c.mentioned_at or "").strip()
         )
     ]
