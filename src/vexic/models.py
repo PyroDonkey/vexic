@@ -32,6 +32,11 @@ def _is_real_date(text: str) -> bool:
 class FactCandidate(BaseModel):
     """A memory candidate extracted from transcript messages by the Light phase."""
 
+    # validate_assignment so a post-construction assignment (e.g. the Light
+    # occurred_at guards) can never smuggle an invalid date onto the row: the
+    # validator re-runs and degrades junk to None (ADR 0038).
+    model_config = ConfigDict(validate_assignment=True)
+
     fact_text: str
     subject: str
     category: Literal[
@@ -71,8 +76,16 @@ class FactCandidate(BaseModel):
         # Rehydration from persisted rows (src/vexic/storage/candidates.py) can surface
         # legacy datetime-shaped values, e.g. "2026-07-05T00:00:00Z". Truncate
         # to the date part instead of nulling it out: truncation only reduces
-        # precision, it never invents components (Memory Invariant 11).
-        if len(text) > 10 and text[10] in "T " and _is_real_date(text[:10]):
+        # precision, it never invents components (Memory Invariant 11). The
+        # character after the T/space separator must be a digit, so a
+        # date-shaped prefix with non-datetime trailing text ("2023-09-24Tnot")
+        # is rejected as junk rather than silently truncated.
+        if (
+            len(text) > 10
+            and text[10] in "T "
+            and text[11:12].isdigit()
+            and _is_real_date(text[:10])
+        ):
             return text[:10]
         return None
 

@@ -103,7 +103,10 @@ _WEEKDAY_ABBR = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 def _observed_label(timestamp: str | None) -> str:
     """Transient prompt scaffolding only: never persisted into message text,
     FTS, or replay (Memory Invariant 2, ADR 0034/0038)."""
-    if not timestamp:
+    # Fail soft on non-string timestamps: SQLite can yield int/bytes from
+    # foreign writers, and an unlabeled marker is correct where a valid
+    # observed date is not available.
+    if not isinstance(timestamp, str) or not timestamp:
         return ""
     try:
         observed = date.fromisoformat(timestamp[:10])

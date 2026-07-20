@@ -2794,6 +2794,18 @@ class RenderTranscriptObservedTimeTests(unittest.TestCase):
         rows = [(7, "2023-11-17T09:30:00+00:00", user_message("hello"))]
         self.assertEqual(rendered_message_ids(rows), [7])
 
+    def test_render_transcript_fail_soft_on_non_string_timestamp(self) -> None:
+        # SQLite can yield int/bytes timestamps from foreign writers; the
+        # observed-time label must render unlabeled rather than raise.
+        rows = [
+            (7, 20231117, user_message("a")),
+            (8, b"2023-11-17", user_message("b")),
+        ]
+        self.assertEqual(
+            render_transcript(rows),
+            "[message_id=7] User: a\n[message_id=8] User: b",
+        )
+
 
 class FactCandidateOccurredAtValidatorTests(unittest.TestCase):
     """FactCandidate.occurred_at validator accepts YYYY, YYYY-MM, YYYY-MM-DD
@@ -2816,6 +2828,11 @@ class FactCandidateOccurredAtValidatorTests(unittest.TestCase):
             ("2026-07-05 09:30:00", "2026-07-05"),
             ("2026-02-30T00:00:00Z", None),
             ("9999-99-99T00:00:00", None),
+            # The separator must be followed by a digit: a date-shaped prefix
+            # with non-datetime trailing text is junk, not a truncatable value.
+            ("2023-09-24Tnot-a-datetime", None),
+            ("2023-09-24 not-a-datetime", None),
+            ("2023-09-24T", None),
         ]
         for raw, expected in test_cases:
             with self.subTest(raw=raw):
@@ -2828,6 +2845,27 @@ class FactCandidateOccurredAtValidatorTests(unittest.TestCase):
                     occurred_at=raw,
                 )
                 self.assertEqual(c.occurred_at, expected)
+
+    def test_occurred_at_revalidated_on_assignment(self) -> None:
+        # validate_assignment: a post-construction assignment of an invalid
+        # date must re-run the validator and degrade to None, not smuggle the
+        # bad value onto the row.
+        c = FactCandidate(
+            fact_text="x",
+            subject="user",
+            category="event",
+            importance=5,
+            confidence=0.9,
+            occurred_at="2023-11-17",
+        )
+        c.occurred_at = "2023-02-30"
+        self.assertIsNone(c.occurred_at)
+        # A valid reassignment survives, and None (the guard's canonical
+        # "undated" assignment) is accepted.
+        c.occurred_at = "2024-01"
+        self.assertEqual(c.occurred_at, "2024-01")
+        c.occurred_at = None
+        self.assertIsNone(c.occurred_at)
 
 
 def _event_candidate(**overrides: object) -> FactCandidate:
