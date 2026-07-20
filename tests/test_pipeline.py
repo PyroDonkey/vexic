@@ -17,7 +17,13 @@ from vexic.embeddings import EMBEDDING_DIM
 from vexic.error_reporting import dream_failure_recorded
 from vexic.deep import run_deep_phase
 from vexic.models import ContradictionJudgment, FactCandidate
-from vexic.pipeline import _main, render_transcript, rendered_message_ids, run_light_phase
+from vexic.pipeline import (
+    _main,
+    apply_occurred_at_guards,
+    render_transcript,
+    rendered_message_ids,
+    run_light_phase,
+)
 from vexic.ports import HostPortNotConfigured
 from vexic.rem import REM_TOP_K, compute_centrality_boosts, run_rem_phase
 from vexic.storage import (
@@ -2769,6 +2775,100 @@ class FactCandidateOccurredAtValidatorTests(unittest.TestCase):
                     occurred_at=raw,
                 )
                 self.assertEqual(c.occurred_at, expected)
+
+
+def _event_candidate(**overrides: object) -> FactCandidate:
+    fields: dict[str, object] = {
+        "fact_text": "Ryan did something.",
+        "subject": "Ryan",
+        "category": "event",
+        "importance": 5,
+        "confidence": 0.8,
+        "source_message_ids": [1],
+    }
+    fields.update(overrides)
+    return FactCandidate(**fields)
+
+
+def _rows_nov_2023() -> list[tuple[int, str, ModelRequest]]:
+    return [(1, "2023-11-17T09:00:00+00:00", user_message("we talked"))]
+
+
+class OccurredAtGuardTests(unittest.TestCase):
+    """apply_occurred_at_guards is the deterministic anti-fabrication layer
+    for Tier 2 event candidates (ADR 0038): a year-plausibility
+    check that nulls out occurred_at years unmoored from the transcript
+    window, and an in-text date copy-backfill for event candidates the model
+    left undated but which state exactly one absolute date in fact_text."""
+
+    def test_guard_nulls_year_not_grounded_in_window(self) -> None:
+        c = _event_candidate(occurred_at="2025-03-01")
+        apply_occurred_at_guards(
+            [c],
+            _rows_nov_2023(),
+            "[message_id=1 observed=2023-11-17 Fri] User: we talked",
+        )
+        self.assertIsNone(c.occurred_at)
+
+    def test_guard_keeps_observed_year_and_adjacent_years(self) -> None:
+        for kept in ("2023-03-01", "2022-12", "2024"):
+            with self.subTest(kept=kept):
+                c = _event_candidate(occurred_at=kept)
+                apply_occurred_at_guards([c], _rows_nov_2023(), "irrelevant")
+                self.assertEqual(c.occurred_at, kept)
+
+    def test_guard_keeps_year_stated_in_transcript(self) -> None:
+        c = _event_candidate(occurred_at="1999")
+        apply_occurred_at_guards(
+            [c], _rows_nov_2023(), "User: I graduated in 1999"
+        )
+        self.assertEqual(c.occurred_at, "1999")
+
+    def test_guard_copies_single_intext_absolute_date_into_occurred_at(self) -> None:
+        c = _event_candidate(
+            fact_text="User ran the Berlin half on 2023-09-24", occurred_at=None
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(c.occurred_at, "2023-09-24")
+
+    def test_guard_copies_month_year_at_stated_precision(self) -> None:
+        c = _event_candidate(
+            fact_text="User moved to Lisbon in March 2023", occurred_at=None
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(c.occurred_at, "2023-03")
+
+    def test_guard_skips_copy_when_multiple_or_zero_dates(self) -> None:
+        c = _event_candidate(
+            fact_text="Trips on 2023-05-01 and 2023-06-01", occurred_at=None
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertIsNone(c.occurred_at)
+
+    def test_guard_never_copies_for_non_event_categories(self) -> None:
+        c = _event_candidate(
+            fact_text="Prefers the 2023-09-24 build",
+            occurred_at=None,
+            category="preference",
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertIsNone(c.occurred_at)
+
+    def test_guard_copies_full_month_day_year_date(self) -> None:
+        c = _event_candidate(
+            fact_text="User ran the Berlin half on September 24, 2023",
+            occurred_at=None,
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(c.occurred_at, "2023-09-24")
+
+    def test_guard_rejects_calendar_invalid_intext_date(self) -> None:
+        c = _event_candidate(
+            fact_text="User claimed it happened on February 30, 2023",
+            occurred_at=None,
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertIsNone(c.occurred_at)
 
 
 if __name__ == "__main__":

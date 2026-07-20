@@ -8,6 +8,7 @@ extraction agent itself is a host port: callers must inject an
 """
 
 import asyncio
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
@@ -47,6 +48,35 @@ from vexic.usage import UsageSummary, summarize_agent_usage
 
 LIGHT_PHASE_BATCH_SIZE = 50
 _LOCAL_EMBEDDER = embed_texts
+
+_YEAR_RE = re.compile(r"\b(1\d{3}|20\d{2})\b")
+_ISO_FULL_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+_ISO_YM_RE = re.compile(r"\b(\d{4})-(\d{2})\b(?!-)")
+_MONTHS = {
+    m.lower(): i
+    for i, m in enumerate(
+        (
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+        ),
+        start=1,
+    )
+}
+_MONTH_DATE_RE = re.compile(
+    r"\b(January|February|March|April|May|June|July|August|September|October|November|December)"
+    r"\s+(?:(\d{1,2})(?:st|nd|rd|th)?,?\s+)?(\d{4})\b",
+    re.IGNORECASE,
+)
 
 
 def build_extraction_agent(
@@ -137,6 +167,93 @@ def keep_candidates_with_valid_source_ids(
         candidate.source_message_ids = sorted(candidate_ids)
         kept.append(candidate)
     return kept, dropped
+
+
+def _plausible_years(rows: list[tuple[int, str | None, ModelMessage]], transcript: str) -> set[int]:
+    """Years grounded in this Light window: each message's observed year (and
+    its neighbors), plus any 4-digit year literally present in the rendered
+    transcript text."""
+    years: set[int] = set()
+    for _, timestamp, _ in rows:
+        if timestamp:
+            try:
+                y = date.fromisoformat(timestamp[:10]).year
+            except ValueError:
+                continue
+            years.update((y - 1, y, y + 1))
+    years.update(int(m.group(0)) for m in _YEAR_RE.finditer(transcript))
+    return years
+
+
+def _single_intext_date(fact_text: str) -> str | None:
+    """The one absolute date stated in fact_text, at stated precision, or
+    None. A calendar-invalid match (e.g. "February 30, 2023") still counts as
+    a match for the exactly-one-total rule, but is never itself returned --
+    it disqualifies the copy rather than producing a fabricated date."""
+    found: list[str | None] = []
+    for m in _ISO_FULL_RE.finditer(fact_text):
+        year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            date(year, month, day)
+        except ValueError:
+            found.append(None)
+        else:
+            found.append(m.group(0))
+    stripped = _ISO_FULL_RE.sub(" ", fact_text)
+    for m in _ISO_YM_RE.finditer(stripped):
+        year, month = int(m.group(1)), int(m.group(2))
+        try:
+            date(year, month, 1)
+        except ValueError:
+            found.append(None)
+        else:
+            found.append(m.group(0))
+    for m in _MONTH_DATE_RE.finditer(fact_text):
+        month = _MONTHS[m.group(1).lower()]
+        year = int(m.group(3))
+        if m.group(2):
+            day = int(m.group(2))
+            try:
+                date(year, month, day)
+            except ValueError:
+                found.append(None)
+            else:
+                found.append(f"{year}-{month:02d}-{day:02d}")
+        else:
+            try:
+                date(year, month, 1)
+            except ValueError:
+                found.append(None)
+            else:
+                found.append(f"{year}-{month:02d}")
+    return found[0] if len(found) == 1 else None
+
+
+def apply_occurred_at_guards(
+    candidates: list[FactCandidate],
+    rows: list[tuple[int, str | None, ModelMessage]],
+    transcript: str,
+) -> list[FactCandidate]:
+    """Deterministic occurred_at guards (ADR 0038).
+
+    Year plausibility runs first and only against a model-supplied
+    occurred_at: a year with no grounding in the window's observed dates or
+    the transcript text is dropped to None rather than trusted, killing the
+    class of fabricated far-future/far-past dates deterministically. The
+    in-text copy-backfill then runs only for event candidates still lacking
+    a date, and only copies when fact_text states exactly one absolute date.
+
+    Fabricated components degrade to undated (ADR 0037 Tier 2 sink) rather
+    than dropping the candidate; in-text dates copy at stated precision only.
+    """
+    plausible = _plausible_years(rows, transcript)
+    for candidate in candidates:
+        if candidate.occurred_at is not None:
+            if int(candidate.occurred_at[:4]) not in plausible:
+                candidate.occurred_at = None
+        if candidate.occurred_at is None and candidate.category == "event":
+            candidate.occurred_at = _single_intext_date(candidate.fact_text)
+    return candidates
 
 
 def _forbidden_secret_values(
@@ -235,6 +352,7 @@ async def run_light_phase(
         candidates, dropped = keep_candidates_with_valid_source_ids(
             result.output, evidence_ids
         )
+        apply_occurred_at_guards(candidates, rows, transcript)
 
         missing_embeddings = load_candidates_missing_embeddings(
             db_path,
