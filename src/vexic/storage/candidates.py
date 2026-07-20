@@ -300,6 +300,14 @@ def _merge_candidate(
 
     current_hit_count = int(row[1])
     merged_source_ids = _merge_source_message_ids(row[0], candidate.source_message_ids)
+    # mentioned_at is recomputed over the merged source union so an earlier
+    # mention discovered by a duplicate moves the date back, but a NULL
+    # recompute (e.g. sources physically purged) never wipes a known date —
+    # the inverse COALESCE order from occurred_at, where the existing value
+    # wins because event time is extracted, not derived (ADR 0037).
+    merged_mentioned_at = _earliest_mention_date(
+        conn, _load_source_message_ids(merged_source_ids)
+    )
     conn.execute(
         """
         UPDATE memory_candidates
@@ -309,7 +317,8 @@ def _merge_candidate(
             importance = MAX(importance, ?),
             confidence = MAX(confidence, ?),
             best_similarity = ?,
-            occurred_at = COALESCE(NULLIF(occurred_at, ''), NULLIF(?, ''))
+            occurred_at = COALESCE(NULLIF(occurred_at, ''), NULLIF(?, '')),
+            mentioned_at = COALESCE(NULLIF(?, ''), mentioned_at)
         WHERE id = ?
         """,
         (
@@ -318,6 +327,7 @@ def _merge_candidate(
             candidate.confidence,
             match.similarity,
             candidate.occurred_at,
+            merged_mentioned_at,
             match.candidate_id,
         ),
     )

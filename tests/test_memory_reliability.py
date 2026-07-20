@@ -1231,6 +1231,77 @@ class MentionedAtDerivationTests(unittest.TestCase):
         mentioned_at, _ = self._mentioned_at(candidate_id)
         self.assertIsNone(mentioned_at)
 
+    def test_merge_recomputes_mentioned_at_from_merged_source_union(self) -> None:
+        # mentioned_at is a pure function of source_message_ids, so a merge
+        # recomputes it over the union — an earlier mention discovered by a
+        # duplicate observation moves the date back (earliest-mention wins).
+        later = self._save_message(
+            "The Yellowstone trip was amazing.",
+            timestamp="2026-04-10T09:30:00+00:00",
+        )
+        earlier = self._save_message(
+            "We finally visited Yellowstone.",
+            timestamp="2026-03-05T10:00:00+00:00",
+        )
+        fact_text = "Ryan visited Yellowstone."
+        candidate_id = self._commit_candidate(
+            _candidate(fact_text, message_ids=[later], category="event")
+        )
+        mentioned_at, _ = self._mentioned_at(candidate_id)
+        self.assertEqual(mentioned_at, "2026-04-10")
+
+        merged_id = self._commit_candidate(
+            _candidate(fact_text, message_ids=[earlier], category="event")
+        )
+        self.assertEqual(merged_id, candidate_id, "duplicate must merge, not insert")
+        mentioned_at, _ = self._mentioned_at(candidate_id)
+        self.assertEqual(mentioned_at, "2026-03-05")
+
+    def test_merge_heals_legacy_null_mentioned_at(self) -> None:
+        first = self._save_message(
+            "We finally visited Yellowstone.",
+            timestamp="2026-03-05T10:00:00+00:00",
+        )
+        second = self._save_message(
+            "The Yellowstone trip was amazing.",
+            timestamp="2026-04-10T09:30:00+00:00",
+        )
+        fact_text = "Ryan visited Yellowstone."
+        candidate_id = self._commit_candidate(
+            _candidate(fact_text, message_ids=[first], category="event")
+        )
+        # Simulate a pre-column legacy row.
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE memory_candidates SET mentioned_at = NULL WHERE id = ?",
+                (candidate_id,),
+            )
+            conn.commit()
+
+        self._commit_candidate(_candidate(fact_text, message_ids=[second], category="event"))
+        mentioned_at, _ = self._mentioned_at(candidate_id)
+        self.assertEqual(mentioned_at, "2026-03-05")
+
+    def test_merge_does_not_clobber_known_mentioned_at_when_recompute_yields_null(self) -> None:
+        # After a physical purge the source ids can dangle; recompute then
+        # yields NULL, which must not wipe provenance already known
+        # (COALESCE mirror of the occurred_at no-clobber rule).
+        first = self._save_message(
+            "We finally visited Yellowstone.",
+            timestamp="2026-03-05T10:00:00+00:00",
+        )
+        fact_text = "Ryan visited Yellowstone."
+        candidate_id = self._commit_candidate(
+            _candidate(fact_text, message_ids=[first], category="event")
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("DELETE FROM messages WHERE id = ?", (first,))
+            conn.commit()
+
+        self._commit_candidate(_candidate(fact_text, message_ids=[first], category="event"))
+        mentioned_at, _ = self._mentioned_at(candidate_id)
+        self.assertEqual(mentioned_at, "2026-03-05")
+
 
 class LongTermSearchAsOfFilterTests(unittest.TestCase):
     # `as_of` restricts keyword (FTS) and vector (KNN) Tier 3 search
