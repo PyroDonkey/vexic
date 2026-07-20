@@ -189,6 +189,154 @@ class OracleFixtureTests(TestCase):
         with self.assertRaises(oee.OracleFixtureError):
             oee.resolve_constituents(entry)
 
+    def test_drift_guard_is_exact_not_normalized(self) -> None:
+        # A whitespace/case-only difference must trip the guard: an exact match
+        # is the correct check since the fixture copies text verbatim.
+        self._seed_db("q1", [("Fact one.", "fact", None), ("Fact two.", "fact", None)])
+        entry = oee.load_oracle_fixture(
+            self._fixture(
+                [self._entry("q1", expected_fact_texts=["fact one.", "Fact two."])]
+            )
+        )[0]
+        with self.assertRaises(oee.OracleFixtureError):
+            oee.resolve_constituents(entry)
+
+    def test_load_fixture_rejects_duplicate_constituent_ids(self) -> None:
+        path = self._fixture(
+            [
+                self._entry(
+                    "q1",
+                    constituent_fact_ids=[1, 1],
+                    expected_fact_texts=["Fact one.", "Fact one."],
+                )
+            ]
+        )
+        with self.assertRaises(oee.OracleFixtureError):
+            oee.load_oracle_fixture(path)
+
+    def test_reconstruct_fused_reproduces_persisted_fused_column(self) -> None:
+        # The central faithfulness premise: offline reconstruction of fused[:5]
+        # must equal what the run actually stored, over an asymmetric >5 pool.
+        keyword_ids = [1, 2, 3, 4, 5, 6, 7, 8]
+        vector_ids = [8, 3, 1, 9, 2, 10, 4, 5]
+        stored = reciprocal_rank_fusion([keyword_ids, vector_ids])[:5]
+        facts = [(f"Fact {i}.", "fact", None) for i in range(1, 11)]
+        self._seed_db(
+            "q1",
+            facts,
+            event={
+                "keyword_fact_ids": keyword_ids,
+                "vector_fact_ids": vector_ids,
+                "fused_fact_ids": stored,
+            },
+        )
+        entry = oee.load_oracle_fixture(
+            self._fixture(
+                [self._entry("q1", constituent_fact_ids=[1], expected_fact_texts=["Fact 1."])]
+            )
+        )[0]
+        kw, vec, fused_stored = oee._read_answer_arrays(entry)
+        self.assertEqual(oee.reconstruct_fused(kw, vec, len(fused_stored)), fused_stored)
+
+    def test_preflight_fails_when_stored_fused_diverges(self) -> None:
+        # A stored fused that disagrees with RRF over the pools means the run's
+        # fusion wiring drifted; preflight must fail loud, not judge silently.
+        facts = [(f"Fact {i}.", "fact", None) for i in range(1, 8)]
+        self._seed_db(
+            "q1",
+            facts,
+            event={
+                "keyword_fact_ids": [1, 2, 3, 4, 5],
+                "vector_fact_ids": [5, 4, 3, 2, 1],
+                "fused_fact_ids": [7, 6, 5, 4, 3],  # not what RRF would produce
+            },
+        )
+        entry = oee.load_oracle_fixture(
+            self._fixture(
+                [self._entry("q1", constituent_fact_ids=[1], expected_fact_texts=["Fact 1."])]
+            )
+        )[0]
+        with self.assertRaises(oee.OracleFixtureError):
+            oee.preflight([entry])
+
+    def test_preflight_fails_on_missing_event_with_constituents(self) -> None:
+        self._seed_db("q1", [("Fact one.", "fact", None)])  # no retrieval event
+        entry = oee.load_oracle_fixture(
+            self._fixture(
+                [self._entry("q1", constituent_fact_ids=[1], expected_fact_texts=["Fact one."])]
+            )
+        )[0]
+        with self.assertRaises(oee.OracleFixtureError):
+            oee.preflight([entry])
+
+    def test_condition_fact_texts_include_retired_to_match_production(self) -> None:
+        # Production fetch_long_term_facts selects purely by id; a fused id at a
+        # retired fact is still presented, so condition texts must include it.
+        db_path = self.run_dir / _question_path_component("q1") / "memory.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        init_db(str(db_path))
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute(
+                "INSERT INTO long_term_memory (fact_text, subject, category, "
+                "importance, confidence, source_message_ids, "
+                "promoted_from_candidate_id, retired) "
+                "VALUES ('Retired fact.', 'user', 'fact', 5, 0.9, '[1]', 1, 1)"
+            )
+            conn.commit()
+        entry = oee.load_oracle_fixture(
+            self._fixture(
+                [self._entry("q1", constituent_fact_ids=[1], expected_fact_texts=["Retired fact."])]
+            )
+        )[0]
+        self.assertEqual(oee.condition_fact_texts(entry, [1]), ["Retired fact."])
+
+    def test_event_sorted_matches_production_with_events_sorted(self) -> None:
+        # The copied _event_sorted must stay byte-faithful to production's
+        # _with_events_sorted (ADR 0037); compare both on the same rows.
+        from vexic.subagents.retrieval import _with_events_sorted
+
+        rows = [
+            oee._FactRow(1, "older event", "event", "2020-01-01", None, "2024-01-01"),
+            oee._FactRow(2, "a preference", "preference", None, None, "2024-01-01"),
+            oee._FactRow(3, "newer event", "event", "2023-06-01", None, "2024-01-01"),
+        ]
+        mine = [r.fact_id for r in oee._event_sorted(rows)]
+        prod = [f.fact_id for f in _with_events_sorted(rows)]
+        self.assertEqual(mine, prod)
+        self.assertEqual(mine, [3, 2, 1])
+
+    def test_run_experiment_stops_and_records_on_budget_exhaustion(self) -> None:
+        # Two questions, budget too small to finish both: exhaustion stops the
+        # run, records budget_exhausted, keeps completed results.
+        for qid in ("q1", "q2"):
+            # No diagnostics row -> recorded_verdict is None (not "supported"),
+            # so both questions are scored.
+            self._seed_db(
+                qid,
+                [("Fact.", "fact", None)],
+                event={
+                    "keyword_fact_ids": [1],
+                    "vector_fact_ids": [1],
+                    "fused_fact_ids": [1],
+                },
+            )
+        entries = oee.load_oracle_fixture(
+            self._fixture(
+                [
+                    self._entry(q, constituent_fact_ids=[1], expected_fact_texts=["Fact."])
+                    for q in ("q1", "q2")
+                ]
+            )
+        )
+        # 5 conditions x 1 repeat = 5 calls per question; cap at 6 finishes only
+        # the first question.
+        budget = oee.ProviderBudget(6)
+        doc = asyncio.run(
+            oee.run_experiment(entries, _StubJudge({}), repeats=1, budget=budget)
+        )
+        self.assertTrue(doc["budget_exhausted"])
+        self.assertEqual(len(doc["results"]), 1)
+
     def test_resolve_constituents_fails_on_missing_id(self) -> None:
         self._seed_db("q1", [("Fact one.", "fact", None)])  # only id 1 exists
         entry = oee.load_oracle_fixture(self._fixture([self._entry("q1")]))[0]
@@ -343,17 +491,21 @@ class OracleFixtureTests(TestCase):
 
         results = [
             result("qA", 1.0, [0.0, 0.0, 0.0, 0.0]),  # oracle only -> derivation
-            result("qB", 1.0, [0.0, 1.0, 1.0, 1.0]),  # some-k fixes it
+            result("qB", 1.0, [0.0, 1.0, 1.0, 1.0]),  # widening (k>5) fixes it
             result("qC", 0.0, [0.0, 0.0, 0.0, 0.0]),  # unrecoverable here
             result("qD", 0.0, [0.0, 1.0, 0.0, 0.0]),  # k=8 passes, k=10/15 regress
+            result("qE", 1.0, [1.0, 0.0, 0.0, 0.0]),  # only baseline k5 re-judges pass
         ]
 
         headroom = oee.build_headroom(results, threshold=0.5)
 
-        self.assertEqual(headroom["n"], 4)
+        self.assertEqual(headroom["n"], 5)
+        # qE's only pass is at k=RETURN_K (baseline re-judge noise), so it is NOT
+        # reachable-by-widening; it is derivation_needed (oracle passes, no k>5).
         self.assertEqual(set(headroom["set_completeness_reachable"]), {"qB", "qD"})
-        self.assertEqual(set(headroom["combined_ceiling"]), {"qA", "qB"})
-        self.assertEqual(set(headroom["derivation_needed"]), {"qA"})
+        self.assertEqual(set(headroom["baseline_rejudge_pass"]), {"qE"})
+        self.assertEqual(set(headroom["combined_ceiling"]), {"qA", "qB", "qE"})
+        self.assertEqual(set(headroom["derivation_needed"]), {"qA", "qE"})
         self.assertIn("qD", headroom["nonmonotonic_regressions"])
 
     def test_recorded_verdict_reads_diagnostics(self) -> None:
@@ -366,9 +518,10 @@ class OracleFixtureTests(TestCase):
         entry = oee.load_oracle_fixture(self._fixture([self._entry("q1")]))[0]
         self.assertEqual(oee.recorded_verdict(entry), "partial")
 
-    def test_run_experiment_flags_curated_recorded_pass(self) -> None:
+    def test_run_experiment_excludes_curated_recorded_pass_from_n(self) -> None:
         # A curated question the run RECORDED as supported is a curation error --
-        # it does not belong in N. Surface it, don't silently score it.
+        # it is not a miss, so it must NOT be scored (no budget) and NOT counted
+        # in N; surface it under curation_warnings only.
         self._write_diagnostics([{"question_id": "q1", "judge_verdict": "supported"}])
         self._seed_db(
             "q1",
@@ -384,14 +537,16 @@ class OracleFixtureTests(TestCase):
                 [self._entry("q1", constituent_fact_ids=[1], expected_fact_texts=["Only fact."])]
             )
         )[0]
+        judge = _StubJudge({})
+        budget = oee.ProviderBudget(100)
         doc = asyncio.run(
-            oee.run_experiment(
-                [entry], _StubJudge({}), repeats=1, budget=oee.ProviderBudget(100)
-            )
+            oee.run_experiment([entry], judge, repeats=1, budget=budget)
         )
         self.assertIn("q1", doc["curation_warnings"])
-        self.assertEqual(doc["headroom"]["n"], 1)
-        self.assertIn("q1", doc["results"][0]["question_id"])
+        self.assertEqual(doc["headroom"]["n"], 0)
+        self.assertEqual(doc["results"], [])
+        self.assertEqual(len(judge.calls), 0)  # not scored -> no budget spent
+        self.assertEqual(budget.used, 0)
 
 
 class CliTests(TestCase):

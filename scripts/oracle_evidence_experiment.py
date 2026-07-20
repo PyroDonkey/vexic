@@ -50,7 +50,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -90,7 +89,9 @@ JudgeFn = Callable[
 # top-k = the baseline; the wider values probe how much of the curated oracle
 # set widening retrieval surfaces. All stay within the persisted RETRIEVE_K
 # (=20) per-retriever pool, so fused[:k] reconstructs offline with no re-embed.
-SWEEP_K_VALUES = (RETURN_K, 8, 10, 15)
+# dict.fromkeys dedups if RETURN_K is ever set to one of the wider values, so a
+# k is never judged twice (wasting repeats on an identical slice).
+SWEEP_K_VALUES = tuple(dict.fromkeys((RETURN_K, 8, 10, 15)))
 
 
 class OracleFixtureError(ValueError):
@@ -120,12 +121,13 @@ class OracleEntry(BaseModel):
                 f"{len(self.constituent_fact_ids)} vs "
                 f"{len(self.expected_fact_texts)})"
             )
-
-
-def normalize(value: str) -> str:
-    """Lowercase and collapse every whitespace run to a single space, then
-    strip. Shared by the drift guard; mirrors the sibling scripts' norm."""
-    return re.sub(r"\s+", " ", value.lower()).strip()
+        if len(set(self.constituent_fact_ids)) != len(self.constituent_fact_ids):
+            # A duplicated id double-counts in constituent_capture and feeds the
+            # judge the same fact twice, silently distorting the oracle set.
+            raise ValueError(
+                f"question {self.question_id!r}: duplicate constituent_fact_ids "
+                f"{self.constituent_fact_ids}"
+            )
 
 
 def load_oracle_fixture(path: Path) -> list[OracleEntry]:
@@ -196,7 +198,12 @@ def resolve_constituents(entry: OracleEntry) -> list[str]:
                     "live fact in the run DB (deleted or retired)"
                 )
             live = row[0]
-            if normalize(live) != normalize(expected):
+            # Exact equality, not normalized: a rowid reassigned to a fact that
+            # differs only in case or whitespace would slip a normalized guard.
+            # The fixture copies fact_text verbatim from this same DB, so exact
+            # match is the correct, strictly-safer check (normalize would only
+            # widen the accept set). A mismatch fails loud; fix the fixture.
+            if live != expected:
                 raise OracleFixtureError(
                     f"{entry.question_id!r}: fact id {fact_id} drifted -- "
                     f"expected {expected!r}, DB now holds {live!r}"
@@ -205,20 +212,57 @@ def resolve_constituents(entry: OracleEntry) -> list[str]:
     return texts
 
 
-def load_retrieval_arrays(entry: OracleEntry) -> tuple[list[int], list[int]]:
-    """The persisted per-retriever pools (keyword, vector) from the run's answer
-    retrieval event. Each is the full RETRIEVE_K-wide ranking, so fused[:k] is
-    reconstructable offline for any k <= pool size."""
+def _read_answer_arrays(
+    entry: OracleEntry,
+) -> tuple[list[int], list[int], list[int]]:
+    """The persisted per-retriever pools (keyword, vector) and the stored fused
+    top-k from the run's answer retrieval event."""
     db_path = _memory_db_path(entry)
     if not db_path.exists():
         raise OracleFixtureError(
             f"memory.db not found for {entry.question_id!r}: {db_path}"
         )
     with closing(_open_readonly(db_path)) as conn:
-        keyword_ids, vector_ids, _fused_returned = _answer_retrieval_arrays(
-            conn, entry.question_id
-        )
+        return _answer_retrieval_arrays(conn, entry.question_id)
+
+
+def load_retrieval_arrays(entry: OracleEntry) -> tuple[list[int], list[int]]:
+    """The persisted per-retriever pools (keyword, vector) from the run's answer
+    retrieval event. Each is the full RETRIEVE_K-wide ranking, so fused[:k] is
+    reconstructable offline for any k <= pool size."""
+    keyword_ids, vector_ids, _fused_stored = _read_answer_arrays(entry)
     return keyword_ids, vector_ids
+
+
+def preflight(entries: list[OracleEntry]) -> None:
+    """Validate every entry deterministically BEFORE any judge call, so a
+    fixture defect on a late entry fails loud at exit 2 without burning provider
+    budget or emitting a partial run.
+
+    Per entry: the drift guard (resolve_constituents), the answer retrieval
+    event exists with a non-empty pool when constituents are present, and the
+    offline fused reconstruction reproduces exactly what the run stored -- the
+    experiment's central faithfulness premise. Any mismatch means RRF wiring,
+    tie-break, or the pool JSON drifted from the frozen run, so the reconstructed
+    baseline/sweep would look authoritative while differing from what production
+    returned.
+    """
+    for entry in entries:
+        resolve_constituents(entry)
+        keyword_ids, vector_ids, fused_stored = _read_answer_arrays(entry)
+        if entry.constituent_fact_ids and not (keyword_ids or vector_ids):
+            raise OracleFixtureError(
+                f"{entry.question_id!r}: no answer retrieval event / empty "
+                "keyword+vector pools, so fused[:k] cannot be reconstructed -- "
+                "judging empty sets would fabricate a false 'derivation needed' "
+                "result. Check run_dir/question_id (and candidate-fallback rows)."
+            )
+        recon = reconstruct_fused(keyword_ids, vector_ids, len(fused_stored))
+        if recon != fused_stored:
+            raise OracleFixtureError(
+                f"{entry.question_id!r}: reconstructed fused {recon} != stored "
+                f"fused {fused_stored}; RRF wiring drifted from the frozen run."
+            )
 
 
 def reconstruct_fused(
@@ -304,8 +348,11 @@ def _event_sorted(facts: list[_FactRow]) -> list[_FactRow]:
 
 def _fetch_fact_rows(entry: OracleEntry, fact_ids: list[int]) -> list[_FactRow]:
     """Read the columns _event_sorted needs for the given ids, preserving the
-    input (fused-rank) order. Ids with no live row are dropped (a fused id can
-    point at a since-retired fact), never fabricated."""
+    input (fused-rank) order. No retired filter: production fetch_long_term_facts
+    selects purely by id (storage/longterm.py), so a fused id pointing at a
+    retired fact is still presented -- matching that keeps the judged evidence
+    set faithful to what production would return. Ids with no row are dropped,
+    never fabricated."""
     if not fact_ids:
         return []
     db_path = _memory_db_path(entry)
@@ -317,7 +364,7 @@ def _fetch_fact_rows(entry: OracleEntry, fact_ids: list[int]) -> list[_FactRow]:
                 SELECT id, fact_text, category, occurred_at, mentioned_at,
                        created_at
                 FROM long_term_memory
-                WHERE id = ? AND retired = 0
+                WHERE id = ?
                 """,
                 (fact_id,),
             ).fetchone()
@@ -467,12 +514,18 @@ def build_headroom(
 
     A condition "passes" when its pass fraction over repeats is >= threshold.
 
-      * set_completeness_reachable -- some sweep k passes (widening retrieval +
-        the current judge flips it; no explicit derivation step).
+      * set_completeness_reachable -- some sweep k GREATER THAN RETURN_K passes:
+        actually widening retrieval (past the run's top-5) surfaces enough for
+        the current judge to flip it, with no explicit derivation step. The
+        baseline k=RETURN_K re-judge is deliberately excluded here -- a k=5 pass
+        on a recorded miss is judge noise on the same evidence, not widening.
+      * baseline_rejudge_pass -- the k=RETURN_K re-judge passes despite the run
+        recording a miss: single-shot judge non-determinism, reported so it is
+        not mistaken for a headroom gain.
       * combined_ceiling -- the oracle condition passes (complete evidence +
         judge derivation): the upper bound.
       * derivation_needed -- combined_ceiling minus set_completeness_reachable,
-        reported as a set difference: oracle passes but no k does, so an
+        reported as a set difference: oracle passes but no widened k does, so an
         answer-time fold over the assembled set is required.
       * nonmonotonic_regressions -- a larger k drops below threshold after a
         smaller k passed (a distractor flipped the verdict); flagged, never
@@ -483,6 +536,7 @@ def build_headroom(
         return fraction is not None and fraction >= threshold
 
     set_completeness: list[str] = []
+    baseline_rejudge: list[str] = []
     combined: list[str] = []
     regressions: list[str] = []
     ceiling_bound: list[str] = []
@@ -490,9 +544,12 @@ def build_headroom(
     for result in results:
         qid = result["question_id"]
         sweep = _sweep_pass_fractions(result)
-        any_k_pass = any(passes(frac) for _k, frac in sweep)
-        if any_k_pass:
+        # Widening = strictly past the run's returned top-k (RETURN_K); a pass at
+        # k=RETURN_K is the baseline re-judge, tracked separately.
+        if any(passes(frac) for k, frac in sweep if k > RETURN_K):
             set_completeness.append(qid)
+        if any(passes(frac) for k, frac in sweep if k == RETURN_K):
+            baseline_rejudge.append(qid)
         if passes(result["oracle"].get("pass_fraction")):
             combined.append(qid)
         if result.get("pool_ceiling"):
@@ -518,6 +575,7 @@ def build_headroom(
         "n": n,
         "threshold": threshold,
         "set_completeness_reachable": set_completeness,
+        "baseline_rejudge_pass": baseline_rejudge,
         "combined_ceiling": combined,
         "derivation_needed": derivation_needed,
         "nonmonotonic_regressions": regressions,
@@ -556,27 +614,34 @@ async def run_experiment(
     repeats: int,
     budget: ProviderBudget,
 ) -> dict[str, Any]:
-    """Score every curated miss and assemble the metrics document. Budget is
-    shared across questions; exhaustion stops the run and is recorded, never
-    raised past the last completed question."""
+    """Score every curated miss and assemble the metrics document.
+
+    Pre-flights all entries first (no budget spent), so a fixture defect fails
+    loud before any provider call. A question the run RECORDED as supported is a
+    curation error -- it is not a miss, so it is NOT scored and NOT counted in
+    the headroom denominator N; it is surfaced under curation_warnings instead.
+    Budget is shared across questions; exhaustion stops the run and is recorded,
+    never raised past the last completed question.
+    """
+    preflight(entries)
+    recorded = {entry.question_id: recorded_verdict(entry) for entry in entries}
+    curation_warnings = [
+        qid for qid, verdict in recorded.items() if verdict == "supported"
+    ]
+    scored = [e for e in entries if recorded.get(e.question_id) != "supported"]
+
     results: list[dict[str, Any]] = []
-    curation_warnings: list[str] = []
     budget_exhausted = False
-    for entry in entries:
-        if recorded_verdict(entry) == "supported":
-            curation_warnings.append(entry.question_id)
+    for entry in scored:
         try:
-            results.append(
-                await run_question(
-                    entry, judge_fn, repeats=repeats, budget=budget
-                )
+            result = await run_question(
+                entry, judge_fn, repeats=repeats, budget=budget
             )
         except ProviderBudgetExhausted:
             budget_exhausted = True
             break
-    for result in results:
-        entry = next(e for e in entries if e.question_id == result["question_id"])
-        result["recorded_verdict"] = recorded_verdict(entry)
+        result["recorded_verdict"] = recorded.get(entry.question_id)
+        results.append(result)
     return {
         "caps": {"repeats": repeats, "max_provider_calls": budget.max_calls},
         "provider_calls_used": budget.used,
@@ -706,6 +771,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             fixture = _require(args.oracle_fixture, "--oracle-fixture")
             entries = load_oracle_fixture(Path(fixture))
+            preflight(entries)  # drift guard + fused cross-check, no provider
             print(_bind_only_report(entries))
         except OracleFixtureError as exc:
             print(str(exc), file=sys.stderr)
