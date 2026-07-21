@@ -15,6 +15,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -595,6 +596,61 @@ class _FakeAgent:
         )
 
 
+class ValidateDbsTests(unittest.TestCase):
+    """The same physical database supplied twice must be rejected, not
+    measured twice: ``_collect_windows`` walks every supplied path, so an
+    alias silently doubles that corpus's weight in the aggregate metrics and
+    re-spends provider budget on it."""
+
+    def setUp(self) -> None:
+        self.module = _load_module()
+
+    def test_duplicate_db_paths_are_a_config_error(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".db") as handle:
+            with self.assertRaises(self.module.AblationConfigError) as caught:
+                self.module._validate_dbs([handle.name, handle.name])
+            self.assertIn("duplicate", str(caught.exception).lower())
+
+    def test_symlinked_duplicate_paths_are_a_config_error(self) -> None:
+        # A symlink reaches the same physical DB under a different spelling.
+        with tempfile.TemporaryDirectory() as tmp:
+            original = Path(tmp) / "a.db"
+            original.touch()
+            link = Path(tmp) / "b.db"
+            link.symlink_to(original)
+            with self.assertRaises(self.module.AblationConfigError):
+                self.module._validate_dbs([str(original), str(link)])
+
+    def test_hardlinked_duplicate_paths_are_a_config_error(self) -> None:
+        # A hard link has no "real" path to resolve to: identity must key on
+        # (device, inode), which is why Path.resolve() alone is not enough.
+        with tempfile.TemporaryDirectory() as tmp:
+            original = Path(tmp) / "a.db"
+            original.touch()
+            link = Path(tmp) / "b.db"
+            os.link(original, link)
+            with self.assertRaises(self.module.AblationConfigError):
+                self.module._validate_dbs([str(original), str(link)])
+
+    def test_distinct_databases_are_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            first = Path(tmp) / "a.db"
+            second = Path(tmp) / "b.db"
+            first.touch()
+            second.touch()
+            self.module._validate_dbs([str(first), str(second)])
+
+    def test_missing_db_is_still_a_config_error(self) -> None:
+        with self.assertRaises(self.module.AblationConfigError) as caught:
+            self.module._validate_dbs(["/nonexistent/memory.db"])
+        self.assertIn("not found", str(caught.exception))
+
+    def test_no_db_is_a_config_error(self) -> None:
+        with self.assertRaises(self.module.AblationConfigError) as caught:
+            self.module._validate_dbs([])
+        self.assertIn("--db is required", str(caught.exception))
+
+
 class AblationExecutionHarness(unittest.TestCase):
     """Drives the full runner (``main``) with a faked transcript source and
     faked provider agents. No DB reads, no network, no provider."""
@@ -950,6 +1006,33 @@ class MultiWindowPairingTests(AblationExecutionHarness):
                 counts.get((window, "treated")),
                 f"window {window} scored the variants unequally",
             )
+
+
+class AuditProvenanceIdentityTests(AblationExecutionHarness):
+    """The window audit must record the identity actually read, not only the
+    spelling the operator typed: ``load_messages_since`` resolves the path
+    (``Path.resolve()``) before opening it, so a symlinked eval database is
+    read under one identity and, without this, recorded under another."""
+
+    def test_window_audit_records_the_resolved_database_identity(self) -> None:
+        db = self._db_path()
+        link = self.root / "alias.db"
+        link.symlink_to(db)
+        self._install_windows({str(link): [[1, 2]]})
+        self._install_agents()
+
+        exit_code = self._run([str(link)], repeats=1, max_windows=1, max_provider_calls=4)
+
+        self.assertEqual(exit_code, 0, self.stderr)
+        window_records = [
+            record
+            for record in self._audit_records()
+            if record.get("record_type") == "window_transcript_hash"
+        ]
+        self.assertTrue(window_records)
+        for record in window_records:
+            self.assertEqual(record["db"], str(link))
+            self.assertEqual(record["db_resolved"], str(Path(link).resolve()))
 
 
 if __name__ == "__main__":

@@ -24,7 +24,7 @@ from vexic.ports import ContentCodec
 from vexic.storage.errors import is_malformed_fts_query_error, is_unique_violation
 from vexic.storage.schema import _assert_no_forbidden_secret_values, _fts_match_query
 from vexic.text_utils import estimate_tokens
-from vexic.storage.connection import StorageTarget, connect
+from vexic.storage.connection import StorageTarget, _is_libsql_target, connect
 
 # Tier 1 — the append-only transcript. Owns message (de)serialization, the
 # messages_fts shadow that init_db builds, and the read/write/search surface.
@@ -770,6 +770,44 @@ def load_messages_in_id_range(
     return hits
 
 
+def _assert_local_read_only_target(db_path: object) -> None:
+    """Fail closed when a ``read_only=True`` read is handed a target its
+    ``mode=ro`` URI cannot name.
+
+    The read-only branch builds ``Path(db_path).resolve().as_uri()``. That is
+    meaningful only for a local filesystem path: ``:memory:``, a ``file:`` URI,
+    and a libSQL DSN would each be rewritten into a local path that names some
+    other (usually non-existent) database, and a ``StorageTarget`` would raise
+    an opaque ``TypeError`` inside ``Path()``. Rejecting here keeps the failure
+    at the caller's precondition instead of the sqlite3 boundary.
+    """
+    if isinstance(db_path, StorageTarget):
+        raise ValueError(
+            "read_only=True accepts a local filesystem path only; got a "
+            "StorageTarget. Open a hosted target through connect(), or mint a "
+            "read-only token for it."
+        )
+    if isinstance(db_path, str):
+        if db_path == ":memory:":
+            raise ValueError(
+                "read_only=True accepts a local filesystem path only; ':memory:' "
+                "has no read-only URI spelling here."
+            )
+        # Case-insensitive: SQLite accepts "FILE:" too, and a mangled URI is
+        # exactly the silent-wrong-database failure this guard exists to stop.
+        if db_path.casefold().startswith("file:"):
+            raise ValueError(
+                "read_only=True accepts a local filesystem path only; pass the "
+                f"path itself rather than a URI: {db_path!r}"
+            )
+        if _is_libsql_target(db_path):
+            raise ValueError(
+                "read_only=True accepts a local filesystem path only; got the "
+                f"hosted libSQL target {db_path!r}. Open it through connect(), "
+                "or mint a read-only token for it."
+            )
+
+
 def load_messages_since(
     db_path: str,
     after_id: int,
@@ -789,7 +827,16 @@ def load_messages_since(
     ignores ``-wal`` content entirely, so any transaction that is committed but
     not yet checkpointed into the main database would silently vanish from the
     read -- a fidelity regression in an evidence harness.
+
+    ``read_only=True`` accepts a local filesystem path only (``str`` or
+    ``Path``, absolute or relative). It raises ``ValueError`` for ``:memory:``,
+    an already-``file:`` URI, a hosted libSQL DSN, or a ``StorageTarget``: those
+    forms have no ``mode=ro`` URI spelling here and would otherwise be rewritten
+    into a local path that names a different database. Read a hosted target
+    read-write through :func:`connect`, or give it a read-only minted token.
     """
+    if read_only:
+        _assert_local_read_only_target(db_path)
     # Path.as_uri() percent-encodes reserved characters (a path containing ? or
     # # would otherwise be parsed as a query or fragment) and emits the
     # file:///C:/... form Windows requires, which a bare f"file:{path}" does not.

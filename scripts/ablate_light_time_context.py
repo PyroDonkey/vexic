@@ -493,6 +493,11 @@ async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
                     "record_type": "window_transcript_hash",
                     "window": job.window_key,
                     "db": job.db,
+                    # The identity actually read: load_messages_since resolves
+                    # the path before opening it, so a symlinked or otherwise
+                    # aliased eval database would be read under one identity
+                    # and recorded under another, weakening replay provenance.
+                    "db_resolved": str(Path(job.db).resolve()),
                     "variant": variant,
                     "message_count": len(job.rows),
                     "message_id_range": [job.rows[0][0], job.rows[-1][0]],
@@ -749,15 +754,32 @@ def _require(value: str | None, name: str) -> str:
     return value
 
 
+def _validate_dbs(dbs: list[str]) -> None:
+    if not dbs:
+        raise AblationConfigError("--db is required with --allow-live (repeatable).")
+    seen: dict[tuple[int, int], str] = {}
+    for db in dbs:
+        path = Path(db)
+        if not path.exists():
+            raise AblationConfigError(f"--db not found: {db}")
+        # Identity is (device, inode), not path spelling: aliases AND hard
+        # links to the same physical DB would silently double every window,
+        # call, and metric.
+        stat = path.stat()
+        identity = (stat.st_dev, stat.st_ino)
+        if identity in seen:
+            raise AblationConfigError(
+                f"duplicate --db: {db!r} and {seen[identity]!r} are the same "
+                "database."
+            )
+        seen[identity] = db
+
+
 def _validate_args(args: argparse.Namespace) -> None:
     for name in ("repeats", "max_windows", "max_provider_calls"):
         if getattr(args, name) <= 0:
             raise AblationConfigError(f"--{name.replace('_', '-')} must be greater than 0.")
-    if not args.db:
-        raise AblationConfigError("--db is required with --allow-live (repeatable).")
-    for db in args.db:
-        if not Path(db).exists():
-            raise AblationConfigError(f"--db not found: {db}")
+    _validate_dbs(args.db)
 
 
 def main(argv: list[str] | None = None) -> int:
