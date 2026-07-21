@@ -337,6 +337,14 @@ class ProviderBudget:
 @dataclass
 class WindowJob:
     db: str
+    # The identity resolved in the same pass that read this window's rows.
+    # Recording it here rather than re-resolving at audit time keeps the audit
+    # from reporting a third, later resolve that can disagree with the one the
+    # read actually used. This does not make the harness safe against a corpus
+    # mutated mid-run -- an operator who retargets a symlink between validation
+    # and collection gets whatever the filesystem then holds, and the harness
+    # measures a fixture corpus it assumes is stable.
+    db_resolved: str
     window_key: str
     rows: list[tuple[int, str | None, Any]] = field(repr=False)
 
@@ -344,6 +352,7 @@ class WindowJob:
 def _collect_windows(dbs: list[str], max_windows: int, *, limit: int) -> list[WindowJob]:
     jobs: list[WindowJob] = []
     for db in dbs:
+        db_resolved = str(Path(db).resolve())
         after_id = 0
         index = 0
         while len(jobs) < max_windows:
@@ -358,7 +367,14 @@ def _collect_windows(dbs: list[str], max_windows: int, *, limit: int) -> list[Wi
             )
             if not rows:
                 break
-            jobs.append(WindowJob(db=db, window_key=f"{db}#w{index}", rows=rows))
+            jobs.append(
+                WindowJob(
+                    db=db,
+                    db_resolved=db_resolved,
+                    window_key=f"{db}#w{index}",
+                    rows=rows,
+                )
+            )
             after_id = max(message_id for message_id, _, _ in rows)
             index += 1
         if len(jobs) >= max_windows:
@@ -497,7 +513,9 @@ async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
                     # the path before opening it, so a symlinked or otherwise
                     # aliased eval database would be read under one identity
                     # and recorded under another, weakening replay provenance.
-                    "db_resolved": str(Path(job.db).resolve()),
+                    # Bound at collection time (WindowJob.db_resolved), not
+                    # re-resolved here.
+                    "db_resolved": job.db_resolved,
                     "variant": variant,
                     "message_count": len(job.rows),
                     "message_id_range": [job.rows[0][0], job.rows[-1][0]],

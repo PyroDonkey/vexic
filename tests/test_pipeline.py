@@ -3023,16 +3023,22 @@ class LoadMessagesSinceReadOnlyTests(unittest.TestCase):
                 )
 
     @unittest.skipIf(os.name == "nt", "Windows cannot unlink a mapped -shm file.")
-    def test_read_only_open_with_the_shm_file_deleted(self) -> None:
-        """A mode=ro connection cannot *create* the -shm wal-index, which is the
+    def test_read_only_open_with_the_shm_file_deleted_never_reads_stale_data(
+        self,
+    ) -> None:
+        """A mode=ro connection cannot *create* the ``-shm`` wal-index, the
         condition under which a read-only open is usually said to fail.
 
-        Observed on SQLite 3.47.1: it does not fail. The unlink succeeds while
-        the writer holds its mapping, no -shm reappears on disk, and the
-        read-only open still returns the uncheckpointed row -- SQLite falls back
-        to a private heap wal-index. This test pins that observed behavior; if a
-        future SQLite or a switch to immutable=1 changes it, the harness's
-        read-only contract has changed and this must be revisited deliberately.
+        The invariant asserted here is the one the harness actually depends on:
+        the read either fails loudly or returns the committed row. It must never
+        succeed while silently omitting uncheckpointed WAL content, which is the
+        fidelity regression ``immutable=1`` would have introduced.
+
+        Both outcomes are accepted deliberately. Whether SQLite falls back to a
+        private heap wal-index depends on the linked build and VFS -- observed as
+        a successful read on 3.47.1 -- and pinning that fallback would fail this
+        test on a supported build that lacks it, for behavior the read-only
+        contract never promised.
         """
         with tempfile.TemporaryDirectory() as temp_dir, ExitStack() as stack:
             db_path = self._uncheckpointed_wal_db(temp_dir, stack)
@@ -3040,10 +3046,12 @@ class LoadMessagesSinceReadOnlyTests(unittest.TestCase):
             self.assertTrue(shm.exists())
             shm.unlink()
 
-            rows = load_messages_since(db_path, 0, read_only=True)
+            try:
+                rows = load_messages_since(db_path, 0, read_only=True)
+            except sqlite3.OperationalError:
+                return  # Fails loudly: acceptable, and not a silent wrong read.
 
             self.assertEqual(len(rows), 1)
-            self.assertFalse(shm.exists())
 
     def test_read_only_rejects_an_in_memory_target(self) -> None:
         # ":memory:" would be silently rewritten into a cwd-relative file URI
