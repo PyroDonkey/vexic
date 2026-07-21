@@ -793,6 +793,11 @@ class LongMemEvalArtifactTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"status": "ok"', diagnostics)
         self.assertIn('"deep_top_n": 15', diagnostics)
         self.assertIn('"candidate_fallback_used": false', diagnostics)
+        # Gap 1: both the raw and filter-surviving rank fields are emitted.
+        row = json.loads(diagnostics)
+        self.assertIn("answer_candidate_rank", row)
+        self.assertIn("answer_candidate_rank_filtered", row)
+        self.assertIn("answer_candidate_rank_filtered_bucket", row)
 
     async def test_subset_tier3_debug_dreams_then_retrieves_long_term_facts(self) -> None:
         dataset_path = self.root / "longmemeval_oracle.json"
@@ -2034,8 +2039,15 @@ class LongMemEvalCliTests(unittest.TestCase):
         self.assertEqual(args.answer_mode, "retrieval-debug")
         self.assertEqual(args.judge_model_group, "claude")
         self.assertEqual(args.deep_top_n, 15)
+        self.assertEqual(args.max_transient_retries, 2)
         self.assertFalse(args.skip_dream)
         self.assertFalse(args.allow_live)
+
+    def test_cli_accepts_max_transient_retries_override(self) -> None:
+        args = build_parser().parse_args(
+            self._base_argv("--max-transient-retries", "5")
+        )
+        self.assertEqual(args.max_transient_retries, 5)
 
     def test_cli_skip_dream_runs_without_adapter_or_allow_live(self) -> None:
         summary = unittest.mock.MagicMock()
@@ -2141,6 +2153,464 @@ class LongMemEvalCliTests(unittest.TestCase):
 
         self.assertNotEqual(exit_code, 0)
         runner.assert_not_awaited()
+
+
+def _finish_reason_error() -> Exception:
+    """Reproduce OpenRouter's `finish_reason='error'` pydantic ValidationError.
+
+    The real failure is a pydantic ValidationError raised when the OpenAI-shaped
+    ChatCompletion is validated and a choice carries the non-enum
+    `finish_reason='error'` (loc ``choices.0.finish_reason``, literal_error).
+    """
+    from typing import Literal
+
+    from pydantic import BaseModel, ValidationError
+
+    class _Choice(BaseModel):
+        finish_reason: Literal[
+            "stop", "length", "tool_calls", "content_filter", "function_call"
+        ]
+
+    class _ChatCompletion(BaseModel):
+        choices: list[_Choice]
+
+    try:
+        _ChatCompletion(choices=[{"finish_reason": "error"}])
+    except ValidationError as exc:
+        return exc
+    raise AssertionError("expected a ValidationError")
+
+
+class TransientRetryRowRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    """Gap 2: a bounded transient provider fault recovers instead of failing."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _write_dataset(self) -> Path:
+        dataset_path = self.root / "longmemeval_oracle.json"
+        dataset_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "question_id": "q-retry",
+                        "question_type": "single-session-user",
+                        "question": "What benchmark code was mentioned?",
+                        "answer": "cedar",
+                        "question_date": "2026-01-03",
+                        "answer_session_ids": ["session-1"],
+                        "haystack_session_ids": ["session-1"],
+                        "haystack_dates": ["2026-01-02T03:04:05Z"],
+                        "haystack_sessions": [
+                            [{"role": "user", "content": "The benchmark code was cedar."}]
+                        ],
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return dataset_path
+
+    async def _run(self, judge_scorer, *, max_transient_retries: int = 2):
+        fact = LongTermFact(
+            fact_id=1,
+            fact_text="The benchmark code was cedar.",
+            subject="benchmark",
+            category="fact",
+            importance=7,
+            confidence=0.9,
+            source_message_ids=[1],
+            retrieved_count=0,
+            used_count=0,
+        )
+        drain = AsyncMock(return_value=_fake_dream_result())
+        retrieve = AsyncMock(return_value=[fact])
+        with (
+            patch("vexic.longmemeval.drain_light_then_consolidate", new=drain),
+            patch("vexic.longmemeval.retrieve_long_term_facts", new=retrieve),
+            patch("vexic.longmemeval.asyncio.sleep", new=AsyncMock()),
+        ):
+            summary = await run_longmemeval_subset(
+                self._write_dataset(),
+                split="oracle",
+                output_dir=self.root / "runs",
+                limit=1,
+                model_group="glm",
+                answer_mode="judged-recall",
+                judge_model_group="claude",
+                judge_scorer=judge_scorer,
+                max_transient_retries=max_transient_retries,
+            )
+        diagnostics = json.loads(
+            summary.paths.diagnostics_path.read_text(encoding="utf-8")
+        )
+        return summary, diagnostics
+
+    async def test_transient_judge_fault_recovers_within_the_retry_budget(self) -> None:
+        calls = {"n": 0}
+
+        async def flaky_judge(
+            _judge_input: LongMemEvalRecallJudgeInput,
+        ) -> LongMemEvalRecallJudgeVerdict:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise _finish_reason_error()
+            return LongMemEvalRecallJudgeVerdict(
+                verdict="supported", reason="ok", confidence=0.9
+            )
+
+        summary, diagnostics = await self._run(flaky_judge)
+
+        self.assertEqual(diagnostics["status"], "ok")
+        self.assertEqual(diagnostics["transient_retry_count"], 1)
+        self.assertEqual(summary.questions_failed, 0)
+        # The recovered row is scored exactly once (no double counting).
+        self.assertEqual(summary.judged_recall_total, 1)
+        self.assertEqual(calls["n"], 2)
+
+    async def test_non_transient_judge_fault_is_not_retried(self) -> None:
+        calls = {"n": 0}
+
+        async def broken_judge(
+            _judge_input: LongMemEvalRecallJudgeInput,
+        ) -> LongMemEvalRecallJudgeVerdict:
+            calls["n"] += 1
+            raise RuntimeError("Judge exploded.")
+
+        summary, diagnostics = await self._run(broken_judge)
+
+        self.assertEqual(diagnostics["status"], "error")
+        self.assertEqual(diagnostics["transient_retry_count"], 0)
+        self.assertEqual(summary.questions_failed, 1)
+        self.assertEqual(calls["n"], 1)
+
+    async def test_persistent_transient_fault_is_bounded_then_recorded(self) -> None:
+        calls = {"n": 0}
+
+        async def always_transient(
+            _judge_input: LongMemEvalRecallJudgeInput,
+        ) -> LongMemEvalRecallJudgeVerdict:
+            calls["n"] += 1
+            raise _finish_reason_error()
+
+        summary, diagnostics = await self._run(
+            always_transient, max_transient_retries=2
+        )
+
+        self.assertEqual(diagnostics["status"], "error")
+        self.assertEqual(summary.questions_failed, 1)
+        # Bounded: initial attempt + max_transient_retries, no more.
+        self.assertEqual(calls["n"], 3)
+
+    async def test_transient_dream_fault_recovers_after_db_reset(self) -> None:
+        # Real ingest runs (not mocked), so this exercises _reset_question_db +
+        # init-memo eviction: the re-dream must rebuild the wiped per-question
+        # DB and re-ingest, or save_messages raises `no such table: messages`.
+        drain_calls = {"n": 0}
+
+        async def flaky_drain(*_args, **_kwargs):
+            drain_calls["n"] += 1
+            if drain_calls["n"] == 1:
+                # pydantic-ai re-raises the provider fault wrapped; the classifier
+                # must walk __cause__ to see the finish_reason ValidationError.
+                raise RuntimeError("wrapped provider fault") from _finish_reason_error()
+            return _fake_dream_result()
+
+        judge = _FakeRecallJudge(
+            LongMemEvalRecallJudgeVerdict(
+                verdict="supported", reason="ok", confidence=0.9
+            )
+        )
+        retrieve = AsyncMock(
+            return_value=[
+                LongTermFact(
+                    fact_id=1,
+                    fact_text="The benchmark code was cedar.",
+                    subject="benchmark",
+                    category="fact",
+                    importance=7,
+                    confidence=0.9,
+                    source_message_ids=[1],
+                    retrieved_count=0,
+                    used_count=0,
+                )
+            ]
+        )
+        with (
+            patch(
+                "vexic.longmemeval.drain_light_then_consolidate",
+                new=AsyncMock(side_effect=flaky_drain),
+            ),
+            patch("vexic.longmemeval.retrieve_long_term_facts", new=retrieve),
+            patch("vexic.longmemeval.asyncio.sleep", new=AsyncMock()),
+        ):
+            summary = await run_longmemeval_subset(
+                self._write_dataset(),
+                split="oracle",
+                output_dir=self.root / "runs",
+                limit=1,
+                model_group="glm",
+                answer_mode="judged-recall",
+                judge_model_group="claude",
+                judge_scorer=judge,
+            )
+        diagnostics = json.loads(
+            summary.paths.diagnostics_path.read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(diagnostics["status"], "ok")
+        self.assertEqual(diagnostics["transient_retry_count"], 1)
+        self.assertEqual(summary.questions_failed, 0)
+        self.assertEqual(drain_calls["n"], 2)
+
+
+class TransientProviderErrorClassifierTests(unittest.TestCase):
+    """Gap 2: only provider-shape faults are treated as transient/retryable."""
+
+    def test_finish_reason_error_validation_error_is_transient(self) -> None:
+        from vexic.longmemeval import _is_transient_provider_error
+
+        self.assertTrue(_is_transient_provider_error(_finish_reason_error()))
+
+    def test_wrapped_finish_reason_error_is_transient(self) -> None:
+        # pydantic-ai re-raises the ValidationError wrapped, e.g.
+        # `raise UnexpectedModelBehavior(...) from validation_error`; the
+        # classifier must follow __cause__ to still recognize it.
+        from vexic.longmemeval import _is_transient_provider_error
+
+        try:
+            raise RuntimeError("Invalid response from ... chat completions") \
+                from _finish_reason_error()
+        except RuntimeError as exc:
+            self.assertTrue(_is_transient_provider_error(exc))
+
+    def test_wrapped_json_decode_error_is_transient(self) -> None:
+        from vexic.longmemeval import _is_transient_provider_error
+
+        try:
+            try:
+                json.loads("not json {")
+            except json.JSONDecodeError as decode_exc:
+                raise RuntimeError("wrapped") from decode_exc
+        except RuntimeError as exc:
+            self.assertTrue(_is_transient_provider_error(exc))
+
+    def test_malformed_json_decode_error_is_transient(self) -> None:
+        from vexic.longmemeval import _is_transient_provider_error
+
+        try:
+            json.loads("not json {")
+        except json.JSONDecodeError as exc:
+            self.assertTrue(_is_transient_provider_error(exc))
+        else:
+            self.fail("expected JSONDecodeError")
+
+    def test_ordinary_bugs_are_not_transient(self) -> None:
+        from vexic.longmemeval import _is_transient_provider_error
+
+        for exc in (
+            ValueError("boom"),
+            KeyError("missing"),
+            RuntimeError("Tier 3 retrieval failed."),
+        ):
+            self.assertFalse(_is_transient_provider_error(exc))
+
+    def test_unrelated_validation_error_is_not_transient(self) -> None:
+        from pydantic import BaseModel, ValidationError
+
+        from vexic.longmemeval import _is_transient_provider_error
+
+        class _Model(BaseModel):
+            count: int
+
+        try:
+            _Model(count="not-an-int")
+        except ValidationError as exc:
+            self.assertFalse(_is_transient_provider_error(exc))
+        else:
+            self.fail("expected ValidationError")
+
+
+def _diag_candidate(**overrides: object) -> object:
+    from datetime import datetime, timezone
+
+    from vexic.longmemeval import _DiagnosticCandidate
+
+    defaults: dict[str, object] = {
+        "candidate_id": 1,
+        "fact_text": "Ryan prefers dark roast coffee.",
+        "importance": 5,
+        "hit_count": 1,
+        "last_seen_at": datetime(2026, 1, 2, tzinfo=timezone.utc),
+        "rem_boost": 0.0,
+        "promoted": False,
+        "promoted_fact_id": None,
+        "category": "preference",
+        "occurred_at": None,
+        "mentioned_at": None,
+        "has_embedding": True,
+    }
+    defaults.update(overrides)
+    return _DiagnosticCandidate(**defaults)
+
+
+class FilteredCandidateRankDiagnosticsTests(unittest.TestCase):
+    """Gap 1: answer_candidate_rank_filtered ranks the promotion-eligible pool."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "memory.db"
+        init_db(str(self.db_path))
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _commit(self, candidates: list, vectors: list[list[float]]) -> None:
+        commit_dream_cycle(
+            str(self.db_path),
+            candidates,
+            agent_id=None,
+            status="ok",
+            started_at="2026-01-02T00:00:00+00:00",
+            finished_at="2026-01-02T00:00:01+00:00",
+            messages_processed=1,
+            last_processed_message_id=1,
+            candidate_embeddings=vectors,
+        )
+
+    def _instance(self, answer: str):
+        from vexic.longmemeval import LongMemEvalInstance
+
+        return LongMemEvalInstance(
+            question_id="q-rank",
+            question_type="single-session-user",
+            question="Where does Ryan live?",
+            question_date="2026-01-03",
+            sessions=(),
+            answer=answer,
+        )
+
+    def test_filtered_rank_beats_raw_when_undated_event_outranks_answer(self) -> None:
+        from vexic.longmemeval import _answer_diagnostics
+
+        answer_fact = FactCandidate(
+            fact_text="Ryan lives in Helsinki.",
+            subject="Ryan",
+            category="fact",
+            importance=3,
+            confidence=0.8,
+            source_message_ids=[1],
+        )
+        undated_event = FactCandidate(
+            fact_text="Attended a large conference.",
+            subject="Ryan",
+            category="event",
+            importance=9,
+            confidence=0.8,
+            source_message_ids=[1],
+            occurred_at=None,
+        )
+        self._commit(
+            [answer_fact, undated_event],
+            [_basis_vector(0), _basis_vector(1)],
+        )
+
+        diagnostics = _answer_diagnostics(
+            db_path=self.db_path,
+            instance=self._instance("Helsinki"),
+            retrieved_long_term_fact_texts=(),
+            candidate_scoring_time=None,
+        )
+
+        # Raw pool: the importance-9 undated event outranks the answer fact.
+        self.assertEqual(diagnostics.answer_candidate_rank, 2)
+        # Filtered pool: the undated event is dropped, answer rises to rank 1.
+        self.assertEqual(diagnostics.answer_candidate_rank_filtered, 1)
+
+    def test_answer_candidate_that_is_filtered_has_no_filtered_rank(self) -> None:
+        from vexic.longmemeval import _answer_diagnostics
+
+        # The answer itself is an undated event -> dropped from the pool.
+        answer_event = FactCandidate(
+            fact_text="Ryan moved to Helsinki.",
+            subject="Ryan",
+            category="event",
+            importance=5,
+            confidence=0.8,
+            source_message_ids=[1],
+            occurred_at=None,
+        )
+        self._commit([answer_event], [_basis_vector(0)])
+
+        diagnostics = _answer_diagnostics(
+            db_path=self.db_path,
+            instance=self._instance("Helsinki"),
+            retrieved_long_term_fact_texts=(),
+            candidate_scoring_time=None,
+        )
+
+        self.assertEqual(diagnostics.answer_candidate_rank, 1)
+        self.assertIsNone(diagnostics.answer_candidate_rank_filtered)
+
+
+class DeepEligibleFilterTests(unittest.TestCase):
+    """Gap 1: the filter-surviving population mirrors Deep's promotion pool."""
+
+    def _ids(self, candidates: list) -> list[int]:
+        return [candidate.candidate_id for candidate in candidates]
+
+    def test_keeps_a_dated_embedded_unpromoted_candidate(self) -> None:
+        from vexic.longmemeval import _deep_eligible
+
+        keep = _diag_candidate(candidate_id=10)
+        self.assertEqual(self._ids(_deep_eligible([keep])), [10])
+
+    def test_drops_promoted_candidates(self) -> None:
+        from vexic.longmemeval import _deep_eligible
+
+        by_flag = _diag_candidate(candidate_id=1, promoted=True)
+        by_fact_id = _diag_candidate(candidate_id=2, promoted_fact_id=99)
+        kept = _diag_candidate(candidate_id=3)
+        survivors = _deep_eligible([by_flag, by_fact_id, kept])
+        self.assertEqual(self._ids(survivors), [3])
+
+    def test_drops_candidates_without_an_embedding(self) -> None:
+        from vexic.longmemeval import _deep_eligible
+
+        no_vector = _diag_candidate(candidate_id=1, has_embedding=False)
+        embedded = _diag_candidate(candidate_id=2)
+        self.assertEqual(self._ids(_deep_eligible([no_vector, embedded])), [2])
+
+    def test_drops_undated_event_but_keeps_dated_event(self) -> None:
+        from vexic.longmemeval import _deep_eligible
+
+        undated = _diag_candidate(
+            candidate_id=1,
+            category="event",
+            occurred_at=None,
+            mentioned_at="   ",
+        )
+        dated = _diag_candidate(
+            candidate_id=2, category="event", occurred_at="2026-01-01"
+        )
+        mentioned = _diag_candidate(
+            candidate_id=3,
+            category="event",
+            occurred_at=None,
+            mentioned_at="2026-01-02T00:00:00+00:00",
+        )
+        survivors = _deep_eligible([undated, dated, mentioned])
+        self.assertEqual(self._ids(survivors), [2, 3])
+
+    def test_non_event_undated_candidate_is_kept(self) -> None:
+        from vexic.longmemeval import _deep_eligible
+
+        pref = _diag_candidate(candidate_id=1, category="preference", occurred_at=None)
+        self.assertEqual(self._ids(_deep_eligible([pref])), [1])
 
 
 if __name__ == "__main__":

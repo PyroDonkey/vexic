@@ -22,7 +22,7 @@ import sqlite3
 import sys
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -31,7 +31,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Literal, Protocol
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -42,6 +42,7 @@ from pydantic_ai.messages import (
 
 from vexic.deep import compute_score, run_deep_phase
 from vexic.formatting import UNVERIFIED_NOTES_PREAMBLE, format_candidate_note
+from vexic.models import canonical_partial_date
 from vexic.pipeline import LIGHT_PHASE_BATCH_SIZE, run_light_phase
 from vexic.ports import AgentFactory, EmbedTexts, missing_host_port
 from vexic.redaction import assert_no_forbidden_secret_values
@@ -49,6 +50,7 @@ from vexic.rem import run_rem_phase
 from vexic.storage import TranscriptHit, init_db, save_messages, search_messages
 from vexic.storage.connection import connect as storage_connect
 from vexic.storage.errors import is_operational_error
+from vexic.storage.schema import _ensure_vector_memory_schema, evict_init_memo
 from vexic.storage.transcript import get_watermark
 from vexic.subagents.retrieval import (
     retrieve_candidate_fallback,
@@ -406,6 +408,23 @@ def question_db_path(run_dir: Path, question_id: str) -> Path:
             f"question_id {question_id!r}: {question_dir}"
         ) from exc
     return question_dir / "memory.db"
+
+
+def _reset_question_db(db_path: Path) -> None:
+    """Delete a per-question memory DB and its SQLite sidecar files.
+
+    Used before a transient-error re-dream so the retry starts from an empty
+    database rather than partially-written state. Leaves the question directory
+    in place (it was created once by ``question_db_path``).
+    """
+
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        Path(f"{db_path}{suffix}").unlink(missing_ok=True)
+    # init_db/init_vector_memory memoize initialization per path process-wide
+    # and early-return on a hit. Without eviction the re-dream's init_db returns
+    # without recreating the schema for the freshly-deleted file, and the first
+    # message insert raises `no such table: messages`.
+    evict_init_memo(str(db_path))
 
 
 def _fallback_question_id(raw: Mapping[str, Any], row_number: int) -> str:
@@ -855,6 +874,12 @@ class _AnswerDiagnostics:
     answer_extracted_to_tier2: bool
     answer_candidate_id: int | None
     answer_candidate_rank: int | None
+    # Rank over the raw active-candidate population (all retired=0/stale=0/
+    # needs_review=0 rows). answer_candidate_rank_filtered ranks only the
+    # promotion-eligible subset (see _deep_eligible): a filter-surviving
+    # approximation of the pool Deep actually scores, so the two ranks differ
+    # when a promoted/undated-event/unembedded candidate outranks the answer.
+    answer_candidate_rank_filtered: int | None
     answer_promoted_to_tier3: bool
     answer_retrieved_from_tier3: bool
 
@@ -869,6 +894,39 @@ class _DiagnosticCandidate:
     rem_boost: float
     promoted: bool
     promoted_fact_id: int | None
+    category: str
+    occurred_at: str | None
+    mentioned_at: str | None
+    has_embedding: bool
+
+
+def _deep_eligible(
+    candidates: Sequence[_DiagnosticCandidate],
+) -> list[_DiagnosticCandidate]:
+    """Restrict diagnostic candidates to Deep's promotion-eligible population.
+
+    Mirrors the real promotion pool: ``load_promotion_candidates`` excludes
+    promoted candidates and inner-joins embeddings
+    (``src/vexic/storage/candidates.py``), then ``select_promotions`` drops
+    undated ``event`` candidates (``src/vexic/deep.py``). This is a post-run
+    snapshot, so it is a
+    filter-surviving *approximation* of what any single Deep cycle scored.
+    """
+
+    return [
+        candidate
+        for candidate in candidates
+        if not (
+            candidate.promoted
+            or candidate.promoted_fact_id is not None
+            or not candidate.has_embedding
+            or (
+                candidate.category == "event"
+                and canonical_partial_date(candidate.occurred_at) is None
+                and not (candidate.mentioned_at or "").strip()
+            )
+        )
+    ]
 
 
 def _answer_variants(answer: Any) -> tuple[str, ...]:
@@ -933,6 +991,114 @@ def _messages_fts_bodies(db_path: Path) -> list[str]:
     return [str(row[0]) for row in rows]
 
 
+def _embedded_candidate_ids(conn: sqlite3.Connection) -> set[int]:
+    """Candidate ids that carry a vector embedding.
+
+    The embeddings live in a ``vec0`` virtual table, so the extension must be
+    loaded on this connection before the table is queryable (a plain query
+    raises ``no such module: vec0``). We first check ``sqlite_master``: if the
+    table was never created there are genuinely no embeddings, so we return an
+    empty set without loading the extension or creating any schema (avoiding a
+    write on this diagnostic read path). When the table exists,
+    ``_ensure_vector_memory_schema`` only loads the extension -- its
+    ``CREATE ... IF NOT EXISTS`` are no-ops -- before we read the ids.
+    """
+
+    table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        ("memory_candidate_embeddings",),
+    ).fetchone()
+    if table_exists is None:
+        return set()
+    _ensure_vector_memory_schema(conn)
+    rows = conn.execute(
+        "SELECT candidate_id FROM memory_candidate_embeddings"
+    ).fetchall()
+    return {int(row[0]) for row in rows}
+
+
+_DEFAULT_MAX_TRANSIENT_RETRIES = 2
+_TRANSIENT_RETRY_BACKOFF_SECONDS = 0.5
+
+
+async def _retry_transient(
+    make_coro: Callable[[], Awaitable[Any]],
+    *,
+    max_retries: int,
+    label: str,
+    before_retry: Callable[[], None] | None = None,
+    backoff_seconds: float = _TRANSIENT_RETRY_BACKOFF_SECONDS,
+) -> tuple[Any, int]:
+    """Await ``make_coro()`` with bounded retry on transient provider faults.
+
+    Returns ``(result, retries_used)``. Only ``_is_transient_provider_error``
+    faults are retried, up to ``max_retries`` times; anything else (including a
+    forbidden-secret leak or the ``question_db_path`` collision) propagates
+    immediately. ``before_retry`` runs between attempts (e.g. to reset a
+    per-question DB so a re-dream starts clean). Each retry is logged to stderr.
+    """
+
+    attempt = 0
+    while True:
+        try:
+            result = await make_coro()
+        except BaseException as exc:  # noqa: BLE001 - re-raised unless transient
+            if attempt >= max_retries or not _is_transient_provider_error(exc):
+                raise
+            attempt += 1
+            print(
+                f"[longmemeval] transient provider error on {label} "
+                f"(retry {attempt}/{max_retries}): {type(exc).__name__}",
+                file=sys.stderr,
+            )
+            if before_retry is not None:
+                before_retry()
+            await asyncio.sleep(backoff_seconds * attempt)
+            continue
+        return result, attempt
+
+
+def _is_finish_reason_error(exc: BaseException) -> bool:
+    if not isinstance(exc, ValidationError):
+        return False
+    for error in exc.errors():
+        if error.get("type") != "literal_error":
+            continue
+        loc = error.get("loc", ())
+        if any(str(part) == "finish_reason" for part in loc) and (
+            str(error.get("input")) == "error"
+        ):
+            return True
+    return False
+
+
+def _is_transient_provider_error(exc: BaseException) -> bool:
+    """True for provider-shape faults worth a bounded in-run retry.
+
+    Targets the two shapes seen killing rows on OpenRouter: malformed JSON
+    response bodies (`json.JSONDecodeError`) and `finish_reason='error'`, which
+    validates as a pydantic `ValidationError` with a `literal_error` on a
+    `finish_reason` field whose input was `'error'`. pydantic-ai re-raises both
+    wrapped (e.g. `UnexpectedModelBehavior(...) from validation_error`), so the
+    whole `__cause__`/`__context__` chain is inspected, not just the top-level
+    exception. Classified on exception type + structured `.errors()` data, never
+    message text (the wrapper wording is unpinnable across versions). Ordinary
+    bugs and unrelated validation failures are NOT transient, so genuine
+    failures still fail loud.
+    """
+
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, json.JSONDecodeError) or _is_finish_reason_error(
+            current
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def _load_diagnostic_candidates(db_path: Path) -> list[_DiagnosticCandidate]:
     if not db_path.exists():
         return []
@@ -942,7 +1108,8 @@ def _load_diagnostic_candidates(db_path: Path) -> list[_DiagnosticCandidate]:
                 """
                 SELECT id, fact_text, importance, hit_count,
                        COALESCE(last_seen_at, created_at) AS last_seen_at,
-                       created_at, rem_boost, promoted, promoted_fact_id
+                       created_at, rem_boost, promoted, promoted_fact_id,
+                       category, occurred_at, mentioned_at
                 FROM memory_candidates
                 WHERE retired = 0
                     AND stale = 0
@@ -954,6 +1121,7 @@ def _load_diagnostic_candidates(db_path: Path) -> list[_DiagnosticCandidate]:
             if not is_operational_error(exc):
                 raise
             return []
+        embedded_ids = _embedded_candidate_ids(conn)
     return [
         _DiagnosticCandidate(
             candidate_id=int(row[0]),
@@ -964,6 +1132,10 @@ def _load_diagnostic_candidates(db_path: Path) -> list[_DiagnosticCandidate]:
             rem_boost=float(row[6]),
             promoted=bool(row[7]),
             promoted_fact_id=None if row[8] is None else int(row[8]),
+            category=str(row[9]),
+            occurred_at=None if row[10] is None else str(row[10]),
+            mentioned_at=None if row[11] is None else str(row[11]),
+            has_embedding=int(row[0]) in embedded_ids,
         )
         for row in rows
     ]
@@ -1069,6 +1241,7 @@ def _answer_diagnostics(
             answer_extracted_to_tier2=False,
             answer_candidate_id=None,
             answer_candidate_rank=None,
+            answer_candidate_rank_filtered=None,
             answer_promoted_to_tier3=False,
             answer_retrieved_from_tier3=False,
         )
@@ -1080,18 +1253,20 @@ def _answer_diagnostics(
             answer_extracted_to_tier2=False,
             answer_candidate_id=None,
             answer_candidate_rank=None,
+            answer_candidate_rank_filtered=None,
             answer_promoted_to_tier3=False,
             answer_retrieved_from_tier3=False,
         )
 
     candidates = _load_diagnostic_candidates(db_path)
-    ranks = _rank_diagnostic_candidates(
-        candidates,
-        scoring_time=(
-            datetime.fromisoformat(candidate_scoring_time)
-            if candidate_scoring_time is not None
-            else datetime.now(timezone.utc)
-        ),
+    scoring_time = (
+        datetime.fromisoformat(candidate_scoring_time)
+        if candidate_scoring_time is not None
+        else datetime.now(timezone.utc)
+    )
+    ranks = _rank_diagnostic_candidates(candidates, scoring_time=scoring_time)
+    filtered_ranks = _rank_diagnostic_candidates(
+        _deep_eligible(candidates), scoring_time=scoring_time
     )
     answer_candidate = next(
         (
@@ -1120,6 +1295,9 @@ def _answer_diagnostics(
         answer_candidate_rank=None
         if answer_candidate_id is None
         else ranks.get(answer_candidate_id),
+        answer_candidate_rank_filtered=None
+        if answer_candidate_id is None
+        else filtered_ranks.get(answer_candidate_id),
         answer_promoted_to_tier3=(
             False
             if answer_candidate is None
@@ -1145,6 +1323,7 @@ def _diagnostics_error_result(instance: LongMemEvalInstance | None) -> _AnswerDi
         answer_extracted_to_tier2=False,
         answer_candidate_id=None,
         answer_candidate_rank=None,
+        answer_candidate_rank_filtered=None,
         answer_promoted_to_tier3=False,
         answer_retrieved_from_tier3=False,
     )
@@ -1235,6 +1414,7 @@ async def run_longmemeval_subset(
     extraction_agent_factory: AgentFactory | None = None,
     contradiction_agent_factory: AgentFactory | None = None,
     embed: EmbedTexts | None = None,
+    max_transient_retries: int = _DEFAULT_MAX_TRANSIENT_RETRIES,
 ) -> LongMemEvalRunSummary:
     """Run a capped LongMemEval subset and write prediction/diagnostic JSONL."""
 
@@ -1242,6 +1422,8 @@ async def run_longmemeval_subset(
         raise ValueError("limit must be at least 1.")
     if dream_session_batch_size < 1:
         raise ValueError("dream_session_batch_size must be at least 1.")
+    if max_transient_retries < 0:
+        raise ValueError("max_transient_retries must not be negative.")
     if skip_dream and answer_mode != "retrieval-debug":
         raise ValueError("--skip-dream is only supported for retrieval-debug answer mode.")
     if answer_mode not in (
@@ -1303,6 +1485,7 @@ async def run_longmemeval_subset(
         dream_shape: LongMemEvalDreamShape = "single-shot"
         session_count = 0
         message_count = 0
+        transient_retry_count = 0
         try:
             instance = parse_longmemeval_instance(raw, max_sessions=max_sessions)
             artifact_question_id = instance.question_id
@@ -1316,19 +1499,29 @@ async def run_longmemeval_subset(
                     if dream_session_batch_size == 1
                     else "incremental-batched-sessions"
                 )
-                dream = await _ingest_then_consolidate_incrementally(
-                    str(db_path),
-                    instance,
-                    model_group,
-                    secrets=secrets,
-                    forbidden_secret_values=guarded_secret_values,
-                    max_light_cycles=max_light_cycles,
-                    deep_top_n=deep_top_n,
-                    dream_session_batch_size=dream_session_batch_size,
-                    extraction_agent_factory=extraction_agent_factory,
-                    embed=embed,
-                    contradiction_agent_factory=contradiction_agent_factory,
+                dream_db_path = db_path
+                dream, retries = await _retry_transient(
+                    lambda: _ingest_then_consolidate_incrementally(
+                        str(dream_db_path),
+                        instance,
+                        model_group,
+                        secrets=secrets,
+                        forbidden_secret_values=guarded_secret_values,
+                        max_light_cycles=max_light_cycles,
+                        deep_top_n=deep_top_n,
+                        dream_session_batch_size=dream_session_batch_size,
+                        extraction_agent_factory=extraction_agent_factory,
+                        embed=embed,
+                        contradiction_agent_factory=contradiction_agent_factory,
+                    ),
+                    max_retries=max_transient_retries,
+                    label="dream",
+                    # The incremental dream re-inits and re-ingests the DB
+                    # itself, so wiping the per-question DB makes each replay
+                    # start from a clean slate (no partial-write corruption).
+                    before_retry=lambda: _reset_question_db(dream_db_path),
                 )
+                transient_retry_count += retries
             else:
                 ingest_instance(
                     str(db_path),
@@ -1391,14 +1584,22 @@ async def run_longmemeval_subset(
                         f"{dream.error or f'dream status {dream.status}'}"
                     )
                 else:
-                    answer = await _tier3_debug_hypothesis(
-                        str(db_path),
-                        instance,
-                        model_group=model_group,
-                        secrets=secrets,
-                        include_candidate_fallback=answer_mode == "judged-recall",
-                        embed=embed,
+                    tier3_db_path = db_path
+                    answer, retries = await _retry_transient(
+                        lambda: _tier3_debug_hypothesis(
+                            str(tier3_db_path),
+                            instance,
+                            model_group=model_group,
+                            secrets=secrets,
+                            include_candidate_fallback=(
+                                answer_mode == "judged-recall"
+                            ),
+                            embed=embed,
+                        ),
+                        max_retries=max_transient_retries,
+                        label="tier3-retrieval",
                     )
+                    transient_retry_count += retries
                     hypothesis = answer.hypothesis
                     candidate_fallback_used = answer.candidate_fallback_used
                     retrieved_long_term_fact_count = (
@@ -1440,13 +1641,20 @@ async def run_longmemeval_subset(
                                 judge_model_id = _judge_model_id_from_agent(
                                     recall_judge_agent
                                 )
-                                judge_result = await score_longmemeval_recall(
-                                    judge_input,
-                                    judge_model_group=judge_model_group,
-                                    agent=recall_judge_agent,
-                                    secrets=secrets,
-                                    forbidden_secret_values=guarded_secret_values,
+                                judge_result, retries = await _retry_transient(
+                                    lambda: score_longmemeval_recall(
+                                        judge_input,
+                                        judge_model_group=judge_model_group,
+                                        agent=recall_judge_agent,
+                                        secrets=secrets,
+                                        forbidden_secret_values=(
+                                            guarded_secret_values
+                                        ),
+                                    ),
+                                    max_retries=max_transient_retries,
+                                    label="judge",
                                 )
+                                transient_retry_count += retries
                             else:
                                 rendered_input = _render_recall_judge_input(judge_input)
                                 assert_no_forbidden_secret_values(
@@ -1454,7 +1662,12 @@ async def run_longmemeval_subset(
                                     LONGMEMEVAL_RECALL_JUDGE_PROMPT,
                                     rendered_input,
                                 )
-                                judge_result = await judge_scorer(judge_input)
+                                judge_result, retries = await _retry_transient(
+                                    lambda: judge_scorer(judge_input),
+                                    max_retries=max_transient_retries,
+                                    label="judge",
+                                )
+                                transient_retry_count += retries
                                 assert_no_forbidden_secret_values(
                                     guarded_secret_values,
                                     judge_result.model_dump_json(),
@@ -1527,6 +1740,7 @@ async def run_longmemeval_subset(
                 "status": status,
                 "error": error,
                 "answer_mode": answer_mode,
+                "transient_retry_count": transient_retry_count,
                 "session_count": session_count,
                 "message_count": message_count,
                 "dream_skipped": dream.status == "skipped",
@@ -1582,6 +1796,12 @@ async def run_longmemeval_subset(
                 "answer_candidate_rank": answer_diagnostics.answer_candidate_rank,
                 "answer_candidate_rank_bucket": _rank_bucket(
                     answer_diagnostics.answer_candidate_rank
+                ),
+                "answer_candidate_rank_filtered": (
+                    answer_diagnostics.answer_candidate_rank_filtered
+                ),
+                "answer_candidate_rank_filtered_bucket": _rank_bucket(
+                    answer_diagnostics.answer_candidate_rank_filtered
                 ),
                 "answer_promoted_to_tier3": (
                     answer_diagnostics.answer_promoted_to_tier3
@@ -1722,6 +1942,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-light-cycles", type=_positive_int, default=None)
     parser.add_argument("--deep-top-n", type=int, default=15)
     parser.add_argument(
+        "--max-transient-retries",
+        type=int,
+        default=_DEFAULT_MAX_TRANSIENT_RETRIES,
+        help=(
+            "Bounded in-run retries for transient provider-shape faults "
+            "(malformed JSON / finish_reason='error') at each provider call "
+            "site, with backoff. 0 disables retry."
+        ),
+    )
+    parser.add_argument(
         "--skip-dream",
         action="store_true",
         help=(
@@ -1792,6 +2022,7 @@ async def _amain(args: argparse.Namespace) -> int:
         judge_model_group=args.judge_model_group,
         max_light_cycles=args.max_light_cycles,
         deep_top_n=args.deep_top_n,
+        max_transient_retries=args.max_transient_retries,
         skip_dream=args.skip_dream,
         selection=args.selection,
         type_weights=dict(args.type_weight) or None,
