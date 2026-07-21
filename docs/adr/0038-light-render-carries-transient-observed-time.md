@@ -158,4 +158,10 @@ another chance to invent a value.
   metrics per repeat. Per ADR 0033, this document records the recipe -- the
   script and its `--allow-live` gate -- not a run result; `docs/ai/REVIEW.md`
   flags it do-not-run during review, and its deterministic metric functions
-  are pinned by `tests/test_ablate_light_time_context.py`.
+  are pinned by `tests/test_ablate_light_time_context.py`. COA-417 later
+  hardened that runner: repeats are now scheduled atomically over the whole
+  window panel, so a budget-truncated run can no longer score a window with
+  one variant only. Runs recorded before and after that change cover windows
+  under different schedules and should not be pooled; the metric functions and
+  both prompt variants are unchanged, so earlier numbers remain valid on their
+  own terms. `docs/usage.md` carries the command and artifact recipe.

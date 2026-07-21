@@ -11,6 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import vexic.storage.transcript as transcript_module
+
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 from vexic.embeddings import EMBEDDING_DIM
@@ -2916,6 +2918,77 @@ class LoadMessagesSinceTimestampTests(unittest.TestCase):
             message_id, timestamp, msg = rows[0]
             self.assertIsInstance(message_id, int)
             self.assertEqual(timestamp, "2023-11-17T09:30:00+00:00")
+
+
+class LoadMessagesSinceReadOnlyTests(unittest.TestCase):
+    """load_messages_since must be able to open an input database read-only, so
+    an offline analysis or evidence harness cannot mutate the corpus it is
+    measuring. The rows returned must be identical either way.
+
+    Scope note: mode=ro rejects writes through the connection. It does not
+    promise zero filesystem activity -- a WAL database still maintains its -shm
+    wal-index. immutable=1 would guarantee that, but it ignores -wal content
+    entirely, so a transaction that is committed but not yet checkpointed would
+    silently vanish from the read: a fidelity regression in an evidence
+    harness.
+    """
+
+    def _wal_db(self, temp_dir: str) -> str:
+        db_path = str(Path(temp_dir) / "memory.db")
+        init_db(db_path)
+        with closing(connect(db_path)) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+        save_messages(
+            db_path,
+            [ModelRequest(parts=[UserPromptPart(content="I ran the race last Sunday")])],
+            session_id="s1",
+            agent_id=None,
+            timestamp="2023-11-17T09:30:00+00:00",
+        )
+        return db_path
+
+    def test_read_only_returns_the_same_rows_on_a_wal_database(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = self._wal_db(temp_dir)
+
+            read_write = load_messages_since(db_path, 0)
+            read_only = load_messages_since(db_path, 0, read_only=True)
+
+            self.assertEqual(len(read_only), 1)
+            self.assertEqual(
+                [(row[0], row[1]) for row in read_only],
+                [(row[0], row[1]) for row in read_write],
+            )
+
+    def test_read_only_connection_rejects_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = self._wal_db(temp_dir)
+            captured: list[tuple[object, dict[str, object]]] = []
+            real_connect = transcript_module.connect
+
+            def capturing_connect(target: object, **kwargs: object) -> object:
+                captured.append((target, kwargs))
+                return real_connect(target, **kwargs)
+
+            with patch.object(transcript_module, "connect", capturing_connect):
+                load_messages_since(db_path, 0, read_only=True)
+
+            target, kwargs = captured[0]
+            self.assertTrue(kwargs.get("uri"))
+            self.assertIn("mode=ro", str(target))
+            with closing(real_connect(target, **kwargs)) as conn:
+                with self.assertRaises(sqlite3.OperationalError):
+                    conn.execute("DELETE FROM messages")
+
+    def test_read_only_uri_escapes_reserved_characters_in_the_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir) / "run?a#b"
+            directory.mkdir()
+            db_path = self._wal_db(str(directory))
+
+            rows = load_messages_since(db_path, 0, read_only=True)
+
+            self.assertEqual(len(rows), 1)
 
 
 class RenderTranscriptObservedTimeTests(unittest.TestCase):
