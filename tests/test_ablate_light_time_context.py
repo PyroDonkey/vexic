@@ -500,10 +500,11 @@ class GlobalPairedScheduleTests(unittest.TestCase):
             [],
         )
 
-    def test_metrics_attempted_reflects_per_variant_count(self) -> None:
-        # treated was budget-starved to 1 attempted repeat; baseline got 2.
-        # repeats_attempted and the per_repeat slot count must reflect that,
-        # not args.repeats.
+    def test_metrics_attempted_reflects_the_surviving_repeat_indices(self) -> None:
+        # treated survived only repeat 0; baseline survived repeats 0 and 2 --
+        # a gapped set, which is what a voided middle repeat leaves behind.
+        # repeats_attempted and the per_repeat slot count must follow those
+        # indices, not args.repeats and not a bare count.
         class _Args:
             db = ["db.sqlite"]
             model_group = "extraction"
@@ -527,7 +528,7 @@ class GlobalPairedScheduleTests(unittest.TestCase):
             audit_records=audit_records,
             budget=self.module.ProviderBudget(3),
             budget_exhausted=True,
-            attempted_repeats={"baseline": 2, "treated": 1},
+            attempted_repeats={"baseline": [0, 2], "treated": [0]},
         )
         self.assertEqual(doc["variants"]["baseline"]["repeats_attempted"], 2)
         self.assertEqual(doc["variants"]["treated"]["repeats_attempted"], 1)
@@ -694,6 +695,24 @@ class ProviderErrorToleranceTests(AblationExecutionHarness):
             if record.get("record_type") == "candidate"
         ]
         self.assertEqual(len(candidates), 3)
+
+    def test_a_voided_middle_repeat_does_not_hide_a_later_surviving_repeat(self) -> None:
+        db = self._db_path()
+        self._install_windows({db: [[1, 2]]})
+        # One window, so the panel is (baseline, treated) and call index 3 is
+        # repeat 1's treated call. Treated then survives repeats {0, 2} -- a
+        # gapped set. Scoring must follow the surviving indices, not a count:
+        # collapsing {0, 2} to "2 attempted" would score range(2) and silently
+        # drop repeat 2's data while reporting repeat 1 as an empty slot.
+        self._install_agents(fail_on=frozenset({3}))
+
+        exit_code = self._run([db], repeats=3, max_windows=1, max_provider_calls=6)
+
+        self.assertEqual(exit_code, 0, self.stderr)
+        treated = self._metrics()["variants"]["treated"]
+        self.assertEqual(treated["candidate_count"], 2)
+        self.assertEqual(treated["repeats_attempted"], 2)
+        self.assertEqual(treated["repeats_with_candidates"], 2)
 
     def test_a_failed_call_voids_that_variant_repeat_rather_than_biasing_it(self) -> None:
         db = self._db_path()

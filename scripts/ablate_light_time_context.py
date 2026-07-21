@@ -564,12 +564,12 @@ async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
         for record in candidate_records
         if (record["repeat"], record["variant"]) not in failed_cells
     ]
-    attempted_counts = {
-        variant: len({
+    surviving_repeats = {
+        variant: sorted(
             repeat_idx
             for repeat_idx in seen
             if (repeat_idx, variant) not in failed_cells
-        })
+        )
         for variant, seen in attempted_repeats.items()
     }
 
@@ -580,7 +580,7 @@ async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
         audit_records=audit_records,
         budget=budget,
         budget_exhausted=budget_exhausted,
-        attempted_repeats=attempted_counts,
+        attempted_repeats=surviving_repeats,
     )
     return {"metrics_document": metrics_document, "audit_records": audit_records}
 
@@ -593,7 +593,7 @@ def _build_metrics_document(
     audit_records: list[dict[str, Any]],
     budget: ProviderBudget,
     budget_exhausted: bool,
-    attempted_repeats: dict[str, int] | None = None,
+    attempted_repeats: dict[str, Sequence[int]] | None = None,
 ) -> dict[str, Any]:
     variants_doc: dict[str, Any] = {}
     for variant in VARIANTS:
@@ -612,15 +612,18 @@ def _build_metrics_document(
         # denominator. A budget-truncated run attempts fewer repeats than
         # args.repeats; because the schedule upstream is repeat-atomic over the
         # whole window panel, every attempted repeat covers the identical panel
-        # for both variants, so slots stay comparable across repeats. The count
-        # is still read per-variant (a provider error can drop one variant's
-        # repeat) and defaults to args.repeats when not supplied.
-        attempted = (
-            args.repeats
+        # for both variants, so slots stay comparable across repeats.
+        #
+        # These are the surviving *indices*, read per-variant, not a count: a
+        # provider error voids one variant's repeat and can leave a gapped set
+        # such as {0, 2}. Collapsing that to "2 attempted" would score range(2),
+        # reporting repeat 1 as an empty slot while silently dropping repeat 2's
+        # data. Defaults to every repeat when not supplied.
+        repeat_indices = (
+            list(range(args.repeats))
             if attempted_repeats is None
-            else attempted_repeats.get(variant, 0)
+            else list(attempted_repeats.get(variant, ()))
         )
-        repeat_indices = range(attempted)
 
         def _values(name: str) -> list[float | None]:
             if name == "fabricated_year_rate_raw":
@@ -664,7 +667,7 @@ def _build_metrics_document(
             "event_candidate_count": sum(
                 1 for record in variant_records if record["category"] == "event"
             ),
-            "repeats_attempted": attempted,
+            "repeats_attempted": len(repeat_indices),
             "repeats_with_candidates": sum(1 for i in repeat_indices if per_repeat[i]),
             "metrics": metrics,
         }
