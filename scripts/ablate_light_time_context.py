@@ -48,8 +48,12 @@ Evidence caveats (what these numbers do and do not prove):
   the per-repeat aggregation comparable; it costs up to
   ``windows * variants - 1`` unspent calls at the tail.
 - A transient provider failure is recorded as a ``call_error`` audit record and
-  skipped, never counted as attempted, so it scores null rather than a false
-  zero. Completed windows and spent calls survive the failure.
+  voids that variant's whole repeat for scoring, so the repeat reports null
+  rather than a partial-panel score that would compare one variant over some
+  windows against the other over all of them. The other variant keeps that
+  repeat (its panel is still complete), so the variants can carry unequal
+  repeat counts. Every other window and every spent call survives the failure,
+  and the audit keeps the voided candidates alongside the ``call_error``.
 - Input databases are opened read-only (``mode=ro``); the harness never mutates
   the corpus it measures.
 - ``REDACTION`` is empty by default. Set forbidden values there to run against
@@ -447,6 +451,9 @@ async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
     candidate_records: list[dict[str, Any]] = []
     audit_records: list[dict[str, Any]] = []
     attempted_repeats: dict[str, set[int]] = {variant: set() for variant in VARIANTS}
+    # (repeat, variant) cells whose panel is incomplete because a provider
+    # call failed; dropped from scoring below.
+    failed_cells: set[tuple[int, str]] = set()
     budget_exhausted = False
 
     # Render and audit every window's every variant first. This consumes no
@@ -501,6 +508,13 @@ async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
             budget_exhausted = True
             break
         except Exception as exc:  # noqa: BLE001 - live provider boundary
+            # Void this variant's whole repeat, not just this window. Scoring
+            # the surviving windows would compare one variant over part of the
+            # panel against the other over all of it -- a biased comparison
+            # dressed as a repeat. The other variant's same repeat is kept: it
+            # still covers the full panel, so every retained slot stays
+            # panel-complete and the variants simply carry unequal repeat counts.
+            failed_cells.add((repeat_idx, variant))
             audit_records.append(
                 {
                     "record_type": "call_error",
@@ -543,14 +557,30 @@ async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
                 }
             )
 
+    # Drop every voided cell before scoring. The audit keeps its candidate
+    # and call_error records either way, so the raw log stays complete.
+    scored_records = [
+        record
+        for record in candidate_records
+        if (record["repeat"], record["variant"]) not in failed_cells
+    ]
+    attempted_counts = {
+        variant: len({
+            repeat_idx
+            for repeat_idx in seen
+            if (repeat_idx, variant) not in failed_cells
+        })
+        for variant, seen in attempted_repeats.items()
+    }
+
     metrics_document = _build_metrics_document(
         args=args,
         jobs=jobs,
-        candidate_records=candidate_records,
+        candidate_records=scored_records,
         audit_records=audit_records,
         budget=budget,
         budget_exhausted=budget_exhausted,
-        attempted_repeats={variant: len(seen) for variant, seen in attempted_repeats.items()},
+        attempted_repeats=attempted_counts,
     )
     return {"metrics_document": metrics_document, "audit_records": audit_records}
 

@@ -695,6 +695,25 @@ class ProviderErrorToleranceTests(AblationExecutionHarness):
         ]
         self.assertEqual(len(candidates), 3)
 
+    def test_a_failed_call_voids_that_variant_repeat_rather_than_biasing_it(self) -> None:
+        db = self._db_path()
+        self._install_windows({db: [[1, 2], [3, 4]]})
+        # Panel order is window-major, variants inner: index 1 is window 0's
+        # treated call. Window 1's treated call still succeeds, so without a
+        # cell-level void the treated repeat would be scored from one window
+        # while baseline covers both -- a biased comparison, not the null score
+        # the runner documents.
+        self._install_agents(fail_on=frozenset({1}))
+
+        exit_code = self._run([db], repeats=1, max_windows=2, max_provider_calls=4)
+
+        self.assertEqual(exit_code, 0, self.stderr)
+        variants = self._metrics()["variants"]
+        self.assertEqual(variants["baseline"]["candidate_count"], 2)
+        self.assertEqual(variants["baseline"]["repeats_attempted"], 1)
+        self.assertEqual(variants["treated"]["candidate_count"], 0)
+        self.assertEqual(variants["treated"]["repeats_attempted"], 0)
+
 
 class ForbiddenValueGuardTests(AblationExecutionHarness):
     """Gap 1: the runner must fail closed on a configured forbidden value, both
