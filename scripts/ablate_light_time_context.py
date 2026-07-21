@@ -84,6 +84,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from stat import S_ISREG
 from typing import Any
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -337,6 +338,18 @@ class ProviderBudget:
 @dataclass
 class WindowJob:
     db: str
+    # The path resolved once at collection time, recorded so a symlinked or
+    # otherwise aliased eval database is not read under one identity and
+    # reported under another. Recording it here rather than re-resolving at
+    # audit time keeps the audit from reporting a third, later resolve.
+    #
+    # Two honest limits. load_messages_since resolves independently on every
+    # window read, so this is the collection-time spelling, not a proof that
+    # every read used it. And the real identity _validate_dbs dedupes on is
+    # (st_dev, st_ino); a path string is weaker. Neither matters for a fixture
+    # corpus the harness assumes is stable -- an operator who retargets a
+    # symlink mid-run gets whatever the filesystem then holds.
+    db_resolved: str
     window_key: str
     rows: list[tuple[int, str | None, Any]] = field(repr=False)
 
@@ -344,6 +357,7 @@ class WindowJob:
 def _collect_windows(dbs: list[str], max_windows: int, *, limit: int) -> list[WindowJob]:
     jobs: list[WindowJob] = []
     for db in dbs:
+        db_resolved = str(Path(db).resolve())
         after_id = 0
         index = 0
         while len(jobs) < max_windows:
@@ -358,7 +372,14 @@ def _collect_windows(dbs: list[str], max_windows: int, *, limit: int) -> list[Wi
             )
             if not rows:
                 break
-            jobs.append(WindowJob(db=db, window_key=f"{db}#w{index}", rows=rows))
+            jobs.append(
+                WindowJob(
+                    db=db,
+                    db_resolved=db_resolved,
+                    window_key=f"{db}#w{index}",
+                    rows=rows,
+                )
+            )
             after_id = max(message_id for message_id, _, _ in rows)
             index += 1
         if len(jobs) >= max_windows:
@@ -484,7 +505,14 @@ async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
             # rendering, ahead of every provider call, so a forbidden value
             # anywhere in the panel aborts the run before a single call is
             # spent rather than after the window that happens to contain it.
-            assert_no_forbidden_secret_values(REDACTION.forbidden_values, transcript)
+            # db_resolved is guarded here too, not only in the whole-payload
+            # check before writing: a symlink whose *target* path carries a
+            # forbidden value is not covered by main()'s guard over the typed
+            # --db strings, and finding it only at write time would abort a run
+            # whose provider budget had already been spent.
+            assert_no_forbidden_secret_values(
+                REDACTION.forbidden_values, transcript, job.db_resolved
+            )
             plausible_years = sorted(_plausible_years(job.rows, transcript))
             message_lines = _line_by_message_id(job.rows, labeled=(variant == "treated"))
             context[(job.window_key, variant)] = (transcript, message_lines)
@@ -493,6 +521,10 @@ async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
                     "record_type": "window_transcript_hash",
                     "window": job.window_key,
                     "db": job.db,
+                    # Bound at collection time (WindowJob.db_resolved), not
+                    # re-resolved here; see that field for what it does and
+                    # does not establish.
+                    "db_resolved": job.db_resolved,
                     "variant": variant,
                     "message_count": len(job.rows),
                     "message_id_range": [job.rows[0][0], job.rows[-1][0]],
@@ -749,15 +781,43 @@ def _require(value: str | None, name: str) -> str:
     return value
 
 
+def _validate_dbs(dbs: list[str]) -> None:
+    if not dbs:
+        raise AblationConfigError("--db is required with --allow-live (repeatable).")
+    seen: dict[tuple[int, int], str] = {}
+    for db in dbs:
+        path = Path(db)
+        # Identity is (device, inode), not path spelling: aliases AND hard
+        # links to the same physical DB would silently double every window,
+        # call, and metric. One stat() rather than exists()+stat(): exists()
+        # swallows OSError and returns False, so the pair would report a
+        # permission-denied database as "not found" and would race a file
+        # removed between the two calls into an uncaught OSError -- exit 1 out
+        # of the generic handler instead of this function's config channel.
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            raise AblationConfigError(f"--db not found: {db}") from None
+        except OSError as exc:
+            raise AblationConfigError(
+                f"--db not readable: {db} ({exc.strerror})"
+            ) from None
+        if not S_ISREG(stat.st_mode):
+            raise AblationConfigError(f"--db is not a file: {db}")
+        identity = (stat.st_dev, stat.st_ino)
+        if identity in seen:
+            raise AblationConfigError(
+                f"duplicate --db: {db!r} and {seen[identity]!r} are the same "
+                "database."
+            )
+        seen[identity] = db
+
+
 def _validate_args(args: argparse.Namespace) -> None:
     for name in ("repeats", "max_windows", "max_provider_calls"):
         if getattr(args, name) <= 0:
             raise AblationConfigError(f"--{name.replace('_', '-')} must be greater than 0.")
-    if not args.db:
-        raise AblationConfigError("--db is required with --allow-live (repeatable).")
-    for db in args.db:
-        if not Path(db).exists():
-            raise AblationConfigError(f"--db not found: {db}")
+    _validate_dbs(args.db)
 
 
 def main(argv: list[str] | None = None) -> int:

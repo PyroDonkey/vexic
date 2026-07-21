@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
 import sys
 import tempfile
 import unittest
-from contextlib import closing, redirect_stdout
+from contextlib import ExitStack, closing, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -44,7 +45,7 @@ from vexic.storage import (
     save_messages,
 )
 from vexic.storage.candidates import claim_candidate_for_promotion
-from vexic.storage.connection import connect
+from vexic.storage.connection import StorageTarget, connect
 from vexic.storage.schema import _load_vec_extension
 
 
@@ -2979,6 +2980,192 @@ class LoadMessagesSinceReadOnlyTests(unittest.TestCase):
             with closing(real_connect(target, **kwargs)) as conn:
                 with self.assertRaises(sqlite3.OperationalError):
                     conn.execute("DELETE FROM messages")
+
+    def _uncheckpointed_wal_db(
+        self, temp_dir: str, stack: ExitStack, name: str = "memory.db"
+    ) -> str:
+        """A WAL database with a committed-but-uncheckpointed row.
+
+        The writer connection is held open for the caller's lifetime: SQLite
+        checkpoints when the *last* connection closes, so holding one keeps the
+        committed frames in ``-wal`` where a reader must go find them.
+        """
+        db_path = str(Path(temp_dir) / name)
+        init_db(db_path)  # already sets journal_mode=WAL
+        # Holding this connection open is the whole mechanism: SQLite
+        # checkpoints when the LAST connection closes, so this keeps the
+        # committed frames in -wal where a reader has to go find them.
+        # wal_autocheckpoint plays no part -- it is a property of the connection
+        # that commits, and this one never writes. The statement below is not
+        # decorative: sqlite3.connect is lazy, so a connection that never
+        # executes anything holds nothing open, save_messages' connection
+        # becomes the last one, and its close checkpoints the WAL away.
+        holder = stack.enter_context(closing(connect(db_path)))
+        holder.execute("SELECT COUNT(*) FROM messages").fetchone()
+        save_messages(
+            db_path,
+            [ModelRequest(parts=[UserPromptPart(content="I ran the race last Sunday")])],
+            session_id="s1",
+            agent_id=None,
+            timestamp="2023-11-17T09:30:00+00:00",
+        )
+        # Assert the precondition here, not in one caller: a fixture that
+        # quietly checkpointed would let every test built on it pass for the
+        # wrong reason. -wal holds frames, and immutable=1 (which ignores -wal)
+        # cannot see the row.
+        self.assertGreater(Path(f"{db_path}-wal").stat().st_size, 0)
+        immutable_uri = f"{Path(db_path).resolve().as_uri()}?immutable=1"
+        with closing(sqlite3.connect(immutable_uri, uri=True)) as conn:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 0
+            )
+        return db_path
+
+    def test_read_only_reads_committed_but_uncheckpointed_wal_content(self) -> None:
+        # The fidelity guarantee mode=ro was chosen for over immutable=1: a
+        # transaction committed into -wal but not yet checkpointed into the main
+        # database must still be visible to the harness.
+        # The fixture itself asserts that the row lives only in -wal (an
+        # immutable=1 reader cannot see it), so reaching this line already
+        # means the read below has to consult the WAL to succeed.
+        with tempfile.TemporaryDirectory() as temp_dir, ExitStack() as stack:
+            db_path = self._uncheckpointed_wal_db(temp_dir, stack)
+            captured: list[object] = []
+            real_connect = transcript_module.connect
+
+            def capturing_connect(target: object, **kwargs: object) -> object:
+                captured.append(target)
+                return real_connect(target, **kwargs)
+
+            with patch.object(transcript_module, "connect", capturing_connect):
+                rows = load_messages_since(db_path, 0, read_only=True)
+
+            self.assertEqual(len(rows), 1)
+            # Pin the mechanism, not just the outcome: a read_only that quietly
+            # degraded to a plain read-write open would also see these WAL
+            # frames and leave the row assertion above green.
+            self.assertIn("mode=ro", str(captured[0]))
+            self.assertNotIn("immutable", str(captured[0]))
+
+    @unittest.skipIf(os.name == "nt", "Windows cannot unlink a mapped -shm file.")
+    def test_read_only_open_with_the_shm_file_deleted_never_reads_stale_data(
+        self,
+    ) -> None:
+        """A mode=ro connection cannot *create* the ``-shm`` wal-index, the
+        condition under which a read-only open is usually said to fail.
+
+        The invariant asserted here is the one the harness actually depends on:
+        the read either fails loudly or returns the committed row. It must never
+        succeed while silently omitting uncheckpointed WAL content, which is the
+        fidelity regression ``immutable=1`` would have introduced.
+
+        Both outcomes are accepted deliberately. Whether SQLite falls back to a
+        private heap wal-index depends on the linked build and VFS -- observed as
+        a successful read on 3.47.1 -- and pinning that fallback would fail this
+        test on a supported build that lacks it, for behavior the read-only
+        contract never promised.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir, ExitStack() as stack:
+            db_path = self._uncheckpointed_wal_db(temp_dir, stack)
+            shm = Path(f"{db_path}-shm")
+            self.assertTrue(shm.exists())
+            shm.unlink()
+
+            try:
+                rows = load_messages_since(db_path, 0, read_only=True)
+            except sqlite3.OperationalError:
+                return  # Fails loudly: acceptable, and not a silent wrong read.
+
+            self.assertEqual(len(rows), 1)
+
+    def test_read_only_rejects_an_in_memory_target(self) -> None:
+        # ":memory:" would be silently rewritten into a cwd-relative file URI
+        # by Path(...).resolve().as_uri() -- a different database entirely.
+        with self.assertRaises(ValueError):
+            load_messages_since(":memory:", 0, read_only=True)
+
+    def test_read_only_rejects_a_file_uri_in_any_case(self) -> None:
+        # A "file:" string is not a path: Path() would treat it as a relative
+        # name and open (or fail to open) a different database entirely.
+        for spelling in ("file:memory.db", "FILE:///tmp/memory.db"):
+            with self.subTest(spelling=spelling):
+                with self.assertRaises(ValueError):
+                    load_messages_since(spelling, 0, read_only=True)
+
+    def test_read_only_rejects_a_hosted_libsql_target(self) -> None:
+        # URI schemes are case-insensitive (RFC 3986): an uppercase DSN mangles
+        # into a local path exactly like a lowercase one.
+        for dsn in (
+            "libsql://tenant.turso.io",
+            "https://tenant.turso.io",
+            "http://tenant.turso.io",
+            "wss://tenant.turso.io",
+            "ws://tenant.turso.io",
+            "LIBSQL://tenant.turso.io",
+            "HTTPS://tenant.turso.io",
+            "HTTP://tenant.turso.io",
+            "WSS://tenant.turso.io",
+            "WS://tenant.turso.io",
+        ):
+            with self.subTest(dsn=dsn):
+                with self.assertRaises(ValueError):
+                    load_messages_since(dsn, 0, read_only=True)
+
+    def test_read_only_does_not_reject_a_local_file_named_like_a_scheme(self) -> None:
+        # "http:notes.db" is an ordinary relative filename, not a DSN: the
+        # guard keys on "scheme:/" so it must not swallow this one.
+        with tempfile.TemporaryDirectory() as temp_dir, ExitStack() as stack:
+            db_path = self._uncheckpointed_wal_db(temp_dir, stack, "http:notes.db")
+
+            rows = load_messages_since(db_path, 0, read_only=True)
+
+            self.assertEqual(len(rows), 1)
+
+    def test_read_only_rejects_a_path_like_that_is_not_text(self) -> None:
+        class BytesPath:
+            def __fspath__(self) -> bytes:
+                return b"/tmp/memory.db"
+
+        with self.assertRaises(ValueError):
+            load_messages_since(BytesPath(), 0, read_only=True)  # type: ignore[arg-type]
+
+    def test_read_only_rejects_the_same_forms_spelled_as_path_objects(self) -> None:
+        # A caller that normalizes to Path before calling -- the natural thing
+        # for a harness -- must get the same guard a str gets.
+        for spelling in (":memory:", "file:/tmp/x.db", "libsql://tenant.turso.io"):
+            with self.subTest(spelling=spelling):
+                with self.assertRaises(ValueError):
+                    load_messages_since(Path(spelling), 0, read_only=True)
+
+    def test_read_only_rejects_a_storage_target(self) -> None:
+        # Would raise an opaque TypeError inside Path() before connect() could
+        # dispatch it.
+        target = StorageTarget(target="libsql://tenant.turso.io", auth_token="t")
+        with self.assertRaises(ValueError):
+            load_messages_since(target, 0, read_only=True)  # type: ignore[arg-type]
+
+    def test_read_only_accepts_a_path_object_and_a_relative_path(self) -> None:
+        # Both are ordinary local targets; the guard must not reject them.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = self._wal_db(temp_dir)
+
+            self.assertEqual(len(load_messages_since(Path(db_path), 0, read_only=True)), 1)
+
+            cwd = os.getcwd()
+            os.chdir(temp_dir)
+            try:
+                rows = load_messages_since("memory.db", 0, read_only=True)
+            finally:
+                os.chdir(cwd)
+            self.assertEqual(len(rows), 1)
+
+    def test_read_write_path_is_unaffected_by_the_read_only_guard(self) -> None:
+        # The guard is a read_only precondition only. Exercise the guarded
+        # function itself: ":memory:" must still reach connect() (and fail on
+        # the missing table, not on the guard's ValueError) when read_only is
+        # left at its default.
+        with self.assertRaises(sqlite3.OperationalError):
+            load_messages_since(":memory:", 0)
 
     def test_read_only_uri_escapes_reserved_characters_in_the_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
