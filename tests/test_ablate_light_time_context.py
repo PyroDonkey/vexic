@@ -645,6 +645,15 @@ class ValidateDbsTests(unittest.TestCase):
             self.module._validate_dbs(["/nonexistent/memory.db"])
         self.assertIn("not found", str(caught.exception))
 
+    def test_a_directory_is_a_config_error(self) -> None:
+        # stat() sees a directory happily; without a file check the failure
+        # surfaces later as a generic SQLite error (exit 1) instead of the
+        # config channel this function feeds (exit 2).
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(self.module.AblationConfigError) as caught:
+                self.module._validate_dbs([tmp])
+            self.assertIn("not a file", str(caught.exception))
+
     def test_no_db_is_a_config_error(self) -> None:
         with self.assertRaises(self.module.AblationConfigError) as caught:
             self.module._validate_dbs([])

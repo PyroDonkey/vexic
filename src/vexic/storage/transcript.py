@@ -772,12 +772,15 @@ def load_messages_in_id_range(
     return hits
 
 
-# Scheme names, not full "scheme://" prefixes: Path() collapses the double
-# slash, so Path("libsql://host") stringifies to "libsql:/host" and would slip
-# past a "libsql://" check. Derived from connect()'s tuple so a new hosted
-# scheme there is covered here too.
+# "scheme:/", not "scheme://" and not a bare "scheme:". Path() collapses the
+# double slash -- Path("libsql://host") stringifies to "libsql:/host" -- so a
+# "libsql://" check would miss it, while a bare "libsql:" check would reject an
+# ordinary relative file literally named "http:notes.db". Derived by splitting
+# each of connect()'s schemes on ":" rather than by stripping a "//" suffix, so
+# an entry that is not spelled "scheme://" cannot silently degrade this into a
+# prefix that matches everything.
 _NON_LOCAL_SCHEME_PREFIXES = tuple(
-    scheme.removesuffix("//") for scheme in _LIBSQL_SCHEMES
+    f"{scheme.split(':', 1)[0]}:/" for scheme in _LIBSQL_SCHEMES
 )
 
 
@@ -801,9 +804,15 @@ def _assert_local_read_only_target(db_path: object) -> None:
     if not isinstance(db_path, (str, PathLike)):
         return  # Path() below raises TypeError on its own for anything else.
     # Normalize str and Path identically: a caller that wraps its target in a
-    # Path before calling must get the same guard, since Path() preserves
-    # ":memory:" and URI spellings verbatim and as_uri() then mangles them.
+    # Path before calling must get the same guard. Path() keeps ":memory:" and
+    # the URI scheme intact (collapsing only the "//" after it), and as_uri()
+    # then mangles the result into a local path naming something else.
     text = os.fspath(db_path)
+    if not isinstance(text, str):
+        raise ValueError(
+            "read_only=True accepts a local filesystem path only; got a "
+            f"non-text path ({type(text).__name__})."
+        )
     if text == ":memory:":
         raise ValueError(
             "read_only=True accepts a local filesystem path only; ':memory:' "

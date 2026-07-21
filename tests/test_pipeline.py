@@ -2981,14 +2981,16 @@ class LoadMessagesSinceReadOnlyTests(unittest.TestCase):
                 with self.assertRaises(sqlite3.OperationalError):
                     conn.execute("DELETE FROM messages")
 
-    def _uncheckpointed_wal_db(self, temp_dir: str, stack: ExitStack) -> str:
+    def _uncheckpointed_wal_db(
+        self, temp_dir: str, stack: ExitStack, name: str = "memory.db"
+    ) -> str:
         """A WAL database with a committed-but-uncheckpointed row.
 
         The writer connection is held open for the caller's lifetime: SQLite
         checkpoints when the *last* connection closes, so holding one keeps the
         committed frames in ``-wal`` where a reader must go find them.
         """
-        db_path = str(Path(temp_dir) / "memory.db")
+        db_path = str(Path(temp_dir) / name)
         init_db(db_path)  # already sets journal_mode=WAL
         # Holding this connection open is the whole mechanism: SQLite
         # checkpoints when the LAST connection closes, so this keeps the
@@ -3028,10 +3030,22 @@ class LoadMessagesSinceReadOnlyTests(unittest.TestCase):
         # means the read below has to consult the WAL to succeed.
         with tempfile.TemporaryDirectory() as temp_dir, ExitStack() as stack:
             db_path = self._uncheckpointed_wal_db(temp_dir, stack)
+            captured: list[object] = []
+            real_connect = transcript_module.connect
 
-            rows = load_messages_since(db_path, 0, read_only=True)
+            def capturing_connect(target: object, **kwargs: object) -> object:
+                captured.append(target)
+                return real_connect(target, **kwargs)
+
+            with patch.object(transcript_module, "connect", capturing_connect):
+                rows = load_messages_since(db_path, 0, read_only=True)
 
             self.assertEqual(len(rows), 1)
+            # Pin the mechanism, not just the outcome: a read_only that quietly
+            # degraded to a plain read-write open would also see these WAL
+            # frames and leave the row assertion above green.
+            self.assertIn("mode=ro", str(captured[0]))
+            self.assertNotIn("immutable", str(captured[0]))
 
     @unittest.skipIf(os.name == "nt", "Windows cannot unlink a mapped -shm file.")
     def test_read_only_open_with_the_shm_file_deleted_never_reads_stale_data(
@@ -3084,13 +3098,36 @@ class LoadMessagesSinceReadOnlyTests(unittest.TestCase):
         for dsn in (
             "libsql://tenant.turso.io",
             "https://tenant.turso.io",
+            "http://tenant.turso.io",
+            "wss://tenant.turso.io",
+            "ws://tenant.turso.io",
             "LIBSQL://tenant.turso.io",
             "HTTPS://tenant.turso.io",
+            "HTTP://tenant.turso.io",
             "WSS://tenant.turso.io",
+            "WS://tenant.turso.io",
         ):
             with self.subTest(dsn=dsn):
                 with self.assertRaises(ValueError):
                     load_messages_since(dsn, 0, read_only=True)
+
+    def test_read_only_does_not_reject_a_local_file_named_like_a_scheme(self) -> None:
+        # "http:notes.db" is an ordinary relative filename, not a DSN: the
+        # guard keys on "scheme:/" so it must not swallow this one.
+        with tempfile.TemporaryDirectory() as temp_dir, ExitStack() as stack:
+            db_path = self._uncheckpointed_wal_db(temp_dir, stack, "http:notes.db")
+
+            rows = load_messages_since(db_path, 0, read_only=True)
+
+            self.assertEqual(len(rows), 1)
+
+    def test_read_only_rejects_a_path_like_that_is_not_text(self) -> None:
+        class BytesPath:
+            def __fspath__(self) -> bytes:
+                return b"/tmp/memory.db"
+
+        with self.assertRaises(ValueError):
+            load_messages_since(BytesPath(), 0, read_only=True)  # type: ignore[arg-type]
 
     def test_read_only_rejects_the_same_forms_spelled_as_path_objects(self) -> None:
         # A caller that normalizes to Path before calling -- the natural thing

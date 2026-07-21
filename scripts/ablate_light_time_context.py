@@ -84,6 +84,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from stat import S_ISREG
 from typing import Any
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -801,6 +802,8 @@ def _validate_dbs(dbs: list[str]) -> None:
             raise AblationConfigError(
                 f"--db not readable: {db} ({exc.strerror})"
             ) from None
+        if not S_ISREG(stat.st_mode):
+            raise AblationConfigError(f"--db is not a file: {db}")
         identity = (stat.st_dev, stat.st_ino)
         if identity in seen:
             raise AblationConfigError(
