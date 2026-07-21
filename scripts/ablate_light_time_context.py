@@ -41,6 +41,20 @@ Evidence caveats (what these numbers do and do not prove):
 - The provider budget counts ``agent.run()`` calls; a provider's
   structured-output retries may push actual upstream calls moderately above the
   cap.
+- Repeats are scheduled atomically over the whole window panel
+  (``_global_paired_schedule``): a repeat runs every window's every variant or
+  is not scheduled at all. So a budget below one full panel scores nothing, and
+  a truncated run's repeats all cover the identical panel. This is what makes
+  the per-repeat aggregation comparable; it costs up to
+  ``windows * variants - 1`` unspent calls at the tail.
+- A transient provider failure is recorded as a ``call_error`` audit record and
+  skipped, never counted as attempted, so it scores null rather than a false
+  zero. Completed windows and spent calls survive the failure.
+- Input databases are opened read-only (``mode=ro``); the harness never mutates
+  the corpus it measures.
+- ``REDACTION`` is empty by default. Set forbidden values there to run against
+  non-fixture data: transcripts are checked before any provider call and the
+  whole artifact payload before anything is written.
 
 Metric functions return None (not 0.0) on an empty denominator; aggregation
 skips None repeats and reports ``repeats_with_data`` per metric.
@@ -77,6 +91,7 @@ from adapters.openrouter_live_adapter import (  # noqa: E402
     _agent as _build_agent,
     build_extraction_agent,
 )
+from vexic.contract import RedactionContext  # noqa: E402
 from vexic.models import FactCandidate  # noqa: E402
 from vexic.pipeline import (  # noqa: E402
     LIGHT_PHASE_BATCH_SIZE,
@@ -87,7 +102,18 @@ from vexic.pipeline import (  # noqa: E402
     render_transcript,
     rendered_message_ids,
 )
+from vexic.redaction import (  # noqa: E402
+    assert_no_forbidden_secret_values,
+    assert_no_forbidden_secret_values_in_payload,
+)
 from vexic.storage import load_messages_since  # noqa: E402
+
+# Forbidden values this run must never send to a provider or write to disk.
+# Empty by default and deliberately not a CLI flag: the sibling live harness
+# (src/vexic/live_retrieval_baseline.py) also runs an empty set against local
+# fixtures, and AGENTS.md forbids config options ahead of need. A run against
+# non-fixture data sets values here; the guard plumbing already exists.
+REDACTION = RedactionContext(forbidden_values=())
 
 # The paragraph currently shipped in EXTRACTION_INSTRUCTIONS (Task 5,
 # ad93f22): guarded absolute/relative resolution rules keyed off the
@@ -306,8 +332,14 @@ def _collect_windows(dbs: list[str], max_windows: int, *, limit: int) -> list[Wi
         after_id = 0
         index = 0
         while len(jobs) < max_windows:
+            # read_only: this harness measures an eval corpus it must never
+            # mutate, so the input database is opened mode=ro.
             rows = load_messages_since(
-                db, after_id, limit=limit, exclude_session_prefixes=("onboarding:",)
+                db,
+                after_id,
+                limit=limit,
+                exclude_session_prefixes=("onboarding:",),
+                read_only=True,
             )
             if not rows:
                 break
@@ -347,30 +379,47 @@ def _drop_out_of_window_candidates(
     return keep_candidates_with_valid_source_ids(candidates, evidence_ids)
 
 
-def _paired_variant_schedule(
+def _global_paired_schedule(
     n_repeats: int,
+    window_keys: Sequence[str],
     variants: Sequence[str],
     budget_remaining: int,
-) -> list[tuple[int, str]]:
-    """Interleaved ``(repeat_idx, variant)`` call plan that fits within
-    ``budget_remaining``.
+) -> list[tuple[int, str, str]]:
+    """Repeat-major ``(repeat_idx, window_key, variant)`` call plan that fits
+    within ``budget_remaining``.
 
-    Each repeat runs every variant in order before the next repeat starts, and
-    the plan stops the moment the next call would exceed budget. This keeps the
-    variants paired under a tight cap: the old shape ran every baseline repeat
-    before any treated repeat, so a budget smaller than ``repeats * variants``
-    starved treated to zero while still counting ``repeats`` attempted treated
-    repeats. Here treated is never starved past a single-call asymmetry, and a
-    repeat a variant never reached is simply absent from the plan (so it is not
-    counted as attempted).
+    Pairing spans the whole window panel, and a repeat is **atomic**: it is
+    scheduled only when every window's every variant fits in the remaining
+    budget. Anything less is not scheduled at all.
+
+    Two earlier shapes were weaker. Running all of one variant's repeats before
+    the other starved the second variant to zero under a tight cap. Sizing a
+    fresh per-window plan from the budget left at that window (the shape this
+    replaces) still executed a truncated plan, so a later window could generate
+    baseline-only candidates -- an unpaired window feeding cross-window
+    aggregation with content and plausible-year sets the other variant never
+    saw.
+
+    Repeat-atomicity also keeps the metric aggregation honest: metrics are
+    aggregated mean/min/max *across repeats*, so a partially-covered repeat
+    would silently mix a full-panel slot with a one-window slot and report the
+    spread as model nondeterminism. Every scheduled repeat covers exactly the
+    same panel. The cost is up to ``windows * variants - 1`` unspent calls at
+    the tail; the default 120-call cap fits seven full 8x2 panels against a
+    default of five repeats.
     """
-    plan: list[tuple[int, str]] = []
+    panel = [
+        (window_key, variant) for window_key in window_keys for variant in variants
+    ]
+    if not panel:
+        return []
+    plan: list[tuple[int, str, str]] = []
     remaining = budget_remaining
     for repeat_idx in range(n_repeats):
-        for variant in variants:
-            if remaining <= 0:
-                return plan
-            plan.append((repeat_idx, variant))
+        if remaining < len(panel):
+            return plan
+        for window_key, variant in panel:
+            plan.append((repeat_idx, window_key, variant))
             remaining -= 1
     return plan
 
@@ -400,16 +449,22 @@ async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
     attempted_repeats: dict[str, set[int]] = {variant: set() for variant in VARIANTS}
     budget_exhausted = False
 
+    # Render and audit every window's every variant first. This consumes no
+    # budget and must be emitted for every window so plausible_years_by_window
+    # stays complete even for windows the budget never scores.
+    jobs_by_key = {job.window_key: job for job in jobs}
+    context: dict[tuple[str, str], tuple[str, dict[int, str]]] = {}
     for job in jobs:
-        # Audit both variants first -- this consumes no budget and must be
-        # emitted for every window so plausible_years_by_window stays complete
-        # even for windows whose candidate generation was budget-truncated.
-        variant_ctx: dict[str, tuple[str, dict[int, str]]] = {}
         for variant in VARIANTS:
             transcript = _variant_transcript(job.rows, variant)
+            # Fail closed before any third-party egress: this runs while
+            # rendering, ahead of every provider call, so a forbidden value
+            # anywhere in the panel aborts the run before a single call is
+            # spent rather than after the window that happens to contain it.
+            assert_no_forbidden_secret_values(REDACTION.forbidden_values, transcript)
             plausible_years = sorted(_plausible_years(job.rows, transcript))
             message_lines = _line_by_message_id(job.rows, labeled=(variant == "treated"))
-            variant_ctx[variant] = (transcript, message_lines)
+            context[(job.window_key, variant)] = (transcript, message_lines)
             audit_records.append(
                 {
                     "record_type": "window_transcript_hash",
@@ -422,48 +477,71 @@ async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
                     "plausible_years": plausible_years,
                 }
             )
-        if budget_exhausted:
-            continue
-        # Interleave the variants per repeat so a tight budget cannot spend
-        # every call on baseline before treated runs at all. The plan is sized
-        # to the budget remaining at this window; a truncated plan means the
-        # cap is exhausted and no later window generates candidates.
-        plan = _paired_variant_schedule(args.repeats, VARIANTS, budget.remaining())
-        if len(plan) < args.repeats * len(VARIANTS):
-            budget_exhausted = True
-        for repeat_idx, variant in plan:
-            transcript, message_lines = variant_ctx[variant]
-            attempted_repeats[variant].add(repeat_idx)
+
+    # One panel-wide plan, built before any provider call, so truncation lands
+    # on a repeat boundary instead of mid-window.
+    plan = _global_paired_schedule(
+        args.repeats, [job.window_key for job in jobs], VARIANTS, budget.remaining()
+    )
+    if len(plan) < args.repeats * len(jobs) * len(VARIANTS):
+        budget_exhausted = True
+
+    for repeat_idx, window_key, variant in plan:
+        job = jobs_by_key[window_key]
+        transcript, message_lines = context[(window_key, variant)]
+        # A transient provider failure (timeout, rate limit, structured-output
+        # error) must not discard every result already collected and every
+        # paid call already spent: record the error to the audit and move on.
+        # The call is NOT counted as attempted, so the affected repeat scores
+        # null for this variant, never a false zero. The budget call was still
+        # spent.
+        try:
             raw_candidates = await _run_agent(agents[variant], transcript, budget)
-            raw_candidates, _dropped = _drop_out_of_window_candidates(raw_candidates, job.rows)
-            guarded_candidates = [candidate.model_copy(deep=True) for candidate in raw_candidates]
-            apply_occurred_at_guards(guarded_candidates, job.rows, transcript)
-            for raw, guarded in zip(raw_candidates, guarded_candidates, strict=True):
-                relative_reference_lines = [
-                    {"message_id": message_id, "text": message_lines[message_id]}
-                    for message_id in raw.source_message_ids
-                    if message_id in message_lines
-                    and _has_relative_reference(message_lines[message_id])
-                ]
-                record = {
+        except ProviderBudgetExhausted:
+            budget_exhausted = True
+            break
+        except Exception as exc:  # noqa: BLE001 - live provider boundary
+            audit_records.append(
+                {
+                    "record_type": "call_error",
                     "window": job.window_key,
                     "db": job.db,
                     "variant": variant,
                     "repeat": repeat_idx,
-                    "fact_text": raw.fact_text,
-                    "category": raw.category,
-                    "occurred_at_raw": raw.occurred_at,
-                    "occurred_at_guarded": guarded.occurred_at,
-                    "source_message_ids": list(raw.source_message_ids),
+                    "error": f"{type(exc).__name__}: {exc}"[:500],
                 }
-                candidate_records.append(record)
-                audit_records.append(
-                    {
-                        "record_type": "candidate",
-                        **record,
-                        "relative_reference_lines": relative_reference_lines,
-                    }
-                )
+            )
+            continue
+        attempted_repeats[variant].add(repeat_idx)
+        raw_candidates, _dropped = _drop_out_of_window_candidates(raw_candidates, job.rows)
+        guarded_candidates = [candidate.model_copy(deep=True) for candidate in raw_candidates]
+        apply_occurred_at_guards(guarded_candidates, job.rows, transcript)
+        for raw, guarded in zip(raw_candidates, guarded_candidates, strict=True):
+            relative_reference_lines = [
+                {"message_id": message_id, "text": message_lines[message_id]}
+                for message_id in raw.source_message_ids
+                if message_id in message_lines
+                and _has_relative_reference(message_lines[message_id])
+            ]
+            record = {
+                "window": job.window_key,
+                "db": job.db,
+                "variant": variant,
+                "repeat": repeat_idx,
+                "fact_text": raw.fact_text,
+                "category": raw.category,
+                "occurred_at_raw": raw.occurred_at,
+                "occurred_at_guarded": guarded.occurred_at,
+                "source_message_ids": list(raw.source_message_ids),
+            }
+            candidate_records.append(record)
+            audit_records.append(
+                {
+                    "record_type": "candidate",
+                    **record,
+                    "relative_reference_lines": relative_reference_lines,
+                }
+            )
 
     metrics_document = _build_metrics_document(
         args=args,
@@ -501,9 +579,12 @@ def _build_metrics_document(
         # Iterate over every repeat this variant actually attempted, NOT
         # sorted(per_repeat): a repeat that produced zero candidates must appear
         # as a None-metric slot, not vanish and inflate the apparent
-        # denominator. A budget-starved variant attempts fewer repeats than
-        # args.repeats (interleaved pairing upstream), so the attempted count is
-        # per-variant; it defaults to args.repeats when not supplied.
+        # denominator. A budget-truncated run attempts fewer repeats than
+        # args.repeats; because the schedule upstream is repeat-atomic over the
+        # whole window panel, every attempted repeat covers the identical panel
+        # for both variants, so slots stay comparable across repeats. The count
+        # is still read per-variant (a provider error can drop one variant's
+        # repeat) and defaults to args.repeats when not supplied.
         attempted = (
             args.repeats
             if attempted_repeats is None
@@ -629,6 +710,14 @@ def main(argv: list[str] | None = None) -> int:
         out_dir = Path(_require(args.out, "--out"))
         _validate_args(args)
         result = asyncio.run(_run_ablation(args))
+        # Egress guard over the *whole* payload before anything is written.
+        # _write_artifacts writes ablation_metrics.json before it opens the
+        # jsonl, so guarding per-record inside it would leave a metrics file on
+        # disk for a run that must fail closed. Checking the built payload also
+        # covers model output (fact_text), the verbatim transcript lines in
+        # relative_reference_lines, and window keys embedding db paths, without
+        # the hand-picked-field antipattern.
+        assert_no_forbidden_secret_values_in_payload(REDACTION.forbidden_values, result)
         _write_artifacts(out_dir, result)
     except AblationConfigError as exc:
         print(str(exc), file=sys.stderr)

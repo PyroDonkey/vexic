@@ -4,6 +4,7 @@ import unicodedata
 from collections.abc import Iterable
 from contextlib import closing
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Literal
 
 from pydantic import TypeAdapter
@@ -777,8 +778,25 @@ def load_messages_since(
     agent_id: str | None = None,
     exclude_session_prefixes: tuple[str, ...] = (),
     content_codec: ContentCodec | None = None,
+    read_only: bool = False,
 ) -> list[tuple[int, str | None, ModelMessage]]:
-    with closing(connect(db_path)) as conn:
+    """Load cleaned transcript rows after ``after_id``.
+
+    ``read_only=True`` opens the database through a ``mode=ro`` SQLite URI so an
+    offline analysis or evidence harness cannot mutate the corpus it measures.
+    Writes through that connection raise. It is deliberately not
+    ``immutable=1``: immutable would also suppress the ``-shm`` wal-index, but it
+    ignores ``-wal`` content entirely and would silently drop a crashed run's
+    uncommitted tail, which is a fidelity regression in an evidence harness.
+    """
+    # Path.as_uri() percent-encodes reserved characters (a path containing ? or
+    # # would otherwise be parsed as a query or fragment) and emits the
+    # file:///C:/... form Windows requires, which a bare f"file:{path}" does not.
+    target = (
+        f"{Path(db_path).resolve().as_uri()}?mode=ro" if read_only else db_path
+    )
+    connect_kwargs: dict[str, object] = {"uri": True} if read_only else {}
+    with closing(connect(target, **connect_kwargs)) as conn:
         filters = ["id > ?", "agent_id IS ?"]
         params: list[object] = [after_id, agent_id]
         for prefix in exclude_session_prefixes:

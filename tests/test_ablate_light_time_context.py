@@ -14,12 +14,16 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import ModuleType
 
 from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+from vexic.models import FactCandidate
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = REPO_ROOT / "scripts" / "ablate_light_time_context.py"
@@ -433,35 +437,67 @@ class MirrorProductionCandidateDropTests(unittest.TestCase):
         self.assertEqual(dropped, 1)
 
 
-class PairedVariantScheduleTests(unittest.TestCase):
-    """3b: under a tight budget the variants must interleave per repeat so one
-    does not starve the other, and per-variant attempted accounting must
-    reflect what actually ran."""
+class GlobalPairedScheduleTests(unittest.TestCase):
+    """3b: pairing spans the whole window panel and a repeat is atomic, so a
+    tight budget truncates on a repeat boundary rather than starving one
+    variant or leaving one window scored by only one variant."""
 
     def setUp(self) -> None:
         self.module = _load_module()
 
-    def test_full_budget_runs_every_repeat_variant(self) -> None:
-        plan = self.module._paired_variant_schedule(2, ("baseline", "treated"), 10)
+    def test_full_budget_covers_every_window_variant_repeat_major(self) -> None:
+        plan = self.module._global_paired_schedule(
+            2, ("w0", "w1"), ("baseline", "treated"), 100
+        )
         self.assertEqual(
             plan,
-            [(0, "baseline"), (0, "treated"), (1, "baseline"), (1, "treated")],
+            [
+                (0, "w0", "baseline"),
+                (0, "w0", "treated"),
+                (0, "w1", "baseline"),
+                (0, "w1", "treated"),
+                (1, "w0", "baseline"),
+                (1, "w0", "treated"),
+                (1, "w1", "baseline"),
+                (1, "w1", "treated"),
+            ],
         )
 
-    def test_tight_budget_interleaves_and_does_not_starve_treated(self) -> None:
-        # Budget 3 < repeats(3) * variants(2) = 6. The old shape ran all
-        # baseline repeats first, starving treated to zero; interleaving gives
-        # treated repeat 0 and stops before an unpaired treated repeat 1.
-        plan = self.module._paired_variant_schedule(3, ("baseline", "treated"), 3)
-        self.assertEqual(plan, [(0, "baseline"), (0, "treated"), (1, "baseline")])
-        baseline_repeats = {repeat for repeat, variant in plan if variant == "baseline"}
-        treated_repeats = {repeat for repeat, variant in plan if variant == "treated"}
-        self.assertEqual(baseline_repeats, {0, 1})
-        self.assertEqual(treated_repeats, {0})
+    def test_budget_truncates_on_a_repeat_boundary(self) -> None:
+        # Panel is 2 windows x 2 variants = 4. Budget 7 affords one full repeat
+        # and three quarters of a second; the partial repeat is not scheduled,
+        # so every scheduled repeat covers the identical panel.
+        plan = self.module._global_paired_schedule(
+            3, ("w0", "w1"), ("baseline", "treated"), 7
+        )
+        self.assertEqual({repeat for repeat, _, _ in plan}, {0})
+        self.assertEqual(len(plan), 4)
+
+    def test_budget_below_one_panel_plans_nothing(self) -> None:
+        # The prior per-window shape ran a truncated plan here, which is what
+        # produced a baseline-only window.
+        plan = self.module._global_paired_schedule(
+            3, ("w0", "w1"), ("baseline", "treated"), 3
+        )
+        self.assertEqual(plan, [])
+
+    def test_every_scheduled_repeat_pairs_every_window(self) -> None:
+        plan = self.module._global_paired_schedule(
+            5, ("w0", "w1", "w2"), ("baseline", "treated"), 13
+        )
+        by_cell: dict[tuple[int, str], set[str]] = {}
+        for repeat, window, variant in plan:
+            by_cell.setdefault((repeat, window), set()).add(variant)
+        self.assertTrue(by_cell)
+        for cell, variants in by_cell.items():
+            self.assertEqual(variants, {"baseline", "treated"}, f"cell {cell} unpaired")
 
     def test_zero_budget_plans_nothing(self) -> None:
         self.assertEqual(
-            self.module._paired_variant_schedule(3, ("baseline", "treated"), 0), []
+            self.module._global_paired_schedule(
+                3, ("w0",), ("baseline", "treated"), 0
+            ),
+            [],
         )
 
     def test_metrics_attempted_reflects_per_variant_count(self) -> None:
@@ -503,6 +539,296 @@ class PairedVariantScheduleTests(unittest.TestCase):
             len(doc["variants"]["baseline"]["metrics"]["dated_event_rate"]["per_repeat"]),
             2,
         )
+
+
+class _Result:
+    """Minimal pydantic-ai result shape: ``_run_agent`` does
+    ``list(result.output)``. Shaped after tests/test_live_retrieval_baseline.py's
+    fake adapter."""
+
+    def __init__(self, output: list[FactCandidate]) -> None:
+        self.output = output
+
+
+class _Recorder:
+    """Shared call log across both variants' fake agents, so a failure can be
+    scheduled at an exact global call index."""
+
+    def __init__(self, fail_on: frozenset[int]) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.fail_on = fail_on
+
+
+class _FakeAgent:
+    def __init__(
+        self, variant: str, recorder: _Recorder, fact_text: str | None = None
+    ) -> None:
+        self.variant = variant
+        self.recorder = recorder
+        self.fact_text = fact_text or "Ryan ran the Berlin marathon on 2024-09-29."
+
+    async def run(self, transcript: str) -> _Result:
+        index = len(self.recorder.calls)
+        self.recorder.calls.append((self.variant, transcript))
+        if index in self.recorder.fail_on:
+            raise RuntimeError(f"synthetic provider failure on call {index}")
+        # Cite the window's first rendered message id so
+        # _drop_out_of_window_candidates keeps the candidate; a candidate citing
+        # an out-of-window id would be dropped and every assertion would then
+        # run over empty lists.
+        # The treated marker is "[message_id=1 observed=2024-09-30 Mon]", the
+        # baseline marker "[message_id=1]"; take the leading digits of either.
+        marker = transcript.split("[message_id=", 1)[1]
+        first_id = int(marker[: len(marker) - len(marker.lstrip("0123456789"))])
+        return _Result(
+            [
+                FactCandidate(
+                    fact_text=self.fact_text,
+                    subject="Ryan",
+                    category="event",
+                    importance=6,
+                    confidence=0.9,
+                    source_message_ids=[first_id],
+                )
+            ]
+        )
+
+
+class AblationExecutionHarness(unittest.TestCase):
+    """Drives the full runner (``main``) with a faked transcript source and
+    faked provider agents. No DB reads, no network, no provider."""
+
+    def setUp(self) -> None:
+        self.module = _load_module()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.out_dir = self.root / "out"
+
+    def _db_path(self, name: str = "memory.db") -> str:
+        path = self.root / name
+        path.touch()
+        return str(path)
+
+    def _install_windows(self, windows: dict[str, list[list[int]]]) -> None:
+        """Fake ``load_messages_since`` (the module global the runner imports at
+        :90), not ``_collect_windows`` -- keeping the real window-collection
+        path live so the read-only DB behavior stays observable."""
+
+        self.load_calls: list[dict[str, object]] = []
+
+        def fake_load_messages_since(
+            db: str, after_id: int, limit: int | None = None, **kwargs: object
+        ) -> list[tuple[int, str, ModelRequest]]:
+            self.load_calls.append(kwargs)
+            for batch in windows[db]:
+                if batch and batch[0] > after_id:
+                    return [
+                        (
+                            message_id,
+                            "2024-09-30T09:30:00+00:00",
+                            user_message(f"message {message_id} about last Sunday"),
+                        )
+                        for message_id in batch
+                    ]
+            return []
+
+        self.module.load_messages_since = fake_load_messages_since
+
+    def _install_agents(
+        self, fail_on: frozenset[int] = frozenset(), fact_text: str | None = None
+    ) -> _Recorder:
+        recorder = _Recorder(fail_on)
+        self.module.build_extraction_agent = lambda *a, **k: _FakeAgent(
+            "treated", recorder, fact_text
+        )
+        self.module._build_agent = lambda *a, **k: _FakeAgent(
+            "baseline", recorder, fact_text
+        )
+        return recorder
+
+    def _run(self, db_paths: list[str], **flags: object) -> int:
+        argv = ["--allow-live", "--out", str(self.out_dir)]
+        for db in db_paths:
+            argv += ["--db", db]
+        for name, value in flags.items():
+            argv += [f"--{name.replace('_', '-')}", str(value)]
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            exit_code = self.module.main(argv)
+        self.stderr = stderr.getvalue()
+        return exit_code
+
+    def _audit_records(self) -> list[dict[str, object]]:
+        lines = (self.out_dir / "ablation_audit.jsonl").read_text().splitlines()
+        return [json.loads(line) for line in lines]
+
+    def _metrics(self) -> dict[str, object]:
+        return json.loads((self.out_dir / "ablation_metrics.json").read_text())
+
+
+class ProviderErrorToleranceTests(AblationExecutionHarness):
+    """Gap 4: a transient provider failure must not discard every completed
+    window and every already-spent paid provider call."""
+
+    def test_transient_provider_error_preserves_completed_work(self) -> None:
+        db = self._db_path()
+        self._install_windows({db: [[1, 2]]})
+        recorder = self._install_agents(fail_on=frozenset({1}))
+
+        exit_code = self._run([db], repeats=2, max_windows=1, max_provider_calls=10)
+
+        self.assertEqual(exit_code, 0, self.stderr)
+        self.assertTrue((self.out_dir / "ablation_metrics.json").exists())
+        self.assertEqual(len(recorder.calls), 4)
+        errors = [
+            record
+            for record in self._audit_records()
+            if record.get("record_type") == "call_error"
+        ]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("synthetic provider failure", str(errors[0]["error"]))
+        candidates = [
+            record
+            for record in self._audit_records()
+            if record.get("record_type") == "candidate"
+        ]
+        self.assertEqual(len(candidates), 3)
+
+
+class ForbiddenValueGuardTests(AblationExecutionHarness):
+    """Gap 1: the runner must fail closed on a configured forbidden value, both
+    before the transcript reaches a third-party provider and before any artifact
+    lands on disk."""
+
+    def test_forbidden_value_in_transcript_never_reaches_the_provider(self) -> None:
+        db = self._db_path()
+        self._install_windows({db: [[1, 2]]})
+        recorder = self._install_agents()
+        self.module.REDACTION = self.module.RedactionContext(
+            forbidden_values=("last Sunday",)
+        )
+
+        exit_code = self._run([db], repeats=1, max_windows=1, max_provider_calls=4)
+
+        self.assertEqual(exit_code, 1)
+        # Fail closed *before* egress: the provider was never called at all.
+        self.assertEqual(recorder.calls, [])
+        self.assertFalse((self.out_dir / "ablation_metrics.json").exists())
+
+    def test_forbidden_value_in_model_output_blocks_every_artifact(self) -> None:
+        db = self._db_path()
+        self._install_windows({db: [[1, 2]]})
+        # The secret is absent from the transcript and arrives only in the
+        # provider's response, so the transcript guard cannot catch it.
+        self._install_agents(fact_text="the key is sk-live-abc123")
+        self.module.REDACTION = self.module.RedactionContext(
+            forbidden_values=("sk-live-abc123",)
+        )
+
+        exit_code = self._run([db], repeats=1, max_windows=1, max_provider_calls=4)
+
+        self.assertEqual(exit_code, 1)
+        # _write_artifacts writes ablation_metrics.json before it opens the
+        # jsonl, so a guard placed inside it would leave the metrics file on
+        # disk for a run that must fail closed.
+        self.assertFalse((self.out_dir / "ablation_metrics.json").exists())
+        self.assertFalse((self.out_dir / "ablation_audit.jsonl").exists())
+
+    def test_clean_run_writes_artifacts_with_a_configured_forbidden_value(self) -> None:
+        db = self._db_path()
+        self._install_windows({db: [[1, 2]]})
+        self._install_agents()
+        self.module.REDACTION = self.module.RedactionContext(
+            forbidden_values=("a-value-that-appears-nowhere",)
+        )
+
+        exit_code = self._run([db], repeats=1, max_windows=1, max_provider_calls=4)
+
+        self.assertEqual(exit_code, 0, self.stderr)
+        self.assertTrue((self.out_dir / "ablation_metrics.json").exists())
+
+
+class ReadOnlyEvalDatabaseTests(AblationExecutionHarness):
+    """Gap 2: the runner measures an eval corpus it must not mutate, so every
+    window read opens the input database read-only."""
+
+    def test_windows_are_collected_through_a_read_only_connection(self) -> None:
+        db = self._db_path()
+        self._install_windows({db: [[1, 2]]})
+        self._install_agents()
+
+        exit_code = self._run([db], repeats=1, max_windows=1, max_provider_calls=4)
+
+        self.assertEqual(exit_code, 0, self.stderr)
+        self.assertTrue(self.load_calls)
+        for kwargs in self.load_calls:
+            self.assertIs(kwargs.get("read_only"), True)
+
+
+class MultiWindowPairingTests(AblationExecutionHarness):
+    """Gap 3: a budget that truncates mid-panel must never leave a window with
+    one variant's candidates and not the other's. An unpaired window feeds
+    cross-window aggregation with content and plausible-year sets the other
+    variant never saw."""
+
+    def _variants_by_window(self) -> dict[str, set[str]]:
+        by_window: dict[str, set[str]] = {}
+        for record in self._audit_records():
+            if record.get("record_type") != "candidate":
+                continue
+            by_window.setdefault(str(record["window"]), set()).add(str(record["variant"]))
+        return by_window
+
+    def test_tight_budget_never_leaves_a_window_with_one_variant(self) -> None:
+        db = self._db_path()
+        self._install_windows({db: [[1, 2], [3, 4]]})
+        # Budget 3 with repeats=1 over 2 windows: window 0 costs both variants
+        # (2 calls) and window 1 can only afford baseline.
+        self._install_agents()
+
+        exit_code = self._run([db], repeats=1, max_windows=2, max_provider_calls=3)
+
+        self.assertEqual(exit_code, 0, self.stderr)
+        for window, variants in self._variants_by_window().items():
+            self.assertEqual(
+                variants, {"baseline", "treated"}, f"window {window} is unpaired"
+            )
+        # The 2x2 panel does not fit in 3 calls, so nothing is scored and no
+        # call is spent -- rather than spending 3 calls to produce one paired
+        # window plus one baseline-only window.
+        metrics = self._metrics()
+        self.assertEqual(metrics["provider_calls_used"], 0)
+        self.assertTrue(metrics["budget_exhausted"])
+        # Every window is still rendered and audited: plausible_years must stay
+        # complete for windows the budget never scores.
+        hashed = {
+            record["window"]
+            for record in self._audit_records()
+            if record.get("record_type") == "window_transcript_hash"
+        }
+        self.assertEqual(len(hashed), 2)
+
+    def test_every_window_scores_both_variants_at_equal_repeat_counts(self) -> None:
+        db = self._db_path()
+        self._install_windows({db: [[1, 2], [3, 4]]})
+        self._install_agents()
+
+        exit_code = self._run([db], repeats=2, max_windows=2, max_provider_calls=5)
+
+        self.assertEqual(exit_code, 0, self.stderr)
+        counts: dict[tuple[str, str], int] = {}
+        for record in self._audit_records():
+            if record.get("record_type") != "candidate":
+                continue
+            key = (str(record["window"]), str(record["variant"]))
+            counts[key] = counts.get(key, 0) + 1
+        for window in {window for window, _ in counts}:
+            self.assertEqual(
+                counts.get((window, "baseline")),
+                counts.get((window, "treated")),
+                f"window {window} scored the variants unequally",
+            )
 
 
 if __name__ == "__main__":

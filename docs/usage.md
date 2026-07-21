@@ -412,6 +412,39 @@ provider-call budget cap (`--max-provider-calls`, default 140); without
 the target-to-window binding table and exit before any provider call, which
 validates binding without `--allow-live` or budget.
 
+### Light Time-Context Ablation
+
+`scripts/ablate_light_time_context.py` is the evidence harness for ADR 0038. It
+replays the exact persisted Light windows of one or more LongMemEval databases
+through two extraction variants -- `baseline` (transcript rendered without
+`observed=` labels, prior temporal paragraph) and `treated` (the shipped
+`render_transcript` plus the current `EXTRACTION_INSTRUCTIONS`) -- and reports
+five deterministic metrics per repeat, aggregated mean/min/max across repeats.
+`fabricated_year_rate` is scored both pre-guard and post-guard.
+
+```bash
+uv run python scripts/ablate_light_time_context.py \
+  --db .eval-runs/<run>/<question-id>/memory.db \
+  --allow-live --repeats 5 --max-windows 8 \
+  --out .eval-runs/light-time-context-ablation
+```
+
+`--db` is repeatable and points at machine-local `.eval-runs/` databases (they
+are gitignored, not vendored). The run is gated behind `--allow-live` with a
+provider-call budget cap (`--max-provider-calls`, default 120); without
+`--allow-live` it prints a skip notice and exits. The `--out` directory receives
+`ablation_metrics.json` and `ablation_audit.jsonl`.
+
+Repeats are scheduled atomically over the whole window panel: a repeat runs
+every window's every variant or is not scheduled at all, so a truncated run's
+repeats all cover the identical panel and no window is ever scored by one
+variant alone. A budget below one full panel (`max_windows x variants`) scores
+nothing. A transient provider failure is recorded as a `call_error` audit record
+and skipped rather than discarding the whole run. Input databases are opened
+read-only. To run against non-fixture data, set forbidden values in the module's
+`REDACTION` constant; transcripts are checked before any provider call and the
+whole artifact payload before anything is written.
+
 ## Hosted MVP Shell
 
 The dependency-free hosted shell in `vexic.hosted` binds authenticated tenant
