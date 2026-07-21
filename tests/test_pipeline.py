@@ -2928,8 +2928,9 @@ class LoadMessagesSinceReadOnlyTests(unittest.TestCase):
     Scope note: mode=ro rejects writes through the connection. It does not
     promise zero filesystem activity -- a WAL database still maintains its -shm
     wal-index. immutable=1 would guarantee that, but it ignores -wal content
-    entirely and would silently drop a crashed run's uncommitted tail, which is
-    a fidelity regression in an evidence harness.
+    entirely, so a transaction that is committed but not yet checkpointed would
+    silently vanish from the read: a fidelity regression in an evidence
+    harness.
     """
 
     def _wal_db(self, temp_dir: str) -> str:

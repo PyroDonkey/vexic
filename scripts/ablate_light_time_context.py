@@ -48,12 +48,14 @@ Evidence caveats (what these numbers do and do not prove):
   the per-repeat aggregation comparable; it costs up to
   ``windows * variants - 1`` unspent calls at the tail.
 - A transient provider failure is recorded as a ``call_error`` audit record and
-  voids that variant's whole repeat for scoring, so the repeat reports null
-  rather than a partial-panel score that would compare one variant over some
-  windows against the other over all of them. The other variant keeps that
-  repeat (its panel is still complete), so the variants can carry unequal
-  repeat counts. Every other window and every spent call survives the failure,
-  and the audit keeps the voided candidates alongside the ``call_error``.
+  voids that whole repeat for *every* variant, so the repeat reports null rather
+  than a score comparing one variant over part of the panel (or over a repeat
+  the other variant never scored). Only a repeat every variant completed over
+  the full panel is comparable. Every other repeat and every spent call survives
+  the failure; the audit keeps the voided candidates, marked ``voided``, next to
+  the ``call_error``. ``provider_errors`` and per-variant ``calls_failed`` are
+  reported in the metrics document, and a run whose every call failed writes no
+  artifacts at all -- zero successful calls is not a null result.
 - Input databases are opened read-only (``mode=ro``); the harness never mutates
   the corpus it measures.
 - ``REDACTION`` is empty by default. Set forbidden values there to run against
@@ -165,6 +167,15 @@ VARIANTS = ("baseline", "treated")
 
 class AblationConfigError(ValueError):
     pass
+
+
+class AblationNoEvidenceError(RuntimeError):
+    """Every attempted provider call failed, so the run measured nothing.
+
+    Raised instead of writing artifacts: a metrics document with zero
+    successful calls reads as "measured, found nothing" and is
+    indistinguishable from a genuine null result.
+    """
 
 
 def render_transcript_unlabeled(rows: list[tuple[int, str | None, Any]]) -> str:
@@ -451,9 +462,14 @@ async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
     candidate_records: list[dict[str, Any]] = []
     audit_records: list[dict[str, Any]] = []
     attempted_repeats: dict[str, set[int]] = {variant: set() for variant in VARIANTS}
-    # (repeat, variant) cells whose panel is incomplete because a provider
-    # call failed; dropped from scoring below.
-    failed_cells: set[tuple[int, str]] = set()
+    # Repeats whose panel is incomplete because a provider call failed. Voiding
+    # is per repeat, not per (repeat, variant): scoring the surviving variant's
+    # repeat would leave the two variants averaged over different repeat
+    # samples, which is exactly the pairing the repeat-atomic schedule exists to
+    # guarantee. Dropped from scoring below.
+    voided_repeats: set[int] = set()
+    provider_errors = 0
+    error_counts: dict[str, int] = {variant: 0 for variant in VARIANTS}
     budget_exhausted = False
 
     # Render and audit every window's every variant first. This consumes no
@@ -508,13 +524,14 @@ async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
             budget_exhausted = True
             break
         except Exception as exc:  # noqa: BLE001 - live provider boundary
-            # Void this variant's whole repeat, not just this window. Scoring
-            # the surviving windows would compare one variant over part of the
-            # panel against the other over all of it -- a biased comparison
-            # dressed as a repeat. The other variant's same repeat is kept: it
-            # still covers the full panel, so every retained slot stays
-            # panel-complete and the variants simply carry unequal repeat counts.
-            failed_cells.add((repeat_idx, variant))
+            # Void this whole repeat, for every variant. Scoring the surviving
+            # windows would compare one variant over part of the panel against
+            # the other over all of it; scoring the surviving *variant* would
+            # leave the two averaged over different repeat samples. Only a
+            # repeat every variant completed over the full panel is comparable.
+            voided_repeats.add(repeat_idx)
+            provider_errors += 1
+            error_counts[variant] += 1
             audit_records.append(
                 {
                     "record_type": "call_error",
@@ -560,18 +577,27 @@ async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
     # Drop every voided cell before scoring. The audit keeps its candidate
     # and call_error records either way, so the raw log stays complete.
     scored_records = [
-        record
-        for record in candidate_records
-        if (record["repeat"], record["variant"]) not in failed_cells
+        record for record in candidate_records if record["repeat"] not in voided_repeats
     ]
+    # Mark the voided candidates in the audit rather than deleting them: the
+    # audit is the raw log and must stay complete, but an unmarked record a
+    # consumer counts would contradict candidate_count in the metrics document.
+    for record in audit_records:
+        if (
+            record.get("record_type") == "candidate"
+            and record.get("repeat") in voided_repeats
+        ):
+            record["voided"] = True
     surviving_repeats = {
-        variant: sorted(
-            repeat_idx
-            for repeat_idx in seen
-            if (repeat_idx, variant) not in failed_cells
-        )
+        variant: sorted(seen - voided_repeats)
         for variant, seen in attempted_repeats.items()
     }
+
+    if provider_errors and not scored_records and budget.used == provider_errors:
+        raise AblationNoEvidenceError(
+            f"every provider call failed ({provider_errors}/{budget.used}); "
+            "no artifacts written"
+        )
 
     metrics_document = _build_metrics_document(
         args=args,
@@ -581,6 +607,8 @@ async def _run_ablation(args: argparse.Namespace) -> dict[str, Any]:
         budget=budget,
         budget_exhausted=budget_exhausted,
         attempted_repeats=surviving_repeats,
+        provider_errors=provider_errors,
+        error_counts=error_counts,
     )
     return {"metrics_document": metrics_document, "audit_records": audit_records}
 
@@ -594,6 +622,8 @@ def _build_metrics_document(
     budget: ProviderBudget,
     budget_exhausted: bool,
     attempted_repeats: dict[str, Sequence[int]] | None = None,
+    provider_errors: int = 0,
+    error_counts: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     variants_doc: dict[str, Any] = {}
     for variant in VARIANTS:
@@ -668,6 +698,7 @@ def _build_metrics_document(
                 1 for record in variant_records if record["category"] == "event"
             ),
             "repeats_attempted": len(repeat_indices),
+            "calls_failed": (error_counts or {}).get(variant, 0),
             "repeats_with_candidates": sum(1 for i in repeat_indices if per_repeat[i]),
             "metrics": metrics,
         }
@@ -682,6 +713,7 @@ def _build_metrics_document(
             "max_provider_calls": args.max_provider_calls,
         },
         "provider_calls_used": budget.used,
+        "provider_errors": provider_errors,
         "budget_exhausted": budget_exhausted,
         "variants": variants_doc,
     }
@@ -740,6 +772,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
+        # Guard the path arguments before anything interpolates them. Config
+        # errors below quote the offending --db path into a message printed to
+        # stderr, and --out is used to create directories, so path strings are
+        # egress too and the fail-closed rule is categorical.
+        assert_no_forbidden_secret_values(
+            REDACTION.forbidden_values, *args.db, args.out or ""
+        )
         out_dir = Path(_require(args.out, "--out"))
         _validate_args(args)
         result = asyncio.run(_run_ablation(args))

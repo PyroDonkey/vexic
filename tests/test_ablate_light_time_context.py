@@ -714,24 +714,73 @@ class ProviderErrorToleranceTests(AblationExecutionHarness):
         self.assertEqual(treated["repeats_attempted"], 2)
         self.assertEqual(treated["repeats_with_candidates"], 2)
 
-    def test_a_failed_call_voids_that_variant_repeat_rather_than_biasing_it(self) -> None:
+    def test_a_failed_call_voids_that_repeat_for_every_variant(self) -> None:
         db = self._db_path()
         self._install_windows({db: [[1, 2], [3, 4]]})
         # Panel order is window-major, variants inner: index 1 is window 0's
-        # treated call. Window 1's treated call still succeeds, so without a
-        # cell-level void the treated repeat would be scored from one window
-        # while baseline covers both -- a biased comparison, not the null score
-        # the runner documents.
+        # treated call. Voiding only treated's repeat would leave baseline
+        # scoring a repeat treated never scored, so the aggregate means compare
+        # different repeat samples -- the pairing the repeat-atomic schedule
+        # exists to guarantee. A failed cell voids the whole repeat.
         self._install_agents(fail_on=frozenset({1}))
 
         exit_code = self._run([db], repeats=1, max_windows=2, max_provider_calls=4)
 
         self.assertEqual(exit_code, 0, self.stderr)
         variants = self._metrics()["variants"]
-        self.assertEqual(variants["baseline"]["candidate_count"], 2)
-        self.assertEqual(variants["baseline"]["repeats_attempted"], 1)
-        self.assertEqual(variants["treated"]["candidate_count"], 0)
-        self.assertEqual(variants["treated"]["repeats_attempted"], 0)
+        for variant in ("baseline", "treated"):
+            self.assertEqual(variants[variant]["candidate_count"], 0, variant)
+            self.assertEqual(variants[variant]["repeats_attempted"], 0, variant)
+
+    def test_a_run_whose_every_call_fails_is_not_reported_as_a_clean_run(self) -> None:
+        db = self._db_path()
+        self._install_windows({db: [[1, 2]]})
+        self._install_agents(fail_on=frozenset({0, 1, 2, 3}))
+
+        exit_code = self._run([db], repeats=2, max_windows=1, max_provider_calls=10)
+
+        # Zero successful calls is not evidence: the run must fail loudly rather
+        # than write an artifact that reads as "measured, found nothing".
+        self.assertEqual(exit_code, 1)
+        self.assertIn("provider", self.stderr.lower())
+
+    def test_voided_candidates_are_marked_in_the_audit(self) -> None:
+        db = self._db_path()
+        self._install_windows({db: [[1, 2]]})
+        self._install_agents(fail_on=frozenset({1}))
+
+        exit_code = self._run([db], repeats=2, max_windows=1, max_provider_calls=10)
+
+        self.assertEqual(exit_code, 0, self.stderr)
+        candidates = [
+            record
+            for record in self._audit_records()
+            if record.get("record_type") == "candidate"
+        ]
+        # The audit keeps every candidate, including those dropped from scoring;
+        # without an explicit marker a consumer would count candidates that
+        # candidate_count excludes and read the two artifacts as contradictory.
+        voided = [record for record in candidates if record.get("voided")]
+        scored = [record for record in candidates if not record.get("voided")]
+        self.assertEqual(len(voided), 1)
+        self.assertEqual(voided[0]["repeat"], 0)
+        self.assertEqual(
+            len(scored), self._metrics()["variants"]["baseline"]["candidate_count"]
+            + self._metrics()["variants"]["treated"]["candidate_count"],
+        )
+
+    def test_metrics_report_provider_error_counts(self) -> None:
+        db = self._db_path()
+        self._install_windows({db: [[1, 2]]})
+        self._install_agents(fail_on=frozenset({1}))
+
+        exit_code = self._run([db], repeats=2, max_windows=1, max_provider_calls=10)
+
+        self.assertEqual(exit_code, 0, self.stderr)
+        metrics = self._metrics()
+        self.assertEqual(metrics["provider_errors"], 1)
+        self.assertEqual(metrics["variants"]["treated"]["calls_failed"], 1)
+        self.assertEqual(metrics["variants"]["baseline"]["calls_failed"], 0)
 
 
 class ForbiddenValueGuardTests(AblationExecutionHarness):
@@ -772,6 +821,37 @@ class ForbiddenValueGuardTests(AblationExecutionHarness):
         # disk for a run that must fail closed.
         self.assertFalse((self.out_dir / "ablation_metrics.json").exists())
         self.assertFalse((self.out_dir / "ablation_audit.jsonl").exists())
+
+    def test_a_forbidden_value_in_a_path_argument_never_reaches_stderr(self) -> None:
+        # --db not found interpolates the path straight into an error printed to
+        # stderr, and --out is used to build directories but never enters the
+        # guarded payload. The fail-closed rule is categorical, so path strings
+        # are egress too.
+        self.module.REDACTION = self.module.RedactionContext(
+            forbidden_values=("sk-live-abc123",)
+        )
+
+        exit_code = self._run([str(self.root / "sk-live-abc123" / "missing.db")])
+
+        # 1, not the 2 a usage error returns: a forbidden value is a fail-closed
+        # run failure, and the guard fires before --db existence is validated.
+        self.assertEqual(exit_code, 1)
+        self.assertNotIn("sk-live-abc123", self.stderr)
+
+    def test_a_forbidden_value_in_the_out_path_never_reaches_stderr(self) -> None:
+        db = self._db_path()
+        self._install_windows({db: [[1, 2]]})
+        self._install_agents()
+        self.out_dir = self.root / "sk-live-abc123-out"
+        self.module.REDACTION = self.module.RedactionContext(
+            forbidden_values=("sk-live-abc123",)
+        )
+
+        exit_code = self._run([db], repeats=1, max_windows=1, max_provider_calls=4)
+
+        self.assertNotEqual(exit_code, 0)
+        self.assertNotIn("sk-live-abc123", self.stderr)
+        self.assertFalse(self.out_dir.exists())
 
     def test_clean_run_writes_artifacts_with_a_configured_forbidden_value(self) -> None:
         db = self._db_path()
@@ -861,7 +941,10 @@ class MultiWindowPairingTests(AblationExecutionHarness):
                 continue
             key = (str(record["window"]), str(record["variant"]))
             counts[key] = counts.get(key, 0) + 1
-        for window in {window for window, _ in counts}:
+        windows = {window for window, _ in counts}
+        # Without this the loop below is vacuous: zero candidates would pass.
+        self.assertEqual(len(windows), 2, counts)
+        for window in windows:
             self.assertEqual(
                 counts.get((window, "baseline")),
                 counts.get((window, "treated")),

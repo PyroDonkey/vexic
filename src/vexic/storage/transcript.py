@@ -786,8 +786,9 @@ def load_messages_since(
     offline analysis or evidence harness cannot mutate the corpus it measures.
     Writes through that connection raise. It is deliberately not
     ``immutable=1``: immutable would also suppress the ``-shm`` wal-index, but it
-    ignores ``-wal`` content entirely and would silently drop a crashed run's
-    uncommitted tail, which is a fidelity regression in an evidence harness.
+    ignores ``-wal`` content entirely, so any transaction that is committed but
+    not yet checkpointed into the main database would silently vanish from the
+    read -- a fidelity regression in an evidence harness.
     """
     # Path.as_uri() percent-encodes reserved characters (a path containing ? or
     # # would otherwise be parsed as a query or fragment) and emits the
