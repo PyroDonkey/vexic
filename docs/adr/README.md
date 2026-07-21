@@ -54,6 +54,7 @@ index (and the reverse).
 | 0036 | Transcript recall uses any-token OR FTS semantics | accepted |
 | 0037 | Undated events promote on deterministic mention-time provenance | accepted |
 | 0038 | Light render carries transient observed time                   | accepted |
+| 0039 | Subject keys normalize for dedup and histogram; entity signal deferred | accepted |
 
 Notes:
 
@@ -176,6 +177,16 @@ Notes:
   deterministically degrade a fabricated or ungrounded date to undated (the
   ADR 0037 sink) rather than blocking the candidate. Amends Memory Invariant
   11 in `AGENTS.md`.
+- 0039 settles COA-415's subject-key degeneracy: the dedup gate
+  (`_nearest_candidate`) and the eval subject histogram (`_subject_counts`)
+  both key on `lower(trim(subject))` so case/whitespace variants (`User`/`user`)
+  share one merge/group bucket, while the stored subject stays verbatim
+  (normalize the key, not the value). The entity-signal work is deferred with a
+  recorded direction: extraction prompt subject guidance (option A) is COA-419,
+  sequenced after COA-414 so its ablation control is not rebaselined; a separate
+  `entity` field (option B) stays evidence-gated behind COA-351. The real 96%
+  `User` mega-bucket and the `the user` synonym are extraction-driven and do not
+  move under normalization alone.
 - These numbers are the Vexic `docs/adr/` series and are self-contained.
   `src/vexic` source no longer carries any `upstream ADR-00NN` extraction-source
   labels (they were removed when the COA boundary policy was clarified), so there
