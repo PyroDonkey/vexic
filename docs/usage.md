@@ -431,10 +431,16 @@ uv run python scripts/ablate_light_time_context.py \
 ```
 
 `--db` is repeatable and points at machine-local `.eval-runs/` databases (they
-are gitignored, not vendored). The run is gated behind `--allow-live` with a
+are gitignored, not vendored). Two `--db` values naming the same physical
+database are a config error (exit 2): identity is device plus inode, so a
+repeated path, a symlink, and a hard link are all rejected, since measuring one
+corpus twice would double its weight in the aggregate metrics and re-spend
+budget on it. The run is gated behind `--allow-live` with a
 provider-call budget cap (`--max-provider-calls`, default 120); without
 `--allow-live` it prints a skip notice and exits. The `--out` directory receives
-`ablation_metrics.json` and `ablation_audit.jsonl`.
+`ablation_metrics.json` and `ablation_audit.jsonl`. Each
+`window_transcript_hash` audit record carries both the `--db` spelling that was
+supplied (`db`) and the path it resolved to at collection time (`db_resolved`).
 
 Those windows match what Light actually saw only when that database's history
 was consumed at the default batch size, under the default shared agent scope,

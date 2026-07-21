@@ -2989,10 +2989,17 @@ class LoadMessagesSinceReadOnlyTests(unittest.TestCase):
         committed frames in ``-wal`` where a reader must go find them.
         """
         db_path = str(Path(temp_dir) / "memory.db")
-        init_db(db_path)
-        writer = stack.enter_context(closing(connect(db_path)))
-        writer.execute("PRAGMA journal_mode=WAL")
-        writer.execute("PRAGMA wal_autocheckpoint=0")
+        init_db(db_path)  # already sets journal_mode=WAL
+        # Holding this connection open is the whole mechanism: SQLite
+        # checkpoints when the LAST connection closes, so this keeps the
+        # committed frames in -wal where a reader has to go find them.
+        # wal_autocheckpoint plays no part -- it is a property of the connection
+        # that commits, and this one never writes. The statement below is not
+        # decorative: sqlite3.connect is lazy, so a connection that never
+        # executes anything holds nothing open, save_messages' connection
+        # becomes the last one, and its close checkpoints the WAL away.
+        holder = stack.enter_context(closing(connect(db_path)))
+        holder.execute("SELECT COUNT(*) FROM messages").fetchone()
         save_messages(
             db_path,
             [ModelRequest(parts=[UserPromptPart(content="I ran the race last Sunday")])],
@@ -3000,27 +3007,31 @@ class LoadMessagesSinceReadOnlyTests(unittest.TestCase):
             agent_id=None,
             timestamp="2023-11-17T09:30:00+00:00",
         )
+        # Assert the precondition here, not in one caller: a fixture that
+        # quietly checkpointed would let every test built on it pass for the
+        # wrong reason. -wal holds frames, and immutable=1 (which ignores -wal)
+        # cannot see the row.
+        self.assertGreater(Path(f"{db_path}-wal").stat().st_size, 0)
+        immutable_uri = f"{Path(db_path).resolve().as_uri()}?immutable=1"
+        with closing(sqlite3.connect(immutable_uri, uri=True)) as conn:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 0
+            )
         return db_path
 
     def test_read_only_reads_committed_but_uncheckpointed_wal_content(self) -> None:
         # The fidelity guarantee mode=ro was chosen for over immutable=1: a
         # transaction committed into -wal but not yet checkpointed into the main
         # database must still be visible to the harness.
+        # The fixture itself asserts that the row lives only in -wal (an
+        # immutable=1 reader cannot see it), so reaching this line already
+        # means the read below has to consult the WAL to succeed.
         with tempfile.TemporaryDirectory() as temp_dir, ExitStack() as stack:
             db_path = self._uncheckpointed_wal_db(temp_dir, stack)
-            self.assertGreater(Path(f"{db_path}-wal").stat().st_size, 0)
 
             rows = load_messages_since(db_path, 0, read_only=True)
 
             self.assertEqual(len(rows), 1)
-            # Contrast: immutable=1 ignores -wal entirely, so it misses the row.
-            # Without this the test above could pass for the wrong reason -- a
-            # row quietly checkpointed into the main file.
-            immutable_uri = f"{Path(db_path).resolve().as_uri()}?immutable=1"
-            with closing(sqlite3.connect(immutable_uri, uri=True)) as conn:
-                self.assertEqual(
-                    conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 0
-                )
 
     @unittest.skipIf(os.name == "nt", "Windows cannot unlink a mapped -shm file.")
     def test_read_only_open_with_the_shm_file_deleted_never_reads_stale_data(
@@ -3068,10 +3079,26 @@ class LoadMessagesSinceReadOnlyTests(unittest.TestCase):
                     load_messages_since(spelling, 0, read_only=True)
 
     def test_read_only_rejects_a_hosted_libsql_target(self) -> None:
-        for dsn in ("libsql://tenant.turso.io", "https://tenant.turso.io"):
+        # URI schemes are case-insensitive (RFC 3986): an uppercase DSN mangles
+        # into a local path exactly like a lowercase one.
+        for dsn in (
+            "libsql://tenant.turso.io",
+            "https://tenant.turso.io",
+            "LIBSQL://tenant.turso.io",
+            "HTTPS://tenant.turso.io",
+            "WSS://tenant.turso.io",
+        ):
             with self.subTest(dsn=dsn):
                 with self.assertRaises(ValueError):
                     load_messages_since(dsn, 0, read_only=True)
+
+    def test_read_only_rejects_the_same_forms_spelled_as_path_objects(self) -> None:
+        # A caller that normalizes to Path before calling -- the natural thing
+        # for a harness -- must get the same guard a str gets.
+        for spelling in (":memory:", "file:/tmp/x.db", "libsql://tenant.turso.io"):
+            with self.subTest(spelling=spelling):
+                with self.assertRaises(ValueError):
+                    load_messages_since(Path(spelling), 0, read_only=True)
 
     def test_read_only_rejects_a_storage_target(self) -> None:
         # Would raise an opaque TypeError inside Path() before connect() could
@@ -3096,10 +3123,12 @@ class LoadMessagesSinceReadOnlyTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
 
     def test_read_write_path_is_unaffected_by_the_read_only_guard(self) -> None:
-        # The guard is a read_only precondition only: connect() still handles
-        # these forms on the default read-write path.
-        with closing(connect(":memory:")) as conn:
-            self.assertIsNotNone(conn.execute("SELECT 1").fetchone())
+        # The guard is a read_only precondition only. Exercise the guarded
+        # function itself: ":memory:" must still reach connect() (and fail on
+        # the missing table, not on the guard's ValueError) when read_only is
+        # left at its default.
+        with self.assertRaises(sqlite3.OperationalError):
+            load_messages_since(":memory:", 0)
 
     def test_read_only_uri_escapes_reserved_characters_in_the_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -1,7 +1,9 @@
 import json
+import os
 import sqlite3
 import unicodedata
 from collections.abc import Iterable
+from os import PathLike
 from contextlib import closing
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -24,7 +26,7 @@ from vexic.ports import ContentCodec
 from vexic.storage.errors import is_malformed_fts_query_error, is_unique_violation
 from vexic.storage.schema import _assert_no_forbidden_secret_values, _fts_match_query
 from vexic.text_utils import estimate_tokens
-from vexic.storage.connection import StorageTarget, _is_libsql_target, connect
+from vexic.storage.connection import _LIBSQL_SCHEMES, StorageTarget, connect
 
 # Tier 1 — the append-only transcript. Owns message (de)serialization, the
 # messages_fts shadow that init_db builds, and the read/write/search surface.
@@ -770,6 +772,15 @@ def load_messages_in_id_range(
     return hits
 
 
+# Scheme names, not full "scheme://" prefixes: Path() collapses the double
+# slash, so Path("libsql://host") stringifies to "libsql:/host" and would slip
+# past a "libsql://" check. Derived from connect()'s tuple so a new hosted
+# scheme there is covered here too.
+_NON_LOCAL_SCHEME_PREFIXES = tuple(
+    scheme.removesuffix("//") for scheme in _LIBSQL_SCHEMES
+)
+
+
 def _assert_local_read_only_target(db_path: object) -> None:
     """Fail closed when a ``read_only=True`` read is handed a target its
     ``mode=ro`` URI cannot name.
@@ -787,29 +798,38 @@ def _assert_local_read_only_target(db_path: object) -> None:
             "StorageTarget. Open a hosted target through connect(), or mint a "
             "read-only token for it."
         )
-    if isinstance(db_path, str):
-        if db_path == ":memory:":
-            raise ValueError(
-                "read_only=True accepts a local filesystem path only; ':memory:' "
-                "has no read-only URI spelling here."
-            )
-        # Case-insensitive: SQLite accepts "FILE:" too, and a mangled URI is
-        # exactly the silent-wrong-database failure this guard exists to stop.
-        if db_path.casefold().startswith("file:"):
-            raise ValueError(
-                "read_only=True accepts a local filesystem path only; pass the "
-                f"path itself rather than a URI: {db_path!r}"
-            )
-        if _is_libsql_target(db_path):
-            raise ValueError(
-                "read_only=True accepts a local filesystem path only; got the "
-                f"hosted libSQL target {db_path!r}. Open it through connect(), "
-                "or mint a read-only token for it."
-            )
+    if not isinstance(db_path, (str, PathLike)):
+        return  # Path() below raises TypeError on its own for anything else.
+    # Normalize str and Path identically: a caller that wraps its target in a
+    # Path before calling must get the same guard, since Path() preserves
+    # ":memory:" and URI spellings verbatim and as_uri() then mangles them.
+    text = os.fspath(db_path)
+    if text == ":memory:":
+        raise ValueError(
+            "read_only=True accepts a local filesystem path only; ':memory:' "
+            "has no read-only URI spelling here."
+        )
+    # Case-insensitive throughout: URI schemes are case-insensitive (RFC 3986),
+    # and a mangled URI is exactly the silent-wrong-database failure this guard
+    # exists to stop. _is_libsql_target itself is case-sensitive because it
+    # routes trusted configuration inside connect(); here the input is a
+    # caller-supplied path, so the casefolded form is what must be checked.
+    folded = text.casefold()
+    if folded.startswith("file:"):
+        raise ValueError(
+            "read_only=True accepts a local filesystem path only; pass the "
+            f"path itself rather than a URI: {text!r}"
+        )
+    if folded.startswith(_NON_LOCAL_SCHEME_PREFIXES):
+        raise ValueError(
+            "read_only=True accepts a local filesystem path only; got the "
+            f"hosted libSQL target {text!r}. Open it through connect(), "
+            "or mint a read-only token for it."
+        )
 
 
 def load_messages_since(
-    db_path: str,
+    db_path: str | Path,
     after_id: int,
     limit: int | None = None,
     *,

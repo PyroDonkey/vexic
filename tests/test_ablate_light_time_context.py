@@ -1008,6 +1008,25 @@ class MultiWindowPairingTests(AblationExecutionHarness):
             )
 
 
+class DuplicateDbWiringTests(AblationExecutionHarness):
+    """_validate_dbs must actually be reached from main(): the unit tests above
+    call it directly, so deleting its call site would leave them all green."""
+
+    def test_an_aliased_duplicate_db_exits_two_before_any_provider_call(self) -> None:
+        db = self._db_path()
+        alias = self.root / "alias.db"
+        alias.symlink_to(db)
+        self._install_windows({db: [[1, 2]]})
+        recorder = self._install_agents()
+
+        exit_code = self._run([db, str(alias)], repeats=1, max_windows=1)
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("duplicate --db", self.stderr)
+        self.assertEqual(recorder.calls, [])
+        self.assertFalse(self.out_dir.exists())
+
+
 class AuditProvenanceIdentityTests(AblationExecutionHarness):
     """The window audit must record the identity actually read, not only the
     spelling the operator typed: ``load_messages_since`` resolves the path
