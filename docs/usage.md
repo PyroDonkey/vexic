@@ -351,12 +351,19 @@ built from the adapter's `build_longmemeval_recall_judge_agent`). Each run
 writes `predictions.jsonl` and `diagnostics.jsonl` (stage decomposition:
 `answer_extracted_to_tier2`, `answer_promoted_to_tier3`,
 `answer_retrieved_from_tier3`, `answer_candidate_rank`), plus per-question-type
-judged-recall rates. `--selection stratified` round-robins across question
-types; repeatable `--type-weight multi-session=3` takes N rows from that
-question type per round-robin pass (others default to 1) for a diagnostic
-subset weighted toward specific types, still fully deterministic.
-`--resume-from-run` skips rows already `ok` in a prior run's
-diagnostics. Dream-phase runs require `--allow-live` and an `--adapter`; the
+judged-recall rates. `answer_candidate_rank` ranks the raw active-candidate
+population; `answer_candidate_rank_filtered` ranks only the promotion-eligible
+subset (excludes promoted, undated-event, and unembedded candidates) as a
+filter-surviving approximation of the pool Deep actually scores, so the two
+differ when an ineligible candidate outranks the answer. `--selection
+stratified` round-robins across question types; repeatable `--type-weight
+multi-session=3` takes N rows from that question type per round-robin pass
+(others default to 1) for a diagnostic subset weighted toward specific types,
+still fully deterministic. `--resume-from-run` skips rows already `ok` in a
+prior run's diagnostics. `--max-transient-retries` (default 2) bounds in-run
+retries for transient provider-shape faults (malformed JSON /
+`finish_reason='error'`) at each provider call site, logged to stderr and
+counted in the diagnostics `transient_retry_count`. Dream-phase runs require `--allow-live` and an `--adapter`; the
 judge fails closed with `HostPortNotConfigured` when no judge port is supplied.
 Do not vendor the LongMemEval benchmark corpus into this repo.
 

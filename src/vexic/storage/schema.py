@@ -12,6 +12,7 @@ from vexic.embeddings import EMBEDDING_DIM, EMBEDDING_MODEL_NAME
 
 if TYPE_CHECKING:
     from vexic.ports import ContentCodec
+    from vexic.storage.connection import StorageTarget
 
 # Back-compat re-export: storage-internal callers keep importing the persistence
 # secret guard from here under the old private name.
@@ -38,6 +39,23 @@ def _memo_key(db_path: "str | StorageTarget") -> str:
 def _reset_init_memo() -> None:  # test hook
     with _INIT_LOCK:
         _INITIALIZED.clear()
+
+
+def evict_init_memo(db_path: "str | StorageTarget") -> None:
+    """Forget that ``db_path`` was schema-initialized.
+
+    ``init_db``/``init_vector_memory`` memoize successful initialization per
+    path in a process-global set and early-return on a hit. A caller that
+    deletes and recreates the database file underneath that memo (e.g. an eval
+    harness wiping a per-question DB to retry) must evict the path first, or the
+    next ``init_db`` returns without recreating the schema and later queries hit
+    ``no such table``.
+    """
+
+    key = _memo_key(db_path)
+    with _INIT_LOCK:
+        _INITIALIZED.discard(key)
+        _INITIALIZED.discard("vec:" + key)
 
 # Shared spine for the three memory tiers. Owns the connection seam (WAL,
 # schema creation, vec-extension load), the embedding-blob math reused across
