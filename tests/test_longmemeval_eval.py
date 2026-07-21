@@ -2305,6 +2305,9 @@ class TransientRetryRowRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary.questions_failed, 1)
         # Bounded: initial attempt + max_transient_retries, no more.
         self.assertEqual(calls["n"], 3)
+        # A row that exhausted its budget must report the retries it consumed,
+        # not zero.
+        self.assertEqual(diagnostics["transient_retry_count"], 2)
 
     async def test_transient_dream_fault_recovers_after_db_reset(self) -> None:
         # Real ingest runs (not mocked), so this exercises _reset_question_db +

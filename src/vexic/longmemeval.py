@@ -1026,26 +1026,32 @@ async def _retry_transient(
     *,
     max_retries: int,
     label: str,
+    record_retry: Callable[[], None] | None = None,
     before_retry: Callable[[], None] | None = None,
     backoff_seconds: float = _TRANSIENT_RETRY_BACKOFF_SECONDS,
-) -> tuple[Any, int]:
+) -> Any:
     """Await ``make_coro()`` with bounded retry on transient provider faults.
 
-    Returns ``(result, retries_used)``. Only ``_is_transient_provider_error``
-    faults are retried, up to ``max_retries`` times; anything else (including a
+    Returns the coroutine's result. Only ``_is_transient_provider_error`` faults
+    are retried, up to ``max_retries`` times; anything else (including a
     forbidden-secret leak or the ``question_db_path`` collision) propagates
-    immediately. ``before_retry`` runs between attempts (e.g. to reset a
-    per-question DB so a re-dream starts clean). Each retry is logged to stderr.
+    immediately. ``record_retry`` is invoked once per retry attempt -- BEFORE the
+    eventual success or exhaustion re-raise -- so callers count the retries a row
+    consumed even when it ultimately fails. ``before_retry`` runs between
+    attempts (e.g. to reset a per-question DB so a re-dream starts clean). Each
+    retry is logged to stderr.
     """
 
     attempt = 0
     while True:
         try:
-            result = await make_coro()
+            return await make_coro()
         except BaseException as exc:  # noqa: BLE001 - re-raised unless transient
             if attempt >= max_retries or not _is_transient_provider_error(exc):
                 raise
             attempt += 1
+            if record_retry is not None:
+                record_retry()
             print(
                 f"[longmemeval] transient provider error on {label} "
                 f"(retry {attempt}/{max_retries}): {type(exc).__name__}",
@@ -1054,8 +1060,6 @@ async def _retry_transient(
             if before_retry is not None:
                 before_retry()
             await asyncio.sleep(backoff_seconds * attempt)
-            continue
-        return result, attempt
 
 
 def _is_finish_reason_error(exc: BaseException) -> bool:
@@ -1486,6 +1490,11 @@ async def run_longmemeval_subset(
         session_count = 0
         message_count = 0
         transient_retry_count = 0
+
+        def _record_retry() -> None:
+            nonlocal transient_retry_count
+            transient_retry_count += 1
+
         try:
             instance = parse_longmemeval_instance(raw, max_sessions=max_sessions)
             artifact_question_id = instance.question_id
@@ -1500,7 +1509,7 @@ async def run_longmemeval_subset(
                     else "incremental-batched-sessions"
                 )
                 dream_db_path = db_path
-                dream, retries = await _retry_transient(
+                dream = await _retry_transient(
                     lambda: _ingest_then_consolidate_incrementally(
                         str(dream_db_path),
                         instance,
@@ -1516,12 +1525,12 @@ async def run_longmemeval_subset(
                     ),
                     max_retries=max_transient_retries,
                     label="dream",
+                    record_retry=_record_retry,
                     # The incremental dream re-inits and re-ingests the DB
                     # itself, so wiping the per-question DB makes each replay
                     # start from a clean slate (no partial-write corruption).
                     before_retry=lambda: _reset_question_db(dream_db_path),
                 )
-                transient_retry_count += retries
             else:
                 ingest_instance(
                     str(db_path),
@@ -1585,7 +1594,7 @@ async def run_longmemeval_subset(
                     )
                 else:
                     tier3_db_path = db_path
-                    answer, retries = await _retry_transient(
+                    answer = await _retry_transient(
                         lambda: _tier3_debug_hypothesis(
                             str(tier3_db_path),
                             instance,
@@ -1598,8 +1607,8 @@ async def run_longmemeval_subset(
                         ),
                         max_retries=max_transient_retries,
                         label="tier3-retrieval",
+                        record_retry=_record_retry,
                     )
-                    transient_retry_count += retries
                     hypothesis = answer.hypothesis
                     candidate_fallback_used = answer.candidate_fallback_used
                     retrieved_long_term_fact_count = (
@@ -1641,7 +1650,7 @@ async def run_longmemeval_subset(
                                 judge_model_id = _judge_model_id_from_agent(
                                     recall_judge_agent
                                 )
-                                judge_result, retries = await _retry_transient(
+                                judge_result = await _retry_transient(
                                     lambda: score_longmemeval_recall(
                                         judge_input,
                                         judge_model_group=judge_model_group,
@@ -1653,8 +1662,8 @@ async def run_longmemeval_subset(
                                     ),
                                     max_retries=max_transient_retries,
                                     label="judge",
+                                    record_retry=_record_retry,
                                 )
-                                transient_retry_count += retries
                             else:
                                 rendered_input = _render_recall_judge_input(judge_input)
                                 assert_no_forbidden_secret_values(
@@ -1662,12 +1671,12 @@ async def run_longmemeval_subset(
                                     LONGMEMEVAL_RECALL_JUDGE_PROMPT,
                                     rendered_input,
                                 )
-                                judge_result, retries = await _retry_transient(
+                                judge_result = await _retry_transient(
                                     lambda: judge_scorer(judge_input),
                                     max_retries=max_transient_retries,
                                     label="judge",
+                                    record_retry=_record_retry,
                                 )
-                                transient_retry_count += retries
                                 assert_no_forbidden_secret_values(
                                     guarded_secret_values,
                                     judge_result.model_dump_json(),
