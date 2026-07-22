@@ -1,7 +1,7 @@
 """Opt-in live rubric-delta rescore over an existing LongMemEval run.
 
 Reopens a completed run directory, re-judges every *preference* judged-recall
-MISS row through the WP1 rubric-aware recall-judge render (ADR/COA-420), and
+MISS row through the rubric-aware recall-judge render, and
 writes ``<run-dir>/preference_rescore.jsonl``. This closes the loop that the
 offline analysis section (``vexic.longmemeval_analysis``) only marks
 ``rescore_available``: analysis holds preference misses out of literal
@@ -84,11 +84,12 @@ def _fetch_long_term_facts_readonly(
 ) -> list[LongTermFact]:
     """Load Tier-3 facts by id in the given order, read-only.
 
-    Mirrors ``vexic.storage.fetch_long_term_facts`` column-for-column so the
-    reconstructed ``LongTermFact`` objects carry the fields
-    ``_with_events_sorted`` reads (category, occurred_at, mentioned_at,
-    created_at), but never calls ``init_db`` -- the run artifact must not be
-    mutated. Unknown ids are skipped, preserving the requested order.
+    Selects the same columns as ``vexic.storage.fetch_long_term_facts`` (by
+    primary-key id, without its ``agent_id`` filter) so the reconstructed
+    ``LongTermFact`` objects carry the fields ``_with_events_sorted`` reads
+    (category, occurred_at, mentioned_at, created_at), but never calls
+    ``init_db`` -- the run artifact must not be mutated. Unknown ids are
+    skipped, preserving the requested order.
     """
     if not fact_ids:
         return []
