@@ -541,8 +541,53 @@ class LongMemEvalRescoreTests(unittest.TestCase):
         self.assertEqual(
             artifact_path.read_text(encoding="utf-8"), prior_content
         )
-        # No leftover temp file.
-        self.assertFalse((self.run_dir / "preference_rescore.jsonl.tmp").exists())
+        # No leftover temp file from this invocation. The rescore's temp name
+        # is unique per invocation, so a clean run leaves no ``*.tmp`` residue
+        # behind in the (decoy-free) run dir.
+        self.assertEqual(list(self.run_dir.glob("*.tmp")), [])
+
+    def test_rescore_does_not_touch_foreign_tmp_files(self) -> None:
+        # A concurrent rescore over the same run dir carries its own in-flight
+        # temp file. This invocation must isolate its own temp (unique name in
+        # the same dir) and never truncate, rename, or unlink a foreign one.
+        self._write_run(
+            [_diagnostics_row("q-pref", retrieved_long_term_fact_count=1)]
+        )
+        dataset_path = self._write_dataset([self._dataset_row("q-pref")])
+        self._seed_question_db(
+            "q-pref",
+            [("Likes espresso.", "user", "preference", None)],
+            fused_fact_ids=[1],
+        )
+
+        # Seed a decoy temp file simulating another invocation's in-flight temp.
+        decoy_path = self.run_dir / "preference_rescore.jsonl.tmp"
+        decoy_content = "another-invocation-in-flight-row\n"
+        decoy_path.write_text(decoy_content, encoding="utf-8")
+
+        judge = _FakeRecallJudge(
+            LongMemEvalRecallJudgeVerdict(
+                verdict="supported", reason="Rubric satisfied.", confidence=0.8
+            )
+        )
+
+        artifact = self._run(dataset_path, judge)
+
+        # The foreign temp is untouched.
+        self.assertTrue(decoy_path.exists())
+        self.assertEqual(
+            decoy_path.read_text(encoding="utf-8"), decoy_content
+        )
+        # The final artifact is this invocation's correct output.
+        rows = self._read_rescore(artifact)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].question_id, "q-pref")
+        self.assertEqual(rows[0].rubric_verdict, "supported")
+        # This invocation's own temp is gone; only the decoy remains.
+        self.assertEqual(
+            sorted(p.name for p in self.run_dir.glob("*.tmp")),
+            ["preference_rescore.jsonl.tmp"],
+        )
 
 
 if __name__ == "__main__":

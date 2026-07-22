@@ -35,6 +35,7 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
 from contextlib import closing
 from pathlib import Path
 from typing import Any, Sequence
@@ -248,8 +249,17 @@ async def rescore_preference_rows(
     # still renames an empty artifact into place -- which the analysis loader
     # reads as "ran, nothing usable" (``[]``), distinct from "never ran"
     # (absent -> ``None``).
-    tmp_path = run_dir / f"{RESCORE_ARTIFACT_NAME}.tmp"
-    tmp_path.write_text("", encoding="utf-8")
+    # A unique temp name per invocation (in run_dir, so on the same filesystem
+    # for os.replace atomicity) isolates concurrent rescores over one run dir:
+    # two invocations must not share, truncate, or unlink each other's in-flight
+    # temp. mkstemp creates the file empty and returns an fd we close at once,
+    # keeping only the path -- the empty file is exactly the "ran, zero misses"
+    # signal the rename semantics below rely on.
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        dir=run_dir, prefix=f"{RESCORE_ARTIFACT_NAME}.", suffix=".tmp"
+    )
+    os.close(tmp_fd)
+    tmp_path = Path(tmp_name)
 
     diagnostics_rows, _ = _load_diagnostics(run_dir)
     # A resumed/retried run can emit several rows per question_id; the last row
