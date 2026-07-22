@@ -11,7 +11,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from types import ModuleType
@@ -93,6 +93,51 @@ class CoverageTests(_RunFixture):
 
         self.assertEqual(result["gaps"][0]["coverage"], "tier2-only")
         self.assertFalse(result["oracle_complete"])
+
+    def test_inactive_candidates_are_not_tier2_only(self) -> None:
+        # retired, stale, and needs_review candidates are all out of the
+        # promotion pool, so a gap matching only those must read as absent, not
+        # tier2-only. (Pins the retired/stale WHERE terms and the needs_review
+        # filter together.)
+        self._seed_db(
+            "q1",
+            [
+                {
+                    "id": 1,
+                    "category": "event",
+                    "fact_text": "User went camping at Yellowstone.",
+                    "retired": 1,
+                    "source_message_ids": [1],
+                },
+                {
+                    "id": 2,
+                    "category": "event",
+                    "fact_text": "User went camping at Yellowstone.",
+                    "stale": 1,
+                    "source_message_ids": [1],
+                },
+                {
+                    "id": 3,
+                    "category": "event",
+                    "fact_text": "User went camping at Yellowstone.",
+                    "needs_review": 1,
+                    "source_message_ids": [1],
+                },
+            ],
+            messages={1: "2023-04-29 10:00:00"},
+        )
+
+        result = self._probe_one(
+            [
+                {
+                    "gap_id": "g1",
+                    "kind": "tier2-undated-event",
+                    "match_tokens": ["Yellowstone", "camping"],
+                }
+            ]
+        )
+
+        self.assertEqual(result["gaps"][0]["coverage"], "absent")
 
     def test_missing_from_both_tiers_is_absent(self) -> None:
         self._seed_db(
@@ -228,6 +273,14 @@ class CoverageTests(_RunFixture):
         self.assertFalse(result["answer_promoted_to_tier3"])
 
 
+class MatchesTests(_RunFixture):
+    def test_matches_empty_tokens_returns_false(self) -> None:
+        # Pins the empty-token guard in _matches: with no tokens nothing can be
+        # required, so an "all() over nothing is True" reading would wrongly
+        # match every text. The load-path rejection depends on this staying False.
+        self.assertIs(probe._matches("anything", []), False)
+
+
 class CliTests(_RunFixture):
     def _seed_one(self) -> Path:
         self._seed_db(
@@ -263,10 +316,102 @@ class CliTests(_RunFixture):
         self.assertEqual(doc["summary"]["gaps_covered"], 1)
         self.assertIn("covered", (out_dir / "class3_gap_probe.md").read_text())
 
+    def test_main_runs_only_requested_question(self) -> None:
+        for qid, fact_id in (("q1", 1), ("q2", 2)):
+            self._seed_db(
+                qid,
+                [{"id": 1, "category": "fact", "source_message_ids": [1]}],
+                messages={1: "2023-04-29 10:00:00"},
+                facts=[{"id": fact_id, "fact_text": "User camped at Yellowstone."}],
+            )
+        path = self._fixture(
+            [
+                self._question(
+                    "q1",
+                    [
+                        {
+                            "gap_id": "g1",
+                            "kind": "tier2-undated-event",
+                            "match_tokens": ["Yellowstone"],
+                        }
+                    ],
+                ),
+                self._question(
+                    "q2",
+                    [
+                        {
+                            "gap_id": "g2",
+                            "kind": "tier2-undated-event",
+                            "match_tokens": ["Yellowstone"],
+                        }
+                    ],
+                ),
+            ]
+        )
+        out_dir = self.root / "out"
+
+        with redirect_stdout(StringIO()):
+            exit_code = probe.main(
+                ["--gaps", str(path), "--question-id", "q1", "--out", str(out_dir)]
+            )
+
+        self.assertEqual(exit_code, 0)
+        doc = json.loads((out_dir / "class3_gap_probe.json").read_text())
+        self.assertEqual([q["question_id"] for q in doc["questions"]], ["q1"])
+
     def test_missing_db_without_override_fails_loud(self) -> None:
         path = self._fixture([self._question("q1", [])])
 
         self.assertEqual(probe.main(["--gaps", str(path)]), 2)
+
+    def test_empty_match_tokens_fails_loud_before_probing(self) -> None:
+        # An empty token list can never match, so a gap that carries one is a
+        # malformed fixture, not a genuine "absent" verdict. It must fail loud
+        # in the load path before any question is probed.
+        self._seed_db(
+            "q1",
+            [{"id": 1, "category": "fact", "source_message_ids": [1]}],
+            messages={1: "2023-04-29 10:00:00"},
+        )
+        path = self._fixture(
+            [
+                self._question(
+                    "q1",
+                    [{"gap_id": "g1", "kind": "transcript-only", "match_tokens": []}],
+                )
+            ]
+        )
+        err = StringIO()
+        with redirect_stdout(StringIO()), redirect_stderr(err):
+            exit_code = probe.main(["--gaps", str(path)])
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("g1", err.getvalue())
+
+    def test_empty_match_tokens_fails_loud_even_with_run_dir(self) -> None:
+        # The empty-token guard is a fixture defect, not a per-question skip, so
+        # --run-dir (which turns missing-DB into a skip) must not swallow it.
+        self._seed_db(
+            "q1",
+            [{"id": 1, "category": "fact", "source_message_ids": [1]}],
+            messages={1: "2023-04-29 10:00:00"},
+        )
+        path = self._fixture(
+            [
+                self._question(
+                    "q1",
+                    [{"gap_id": "g1", "kind": "transcript-only", "match_tokens": []}],
+                )
+            ]
+        )
+        err = StringIO()
+        with redirect_stdout(StringIO()), redirect_stderr(err):
+            exit_code = probe.main(
+                ["--gaps", str(path), "--run-dir", str(self.run_dir)]
+            )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("g1", err.getvalue())
 
     def test_run_dir_override_skips_and_reports_absent_questions(self) -> None:
         self._seed_one()

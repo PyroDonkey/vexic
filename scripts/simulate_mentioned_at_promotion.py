@@ -32,8 +32,9 @@ LIMITATIONS -- this bounds the undated-event bucket, it does not confirm it:
     frozen candidate texts are what the old prompt produced.
   * Deep's contradiction check is model-backed and is not simulated.
 
-The frozen run artifacts are never mutated: each question DB is copied to a
-temporary directory before init heals the copy.
+The frozen run artifacts are never opened: each question DB is copied to a
+temporary directory first, and the harness reads and heals only the copy, so
+no read-only handle can leave a WAL sidecar next to the source.
 
 Example:
 
@@ -71,6 +72,9 @@ from vexic.longmemeval_analysis import _question_path_component  # noqa: E402
 from vexic.storage import init_db  # noqa: E402
 
 DEFAULT_DEEP_TOP_N = 15
+
+# Prefix for the disposable heal-the-copy workspace. Tracker-id free by design.
+_WORKSPACE_PREFIX = "class3-sim-"
 
 
 class GapFixtureError(ValueError):
@@ -181,17 +185,10 @@ def frozen_candidate_rows(db_path: Path) -> dict[int, dict[str, Any]]:
     }
 
 
-def _without_mentioned_at(
-    candidates: list[_DiagnosticCandidate],
-) -> list[_DiagnosticCandidate]:
-    """The same pool as it stood before ADR 0037: mentioned_at unset."""
-    return [
-        candidate if candidate.mentioned_at is None else _replace_mentioned_at(candidate)
-        for candidate in candidates
-    ]
-
-
-def _replace_mentioned_at(candidate: _DiagnosticCandidate) -> _DiagnosticCandidate:
+def _with_mentioned_at(
+    candidate: _DiagnosticCandidate, value: str | None
+) -> _DiagnosticCandidate:
+    """The same candidate with its ``mentioned_at`` replaced by ``value``."""
     return _DiagnosticCandidate(
         candidate_id=candidate.candidate_id,
         fact_text=candidate.fact_text,
@@ -203,9 +200,29 @@ def _replace_mentioned_at(candidate: _DiagnosticCandidate) -> _DiagnosticCandida
         promoted_fact_id=candidate.promoted_fact_id,
         category=candidate.category,
         occurred_at=candidate.occurred_at,
-        mentioned_at=None,
+        mentioned_at=value,
         has_embedding=candidate.has_embedding,
     )
+
+
+def _before_pool(
+    healed: list[_DiagnosticCandidate],
+    frozen_rows: dict[int, dict[str, Any]],
+) -> list[_DiagnosticCandidate]:
+    """The candidate pool as it stood in the frozen artifact.
+
+    Each healed candidate's ``mentioned_at`` is rolled back to the value the
+    frozen DB carried (None only when the column was absent or NULL), so the
+    before-heal eligibility is judged against the real pre-heal state rather
+    than a blanket blank that would spuriously flip already-dated candidates.
+    """
+    return [
+        _with_mentioned_at(
+            candidate,
+            (frozen_rows.get(candidate.candidate_id) or {}).get("mentioned_at"),
+        )
+        for candidate in healed
+    ]
 
 
 def _simulate_fact_date(db_path: Path, fact_id: int) -> dict[str, Any]:
@@ -253,8 +270,11 @@ def simulate_question(
     deep_top_n: int = DEFAULT_DEEP_TOP_N,
 ) -> dict[str, Any]:
     db_path = question_db_path(entry)
-    frozen_rows = frozen_candidate_rows(db_path)
+    # Copy first, then read and heal only the copy: opening the source at all --
+    # even read-only -- can create a -shm/-wal sidecar next to a WAL-mode
+    # artifact, so the source is never opened.
     copy_path = _copy_question_db(db_path, workspace / entry.question_id)
+    frozen_rows = frozen_candidate_rows(copy_path)
     # init_db runs the schema ensure, which adds mentioned_at and backfills it
     # from the transcript (ADR 0037). This is the whole simulation.
     init_db(str(copy_path))
@@ -265,7 +285,7 @@ def simulate_question(
     after_ranks = _rank_diagnostic_candidates(
         _deep_eligible(healed), scoring_time=scoring_time
     )
-    before_pool = _deep_eligible(_without_mentioned_at(healed))
+    before_pool = _deep_eligible(_before_pool(healed, frozen_rows))
     before_ranks = _rank_diagnostic_candidates(before_pool, scoring_time=scoring_time)
 
     gap_results: list[dict[str, Any]] = []
@@ -312,14 +332,18 @@ def simulate_question(
                 "rank_after": after_rank,
                 "eligible_pool_size": len(after_ranks),
                 "within_deep_top_n": after_rank is not None and after_rank <= deep_top_n,
+                # A pool no larger than the top-n slice ranks every survivor
+                # trivially, so a flip inside it is not evidence about ranking.
+                "top_n_covers_pool": len(after_ranks) <= deep_top_n,
             }
         )
         if result["eligible_after"] and not result["eligible_before"]:
-            result["verdict"] = (
-                "flips-eligible-and-ranked"
-                if result["within_deep_top_n"]
-                else "flips-eligible-outside-top-n"
-            )
+            if not result["within_deep_top_n"]:
+                result["verdict"] = "flips-eligible-outside-top-n"
+            elif result["top_n_covers_pool"]:
+                result["verdict"] = "flips-eligible-degenerate-pool"
+            else:
+                result["verdict"] = "flips-eligible-and-ranked"
         elif result["eligible_after"]:
             result["verdict"] = "already-eligible"
         else:
@@ -393,6 +417,9 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
         "flips_eligible_and_ranked": sum(
             1 for gap in simulated if gap["verdict"] == "flips-eligible-and-ranked"
         ),
+        "flips_eligible_degenerate_pool": sum(
+            1 for gap in simulated if gap["verdict"] == "flips-eligible-degenerate-pool"
+        ),
         "flips_eligible_outside_top_n": sum(
             1 for gap in simulated if gap["verdict"] == "flips-eligible-outside-top-n"
         ),
@@ -456,7 +483,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     results: list[dict[str, Any]] = []
-    with TemporaryDirectory(prefix="coa418-sim-") as tmp:
+    with TemporaryDirectory(prefix=_WORKSPACE_PREFIX) as tmp:
         workspace = Path(tmp)
         try:
             for entry in entries:

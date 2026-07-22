@@ -4,14 +4,21 @@ Read-only over a LongMemEval run directory, with no provider calls. For every
 gap named in the gap fixture it asks one question: does this run's Tier 3
 contain the missing constituent?
 
-  * ``covered``    -- a live ``long_term_memory`` fact matches every match token
-  * ``tier2-only`` -- no Tier-3 match, but an active ``memory_candidates`` row
-                      matches (the constituent was extracted but never promoted)
-  * ``absent``     -- neither tier holds it (extraction never captured it)
+  * ``covered``        -- a live ``long_term_memory`` fact matches every match token
+  * ``tier2-only``     -- no Tier-3 match, but an active ``memory_candidates`` row
+                          matches (the constituent was extracted but never promoted)
+  * ``tier3-undated``  -- a fact matches but carries no date, for gaps whose whole
+                          miss is the missing date (the fact existing is not enough)
+  * ``absent``         -- neither tier holds it (extraction never captured it)
 
 A question is oracle-complete when every one of its gaps is ``covered``;
 questions the earlier curation already found complete carry no gaps and are
 complete by construction.
+
+This probe reads run databases read-only and copies nothing. Opening a WAL-mode
+run database in read-only mode may create or update ``-wal``/``-shm`` sidecars
+next to it; byte-frozen provenance is the simulation harness's guarantee (it
+heals a copy), not this probe's.
 
 Point it at the frozen benchmark shards to reproduce the baseline classification,
 or at a fresh run to measure the same gaps on current code:
@@ -69,6 +76,24 @@ GapFixtureError = _sim.GapFixtureError
 load_gap_fixture = _sim.load_gap_fixture
 
 
+def _reject_empty_match_tokens(entries: list[Any]) -> None:
+    """Fail loud on any gap with no match tokens.
+
+    An empty token list can never match (``_matches`` returns False), so it
+    would silently classify as ``absent`` rather than covered -- a fixture
+    defect masquerading as a real miss. This is a load-path check: it fires
+    before any question is probed, and independently of ``--run-dir``, which
+    only turns a missing per-question DB into a reported skip.
+    """
+    for entry in entries:
+        for gap in entry.gaps:
+            if not gap.match_tokens:
+                raise GapFixtureError(
+                    f"question {entry.question_id} gap {gap.gap_id}: "
+                    "match_tokens is empty; an empty token list never matches"
+                )
+
+
 def resolve_run_dir(entry: Any, override: Path | None) -> Path:
     return Path(entry.run_dir) if override is None else override
 
@@ -113,7 +138,7 @@ def _tier_texts(db_path: Path) -> tuple[list[tuple[str, bool]], list[str]]:
             for row in conn.execute(
                 """
                 SELECT fact_text FROM memory_candidates
-                WHERE retired = 0 AND stale = 0
+                WHERE retired = 0 AND stale = 0 AND needs_review = 0
                 """
             )
         ]
@@ -264,6 +289,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         entries = load_gap_fixture(args.gaps)
+        _reject_empty_match_tokens(entries)
     except GapFixtureError as exc:
         print(f"gap fixture error: {exc}", file=sys.stderr)
         return 2
