@@ -461,6 +461,54 @@ failed writes no artifacts at all. Input databases are opened read-only. To run 
 `REDACTION` constant; transcripts are checked before any provider call and the
 whole artifact payload before anything is written.
 
+### Class-3 Gap Simulation And Probe
+
+Two provider-free harnesses re-measure the class-3 miss analysis against
+current code. Both are read-only over LongMemEval run artifacts and take a gap
+fixture: a machine-local JSON file naming, per question, the missing
+constituents behind that miss (Tier-2 candidate id, Tier-3 fact id, or neither
+for transcript-only gaps) plus the match tokens that identify them. Like the
+oracle fixture, it is a run-local artifact attached to the issue, not committed.
+
+`scripts/simulate_mentioned_at_promotion.py` answers what the ADR 0037
+`mentioned_at` backfill does to promotion eligibility. It copies each frozen
+question database to a temporary directory, lets schema init heal the copy, and
+reports per gap candidate whether `mentioned_at` derives, whether Deep
+promotion eligibility flips, and where the candidate ranks inside the eligible
+pool. Eligibility and ranking are not re-derived: it reuses `_deep_eligible`
+and `_rank_diagnostic_candidates` from `vexic.longmemeval`.
+
+```bash
+uv run python scripts/simulate_mentioned_at_promotion.py \
+  --gaps <gap-fixture>.json --out .eval-runs/<out-dir>
+```
+
+Artifacts: `promotion_simulation_metrics.json` and
+`promotion_simulation_table.md`. Frozen inputs are never mutated. The result
+bounds the undated-event bucket rather than confirming it: it is a post-run
+snapshot of the final candidate pool, not a replay of the per-cycle Deep pool,
+it does not model Deep's model-backed contradiction check, and it says nothing
+about later extraction-prompt changes.
+
+`scripts/probe_class3_gaps.py` classifies each gap against a run's tiers as
+`covered` (a live Tier-3 fact matches every token), `tier2-only` (extracted but
+never promoted), `tier3-undated` (the fact exists but carries no date, for gaps
+that are about datedness), or `absent`. Point it at the frozen runs for the
+baseline, or at a fresh run with `--run-dir` to measure the same gaps on current
+code; questions with no database under an overridden `--run-dir` are skipped and
+listed in the artifact.
+
+```bash
+uv run python scripts/probe_class3_gaps.py \
+  --gaps <gap-fixture>.json --run-dir .eval-runs/<run>/<timestamp> \
+  --out .eval-runs/<out-dir>
+```
+
+Artifacts: `class3_gap_probe.json` and `class3_gap_probe.md`. Matching is
+deterministic case-folded substring containment over the curated tokens, so
+`covered` means the constituent text is present in Tier 3 -- not that the run
+answered the question.
+
 ## Hosted MVP Shell
 
 The dependency-free hosted shell in `vexic.hosted` binds authenticated tenant
