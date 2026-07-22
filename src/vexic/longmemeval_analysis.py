@@ -38,9 +38,11 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any, Literal, Mapping, Sequence
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from vexic.longmemeval import (
+    PREFERENCE_QUESTION_TYPES,
+    LongMemEvalRecallJudgeVerdictValue,
     _contains_answer_tokens,
     _load_dataset,
     _matchable_answer_tokens,
@@ -90,6 +92,31 @@ class AggregateHistogram(BaseModel):
     max_facts_per_subject: int
 
 
+class PreferenceRescoreRow(BaseModel):
+    question_id: str
+    question_type: str
+    original_verdict: str | None
+    rubric_verdict: LongMemEvalRecallJudgeVerdictValue
+    rubric_reason: str
+    rubric_confidence: float
+    judge_model_id: str | None
+    judge_prompt_version: str
+    reconstruction_complete: bool
+
+
+class PreferenceRow(BaseModel):
+    question_id: str
+    question_type: str
+    original_verdict: str | None
+    evidence: dict[str, Any]
+
+
+class PreferenceReportSection(BaseModel):
+    rows: list[PreferenceRow]
+    rescore_available: bool
+    verdict_delta: dict[str, int] | None
+
+
 class RunAnalysisReport(BaseModel):
     run_dir: str
     judged_recall_by_question_type: dict[str, dict[str, int]]
@@ -98,6 +125,7 @@ class RunAnalysisReport(BaseModel):
     subject_histograms: list[SubjectHistogram]
     aggregate_histogram: AggregateHistogram
     skipped_diagnostics_lines: int = 0
+    preference: PreferenceReportSection | None = None
 
 
 def _open_readonly(db_path: Path) -> StorageConnection:
@@ -401,6 +429,128 @@ def _analysis_error(
     )
 
 
+def _load_preference_rescore(run_dir: Path) -> list[PreferenceRescoreRow] | None:
+    """Parse a precomputed ``preference_rescore.jsonl``, or None when absent.
+
+    Mirrors ``_load_diagnostics`` malformed-line tolerance: a truncated or
+    non-conforming line is skipped (via a local counter, not the diagnostics
+    ``skipped`` count, which belongs to a different artifact) rather than
+    sinking the whole rescore file. Absence of the file is distinct from an
+    empty file: absence returns ``None`` (rescore never ran), an empty or
+    all-malformed file returns ``[]`` (ran, produced nothing usable).
+    """
+    rescore_path = run_dir / "preference_rescore.jsonl"
+    if not rescore_path.exists():
+        return None
+    rows: list[PreferenceRescoreRow] = []
+    for line in rescore_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rows.append(PreferenceRescoreRow.model_validate_json(line))
+        except ValidationError:
+            continue
+    return rows
+
+
+def _verdict_delta(
+    matched_rows: Sequence[PreferenceRescoreRow],
+    unmatched_artifact_rows: int,
+) -> dict[str, int]:
+    # Only rows whose question_id is among the current preference misses feed
+    # the literal-vs-rubric headline; a stale/copied artifact carrying rows for
+    # absent questions would otherwise report flips for questions the section
+    # never lists. Those rows are surfaced as ``unmatched_artifact_rows`` rather
+    # than silently dropped. Among matched rows, only fully reconstructed ones
+    # feed the flip buckets; incomplete rows are bucketed separately, so the
+    # buckets plus ``unmatched_artifact_rows`` sum to the deduped row total.
+    delta = {
+        "flipped_to_supported": 0,
+        "unchanged": 0,
+        "flipped_from_supported": 0,
+        "incomplete_reconstruction": 0,
+        "unmatched_artifact_rows": unmatched_artifact_rows,
+    }
+    for row in matched_rows:
+        if not row.reconstruction_complete:
+            delta["incomplete_reconstruction"] += 1
+            continue
+        was_supported = row.original_verdict == "supported"
+        now_supported = row.rubric_verdict == "supported"
+        if now_supported and not was_supported:
+            delta["flipped_to_supported"] += 1
+        elif was_supported and not now_supported:
+            delta["flipped_from_supported"] += 1
+        else:
+            delta["unchanged"] += 1
+    return delta
+
+
+def _build_preference_section(
+    preference_rows: Sequence[PreferenceRow],
+    rescore_rows: Sequence[PreferenceRescoreRow] | None,
+) -> PreferenceReportSection | None:
+    # Report the section when there is anything to say: at least one preference
+    # miss row, or a rescore artifact present (even if empty). Otherwise None.
+    if not preference_rows and rescore_rows is None:
+        return None
+    verdict_delta: dict[str, int] | None = None
+    if rescore_rows is not None:
+        # Dedupe artifact rows by question_id, last occurrence wins (consistent
+        # with diagnostics last-wins), then split into rows matching a listed
+        # preference miss and unmatched rows. The delta counts flips only over
+        # matched rows; a duplicate question_id counts once.
+        deduped: dict[str, PreferenceRescoreRow] = {}
+        for row in rescore_rows:
+            deduped[row.question_id] = row
+        listed_ids = {row.question_id for row in preference_rows}
+        matched = [
+            row for qid, row in deduped.items() if qid in listed_ids
+        ]
+        unmatched = [
+            row for qid, row in deduped.items() if qid not in listed_ids
+        ]
+        verdict_delta = _verdict_delta(matched, len(unmatched))
+    return PreferenceReportSection(
+        rows=list(preference_rows),
+        rescore_available=rescore_rows is not None,
+        verdict_delta=verdict_delta,
+    )
+
+
+def _build_preference_row(
+    diagnostics_row: Mapping[str, Any],
+    dataset_row: Mapping[str, Any] | None,
+    db_path: Path,
+) -> PreferenceRow:
+    # Preference misses are held out of stage classification: the literal
+    # answer-token containment that classes 1-3 rely on is the wrong lens for
+    # a rubric-judged preference. We keep the question, the rubric answer, and
+    # the returned facts as review evidence and defer the verdict to rescore.
+    question_id = diagnostics_row["question_id"]
+    question_type = diagnostics_row.get("question_type")
+    evidence: dict[str, Any] = {
+        "question": None if dataset_row is None else dataset_row.get("question"),
+        "answer": None if dataset_row is None else dataset_row.get("answer"),
+        "retrieved_fact_texts": [],
+    }
+    if db_path.exists():
+        try:
+            with closing(_open_readonly(db_path)) as conn:
+                _, _, fused_returned = _answer_retrieval_arrays(conn, question_id)
+                evidence["retrieved_fact_texts"] = _fact_texts(conn, fused_returned)
+        except Exception:
+            # A corrupt question DB must not drop the preference row; the row
+            # is still surfaced with empty retrieval evidence for review.
+            pass
+    return PreferenceRow(
+        question_id=question_id,
+        question_type=str(question_type),
+        original_verdict=diagnostics_row.get("judge_verdict"),
+        evidence=evidence,
+    )
+
+
 def analyze_run(run_dir: Path, dataset_path: Path) -> RunAnalysisReport:
     """Classify every judged-recall miss in a run and build subject histograms."""
 
@@ -419,6 +569,7 @@ def analyze_run(run_dir: Path, dataset_path: Path) -> RunAnalysisReport:
         dataset_by_id.setdefault(row.get("question_id"), row)
 
     misses: list[MissClassification] = []
+    preference_rows: list[PreferenceRow] = []
     histograms: list[SubjectHistogram] = []
     pooled_counts: list[int] = []
     for question_id, row in rows_by_question_id.items():
@@ -434,6 +585,14 @@ def analyze_run(run_dir: Path, dataset_path: Path) -> RunAnalysisReport:
             pooled_counts.extend(count for _, count in counts)
         if row.get("status") != "ok" or row.get("judged_recall_pass") is not False:
             continue
+        # Preference misses use a rubric, not literal answer containment, so
+        # they must never enter stage classification (classes 1-3). Route them
+        # to the dedicated preference section instead.
+        if row.get("question_type") in PREFERENCE_QUESTION_TYPES:
+            preference_rows.append(
+                _build_preference_row(row, dataset_by_id.get(question_id), db_path)
+            )
+            continue
         try:
             misses.append(
                 _classify_miss(row, dataset_by_id.get(question_id), db_path)
@@ -446,6 +605,9 @@ def analyze_run(run_dir: Path, dataset_path: Path) -> RunAnalysisReport:
         key = "unclassified" if miss.miss_class is None else f"class_{miss.miss_class}"
         class_counts[key] = class_counts.get(key, 0) + 1
 
+    rescore_rows = _load_preference_rescore(run_dir)
+    preference_section = _build_preference_section(preference_rows, rescore_rows)
+
     return RunAnalysisReport(
         run_dir=str(run_dir),
         judged_recall_by_question_type=_recall_by_question_type(
@@ -456,6 +618,7 @@ def analyze_run(run_dir: Path, dataset_path: Path) -> RunAnalysisReport:
         subject_histograms=histograms,
         aggregate_histogram=_aggregate_histogram(pooled_counts),
         skipped_diagnostics_lines=skipped_lines,
+        preference=preference_section,
     )
 
 
@@ -477,6 +640,25 @@ def _print_summary(report: RunAnalysisReport) -> None:
     manual = [miss.question_id for miss in report.misses if miss.needs_manual_review]
     if manual:
         print(f"Needs manual review: {', '.join(manual)}")
+    if report.preference is not None:
+        preference = report.preference
+        line = (
+            f"Preference (held out of stage classes): "
+            f"{len(preference.rows)} rows"
+        )
+        if preference.verdict_delta is not None:
+            delta = preference.verdict_delta
+            line += (
+                ", rubric delta: "
+                f"+{delta['flipped_to_supported']} to supported, "
+                f"{delta['unchanged']} unchanged, "
+                f"-{delta['flipped_from_supported']} from supported, "
+                f"{delta['incomplete_reconstruction']} incomplete, "
+                f"{delta['unmatched_artifact_rows']} unmatched artifact rows"
+            )
+        else:
+            line += ", no rescore artifact"
+        print(line)
     aggregate = report.aggregate_histogram
     print(
         "Subjects (pooled across question DBs): "

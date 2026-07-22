@@ -383,6 +383,30 @@ flagged `needs_manual_review`, including answers that appear verbatim nowhere
 in the transcript). Every `memory.db` is opened read-only; the output is
 `analysis_report.json` in the run directory plus a stdout summary.
 
+`single-session-preference` misses are held out of classes 1-3: their gold
+answers are prose rubrics, not literal strings, so token containment is the
+wrong lens. They land in the report's `preference` section instead. When a
+precomputed `preference_rescore.jsonl` is present in the run directory, the
+section also reports the literal-vs-rubric verdict delta, bucketing
+incomplete-reconstruction rows separately.
+
+To produce that artifact, re-judge a completed run's preference misses under
+the rubric-aware judge render (live provider, opt-in):
+
+```bash
+uv run python -m vexic.longmemeval_rescore \
+  --run-dir .eval-runs/longmemeval/<run-id> \
+  --dataset /path/to/longmemeval_s_cleaned.json \
+  --adapter adapters/openrouter_live_adapter.py --allow-live
+```
+
+Without `--allow-live` it prints a skip notice and never loads the adapter.
+It reopens the run's question databases read-only, reconstructs the exact
+fact list and ordering the eval-time judge saw, and writes
+`preference_rescore.jsonl`; rows whose fact set cannot be faithfully rebuilt
+(candidate-note fallback, count mismatch, missing database) are flagged
+`reconstruction_complete: false` rather than dropped.
+
 ### Extraction-Prompt Ablation
 
 `scripts/ablate_extraction_prompts.py` is a window-faithful ablation over the

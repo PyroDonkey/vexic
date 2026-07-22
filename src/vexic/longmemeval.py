@@ -70,6 +70,16 @@ LongMemEvalDreamShape = Literal[
 ]
 
 LONGMEMEVAL_RECALL_JUDGE_PROMPT_VERSION = "longmemeval-recall-judge-v1"
+PREFERENCE_QUESTION_TYPES: frozenset[str] = frozenset({"single-session-preference"})
+LONGMEMEVAL_RECALL_JUDGE_PREFERENCE_PROMPT_VERSION = (
+    f"{LONGMEMEVAL_RECALL_JUDGE_PROMPT_VERSION}+preference-rubric-v1"
+)
+_PREFERENCE_RUBRIC_GUIDANCE = (
+    "Rubric guidance:\n"
+    "The gold answer is a preference rubric, not a literal string. Mark "
+    "supported when the retrieved facts satisfy the criterion it describes, "
+    "not only when they restate it."
+)
 LONGMEMEVAL_RECALL_JUDGE_PROMPT = """\
 You judge whether retrieved Vexic long-term memory facts contain or support
 the benchmark gold answer.
@@ -357,6 +367,7 @@ class LongMemEvalRecallJudgeInput:
     question: str
     gold_answer: Any
     retrieved_fact_texts: tuple[str, ...]
+    question_type: str | None = None
 
 
 class LongMemEvalRecallJudge(Protocol):
@@ -784,7 +795,7 @@ def _render_recall_judge_input(judge_input: LongMemEvalRecallJudgeInput) -> str:
     )
     if not facts:
         facts = "None"
-    return (
+    base = (
         "Question:\n"
         f"{judge_input.question}\n\n"
         "Gold answer:\n"
@@ -792,6 +803,9 @@ def _render_recall_judge_input(judge_input: LongMemEvalRecallJudgeInput) -> str:
         "Retrieved facts:\n"
         f"{facts}"
     )
+    if judge_input.question_type in PREFERENCE_QUESTION_TYPES:
+        return base + "\n\n" + _PREFERENCE_RUBRIC_GUIDANCE
+    return base
 
 
 async def score_longmemeval_recall(
@@ -1632,6 +1646,7 @@ async def run_longmemeval_subset(
                             question=instance.question,
                             gold_answer=instance.answer,
                             retrieved_fact_texts=retrieved_judge_texts,
+                            question_type=instance.question_type,
                         )
                         try:
                             if judge_scorer is None:
@@ -1788,7 +1803,11 @@ async def run_longmemeval_subset(
                 ),
                 "judge_model_id": judge_model_id,
                 "judge_prompt_version": (
-                    LONGMEMEVAL_RECALL_JUDGE_PROMPT_VERSION
+                    (
+                        LONGMEMEVAL_RECALL_JUDGE_PREFERENCE_PROMPT_VERSION
+                        if question_type in PREFERENCE_QUESTION_TYPES
+                        else LONGMEMEVAL_RECALL_JUDGE_PROMPT_VERSION
+                    )
                     if answer_mode == "judged-recall"
                     else None
                 ),

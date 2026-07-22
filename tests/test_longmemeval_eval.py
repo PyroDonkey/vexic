@@ -14,8 +14,12 @@ from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserProm
 from vexic.longmemeval import (
     build_parser,
     main as longmemeval_main,
+    LONGMEMEVAL_RECALL_JUDGE_PREFERENCE_PROMPT_VERSION,
+    LONGMEMEVAL_RECALL_JUDGE_PROMPT_VERSION,
     LongMemEvalRecallJudgeInput,
     LongMemEvalRecallJudgeVerdict,
+    PREFERENCE_QUESTION_TYPES,
+    _PREFERENCE_RUBRIC_GUIDANCE,
     _answer_variants,
     _render_recall_judge_input,
     _select_instances,
@@ -1113,6 +1117,67 @@ class LongMemEvalJudgedRecallTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[unverified note] The benchmark code was cedar.", rendered)
         self.assertNotIn("[fact 1] [unverified note]", rendered)
 
+    # Exact v1 render bytes, written by hand from the renderer spec and
+    # verified against current output before any behavior change. Any drift in
+    # the base render must break this golden.
+    _V1_GOLDEN = (
+        "Question:\n"
+        "What kind of Premiere Pro resource suggestions do I prefer?\n\n"
+        "Gold answer:\n"
+        '"tailored Premiere-Pro-specific resource suggestions"\n\n'
+        "Retrieved facts:\n"
+        "[fact 1] Ryan edits video in Adobe Premiere Pro.\n"
+        "[unverified note] Ryan likes concise, tailored tips.\n"
+        "(category: preference, recently noted, not yet confirmed, source messages: 2)"
+    )
+
+    def _golden_judge_input(
+        self, question_type: str | None = None
+    ) -> LongMemEvalRecallJudgeInput:
+        kwargs: dict[str, object] = {}
+        if question_type is not None:
+            kwargs["question_type"] = question_type
+        return LongMemEvalRecallJudgeInput(
+            question="What kind of Premiere Pro resource suggestions do I prefer?",
+            gold_answer="tailored Premiere-Pro-specific resource suggestions",
+            retrieved_fact_texts=(
+                "Ryan edits video in Adobe Premiere Pro.",
+                "[unverified note] Ryan likes concise, tailored tips.\n"
+                "(category: preference, recently noted, not yet confirmed, "
+                "source messages: 2)",
+            ),
+            **kwargs,
+        )
+
+    def test_recall_judge_render_non_preference_byte_equals_v1_golden(self) -> None:
+        self.assertEqual(
+            _render_recall_judge_input(
+                self._golden_judge_input(question_type="single-session-user")
+            ),
+            self._V1_GOLDEN,
+        )
+        self.assertEqual(
+            _render_recall_judge_input(self._golden_judge_input()),
+            self._V1_GOLDEN,
+        )
+
+    def test_recall_judge_render_preference_appends_rubric_instruction(self) -> None:
+        rendered = _render_recall_judge_input(
+            self._golden_judge_input(question_type="single-session-preference")
+        )
+        self.assertEqual(
+            rendered,
+            self._V1_GOLDEN + "\n\n" + _PREFERENCE_RUBRIC_GUIDANCE,
+        )
+
+    def test_recall_judge_input_question_type_defaults_none(self) -> None:
+        judge_input = LongMemEvalRecallJudgeInput(
+            question="q",
+            gold_answer="a",
+            retrieved_fact_texts=(),
+        )
+        self.assertIsNone(judge_input.question_type)
+
     async def _run_case(
         self,
         *,
@@ -1177,6 +1242,123 @@ class LongMemEvalJudgedRecallTests(unittest.IsolatedAsyncioTestCase):
             summary.paths.diagnostics_path.read_text(encoding="utf-8")
         )
         return prediction, diagnostics, judge, summary
+
+    async def test_preference_row_records_rubric_prompt_version(self) -> None:
+        pref_fact = LongTermFact(
+            fact_id=1,
+            fact_text="Ryan asks for Premiere-Pro-specific how-to walkthroughs.",
+            subject="Ryan",
+            category="preference",
+            importance=6,
+            confidence=0.9,
+            source_message_ids=[1],
+            retrieved_count=0,
+            used_count=0,
+        )
+        _, pref_diag, _, _ = await self._run_case(
+            question_id="q-pref",
+            question_type="single-session-preference",
+            question="What kind of editing resources should suggestions favor?",
+            answer=(
+                "Suggestions should favor resources tailored to Adobe Premiere "
+                "Pro rather than generic video-editing tips."
+            ),
+            transcript="When I ask for editing help I edit in Adobe Premiere Pro.",
+            facts=[pref_fact],
+            judge_verdict=LongMemEvalRecallJudgeVerdict(
+                verdict="supported",
+                reason="The fact satisfies the tailored-to-Premiere-Pro rubric.",
+                confidence=0.9,
+            ),
+        )
+
+        base_fact = LongTermFact(
+            fact_id=1,
+            fact_text="Ryan's personal best 5K is 25:50.",
+            subject="Ryan",
+            category="fact",
+            importance=7,
+            confidence=0.9,
+            source_message_ids=[1],
+            retrieved_count=0,
+            used_count=0,
+        )
+        _, base_diag, _, _ = await self._run_case(
+            question_id="q-base",
+            question_type="single-session-user",
+            question="What is my personal best 5K time?",
+            answer="25 minutes and 50 seconds",
+            transcript="My personal best 5K is 25:50.",
+            facts=[base_fact],
+            judge_verdict=LongMemEvalRecallJudgeVerdict(
+                verdict="supported",
+                reason="The fact states the duration.",
+                confidence=0.95,
+            ),
+        )
+
+        self.assertEqual(
+            pref_diag["judge_prompt_version"],
+            LONGMEMEVAL_RECALL_JUDGE_PREFERENCE_PROMPT_VERSION,
+        )
+        self.assertEqual(
+            pref_diag["judge_prompt_version"],
+            "longmemeval-recall-judge-v1+preference-rubric-v1",
+        )
+        self.assertEqual(
+            base_diag["judge_prompt_version"],
+            LONGMEMEVAL_RECALL_JUDGE_PROMPT_VERSION,
+        )
+        self.assertEqual(
+            base_diag["judge_prompt_version"], "longmemeval-recall-judge-v1"
+        )
+
+    async def test_preference_rubric_satisfying_fact_scored_supported(self) -> None:
+        # Fact satisfies the rubric criterion without restating the gold prose.
+        fact = LongTermFact(
+            fact_id=1,
+            fact_text="Ryan edits every project in Adobe Premiere Pro.",
+            subject="Ryan",
+            category="preference",
+            importance=6,
+            confidence=0.9,
+            source_message_ids=[1],
+            retrieved_count=0,
+            used_count=0,
+        )
+        _, diagnostics, judge, _ = await self._run_case(
+            question_id="q-pref-rubric",
+            question_type="single-session-preference",
+            question="What should editing-resource suggestions be tailored to?",
+            answer=(
+                "Suggestions should be tailored to Adobe Premiere Pro rather "
+                "than generic editing advice."
+            ),
+            transcript="I do all my editing in Adobe Premiere Pro.",
+            facts=[fact],
+            judge_verdict=LongMemEvalRecallJudgeVerdict(
+                verdict="supported",
+                reason="Premiere Pro usage satisfies the tailored-resource rubric.",
+                confidence=0.9,
+            ),
+        )
+
+        self.assertEqual(len(judge.calls), 1)
+        self.assertEqual(judge.calls[0].question_type, "single-session-preference")
+        self.assertIs(diagnostics["judged_recall_pass"], True)
+
+    def test_preference_fixture_parses(self) -> None:
+        fixture_path = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "longmemeval_oracle_preference_smoke.json"
+        )
+        rows = json.loads(fixture_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(rows), 1)
+        instance = parse_longmemeval_instance(rows[0])
+        self.assertEqual(instance.question_type, "single-session-preference")
+        self.assertIn(instance.question_type, PREFERENCE_QUESTION_TYPES)
+        self.assertIsInstance(instance.answer, str)
 
     async def test_judged_recall_supports_reformatted_duration_answer(self) -> None:
         fact = LongTermFact(
