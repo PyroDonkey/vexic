@@ -515,9 +515,11 @@ uv run python scripts/probe_class3_gaps.py \
 Artifacts: `class3_gap_probe.json` and `class3_gap_probe.md`. Matching is
 deterministic case-folded substring containment over the curated tokens, so
 `covered` means the constituent text is present in Tier 3 -- not that the run
-answered the question. A gap with an empty token list is a fixture error (exit
-2, `gap fixture error`) checked before any question is probed, since an empty
-list can never match and would silently read as `absent`. Unlike the
+answered the question. A gap with an empty token list or a blank token is a
+fixture error (exit 2, `gap fixture error`) checked before any question is
+probed, since neither can match honestly and would silently misclassify. The
+check covers the questions selected for the run -- all of them by default,
+only the `--question-id` subset when that flag is passed. Unlike the
 simulation, the probe copies nothing and opens the run databases directly:
 a read-only open of a WAL-mode run database may create or update `-wal`/`-shm`
 sidecars next to it, so byte-frozen provenance is the simulation harness's

@@ -313,6 +313,14 @@ class MatchesTests(_RunFixture):
         # match every text. The load-path rejection depends on this staying False.
         self.assertIs(probe._matches("anything", []), False)
 
+    def test_matches_blank_token_returns_false(self) -> None:
+        # A blank token is a substring of every text; treating it as a match
+        # would let "" (or a whitespace-only token) match anything, so the guard
+        # must make it never-match, mirroring the empty-list guard.
+        self.assertIs(probe._matches("anything", [""]), False)
+        self.assertIs(probe._matches("anything", ["   "]), False)
+        self.assertIs(probe._matches("anything real", ["", "real"]), False)
+
 
 class CliTests(_RunFixture):
     def _seed_one(self) -> Path:
@@ -439,12 +447,10 @@ class CliTests(_RunFixture):
     def test_empty_match_tokens_fails_loud_before_probing(self) -> None:
         # An empty token list can never match, so a gap that carries one is a
         # malformed fixture, not a genuine "absent" verdict. It must fail loud
-        # in the load path before any question is probed.
-        self._seed_db(
-            "q1",
-            [{"id": 1, "category": "fact", "source_message_ids": [1]}],
-            messages={1: "2023-04-29 10:00:00"},
-        )
+        # BEFORE any DB access: no run DB is seeded here, so validation that ran
+        # after probing would raise the missing-DB error instead. Pinning the
+        # ordering means asserting we get the empty-token error, not "no run DB",
+        # and that no --out artifact is written on a validation failure.
         path = self._fixture(
             [
                 self._question(
@@ -453,11 +459,49 @@ class CliTests(_RunFixture):
                 )
             ]
         )
+        out_dir = self.root / "out"
+        err = StringIO()
+        with redirect_stdout(StringIO()), redirect_stderr(err):
+            exit_code = probe.main(["--gaps", str(path), "--out", str(out_dir)])
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("gap fixture error", err.getvalue())
+        self.assertIn("g1", err.getvalue())
+        self.assertIn("match_tokens is empty", err.getvalue())
+        self.assertNotIn("no run DB", err.getvalue())
+        self.assertFalse((out_dir / "class3_gap_probe.json").exists())
+
+    def test_blank_match_token_fails_loud(self) -> None:
+        # A blank token is a substring of every text, so a gap carrying one
+        # (even alongside a real token) would sail past the empty-list guard and
+        # classify covered against ANY Tier-3 fact. It is a malformed fixture and
+        # must fail loud in the load path, naming the gap.
+        self._seed_db(
+            "q1",
+            [{"id": 1, "category": "fact", "source_message_ids": [1]}],
+            messages={1: "2023-04-29 10:00:00"},
+            facts=[{"id": 1, "fact_text": "User camped at Yellowstone."}],
+        )
+        path = self._fixture(
+            [
+                self._question(
+                    "q1",
+                    [
+                        {
+                            "gap_id": "g1",
+                            "kind": "transcript-only",
+                            "match_tokens": [""],
+                        }
+                    ],
+                )
+            ]
+        )
         err = StringIO()
         with redirect_stdout(StringIO()), redirect_stderr(err):
             exit_code = probe.main(["--gaps", str(path)])
 
         self.assertEqual(exit_code, 2)
+        self.assertIn("gap fixture error", err.getvalue())
         self.assertIn("g1", err.getvalue())
 
     def test_empty_match_tokens_fails_loud_even_with_run_dir(self) -> None:

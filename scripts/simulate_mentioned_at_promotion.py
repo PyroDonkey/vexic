@@ -163,10 +163,14 @@ def frozen_candidate_rows(db_path: Path) -> dict[int, dict[str, Any]]:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(memory_candidates)")}
         has_mentioned_at = "mentioned_at" in columns
         mentioned_at_select = "mentioned_at" if has_mentioned_at else "NULL"
+        # retired/stale/promoted predate everything and stay unconditional, but
+        # a pre-migration artifact may also lack needs_review; guard it the same
+        # way as mentioned_at so the pre-heal read never raises on old DBs.
+        needs_review_select = "needs_review" if "needs_review" in columns else "NULL"
         rows = conn.execute(
             f"""
             SELECT id, category, occurred_at, {mentioned_at_select},
-                   promoted, retired, stale, needs_review
+                   promoted, retired, stale, {needs_review_select}
             FROM memory_candidates
             """
         ).fetchall()
@@ -178,7 +182,7 @@ def frozen_candidate_rows(db_path: Path) -> dict[int, dict[str, Any]]:
             "promoted": bool(row[4]),
             "retired": bool(row[5]),
             "stale": bool(row[6]),
-            "needs_review": bool(row[7]),
+            "needs_review": False if row[7] is None else bool(row[7]),
             "pre_mentioned_at_column": not has_mentioned_at,
         }
         for row in rows
@@ -273,7 +277,9 @@ def simulate_question(
     # Copy first, then read and heal only the copy: opening the source at all --
     # even read-only -- can create a -shm/-wal sidecar next to a WAL-mode
     # artifact, so the source is never opened.
-    copy_path = _copy_question_db(db_path, workspace / entry.question_id)
+    copy_path = _copy_question_db(
+        db_path, workspace / _question_path_component(entry.question_id)
+    )
     frozen_rows = frozen_candidate_rows(copy_path)
     # init_db runs the schema ensure, which adds mentioned_at and backfills it
     # from the transcript (ADR 0037). This is the whole simulation.

@@ -77,14 +77,16 @@ load_gap_fixture = _sim.load_gap_fixture
 
 
 def _reject_empty_match_tokens(entries: list[Any]) -> None:
-    """Fail loud on any gap with no match tokens.
+    """Fail loud on any gap with no match tokens or a blank one.
 
     An empty token list can never match (``_matches`` returns False), so it
     would silently classify as ``absent`` rather than covered -- a fixture
-    defect masquerading as a real miss. It validates the entries that will be
-    probed (after any ``--question-id`` filter), fires before any question is
-    probed, and is independent of ``--run-dir``, which only turns a missing
-    per-question DB into a reported skip.
+    defect masquerading as a real miss. A blank token (empty or whitespace) is
+    the opposite defect: a substring of every text, it would classify covered
+    against ANY Tier-3 fact even alongside a real token. It validates the
+    entries that will be probed (after any ``--question-id`` filter), fires
+    before any question is probed, and is independent of ``--run-dir``, which
+    only turns a missing per-question DB into a reported skip.
     """
     for entry in entries:
         for gap in entry.gaps:
@@ -92,6 +94,12 @@ def _reject_empty_match_tokens(entries: list[Any]) -> None:
                 raise GapFixtureError(
                     f"question {entry.question_id} gap {gap.gap_id}: "
                     "match_tokens is empty; an empty token list never matches"
+                )
+            if any(not token.strip() for token in gap.match_tokens):
+                raise GapFixtureError(
+                    f"question {entry.question_id} gap {gap.gap_id}: "
+                    "match_tokens contains a blank token; a blank token is a "
+                    "substring of every text and would match anything"
                 )
 
 
@@ -107,8 +115,15 @@ def question_db_path(entry: Any, run_dir: Path) -> Path:
 
 
 def _matches(text: str, tokens: list[str]) -> bool:
-    """Every token must appear; an empty token list never matches."""
-    if not tokens:
+    """Every token must appear; an empty list or a blank token never matches.
+
+    A blank token (empty or whitespace) is a substring of every text, so it
+    would make ``all(...)`` skip past it and match anything. Guarding it here,
+    consistent with the empty-list guard, keeps matching skip-proof even if a
+    blank token reaches this function; the load path rejects such fixtures up
+    front via ``_reject_empty_match_tokens``.
+    """
+    if not tokens or any(not token.strip() for token in tokens):
         return False
     folded = text.casefold()
     return all(token.casefold() in folded for token in tokens)

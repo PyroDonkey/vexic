@@ -655,6 +655,73 @@ class SimulationTests(_RunFixture):
             result["gaps"][0]["verdict"], "flips-eligible-degenerate-pool"
         )
 
+    def test_frozen_candidate_rows_handles_missing_needs_review(self) -> None:
+        # A genuinely old artifact: memory_candidates has neither needs_review
+        # nor mentioned_at. The pre-heal read runs before init_db adds either
+        # column, so it must guard both rather than raise OperationalError.
+        db_path = self.root / "old.db"
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute(
+                """
+                CREATE TABLE memory_candidates (
+                    id INTEGER PRIMARY KEY,
+                    category TEXT,
+                    occurred_at TEXT,
+                    promoted INTEGER,
+                    retired INTEGER,
+                    stale INTEGER
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO memory_candidates "
+                "(id, category, occurred_at, promoted, retired, stale) "
+                "VALUES (1, 'event', NULL, 0, 0, 0)"
+            )
+            conn.commit()
+
+        rows = sim.frozen_candidate_rows(db_path)
+
+        self.assertIn(1, rows)
+        self.assertFalse(rows[1]["needs_review"])
+        self.assertIsNone(rows[1]["mentioned_at"])
+        self.assertTrue(rows[1]["pre_mentioned_at_column"])
+
+    def test_healed_copy_stays_inside_workspace(self) -> None:
+        # A question_id carrying a path separator must not steer the healed
+        # copy out of the workspace: the destination has to be sanitized with
+        # _question_path_component, exactly as the source path is.
+        qid = "q1/../escape"
+        self._seed_db(
+            qid,
+            [{"id": 1, "category": "event", "source_message_ids": [1]}],
+            messages={1: "2023-04-29 10:00:00"},
+        )
+        path = self._fixture(
+            [
+                self._question(
+                    qid,
+                    [
+                        {
+                            "gap_id": "g1",
+                            "kind": "tier2-undated-event",
+                            "frozen_candidate_id": 1,
+                        }
+                    ],
+                )
+            ]
+        )
+        entries = sim.load_gap_fixture(path)
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+
+        sim.simulate_question(entries[0], workspace=workspace)
+
+        component = _question_path_component(qid)
+        self.assertTrue((workspace / component / "memory.db").exists())
+        # Nothing may be written outside the workspace TemporaryDirectory.
+        self.assertFalse((self.root / "escape").exists())
+
 
 class ModuleTests(TestCase):
     def test_workspace_prefix_carries_no_tracker_id(self) -> None:
