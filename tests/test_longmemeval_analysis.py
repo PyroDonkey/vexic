@@ -686,6 +686,230 @@ class LongMemEvalAnalysisTests(unittest.TestCase):
         self.assertEqual(len(report.misses), 1)
         self.assertIn("class 1", stdout.getvalue())
 
+    def test_preference_miss_routed_to_preference_section_not_class3(self) -> None:
+        # A single-session-preference miss shaped exactly like a class-3
+        # answer_not_verbatim_requires_join case (answer_found_in_tier1=False)
+        # must NOT pollute the class buckets or the misses list; it belongs in
+        # the dedicated preference section instead.
+        self._write_run(
+            [
+                _diagnostics_row(
+                    "q-pref",
+                    question_type="single-session-preference",
+                    answer_found_in_tier1=False,
+                    judge_verdict="not_supported",
+                )
+            ]
+        )
+        dataset = self._write_dataset(
+            [self._dataset_row("q-pref", "prefers concise summaries")]
+        )
+        self._seed_question_db(
+            "q-pref",
+            [("The user likes trail running.", "user")],
+        )
+
+        report = analyze_run(self.run_dir, dataset)
+
+        self.assertEqual(report.misses, [])
+        self.assertEqual(report.class_counts, {})
+        self.assertIsNotNone(report.preference)
+        assert report.preference is not None
+        row_ids = [row.question_id for row in report.preference.rows]
+        self.assertEqual(row_ids, ["q-pref"])
+        self.assertEqual(report.preference.rows[0].original_verdict, "not_supported")
+
+    def test_supported_preference_row_not_listed(self) -> None:
+        # A preference question judged supported is not a miss and must not be
+        # listed. With no other preference misses and no rescore artifact,
+        # there is nothing to report, so the section is None.
+        self._write_run(
+            [
+                _diagnostics_row(
+                    "q-pref-ok",
+                    question_type="single-session-preference",
+                    judged_recall_pass=True,
+                )
+            ]
+        )
+        dataset = self._write_dataset(
+            [self._dataset_row("q-pref-ok", "prefers concise summaries")]
+        )
+        self._seed_question_db("q-pref-ok", [("Fact.", "user")])
+
+        report = analyze_run(self.run_dir, dataset)
+
+        self.assertIsNone(report.preference)
+
+    def test_preference_section_without_rescore_artifact(self) -> None:
+        # No preference_rescore.jsonl in the run dir: the section still lists
+        # the miss row with retrieved facts reconstructed from the event
+        # arrays, but rescore is unavailable and no verdict delta is computed.
+        self._write_run(
+            [
+                _diagnostics_row(
+                    "q-pref",
+                    question_type="single-session-preference",
+                    judge_verdict="not_supported",
+                )
+            ]
+        )
+        dataset = self._write_dataset(
+            [self._dataset_row("q-pref", "prefers concise summaries")]
+        )
+        self._seed_question_db(
+            "q-pref",
+            [
+                ("The user asked for short replies.", "user"),
+                ("The user dislikes long emails.", "user"),
+            ],
+            event={
+                "keyword_fact_ids": [1, 2],
+                "vector_fact_ids": [1, 2],
+                "fused_fact_ids": [1, 2],
+            },
+        )
+
+        report = analyze_run(self.run_dir, dataset)
+
+        self.assertIsNotNone(report.preference)
+        assert report.preference is not None
+        self.assertFalse(report.preference.rescore_available)
+        self.assertIsNone(report.preference.verdict_delta)
+        self.assertEqual(len(report.preference.rows), 1)
+        self.assertEqual(
+            report.preference.rows[0].evidence["retrieved_fact_texts"],
+            [
+                "The user asked for short replies.",
+                "The user dislikes long emails.",
+            ],
+        )
+        self.assertEqual(
+            report.preference.rows[0].evidence["answer"],
+            "prefers concise summaries",
+        )
+
+    def _rescore_row(self, question_id: str, **overrides) -> dict:
+        row = {
+            "question_id": question_id,
+            "question_type": "single-session-preference",
+            "original_verdict": "not_supported",
+            "rubric_verdict": "supported",
+            "rubric_reason": "matches rubric",
+            "rubric_confidence": 0.9,
+            "judge_model_id": "test-judge",
+            "judge_prompt_version": "v1",
+            "reconstruction_complete": True,
+        }
+        row.update(overrides)
+        return row
+
+    def test_preference_section_surfaces_delta_with_rescore_artifact(self) -> None:
+        # A precomputed preference_rescore.jsonl surfaces the literal-vs-rubric
+        # verdict delta. Only fully reconstructed rows feed the headline flip
+        # counts; incomplete rows are bucketed separately, never hidden.
+        self._write_run(
+            [
+                _diagnostics_row(
+                    "q-pref",
+                    question_type="single-session-preference",
+                    judge_verdict="not_supported",
+                )
+            ]
+        )
+        dataset = self._write_dataset(
+            [self._dataset_row("q-pref", "prefers concise summaries")]
+        )
+        self._seed_question_db("q-pref", [("Fact.", "user")])
+        (self.run_dir / "preference_rescore.jsonl").write_text(
+            "\n".join(
+                json.dumps(row)
+                for row in [
+                    self._rescore_row(
+                        "q-pref",
+                        original_verdict="not_supported",
+                        rubric_verdict="supported",
+                        reconstruction_complete=True,
+                    ),
+                    self._rescore_row(
+                        "q-pref-2",
+                        reconstruction_complete=False,
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        report = analyze_run(self.run_dir, dataset)
+
+        self.assertIsNotNone(report.preference)
+        assert report.preference is not None
+        self.assertTrue(report.preference.rescore_available)
+        self.assertEqual(
+            report.preference.verdict_delta,
+            {
+                "flipped_to_supported": 1,
+                "unchanged": 0,
+                "flipped_from_supported": 0,
+                "incomplete_reconstruction": 1,
+            },
+        )
+
+    def test_non_preference_miss_still_classified(self) -> None:
+        # A non-preference miss must still flow into stage classification and
+        # the class buckets exactly as before, untouched by preference routing.
+        self._write_run([_diagnostics_row("q-plain")])
+        dataset = self._write_dataset(
+            [self._dataset_row("q-plain", "Boston Marathon")]
+        )
+        self._seed_question_db(
+            "q-plain",
+            [("The user likes trail running.", "user")],
+        )
+
+        report = analyze_run(self.run_dir, dataset)
+
+        self.assertEqual([miss.question_id for miss in report.misses], ["q-plain"])
+        self.assertEqual(report.misses[0].miss_class, 1)
+        self.assertEqual(report.class_counts, {"class_1": 1})
+        self.assertIsNone(report.preference)
+
+    def test_cli_report_roundtrips_preference_field(self) -> None:
+        # The CLI-written report round-trips through model_validate_json with a
+        # populated preference section, and the summary mentions it.
+        self._write_run(
+            [
+                _diagnostics_row(
+                    "q-pref",
+                    question_type="single-session-preference",
+                    judge_verdict="not_supported",
+                )
+            ]
+        )
+        dataset = self._write_dataset(
+            [self._dataset_row("q-pref", "prefers concise summaries")]
+        )
+        self._seed_question_db("q-pref", [("Fact.", "user")])
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = analysis_main(
+                ["--run-dir", str(self.run_dir), "--dataset", str(dataset)]
+            )
+
+        self.assertEqual(exit_code, 0)
+        report_path = self.run_dir / "analysis_report.json"
+        report = RunAnalysisReport.model_validate_json(
+            report_path.read_text(encoding="utf-8")
+        )
+        self.assertIsNotNone(report.preference)
+        assert report.preference is not None
+        self.assertEqual(
+            [row.question_id for row in report.preference.rows], ["q-pref"]
+        )
+        self.assertIn("Preference", stdout.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
