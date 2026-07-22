@@ -856,6 +856,60 @@ class LongMemEvalAnalysisTests(unittest.TestCase):
             },
         )
 
+    def test_malformed_rescore_verdict_line_is_skipped(self) -> None:
+        # A rescore line whose rubric_verdict is outside the closed verdict set
+        # (e.g. "supported-ish") must fail validation and be skipped by the
+        # tolerant loader, not counted as an "unchanged" row in the delta.
+        self._write_run(
+            [
+                _diagnostics_row(
+                    "q-pref",
+                    question_type="single-session-preference",
+                    judge_verdict="not_supported",
+                )
+            ]
+        )
+        dataset = self._write_dataset(
+            [self._dataset_row("q-pref", "prefers concise summaries")]
+        )
+        self._seed_question_db("q-pref", [("Fact.", "user")])
+        (self.run_dir / "preference_rescore.jsonl").write_text(
+            "\n".join(
+                json.dumps(row)
+                for row in [
+                    self._rescore_row(
+                        "q-pref",
+                        original_verdict="not_supported",
+                        rubric_verdict="supported",
+                        reconstruction_complete=True,
+                    ),
+                    self._rescore_row(
+                        "q-bad",
+                        rubric_verdict="supported-ish",
+                        reconstruction_complete=True,
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        report = analyze_run(self.run_dir, dataset)
+
+        self.assertIsNotNone(report.preference)
+        assert report.preference is not None
+        self.assertTrue(report.preference.rescore_available)
+        # Only the valid row feeds the delta; the malformed line is dropped.
+        self.assertEqual(
+            report.preference.verdict_delta,
+            {
+                "flipped_to_supported": 1,
+                "unchanged": 0,
+                "flipped_from_supported": 0,
+                "incomplete_reconstruction": 0,
+            },
+        )
+
     def test_non_preference_miss_still_classified(self) -> None:
         # A non-preference miss must still flow into stage classification and
         # the class buckets exactly as before, untouched by preference routing.

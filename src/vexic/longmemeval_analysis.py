@@ -42,6 +42,7 @@ from pydantic import BaseModel, ValidationError
 
 from vexic.longmemeval import (
     PREFERENCE_QUESTION_TYPES,
+    LongMemEvalRecallJudgeVerdictValue,
     _contains_answer_tokens,
     _load_dataset,
     _matchable_answer_tokens,
@@ -95,7 +96,7 @@ class PreferenceRescoreRow(BaseModel):
     question_id: str
     question_type: str
     original_verdict: str | None
-    rubric_verdict: str
+    rubric_verdict: LongMemEvalRecallJudgeVerdictValue
     rubric_reason: str
     rubric_confidence: float
     judge_model_id: str | None

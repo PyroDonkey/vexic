@@ -319,6 +319,36 @@ class LongMemEvalRescoreTests(unittest.TestCase):
         self.assertEqual(len(judge.calls), 1)
         self.assertEqual(judge.calls[0].retrieved_fact_texts, ())
 
+    def test_rescore_zero_fact_row_without_fallback_is_complete(self) -> None:
+        # Zero long-term facts AND no candidate fallback: the eval-time judge saw
+        # an empty fact list ("None" render). An empty reconstruction is exact
+        # (0 == expected 0), so it is complete, not flagged incomplete.
+        self._write_run(
+            [
+                _diagnostics_row(
+                    "q-empty",
+                    retrieved_long_term_fact_count=0,
+                    candidate_fallback_used=False,
+                )
+            ]
+        )
+        dataset_path = self._write_dataset([self._dataset_row("q-empty")])
+        # DB exists but no Tier-3 facts and no fused ids -> empty reconstruction.
+        self._seed_question_db("q-empty", [], fused_fact_ids=[])
+        judge = _FakeRecallJudge(
+            LongMemEvalRecallJudgeVerdict(
+                verdict="not_supported", reason="No facts.", confidence=0.4
+            )
+        )
+
+        artifact = self._run(dataset_path, judge)
+
+        rows = self._read_rescore(artifact)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0].reconstruction_complete)
+        self.assertEqual(len(judge.calls), 1)
+        self.assertEqual(judge.calls[0].retrieved_fact_texts, ())
+
     def test_rescore_marks_reconstruction_incomplete_on_count_mismatch(self) -> None:
         # Diagnostics recorded returning 2 facts, but only 1 id is reconstructable.
         self._write_run(
@@ -401,6 +431,36 @@ class LongMemEvalRescoreTests(unittest.TestCase):
 
         with self.assertRaises(Exception) as ctx:
             self._run(dataset_path, judge, forbidden_secret_values=(secret,))
+        self.assertIn("forbidden secret", str(ctx.exception).lower())
+        self.assertEqual(len(judge.calls), 0)
+
+    def test_rescore_guards_secret_values_from_secrets_mapping(self) -> None:
+        secret = "sk-super-secret"
+        self._write_run(
+            [_diagnostics_row("q-secret", retrieved_long_term_fact_count=1)]
+        )
+        dataset_path = self._write_dataset([self._dataset_row("q-secret")])
+        # The secret value arrives via the ``secrets`` mapping (not
+        # forbidden_secret_values); it must still be merged into the guard so a
+        # reconstructed fact leaking it fails closed before the row is written.
+        self._seed_question_db(
+            "q-secret",
+            [(f"The API key is {secret}.", "user", "preference", None)],
+            fused_fact_ids=[1],
+        )
+        judge = _FakeRecallJudge(
+            LongMemEvalRecallJudgeVerdict(
+                verdict="supported", reason="ok", confidence=0.9
+            )
+        )
+
+        with self.assertRaises(Exception) as ctx:
+            self._run(
+                dataset_path,
+                judge,
+                secrets={"OPENROUTER_API_KEY": secret},
+                forbidden_secret_values=(),
+            )
         self.assertIn("forbidden secret", str(ctx.exception).lower())
         self.assertEqual(len(judge.calls), 0)
 

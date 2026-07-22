@@ -157,7 +157,10 @@ def _reconstruct_retrieved_facts(
 
     complete = True
     # (a) candidate-note fallback answer: no Tier-3 fused ids were the source.
-    if candidate_fallback or expected_count == 0:
+    # candidate_fallback_used is True only when fallback notes were actually
+    # retrieved; a zero-fact row with no fallback means the eval-time judge saw
+    # an empty fact list, which reconstructs exactly (0 == expected 0 below).
+    if candidate_fallback:
         complete = False
     # (b) reconstructed count disagrees with what the run recorded returning.
     if not isinstance(expected_count, int) or len(facts) != expected_count:
@@ -219,6 +222,15 @@ async def rescore_preference_rows(
     up front so re-running never appends duplicate rows. Returns the artifact
     path (created empty when no preference miss rows exist).
     """
+    # Mirror the harness precedent (run_longmemeval_subset): a secret VALUE
+    # supplied via ``secrets`` is as forbidden as one named in
+    # ``forbidden_secret_values``. Merge both (dedup, order-preserving) and use
+    # the merged tuple everywhere renders/verdicts/artifact writes are guarded.
+    loaded_secret_values = tuple((secrets or {}).values())
+    guarded_secret_values = tuple(
+        dict.fromkeys((*forbidden_secret_values, *loaded_secret_values))
+    )
+
     artifact_path = run_dir / RESCORE_ARTIFACT_NAME
     # Overwrite, don't append: rescore is a regeneration of this run's verdicts,
     # not an accumulation across invocations. Truncate up front (rather than
@@ -280,7 +292,7 @@ async def rescore_preference_rows(
             recall_judge_agent=recall_judge_agent,
             judge_agent_factory=judge_agent_factory,
             secrets=secrets,
-            forbidden_secret_values=forbidden_secret_values,
+            forbidden_secret_values=guarded_secret_values,
         )
 
         rescore_row = PreferenceRescoreRow(
@@ -297,7 +309,7 @@ async def rescore_preference_rows(
         _append_jsonl(
             artifact_path,
             rescore_row.model_dump(),
-            forbidden_secret_values,
+            guarded_secret_values,
         )
 
     return artifact_path
