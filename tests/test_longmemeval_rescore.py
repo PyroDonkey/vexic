@@ -487,6 +487,63 @@ class LongMemEvalRescoreTests(unittest.TestCase):
         artifact = self._run(dataset_path, judge)
         self.assertEqual(len(self._read_rescore(artifact)), 1)
 
+    def test_failed_rescore_preserves_prior_artifact(self) -> None:
+        # A mid-run judge failure must not clobber a prior good artifact. The
+        # rescore writes to a temp name and renames onto the final path only
+        # after the loop completes, so an exception leaves the prior artifact
+        # intact and no .tmp file behind.
+        self._write_run(
+            [_diagnostics_row("q-pref", retrieved_long_term_fact_count=1)]
+        )
+        dataset_path = self._write_dataset([self._dataset_row("q-pref")])
+        self._seed_question_db(
+            "q-pref",
+            [("Likes espresso.", "user", "preference", None)],
+            fused_fact_ids=[1],
+        )
+
+        # Seed a valid prior artifact from an earlier successful rescore.
+        artifact_path = self.run_dir / "preference_rescore.jsonl"
+        prior_content = (
+            json.dumps(
+                {
+                    "question_id": "q-old",
+                    "question_type": "single-session-preference",
+                    "original_verdict": "not_supported",
+                    "rubric_verdict": "supported",
+                    "rubric_reason": "prior good verdict",
+                    "rubric_confidence": 0.9,
+                    "judge_model_id": None,
+                    "judge_prompt_version": (
+                        LONGMEMEVAL_RECALL_JUDGE_PREFERENCE_PROMPT_VERSION
+                    ),
+                    "reconstruction_complete": True,
+                }
+            )
+            + "\n"
+        )
+        artifact_path.write_text(prior_content, encoding="utf-8")
+
+        class _BoomJudge:
+            def __init__(self) -> None:
+                self.calls: list[LongMemEvalRecallJudgeInput] = []
+
+            async def __call__(self, judge_input):
+                self.calls.append(judge_input)
+                raise RuntimeError("judge blew up mid-run")
+
+        judge = _BoomJudge()
+
+        with self.assertRaises(RuntimeError):
+            self._run(dataset_path, judge)
+
+        # Prior artifact content is untouched.
+        self.assertEqual(
+            artifact_path.read_text(encoding="utf-8"), prior_content
+        )
+        # No leftover temp file.
+        self.assertFalse((self.run_dir / "preference_rescore.jsonl.tmp").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

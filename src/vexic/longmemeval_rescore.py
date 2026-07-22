@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from contextlib import closing
 from pathlib import Path
@@ -218,9 +219,14 @@ async def rescore_preference_rows(
 ) -> Path:
     """Re-judge preference judged-recall misses under the rubric-aware render.
 
-    Idempotent regeneration: any prior ``preference_rescore.jsonl`` is removed
-    up front so re-running never appends duplicate rows. Returns the artifact
-    path (created empty when no preference miss rows exist).
+    Idempotent regeneration written atomically: rows accumulate into a
+    ``preference_rescore.jsonl.tmp`` sidecar and are renamed onto the final
+    ``preference_rescore.jsonl`` only after the loop completes, so re-running
+    never appends duplicate rows and a mid-run failure (judge error,
+    forbidden-secret raise) leaves any prior good artifact untouched instead of
+    a truncated/partial one that analysis would trust as a completed rescore.
+    Returns the artifact path (created/replaced empty when no preference miss
+    rows exist).
     """
     # Mirror the harness precedent (run_longmemeval_subset): a secret VALUE
     # supplied via ``secrets`` is as forbidden as one named in
@@ -232,13 +238,18 @@ async def rescore_preference_rows(
     )
 
     artifact_path = run_dir / RESCORE_ARTIFACT_NAME
-    # Overwrite, don't append: rescore is a regeneration of this run's verdicts,
-    # not an accumulation across invocations. Truncate up front (rather than
-    # only creating on first row) so a completed rescore that found zero
-    # preference misses still leaves an empty artifact -- which the analysis
-    # loader reads as "ran, nothing usable" (``[]``), distinct from "never ran"
+    # Atomic overwrite: accumulate rows into a temp sidecar, then os.replace it
+    # onto the final path only after the loop completes. Rescore is a
+    # regeneration of this run's verdicts, not an accumulation across
+    # invocations, and a mid-run failure must not leave a truncated final file
+    # (which analysis would read as a completed rescore) nor destroy a prior
+    # good artifact. Start the temp file empty (rather than only creating it on
+    # the first row) so a completed rescore that found zero preference misses
+    # still renames an empty artifact into place -- which the analysis loader
+    # reads as "ran, nothing usable" (``[]``), distinct from "never ran"
     # (absent -> ``None``).
-    artifact_path.write_text("", encoding="utf-8")
+    tmp_path = run_dir / f"{RESCORE_ARTIFACT_NAME}.tmp"
+    tmp_path.write_text("", encoding="utf-8")
 
     diagnostics_rows, _ = _load_diagnostics(run_dir)
     # A resumed/retried run can emit several rows per question_id; the last row
@@ -261,56 +272,66 @@ async def rescore_preference_rows(
         recall_judge_agent = judge_agent_factory(judge_model_group, secrets=secrets)
         judge_model_id = _judge_model_id_from_agent(recall_judge_agent)
 
-    for question_id, diagnostics_row in rows_by_question_id.items():
-        if not _is_preference_miss(diagnostics_row):
-            continue
-        dataset_row = dataset_by_id.get(question_id)
-        if dataset_row is None:
-            # A preference miss whose question_id is absent from --dataset is a
-            # dataset/run mismatch: there is no gold rubric to judge against, so
-            # skip it (with a warning) rather than fabricate one.
-            print(
-                f"warning: skipping {question_id}: not found in dataset "
-                f"{dataset_path}",
-                file=sys.stderr,
+    try:
+        for question_id, diagnostics_row in rows_by_question_id.items():
+            if not _is_preference_miss(diagnostics_row):
+                continue
+            dataset_row = dataset_by_id.get(question_id)
+            if dataset_row is None:
+                # A preference miss whose question_id is absent from --dataset is
+                # a dataset/run mismatch: there is no gold rubric to judge
+                # against, so skip it (with a warning) rather than fabricate one.
+                print(
+                    f"warning: skipping {question_id}: not found in dataset "
+                    f"{dataset_path}",
+                    file=sys.stderr,
+                )
+                continue
+
+            facts, reconstruction_complete = _reconstruct_retrieved_facts(
+                run_dir, question_id, diagnostics_row
             )
-            continue
+            judge_input = LongMemEvalRecallJudgeInput(
+                question=dataset_row.get("question"),
+                gold_answer=dataset_row.get("answer"),
+                retrieved_fact_texts=tuple(fact.fact_text for fact in facts),
+                question_type=diagnostics_row.get("question_type"),
+            )
+            verdict = await _judge_verdict(
+                judge_input,
+                judge_model_group=judge_model_group,
+                judge_scorer=judge_scorer,
+                recall_judge_agent=recall_judge_agent,
+                judge_agent_factory=judge_agent_factory,
+                secrets=secrets,
+                forbidden_secret_values=guarded_secret_values,
+            )
 
-        facts, reconstruction_complete = _reconstruct_retrieved_facts(
-            run_dir, question_id, diagnostics_row
-        )
-        judge_input = LongMemEvalRecallJudgeInput(
-            question=dataset_row.get("question"),
-            gold_answer=dataset_row.get("answer"),
-            retrieved_fact_texts=tuple(fact.fact_text for fact in facts),
-            question_type=diagnostics_row.get("question_type"),
-        )
-        verdict = await _judge_verdict(
-            judge_input,
-            judge_model_group=judge_model_group,
-            judge_scorer=judge_scorer,
-            recall_judge_agent=recall_judge_agent,
-            judge_agent_factory=judge_agent_factory,
-            secrets=secrets,
-            forbidden_secret_values=guarded_secret_values,
-        )
-
-        rescore_row = PreferenceRescoreRow(
-            question_id=question_id,
-            question_type=str(diagnostics_row.get("question_type")),
-            original_verdict=diagnostics_row.get("judge_verdict"),
-            rubric_verdict=verdict.verdict,
-            rubric_reason=verdict.reason,
-            rubric_confidence=verdict.confidence,
-            judge_model_id=judge_model_id,
-            judge_prompt_version=LONGMEMEVAL_RECALL_JUDGE_PREFERENCE_PROMPT_VERSION,
-            reconstruction_complete=reconstruction_complete,
-        )
-        _append_jsonl(
-            artifact_path,
-            rescore_row.model_dump(),
-            guarded_secret_values,
-        )
+            rescore_row = PreferenceRescoreRow(
+                question_id=question_id,
+                question_type=str(diagnostics_row.get("question_type")),
+                original_verdict=diagnostics_row.get("judge_verdict"),
+                rubric_verdict=verdict.verdict,
+                rubric_reason=verdict.reason,
+                rubric_confidence=verdict.confidence,
+                judge_model_id=judge_model_id,
+                judge_prompt_version=LONGMEMEVAL_RECALL_JUDGE_PREFERENCE_PROMPT_VERSION,
+                reconstruction_complete=reconstruction_complete,
+            )
+            _append_jsonl(
+                tmp_path,
+                rescore_row.model_dump(),
+                guarded_secret_values,
+            )
+        # Publish atomically only after every row judged and wrote cleanly. An
+        # os.replace is atomic on the same filesystem, so analysis never sees a
+        # half-written final artifact.
+        os.replace(tmp_path, artifact_path)
+    finally:
+        # On success os.replace already consumed tmp_path (no-op here); on any
+        # failure this removes the partial temp file and leaves any prior final
+        # artifact untouched.
+        tmp_path.unlink(missing_ok=True)
 
     return artifact_path
 

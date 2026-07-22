@@ -453,17 +453,25 @@ def _load_preference_rescore(run_dir: Path) -> list[PreferenceRescoreRow] | None
     return rows
 
 
-def _verdict_delta(rescore_rows: Sequence[PreferenceRescoreRow]) -> dict[str, int]:
-    # Only fully reconstructed rows feed the literal-vs-rubric headline; rows
-    # whose Tier-1 reconstruction was incomplete are bucketed separately and
-    # never silently dropped, so the counts always sum to the row total.
+def _verdict_delta(
+    matched_rows: Sequence[PreferenceRescoreRow],
+    unmatched_artifact_rows: int,
+) -> dict[str, int]:
+    # Only rows whose question_id is among the current preference misses feed
+    # the literal-vs-rubric headline; a stale/copied artifact carrying rows for
+    # absent questions would otherwise report flips for questions the section
+    # never lists. Those rows are surfaced as ``unmatched_artifact_rows`` rather
+    # than silently dropped. Among matched rows, only fully reconstructed ones
+    # feed the flip buckets; incomplete rows are bucketed separately, so the
+    # buckets plus ``unmatched_artifact_rows`` sum to the deduped row total.
     delta = {
         "flipped_to_supported": 0,
         "unchanged": 0,
         "flipped_from_supported": 0,
         "incomplete_reconstruction": 0,
+        "unmatched_artifact_rows": unmatched_artifact_rows,
     }
-    for row in rescore_rows:
+    for row in matched_rows:
         if not row.reconstruction_complete:
             delta["incomplete_reconstruction"] += 1
             continue
@@ -486,7 +494,23 @@ def _build_preference_section(
     # miss row, or a rescore artifact present (even if empty). Otherwise None.
     if not preference_rows and rescore_rows is None:
         return None
-    verdict_delta = None if rescore_rows is None else _verdict_delta(rescore_rows)
+    verdict_delta: dict[str, int] | None = None
+    if rescore_rows is not None:
+        # Dedupe artifact rows by question_id, last occurrence wins (consistent
+        # with diagnostics last-wins), then split into rows matching a listed
+        # preference miss and unmatched rows. The delta counts flips only over
+        # matched rows; a duplicate question_id counts once.
+        deduped: dict[str, PreferenceRescoreRow] = {}
+        for row in rescore_rows:
+            deduped[row.question_id] = row
+        listed_ids = {row.question_id for row in preference_rows}
+        matched = [
+            row for qid, row in deduped.items() if qid in listed_ids
+        ]
+        unmatched = [
+            row for qid, row in deduped.items() if qid not in listed_ids
+        ]
+        verdict_delta = _verdict_delta(matched, len(unmatched))
     return PreferenceReportSection(
         rows=list(preference_rows),
         rescore_available=rescore_rows is not None,
@@ -629,7 +653,8 @@ def _print_summary(report: RunAnalysisReport) -> None:
                 f"+{delta['flipped_to_supported']} to supported, "
                 f"{delta['unchanged']} unchanged, "
                 f"-{delta['flipped_from_supported']} from supported, "
-                f"{delta['incomplete_reconstruction']} incomplete"
+                f"{delta['incomplete_reconstruction']} incomplete, "
+                f"{delta['unmatched_artifact_rows']} unmatched artifact rows"
             )
         else:
             line += ", no rescore artifact"

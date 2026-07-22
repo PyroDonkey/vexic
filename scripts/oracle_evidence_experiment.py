@@ -108,6 +108,12 @@ class OracleEntry(BaseModel):
     question_id: str
     run_dir: str
     question: str
+    # The LongMemEval question_type, threaded into the recall-judge input so a
+    # single-session-preference oracle case is judged under the same
+    # rubric-aware render as the main eval path (not the literal render).
+    # Optional for back-compat: fixtures authored before rubric judging omit it
+    # and judge with question_type None (the pre-rubric behavior).
+    question_type: str | None = None
     gold_answer: Any
     constituent_fact_ids: list[int] = Field(min_length=1)
     expected_fact_texts: list[str] = Field(min_length=1)
@@ -440,6 +446,7 @@ async def _judge_texts(
     fact_texts: list[str],
     repeats: int,
     budget: ProviderBudget,
+    question_type: str | None = None,
 ) -> dict[str, Any]:
     """Judge one evidence set `repeats` times and aggregate. A single-shot LLM
     verdict is noisy even at temperature 0, so headroom is read off the pass
@@ -457,6 +464,7 @@ async def _judge_texts(
         question=question,
         gold_answer=gold_answer,
         retrieved_fact_texts=tuple(fact_texts),
+        question_type=question_type,
     )
     verdicts: list[str] = []
     errors = 0
@@ -502,6 +510,7 @@ async def run_question(
         fact_texts=oracle_texts,
         repeats=repeats,
         budget=budget,
+        question_type=entry.question_type,
     )
 
     sweep: dict[str, Any] = {}
@@ -517,6 +526,7 @@ async def run_question(
             fact_texts=fused_texts,
             repeats=repeats,
             budget=budget,
+            question_type=entry.question_type,
         )
 
     return {

@@ -807,20 +807,33 @@ class LongMemEvalAnalysisTests(unittest.TestCase):
     def test_preference_section_surfaces_delta_with_rescore_artifact(self) -> None:
         # A precomputed preference_rescore.jsonl surfaces the literal-vs-rubric
         # verdict delta. Only fully reconstructed rows feed the headline flip
-        # counts; incomplete rows are bucketed separately, never hidden.
+        # counts; incomplete rows are bucketed separately, never hidden. Both
+        # artifact rows reference listed preference misses so both are matched
+        # (the delta now buckets over matched rows only; unmatched artifact rows
+        # are counted separately, exercised by
+        # test_delta_ignores_artifact_rows_for_absent_questions).
         self._write_run(
             [
                 _diagnostics_row(
                     "q-pref",
                     question_type="single-session-preference",
                     judge_verdict="not_supported",
-                )
+                ),
+                _diagnostics_row(
+                    "q-pref-2",
+                    question_type="single-session-preference",
+                    judge_verdict="not_supported",
+                ),
             ]
         )
         dataset = self._write_dataset(
-            [self._dataset_row("q-pref", "prefers concise summaries")]
+            [
+                self._dataset_row("q-pref", "prefers concise summaries"),
+                self._dataset_row("q-pref-2", "prefers dark mode"),
+            ]
         )
         self._seed_question_db("q-pref", [("Fact.", "user")])
+        self._seed_question_db("q-pref-2", [("Fact.", "user")])
         (self.run_dir / "preference_rescore.jsonl").write_text(
             "\n".join(
                 json.dumps(row)
@@ -853,6 +866,7 @@ class LongMemEvalAnalysisTests(unittest.TestCase):
                 "unchanged": 0,
                 "flipped_from_supported": 0,
                 "incomplete_reconstruction": 1,
+                "unmatched_artifact_rows": 0,
             },
         )
 
@@ -899,7 +913,9 @@ class LongMemEvalAnalysisTests(unittest.TestCase):
         self.assertIsNotNone(report.preference)
         assert report.preference is not None
         self.assertTrue(report.preference.rescore_available)
-        # Only the valid row feeds the delta; the malformed line is dropped.
+        # Only the valid row feeds the delta; the malformed line is dropped by
+        # the tolerant loader before dedup/matching, so it is neither a flip nor
+        # an unmatched artifact row.
         self.assertEqual(
             report.preference.verdict_delta,
             {
@@ -907,6 +923,120 @@ class LongMemEvalAnalysisTests(unittest.TestCase):
                 "unchanged": 0,
                 "flipped_from_supported": 0,
                 "incomplete_reconstruction": 0,
+                "unmatched_artifact_rows": 0,
+            },
+        )
+
+    def test_delta_ignores_artifact_rows_for_absent_questions(self) -> None:
+        # A stale/copied rescore artifact may carry rows for question_ids that
+        # are not among the current run's preference misses. Those must not feed
+        # the flip buckets (they would report flips for questions the section
+        # never lists); they are surfaced separately as unmatched_artifact_rows.
+        self._write_run(
+            [
+                _diagnostics_row(
+                    "q-pref",
+                    question_type="single-session-preference",
+                    judge_verdict="not_supported",
+                )
+            ]
+        )
+        dataset = self._write_dataset(
+            [self._dataset_row("q-pref", "prefers concise summaries")]
+        )
+        self._seed_question_db("q-pref", [("Fact.", "user")])
+        (self.run_dir / "preference_rescore.jsonl").write_text(
+            "\n".join(
+                json.dumps(row)
+                for row in [
+                    # Matches a listed preference miss -> feeds the delta.
+                    self._rescore_row(
+                        "q-pref",
+                        original_verdict="not_supported",
+                        rubric_verdict="supported",
+                        reconstruction_complete=True,
+                    ),
+                    # question_id not among the section rows -> unmatched, must
+                    # not count as a flip.
+                    self._rescore_row(
+                        "q-absent",
+                        original_verdict="not_supported",
+                        rubric_verdict="supported",
+                        reconstruction_complete=True,
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        report = analyze_run(self.run_dir, dataset)
+
+        self.assertIsNotNone(report.preference)
+        assert report.preference is not None
+        self.assertEqual(
+            report.preference.verdict_delta,
+            {
+                "flipped_to_supported": 1,
+                "unchanged": 0,
+                "flipped_from_supported": 0,
+                "incomplete_reconstruction": 0,
+                "unmatched_artifact_rows": 1,
+            },
+        )
+
+    def test_delta_dedupes_duplicate_question_ids_last_wins(self) -> None:
+        # Two artifact rows for the same question_id (a resumed/retried rescore)
+        # must count once, last-wins -- consistent with diagnostics last-wins.
+        self._write_run(
+            [
+                _diagnostics_row(
+                    "q-pref",
+                    question_type="single-session-preference",
+                    judge_verdict="not_supported",
+                )
+            ]
+        )
+        dataset = self._write_dataset(
+            [self._dataset_row("q-pref", "prefers concise summaries")]
+        )
+        self._seed_question_db("q-pref", [("Fact.", "user")])
+        (self.run_dir / "preference_rescore.jsonl").write_text(
+            "\n".join(
+                json.dumps(row)
+                for row in [
+                    self._rescore_row(
+                        "q-pref",
+                        original_verdict="not_supported",
+                        rubric_verdict="not_supported",
+                        reconstruction_complete=True,
+                    ),
+                    # Later row for the same question wins: original still
+                    # not_supported, now flipped to supported.
+                    self._rescore_row(
+                        "q-pref",
+                        original_verdict="not_supported",
+                        rubric_verdict="supported",
+                        reconstruction_complete=True,
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        report = analyze_run(self.run_dir, dataset)
+
+        self.assertIsNotNone(report.preference)
+        assert report.preference is not None
+        self.assertEqual(
+            report.preference.verdict_delta,
+            {
+                "flipped_to_supported": 1,
+                "unchanged": 0,
+                "flipped_from_supported": 0,
+                "incomplete_reconstruction": 0,
+                "unmatched_artifact_rows": 0,
             },
         )
 

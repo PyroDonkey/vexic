@@ -465,6 +465,89 @@ class OracleFixtureTests(TestCase):
         self.assertEqual(budget.used, 15)
         self.assertEqual(result["capture"]["15"]["fraction"], 1.0)
 
+    def test_run_question_threads_question_type_into_judge_input(self) -> None:
+        # A preference-typed oracle entry must be judged under the SAME
+        # rubric-aware render the main eval path uses: the judge input carries
+        # question_type, not the literal render. Otherwise the oracle ceiling
+        # and the eval diverge for single-session-preference misses.
+        self._seed_db(
+            "q1",
+            [("Only fact.", "fact", None)],
+            event={
+                "keyword_fact_ids": [1],
+                "vector_fact_ids": [1],
+                "fused_fact_ids": [1],
+            },
+        )
+        entry = oee.load_oracle_fixture(
+            self._fixture(
+                [
+                    self._entry(
+                        "q1",
+                        constituent_fact_ids=[1],
+                        expected_fact_texts=["Only fact."],
+                        question_type="single-session-preference",
+                    )
+                ]
+            )
+        )[0]
+
+        class _RecordingJudge:
+            def __init__(self) -> None:
+                self.inputs: list[LongMemEvalRecallJudgeInput] = []
+
+            async def __call__(self, judge_input):
+                self.inputs.append(judge_input)
+                return _verdict("supported")
+
+        judge = _RecordingJudge()
+        asyncio.run(
+            oee.run_question(entry, judge, repeats=1, budget=oee.ProviderBudget(100))
+        )
+
+        self.assertTrue(judge.inputs)
+        self.assertTrue(
+            all(
+                ji.question_type == "single-session-preference"
+                for ji in judge.inputs
+            )
+        )
+
+    def test_run_question_defaults_question_type_none_when_absent(self) -> None:
+        # A back-compat fixture without question_type validates and judges with
+        # question_type None (the pre-rubric literal render), unchanged.
+        self._seed_db(
+            "q1",
+            [("Only fact.", "fact", None)],
+            event={
+                "keyword_fact_ids": [1],
+                "vector_fact_ids": [1],
+                "fused_fact_ids": [1],
+            },
+        )
+        entry = oee.load_oracle_fixture(
+            self._fixture(
+                [self._entry("q1", constituent_fact_ids=[1], expected_fact_texts=["Only fact."])]
+            )
+        )[0]
+        self.assertIsNone(entry.question_type)
+
+        class _RecordingJudge:
+            def __init__(self) -> None:
+                self.inputs: list[LongMemEvalRecallJudgeInput] = []
+
+            async def __call__(self, judge_input):
+                self.inputs.append(judge_input)
+                return _verdict("supported")
+
+        judge = _RecordingJudge()
+        asyncio.run(
+            oee.run_question(entry, judge, repeats=1, budget=oee.ProviderBudget(100))
+        )
+
+        self.assertTrue(judge.inputs)
+        self.assertTrue(all(ji.question_type is None for ji in judge.inputs))
+
     def test_judge_error_is_recorded_and_does_not_abort_run(self) -> None:
         # A judge that raises on every call must not crash the run: each repeat
         # records "error", pass/partial are None (no graded signal), budget still
