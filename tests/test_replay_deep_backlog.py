@@ -9,9 +9,10 @@ the pattern in tests/test_simulate_mentioned_at_promotion.py with controllable
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import sys
-from contextlib import closing
+from contextlib import closing, redirect_stderr
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import ModuleType
@@ -1518,6 +1519,23 @@ class MainEndToEndTests(_MainFixture):
 
         self.assertEqual(_saturated(2), 1)
         self.assertEqual(_saturated(3), 0)
+
+    def test_nonpositive_deep_top_n_exits_two(self) -> None:
+        # A --deep-top-n of 0 or negative is invalid: no candidate can satisfy
+        # rank <= top_n, so every run reports authoritative-but-meaningless
+        # starvation. The harness rejects it up front (exit 2 + stderr message)
+        # rather than emitting misleading results.
+        fixture = self._write_fixture(
+            [{"question_id": "q-guard", "seed": self._drained_seed()}]
+        )
+
+        for bad in ("0", "-3"):
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc = replay.main(["--gaps", str(fixture), "--deep-top-n", bad])
+            self.assertEqual(rc, 2)
+            self.assertIn("deep-top-n", err.getvalue())
+            self.assertIn("positive", err.getvalue())
 
 
 class DrainVerdictTests(_MainFixture):

@@ -1478,6 +1478,12 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.deep_top_n <= 0:
+        print(
+            f"--deep-top-n must be positive, got {args.deep_top_n}",
+            file=sys.stderr,
+        )
+        return 2
     try:
         entries = load_gap_fixture(args.gaps)
     except GapFixtureError as exc:
