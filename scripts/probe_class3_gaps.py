@@ -135,8 +135,14 @@ def _tier_texts(db_path: Path) -> tuple[list[tuple[str, bool]], list[str]]:
     A fact counts as dated when it carries ``occurred_at`` (event time) or the
     derived ``mentioned_at`` provenance date (ADR 0037); a pre-migration
     artifact has no ``mentioned_at`` column at all, and likewise may have no
-    ``needs_review`` column on ``memory_candidates`` (retired/stale predate
-    both, so those terms stay unconditional).
+    ``needs_review`` column on ``memory_candidates`` (retired/stale/promoted/
+    promoted_fact_id predate both, so those terms stay unconditional).
+
+    The candidate scan mirrors Deep's promotion pool: it excludes not only
+    retired/stale/needs_review rows but also already-promoted candidates
+    (``promoted`` set or a ``promoted_fact_id``), since a promotion can never
+    draw from those again. A promoted candidate whose Tier-3 fact was later
+    retired must therefore read as absent, not tier2-only.
     """
     with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(long_term_memory)")}
@@ -161,7 +167,8 @@ def _tier_texts(db_path: Path) -> tuple[list[tuple[str, bool]], list[str]]:
             str(row[0])
             for row in conn.execute(
                 "SELECT fact_text FROM memory_candidates "
-                f"WHERE retired = 0 AND stale = 0 {needs_review_filter}"
+                "WHERE retired = 0 AND stale = 0 "
+                f"AND promoted = 0 AND promoted_fact_id IS NULL {needs_review_filter}"
             )
         ]
     return facts, candidates

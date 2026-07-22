@@ -140,6 +140,60 @@ class CoverageTests(_RunFixture):
 
         self.assertEqual(result["gaps"][0]["coverage"], "absent")
 
+    def test_promoted_candidate_with_retired_fact_is_absent(self) -> None:
+        # A promoted candidate can never re-enter the promotion pool that Deep
+        # draws from (_deep_eligible drops rows with promoted set or a
+        # promoted_fact_id), so once its Tier-3 fact is retired the constituent
+        # is genuinely absent, not tier2-only. Two candidates pin each column of
+        # the filter independently: one carries promoted=1, the other a
+        # promoted_fact_id. _seed_db exposes neither knob (nor a retired fact),
+        # so those are set with direct SQL rather than editing the shared helper.
+        self._seed_db(
+            "q1",
+            [
+                {
+                    "id": 1,
+                    "category": "event",
+                    "fact_text": "User went camping at Yellowstone.",
+                    "source_message_ids": [1],
+                },
+                {
+                    "id": 2,
+                    "category": "event",
+                    "fact_text": "User went camping at Yellowstone.",
+                    "source_message_ids": [1],
+                },
+            ],
+            messages={1: "2023-04-29 10:00:00"},
+            facts=[
+                {
+                    "id": 70,
+                    "fact_text": "User went camping at Yellowstone.",
+                    "occurred_at": "2023-04-29",
+                }
+            ],
+        )
+        with closing(sqlite3.connect(self._db_path("q1"))) as conn:
+            conn.execute("UPDATE memory_candidates SET promoted = 1 WHERE id = 1")
+            conn.execute(
+                "UPDATE memory_candidates SET promoted_fact_id = 70 WHERE id = 2"
+            )
+            conn.execute("UPDATE long_term_memory SET retired = 1 WHERE id = 70")
+            conn.commit()
+
+        result = self._probe_one(
+            [
+                {
+                    "gap_id": "g1",
+                    "kind": "tier2-undated-event",
+                    "match_tokens": ["Yellowstone", "camping"],
+                }
+            ]
+        )
+
+        self.assertEqual(result["gaps"][0]["coverage"], "absent")
+        self.assertFalse(result["oracle_complete"])
+
     def test_missing_from_both_tiers_is_absent(self) -> None:
         self._seed_db(
             "q1",
@@ -289,11 +343,13 @@ class PreMigrationSchemaTests(_RunFixture):
             )
             conn.execute(
                 "CREATE TABLE memory_candidates "
-                "(fact_text TEXT, retired INTEGER, stale INTEGER)"
+                "(fact_text TEXT, retired INTEGER, stale INTEGER, "
+                "promoted INTEGER, promoted_fact_id INTEGER)"
             )
             conn.execute(
-                "INSERT INTO memory_candidates (fact_text, retired, stale) "
-                "VALUES ('User went camping at Yellowstone.', 0, 0)"
+                "INSERT INTO memory_candidates "
+                "(fact_text, retired, stale, promoted, promoted_fact_id) "
+                "VALUES ('User went camping at Yellowstone.', 0, 0, 0, NULL)"
             )
             conn.commit()
 

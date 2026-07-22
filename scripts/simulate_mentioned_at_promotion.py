@@ -48,6 +48,7 @@ import argparse
 import json
 import shutil
 import sqlite3
+import stat
 import sys
 from contextlib import closing
 from datetime import datetime, timezone
@@ -72,6 +73,11 @@ from vexic.longmemeval_analysis import _question_path_component  # noqa: E402
 from vexic.storage import init_db  # noqa: E402
 
 DEFAULT_DEEP_TOP_N = 15
+
+# Fixed scoring anchor for an empty candidate pool. Wall-clock now would make an
+# empty-pool question emit a different scoring_time on every rerun; the ranking
+# is empty in that case, so this anchor only stabilizes the surfaced field.
+_EMPTY_POOL_SCORING_TIME = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 # Prefix for the disposable heal-the-copy workspace. Tracker-id free by design.
 _WORKSPACE_PREFIX = "class3-sim-"
@@ -148,7 +154,12 @@ def _copy_question_db(db_path: Path, destination: Path) -> Path:
     for suffix in ("", "-wal", "-shm"):
         source = db_path.with_name(db_path.name + suffix)
         if source.exists():
-            shutil.copy2(source, copy_path.with_name(copy_path.name + suffix))
+            destination_file = copy_path.with_name(copy_path.name + suffix)
+            shutil.copy2(source, destination_file)
+            # copy2 preserves the source mode, so a read-only frozen artifact
+            # (0444) yields a read-only copy that init_db cannot heal. Make the
+            # copy user-writable; mtime preservation from copy2 is fine to keep.
+            destination_file.chmod(destination_file.stat().st_mode | stat.S_IWUSR)
     return copy_path
 
 
@@ -260,10 +271,13 @@ def _scoring_time(candidates: list[_DiagnosticCandidate]) -> datetime:
 
     The frozen runs did not persist ``candidate_scoring_time``, and wall-clock
     now would make the recency term drift with the calendar. Ranking is
-    relative, so a fixed in-pool anchor keeps the table reproducible.
+    relative, so a fixed in-pool anchor keeps the table reproducible. An empty
+    pool has no in-pool anchor, so it falls back to the fixed
+    ``_EMPTY_POOL_SCORING_TIME`` for the same reason: wall-clock now there would
+    make identical reruns emit a different scoring_time.
     """
     if not candidates:
-        return datetime.now(timezone.utc)
+        return _EMPTY_POOL_SCORING_TIME
     return max(candidate.last_seen_at for candidate in candidates)
 
 

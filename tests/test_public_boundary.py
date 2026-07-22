@@ -9,10 +9,13 @@ _TRACKING_REFERENCE_ALLOWED_PREFIXES = ("docs/adr/",)
 _TRACKING_REFERENCE_ALLOWED_FILES = frozenset({"README.md", "docs/provenance.md"})
 
 # Private issue-tracker guard. The separator between the prefix and the digits
-# is optional so a real id is caught whether or not it is punctuated (the prefix
-# itself is assembled from split literals so this test file stays scan-clean).
+# is optional and may be a hyphen, underscore, or dot, so a real id is caught
+# whether or not it is punctuated (the prefix itself is assembled from split
+# literals so this test file stays scan-clean). Only the leading word boundary
+# is anchored: a trailing boundary would let a Python-safe underscore spelling
+# (a word char after the digits) slip past, so it is deliberately omitted.
 # Case-insensitive so a lowercase id cannot slip past.
-_TICKET_PATTERN = re.compile(r"\b" + "C" + r"OA[-_]?\d+\b", re.IGNORECASE)
+_TICKET_PATTERN = re.compile(r"\b" + "C" + r"OA[-_.]?\d+", re.IGNORECASE)
 
 
 def _tracked_public_text_files() -> list[Path]:
@@ -179,9 +182,16 @@ def test_tracking_reference_guard_covers_root_docs_and_public_text_assets() -> N
 
 def test_ticket_pattern_matches_separator_less_ids() -> None:
     # A tracker id with no separator between the prefix and the digits must
-    # still be caught. The probe id is assembled from split literals so this
+    # still be caught. The probe ids are assembled from split literals so this
     # assertion does not itself trip the whole-tree scan.
     assert _TICKET_PATTERN.search("C" + "OA123") is not None
+    # A trailing word char after the digits (Python-safe underscore spelling)
+    # must not let the id slip past.
+    assert _TICKET_PATTERN.search("C" + "OA_418_fixture") is not None
+    # A dot separator between the prefix and the digits must also be caught.
+    assert _TICKET_PATTERN.search("c" + "oa.418") is not None
+    # Sanity negative: an unrelated hyphenated token stays unmatched.
+    assert _TICKET_PATTERN.search("class3-sim-") is None
 
 
 def test_public_tree_does_not_embed_tracking_references() -> None:

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -603,6 +604,67 @@ class SimulationTests(_RunFixture):
         result = self._simulate(path)[0]
 
         self.assertEqual(result["scoring_time"], "2023-06-15T08:00:00+00:00")
+
+    def test_read_only_frozen_db_is_healed_on_a_writable_copy(self) -> None:
+        # A frozen provenance artifact chmod'd read-only (0444) must still heal:
+        # the copy has to be made user-writable before init_db writes to it.
+        db_path = self._seed_db(
+            "q1",
+            [{"id": 36, "category": "event", "source_message_ids": [1]}],
+            messages={1: "2023-04-29 10:00:00"},
+        )
+        frozen = [db_path]
+        for suffix in ("-wal", "-shm"):
+            sidecar = db_path.with_name(db_path.name + suffix)
+            if sidecar.exists():
+                frozen.append(sidecar)
+        for target in frozen:
+            # Restore write permission in cleanup so the tempdir can be removed.
+            self.addCleanup(os.chmod, target, 0o644)
+            os.chmod(target, 0o444)
+        path = self._fixture(
+            [
+                self._question(
+                    "q1",
+                    [
+                        {
+                            "gap_id": "g1",
+                            "kind": "tier2-undated-event",
+                            "frozen_candidate_id": 36,
+                        }
+                    ],
+                )
+            ]
+        )
+
+        gap = self._simulate(path)[0]["gaps"][0]
+
+        self.assertTrue(gap["mentioned_at_healed"])
+        self.assertEqual(gap["verdict"], "flips-eligible-degenerate-pool")
+
+    def test_scoring_time_is_deterministic_for_an_empty_pool(self) -> None:
+        # Every candidate is retired, so the deep-eligible pool is empty. The
+        # scoring clock must fall back to a fixed anchor, not wall-clock now, so
+        # identical reruns emit an identical scoring_time.
+        self._seed_db(
+            "q1",
+            [
+                {
+                    "id": 1,
+                    "category": "event",
+                    "retired": 1,
+                    "source_message_ids": [1],
+                }
+            ],
+            messages={1: "2023-04-29 10:00:00"},
+        )
+        path = self._fixture([self._question("q1", [])])
+
+        first = self._simulate(path)[0]
+        second = self._simulate(path)[0]
+
+        self.assertEqual(first["scoring_time"], second["scoring_time"])
+        self.assertEqual(first["scoring_time"], "1970-01-01T00:00:00+00:00")
 
     def test_copy_question_db_copies_wal_sidecars(self) -> None:
         source = self.root / "src"
