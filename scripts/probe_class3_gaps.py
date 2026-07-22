@@ -4,14 +4,21 @@ Read-only over a LongMemEval run directory, with no provider calls. For every
 gap named in the gap fixture it asks one question: does this run's Tier 3
 contain the missing constituent?
 
-  * ``covered``    -- a live ``long_term_memory`` fact matches every match token
-  * ``tier2-only`` -- no Tier-3 match, but an active ``memory_candidates`` row
-                      matches (the constituent was extracted but never promoted)
-  * ``absent``     -- neither tier holds it (extraction never captured it)
+  * ``covered``        -- a live ``long_term_memory`` fact matches every match token
+  * ``tier2-only``     -- no Tier-3 match, but an active ``memory_candidates`` row
+                          matches (the constituent was extracted but never promoted)
+  * ``tier3-undated``  -- a fact matches but carries no date, for gaps whose whole
+                          miss is the missing date (the fact existing is not enough)
+  * ``absent``         -- neither tier holds it (extraction never captured it)
 
 A question is oracle-complete when every one of its gaps is ``covered``;
 questions the earlier curation already found complete carry no gaps and are
 complete by construction.
+
+This probe reads run databases read-only and copies nothing. Opening a WAL-mode
+run database in read-only mode may create or update ``-wal``/``-shm`` sidecars
+next to it; byte-frozen provenance is the simulation harness's guarantee (it
+heals a copy), not this probe's.
 
 Point it at the frozen benchmark shards to reproduce the baseline classification,
 or at a fresh run to measure the same gaps on current code:
@@ -69,6 +76,33 @@ GapFixtureError = _sim.GapFixtureError
 load_gap_fixture = _sim.load_gap_fixture
 
 
+def _reject_empty_match_tokens(entries: list[Any]) -> None:
+    """Fail loud on any gap with no match tokens or a blank one.
+
+    An empty token list can never match (``_matches`` returns False), so it
+    would silently classify as ``absent`` rather than covered -- a fixture
+    defect masquerading as a real miss. A blank token (empty or whitespace) is
+    the opposite defect: a substring of every text, it would classify covered
+    against ANY Tier-3 fact even alongside a real token. It validates the
+    entries that will be probed (after any ``--question-id`` filter), fires
+    before any question is probed, and is independent of ``--run-dir``, which
+    only turns a missing per-question DB into a reported skip.
+    """
+    for entry in entries:
+        for gap in entry.gaps:
+            if not gap.match_tokens:
+                raise GapFixtureError(
+                    f"question {entry.question_id} gap {gap.gap_id}: "
+                    "match_tokens is empty; an empty token list never matches"
+                )
+            if any(not token.strip() for token in gap.match_tokens):
+                raise GapFixtureError(
+                    f"question {entry.question_id} gap {gap.gap_id}: "
+                    "match_tokens contains a blank token; a blank token is a "
+                    "substring of every text and would match anything"
+                )
+
+
 def resolve_run_dir(entry: Any, override: Path | None) -> Path:
     return Path(entry.run_dir) if override is None else override
 
@@ -81,8 +115,15 @@ def question_db_path(entry: Any, run_dir: Path) -> Path:
 
 
 def _matches(text: str, tokens: list[str]) -> bool:
-    """Every token must appear; an empty token list never matches."""
-    if not tokens:
+    """Every token must appear; an empty list or a blank token never matches.
+
+    A blank token (empty or whitespace) is a substring of every text, so it
+    would make ``all(...)`` skip past it and match anything. Guarding it here,
+    consistent with the empty-list guard, keeps matching skip-proof even if a
+    blank token reaches this function; the load path rejects such fixtures up
+    front via ``_reject_empty_match_tokens``.
+    """
+    if not tokens or any(not token.strip() for token in tokens):
         return False
     folded = text.casefold()
     return all(token.casefold() in folded for token in tokens)
@@ -93,11 +134,25 @@ def _tier_texts(db_path: Path) -> tuple[list[tuple[str, bool]], list[str]]:
 
     A fact counts as dated when it carries ``occurred_at`` (event time) or the
     derived ``mentioned_at`` provenance date (ADR 0037); a pre-migration
-    artifact has no ``mentioned_at`` column at all.
+    artifact has no ``mentioned_at`` column at all, and likewise may have no
+    ``needs_review`` column on ``memory_candidates`` (retired/stale/promoted/
+    promoted_fact_id predate both, so those terms stay unconditional).
+
+    The candidate scan mirrors Deep's promotion pool: it excludes not only
+    retired/stale/needs_review rows but also already-promoted candidates
+    (``promoted`` set or a ``promoted_fact_id``), since a promotion can never
+    draw from those again. A promoted candidate whose Tier-3 fact was later
+    retired must therefore read as absent, not tier2-only.
     """
     with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(long_term_memory)")}
         mentioned_at_select = "mentioned_at" if "mentioned_at" in columns else "NULL"
+        candidate_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(memory_candidates)")
+        }
+        needs_review_filter = (
+            "AND needs_review = 0" if "needs_review" in candidate_columns else ""
+        )
         facts = [
             (
                 str(row[0]),
@@ -111,10 +166,9 @@ def _tier_texts(db_path: Path) -> tuple[list[tuple[str, bool]], list[str]]:
         candidates = [
             str(row[0])
             for row in conn.execute(
-                """
-                SELECT fact_text FROM memory_candidates
-                WHERE retired = 0 AND stale = 0
-                """
+                "SELECT fact_text FROM memory_candidates "
+                "WHERE retired = 0 AND stale = 0 "
+                f"AND promoted = 0 AND promoted_fact_id IS NULL {needs_review_filter}"
             )
         ]
     return facts, candidates
@@ -274,6 +328,13 @@ def main(argv: list[str] | None = None) -> int:
         if missing:
             print(f"question ids not in fixture: {', '.join(missing)}", file=sys.stderr)
             return 2
+    # Validate only the entries that will be probed, and before any DB access:
+    # a malformed UNSELECTED question must not abort a targeted probe.
+    try:
+        _reject_empty_match_tokens(entries)
+    except GapFixtureError as exc:
+        print(f"gap fixture error: {exc}", file=sys.stderr)
+        return 2
 
     results: list[dict[str, Any]] = []
     skipped: list[str] = []

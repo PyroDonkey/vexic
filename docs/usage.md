@@ -475,7 +475,12 @@ oracle fixture, it is a run-local artifact attached to the issue, not committed.
 question database to a temporary directory, lets schema init heal the copy, and
 reports per gap candidate whether `mentioned_at` derives, whether Deep
 promotion eligibility flips, and where the candidate ranks inside the eligible
-pool. Eligibility and ranking are not re-derived: it reuses `_deep_eligible`
+pool. A flip lands one of three verdicts (with matching summary counters): it
+flips within `--deep-top-n` (`flips-eligible-and-ranked`), flips but ranks
+outside it (`flips-eligible-outside-top-n`), or flips into a pool no larger than
+the top-n slice (`flips-eligible-degenerate-pool`) -- where the top-n trivially
+covers the whole pool, so "within top-n" says nothing about ranking. Eligibility
+and ranking are not re-derived: it reuses `_deep_eligible`
 and `_rank_diagnostic_candidates` from `vexic.longmemeval`.
 
 ```bash
@@ -484,7 +489,10 @@ uv run python scripts/simulate_mentioned_at_promotion.py \
 ```
 
 Artifacts: `promotion_simulation_metrics.json` and
-`promotion_simulation_table.md`. Frozen inputs are never mutated. The result
+`promotion_simulation_table.md`. The frozen inputs are never opened: the
+harness copies each question database to a temporary directory first and reads
+and heals only the copy, so no read-only handle can leave a WAL sidecar next to
+the source. The result
 bounds the undated-event bucket rather than confirming it: it is a post-run
 snapshot of the final candidate pool, not a replay of the per-cycle Deep pool,
 it does not model Deep's model-backed contradiction check, and it says nothing
@@ -507,7 +515,15 @@ uv run python scripts/probe_class3_gaps.py \
 Artifacts: `class3_gap_probe.json` and `class3_gap_probe.md`. Matching is
 deterministic case-folded substring containment over the curated tokens, so
 `covered` means the constituent text is present in Tier 3 -- not that the run
-answered the question.
+answered the question. A gap with an empty token list or a blank token is a
+fixture error (exit 2, `gap fixture error`) checked before any question is
+probed, since neither can match honestly and would silently misclassify. The
+check covers the questions selected for the run -- all of them by default,
+only the `--question-id` subset when that flag is passed. Unlike the
+simulation, the probe copies nothing and opens the run databases directly:
+a read-only open of a WAL-mode run database may create or update `-wal`/`-shm`
+sidecars next to it, so byte-frozen provenance is the simulation harness's
+guarantee (it heals a copy), not the probe's.
 
 ## Hosted MVP Shell
 

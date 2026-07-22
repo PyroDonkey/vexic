@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -94,9 +96,10 @@ class _RunFixture(TestCase):
                     INSERT INTO memory_candidates (
                         id, fact_text, subject, category, importance, confidence,
                         source_message_ids, hit_count, rem_boost, occurred_at,
-                        mentioned_at, last_seen_at, created_at
-                    ) VALUES (?, ?, 'user', ?, ?, 0.9, ?, 1, 0.0, ?, NULL,
-                              '2023-06-01 00:00:00', '2023-06-01 00:00:00')
+                        mentioned_at, last_seen_at, created_at,
+                        retired, stale, needs_review
+                    ) VALUES (?, ?, 'user', ?, ?, 0.9, ?, 1, 0.0, ?, ?,
+                              ?, '2023-06-01 00:00:00', ?, ?, ?)
                     """,
                     (
                         candidate.get("id", index),
@@ -105,6 +108,11 @@ class _RunFixture(TestCase):
                         candidate.get("importance", 5),
                         json.dumps(candidate.get("source_message_ids", [1])),
                         candidate.get("occurred_at"),
+                        candidate.get("mentioned_at"),
+                        candidate.get("last_seen_at", "2023-06-01 00:00:00"),
+                        candidate.get("retired", 0),
+                        candidate.get("stale", 0),
+                        candidate.get("needs_review", 0),
                     ),
                 )
                 if candidate.get("embed", True):
@@ -233,7 +241,46 @@ class SimulationTests(_RunFixture):
         self.assertTrue(gap["eligible_after"])
         self.assertEqual(gap["rank_after"], 1)
         self.assertTrue(gap["within_deep_top_n"])
-        self.assertEqual(gap["verdict"], "flips-eligible-and-ranked")
+        # A lone flipping candidate ranks trivially, so the verdict is the
+        # degenerate-pool class rather than the informative ranked class.
+        self.assertTrue(gap["top_n_covers_pool"])
+        self.assertEqual(gap["verdict"], "flips-eligible-degenerate-pool")
+
+    def test_populated_frozen_mentioned_at_does_not_flip(self) -> None:
+        # The frozen artifact already carries mentioned_at, so the before-pool
+        # must reflect that value rather than blanking it: no spurious flip.
+        self._seed_db(
+            "q1",
+            [
+                {
+                    "id": 36,
+                    "category": "event",
+                    "mentioned_at": "2023-04-29",
+                    "source_message_ids": [1],
+                }
+            ],
+            messages={1: "2023-04-29 10:00:00"},
+        )
+        path = self._fixture(
+            [
+                self._question(
+                    "q1",
+                    [
+                        {
+                            "gap_id": "g1",
+                            "kind": "tier2-undated-event",
+                            "frozen_candidate_id": 36,
+                        }
+                    ],
+                )
+            ]
+        )
+
+        gap = self._simulate(path)[0]["gaps"][0]
+
+        self.assertTrue(gap["eligible_before"])
+        self.assertFalse(gap["mentioned_at_healed"])
+        self.assertEqual(gap["verdict"], "already-eligible")
 
     def test_unresolvable_sources_stay_ineligible(self) -> None:
         # The cited message does not exist, so no date can be derived: the
@@ -297,6 +344,68 @@ class SimulationTests(_RunFixture):
 
         self.assertTrue(gap["eligible_before"])
         self.assertEqual(gap["verdict"], "already-eligible")
+
+    def test_flip_in_degenerate_pool_is_reported_separately(self) -> None:
+        # A single flipping candidate ranks 1 trivially, so the flip says
+        # nothing about ranking. Reported as a degenerate-pool flip, distinct
+        # from the informative ranked class.
+        self._seed_db(
+            "q1",
+            [{"id": 36, "category": "event", "source_message_ids": [1]}],
+            messages={1: "2023-04-29 10:00:00"},
+        )
+        path = self._fixture(
+            [
+                self._question(
+                    "q1",
+                    [
+                        {
+                            "gap_id": "g1",
+                            "kind": "tier2-undated-event",
+                            "frozen_candidate_id": 36,
+                        }
+                    ],
+                )
+            ]
+        )
+
+        gap = self._simulate(path)[0]["gaps"][0]
+
+        self.assertTrue(gap["top_n_covers_pool"])
+        self.assertEqual(gap["verdict"], "flips-eligible-degenerate-pool")
+
+    def test_informative_flip_within_top_n(self) -> None:
+        # 16 healable event candidates overflow the default top-n slice, so the
+        # pool is informative. The strongest one flips eligible and ranks first.
+        candidates = [
+            {"id": index, "category": "event", "importance": 5, "source_message_ids": [1]}
+            for index in range(2, 17)
+        ]
+        candidates.insert(
+            0,
+            {"id": 1, "category": "event", "importance": 9, "source_message_ids": [1]},
+        )
+        self._seed_db("q1", candidates, messages={1: "2023-04-29 10:00:00"})
+        path = self._fixture(
+            [
+                self._question(
+                    "q1",
+                    [
+                        {
+                            "gap_id": "g1",
+                            "kind": "tier2-undated-event",
+                            "frozen_candidate_id": 1,
+                        }
+                    ],
+                )
+            ]
+        )
+
+        gap = self._simulate(path)[0]["gaps"][0]
+
+        self.assertFalse(gap["top_n_covers_pool"])
+        self.assertEqual(gap["rank_after"], 1)
+        self.assertEqual(gap["verdict"], "flips-eligible-and-ranked")
 
     def test_rank_outside_deep_top_n_is_reported_separately(self) -> None:
         # One low-importance gap candidate behind three stronger ones, with
@@ -429,6 +538,153 @@ class SimulationTests(_RunFixture):
             sha256(db_path.read_bytes()).hexdigest(),
         )
 
+    def test_source_sidecars_are_not_touched(self) -> None:
+        # A frozen WAL-mode artifact with its sidecars collapsed. Reading the
+        # source in mode=ro would re-create a -shm next to it, so the harness
+        # must open only the copy: the source dir stays byte-for-byte frozen.
+        db_path = self._seed_db(
+            "q1",
+            [{"id": 36, "category": "event", "source_message_ids": [1]}],
+            messages={1: "2023-04-29 10:00:00"},
+        )
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("UPDATE memory_candidates SET hit_count = 2 WHERE id = 36")
+            conn.commit()
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        for suffix in ("-wal", "-shm"):
+            sidecar = db_path.with_name(db_path.name + suffix)
+            if sidecar.exists():
+                sidecar.unlink()
+        before_files = {entry.name for entry in db_path.parent.iterdir()}
+        before_hash = sha256(db_path.read_bytes()).hexdigest()
+        path = self._fixture(
+            [
+                self._question(
+                    "q1",
+                    [
+                        {
+                            "gap_id": "g1",
+                            "kind": "tier2-undated-event",
+                            "frozen_candidate_id": 36,
+                        }
+                    ],
+                )
+            ]
+        )
+
+        self._simulate(path)
+
+        self.assertFalse(db_path.with_name(db_path.name + "-wal").exists())
+        self.assertFalse(db_path.with_name(db_path.name + "-shm").exists())
+        self.assertEqual({entry.name for entry in db_path.parent.iterdir()}, before_files)
+        self.assertEqual(sha256(db_path.read_bytes()).hexdigest(), before_hash)
+
+    def test_scoring_time_is_pool_max_last_seen_at(self) -> None:
+        self._seed_db(
+            "q1",
+            [
+                {
+                    "id": 1,
+                    "category": "event",
+                    "last_seen_at": "2023-06-01 00:00:00",
+                    "source_message_ids": [1],
+                },
+                {
+                    "id": 2,
+                    "category": "event",
+                    "last_seen_at": "2023-06-15 08:00:00",
+                    "source_message_ids": [1],
+                },
+            ],
+            messages={1: "2023-04-29 10:00:00"},
+        )
+        path = self._fixture([self._question("q1", [])])
+
+        result = self._simulate(path)[0]
+
+        self.assertEqual(result["scoring_time"], "2023-06-15T08:00:00+00:00")
+
+    def test_read_only_frozen_db_is_healed_on_a_writable_copy(self) -> None:
+        # A frozen provenance artifact chmod'd read-only (0444) must still heal:
+        # the copy has to be made user-writable before init_db writes to it.
+        db_path = self._seed_db(
+            "q1",
+            [{"id": 36, "category": "event", "source_message_ids": [1]}],
+            messages={1: "2023-04-29 10:00:00"},
+        )
+        frozen = [db_path]
+        for suffix in ("-wal", "-shm"):
+            sidecar = db_path.with_name(db_path.name + suffix)
+            if sidecar.exists():
+                frozen.append(sidecar)
+        for target in frozen:
+            # Restore write permission in cleanup so the tempdir can be removed.
+            self.addCleanup(os.chmod, target, 0o644)
+            os.chmod(target, 0o444)
+        path = self._fixture(
+            [
+                self._question(
+                    "q1",
+                    [
+                        {
+                            "gap_id": "g1",
+                            "kind": "tier2-undated-event",
+                            "frozen_candidate_id": 36,
+                        }
+                    ],
+                )
+            ]
+        )
+
+        gap = self._simulate(path)[0]["gaps"][0]
+
+        self.assertTrue(gap["mentioned_at_healed"])
+        self.assertEqual(gap["verdict"], "flips-eligible-degenerate-pool")
+
+    def test_scoring_time_is_deterministic_for_an_empty_pool(self) -> None:
+        # Every candidate is retired, so the deep-eligible pool is empty. The
+        # scoring clock must fall back to a fixed anchor, not wall-clock now, so
+        # identical reruns emit an identical scoring_time.
+        self._seed_db(
+            "q1",
+            [
+                {
+                    "id": 1,
+                    "category": "event",
+                    "retired": 1,
+                    "source_message_ids": [1],
+                }
+            ],
+            messages={1: "2023-04-29 10:00:00"},
+        )
+        path = self._fixture([self._question("q1", [])])
+
+        first = self._simulate(path)[0]
+        second = self._simulate(path)[0]
+
+        self.assertEqual(first["scoring_time"], second["scoring_time"])
+        self.assertEqual(first["scoring_time"], "1970-01-01T00:00:00+00:00")
+
+    def test_copy_question_db_copies_wal_sidecars(self) -> None:
+        source = self.root / "src"
+        source.mkdir()
+        db = source / "memory.db"
+        db.write_bytes(b"main")
+        db.with_name("memory.db-wal").write_bytes(b"wal")
+        db.with_name("memory.db-shm").write_bytes(b"shm")
+        dest = self.root / "dest"
+
+        copy_path = sim._copy_question_db(db, dest)
+
+        self.assertEqual(copy_path.read_bytes(), b"main")
+        self.assertEqual(
+            copy_path.with_name(copy_path.name + "-wal").read_bytes(), b"wal"
+        )
+        self.assertEqual(
+            copy_path.with_name(copy_path.name + "-shm").read_bytes(), b"shm"
+        )
+
     def test_pre_column_artifact_is_flagged_and_healed(self) -> None:
         # A genuinely pre-ADR-0037 artifact has no mentioned_at column at all.
         db_path = self._seed_db(
@@ -457,16 +713,99 @@ class SimulationTests(_RunFixture):
         result = self._simulate(path)[0]
 
         self.assertTrue(result["pre_mentioned_at_column"])
-        self.assertEqual(result["gaps"][0]["verdict"], "flips-eligible-and-ranked")
+        self.assertEqual(
+            result["gaps"][0]["verdict"], "flips-eligible-degenerate-pool"
+        )
+
+    def test_frozen_candidate_rows_handles_missing_needs_review(self) -> None:
+        # A genuinely old artifact: memory_candidates has neither needs_review
+        # nor mentioned_at. The pre-heal read runs before init_db adds either
+        # column, so it must guard both rather than raise OperationalError.
+        db_path = self.root / "old.db"
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute(
+                """
+                CREATE TABLE memory_candidates (
+                    id INTEGER PRIMARY KEY,
+                    category TEXT,
+                    occurred_at TEXT,
+                    promoted INTEGER,
+                    retired INTEGER,
+                    stale INTEGER
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO memory_candidates "
+                "(id, category, occurred_at, promoted, retired, stale) "
+                "VALUES (1, 'event', NULL, 0, 0, 0)"
+            )
+            conn.commit()
+
+        rows = sim.frozen_candidate_rows(db_path)
+
+        self.assertIn(1, rows)
+        self.assertFalse(rows[1]["needs_review"])
+        self.assertIsNone(rows[1]["mentioned_at"])
+        self.assertTrue(rows[1]["pre_mentioned_at_column"])
+
+    def test_healed_copy_stays_inside_workspace(self) -> None:
+        # A question_id carrying a path separator must not steer the healed
+        # copy out of the workspace: the destination has to be sanitized with
+        # _question_path_component, exactly as the source path is.
+        qid = "q1/../escape"
+        self._seed_db(
+            qid,
+            [{"id": 1, "category": "event", "source_message_ids": [1]}],
+            messages={1: "2023-04-29 10:00:00"},
+        )
+        path = self._fixture(
+            [
+                self._question(
+                    qid,
+                    [
+                        {
+                            "gap_id": "g1",
+                            "kind": "tier2-undated-event",
+                            "frozen_candidate_id": 1,
+                        }
+                    ],
+                )
+            ]
+        )
+        entries = sim.load_gap_fixture(path)
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+
+        sim.simulate_question(entries[0], workspace=workspace)
+
+        component = _question_path_component(qid)
+        self.assertTrue((workspace / component / "memory.db").exists())
+        # Nothing may be written outside the workspace TemporaryDirectory.
+        self.assertFalse((self.root / "escape").exists())
+
+
+class ModuleTests(TestCase):
+    def test_workspace_prefix_carries_no_tracker_id(self) -> None:
+        # The temp-workspace prefix must not smuggle a tracker id into scratch
+        # paths. The pattern is split so this test file stays boundary-clean.
+        self.assertIsNone(
+            re.search(r"(?i)\bC" + r"OA[-_]?\d+", sim._WORKSPACE_PREFIX)
+        )
 
 
 class CliTests(_RunFixture):
     def _seed_one(self) -> Path:
-        self._seed_db(
-            "q1",
-            [{"id": 36, "category": "event", "source_message_ids": [1]}],
-            messages={1: "2023-04-29 10:00:00"},
+        # An informative pool: 16 healable events overflow the top-n slice, so
+        # the named candidate's flip lands in the ranked class, not degenerate.
+        candidates = [
+            {"id": index, "category": "event", "importance": 5, "source_message_ids": [1]}
+            for index in range(1, 16)
+        ]
+        candidates.append(
+            {"id": 36, "category": "event", "importance": 9, "source_message_ids": [1]}
         )
+        self._seed_db("q1", candidates, messages={1: "2023-04-29 10:00:00"})
         return self._fixture(
             [
                 self._question(
@@ -493,6 +832,52 @@ class CliTests(_RunFixture):
         doc = json.loads((out_dir / "promotion_simulation_metrics.json").read_text())
         self.assertEqual(doc["summary"]["flips_eligible_and_ranked"], 1)
         self.assertIn("flips-eligible-and-ranked", (out_dir / "promotion_simulation_table.md").read_text())
+
+    def test_main_runs_only_requested_question(self) -> None:
+        self._seed_db(
+            "q1",
+            [{"id": 36, "category": "event", "source_message_ids": [1]}],
+            messages={1: "2023-04-29 10:00:00"},
+        )
+        self._seed_db(
+            "q2",
+            [{"id": 37, "category": "event", "source_message_ids": [1]}],
+            messages={1: "2023-04-29 10:00:00"},
+        )
+        path = self._fixture(
+            [
+                self._question(
+                    "q1",
+                    [
+                        {
+                            "gap_id": "g1",
+                            "kind": "tier2-undated-event",
+                            "frozen_candidate_id": 36,
+                        }
+                    ],
+                ),
+                self._question(
+                    "q2",
+                    [
+                        {
+                            "gap_id": "g2",
+                            "kind": "tier2-undated-event",
+                            "frozen_candidate_id": 37,
+                        }
+                    ],
+                ),
+            ]
+        )
+        out_dir = self.root / "out"
+
+        with redirect_stdout(StringIO()):
+            exit_code = sim.main(
+                ["--gaps", str(path), "--question-id", "q1", "--out", str(out_dir)]
+            )
+
+        self.assertEqual(exit_code, 0)
+        doc = json.loads((out_dir / "promotion_simulation_metrics.json").read_text())
+        self.assertEqual([q["question_id"] for q in doc["questions"]], ["q1"])
 
     def test_main_filters_by_question_id(self) -> None:
         path = self._seed_one()
