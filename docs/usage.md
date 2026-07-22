@@ -525,6 +525,40 @@ a read-only open of a WAL-mode run database may create or update `-wal`/`-shm`
 sidecars next to it, so byte-frozen provenance is the simulation harness's
 guarantee (it heals a copy), not the probe's.
 
+### Deep Backlog Replay
+
+`scripts/replay_deep_backlog.py` measures whether the promotion-eligible Tier-2
+backlog drains across successive Deep cycles or starves. It is read-only and
+provider-free over frozen LongMemEval run databases and takes the same gap
+fixture as the class-3 harnesses. It reconstructs each historical Deep cycle's
+candidate pool from the persisted `dream_runs`, `long_term_memory`, and
+`memory_dedup_events` tables -- there is no stored phase column, so the
+Light/REM/Deep timeline is rebuilt from each row's counter signature -- and then
+forward-simulates a quiescent drain of the healed final backlog to tell a
+transient end-of-run backlog apart from structural starvation during ingestion.
+Each question lands a drain verdict (`drained-during-run`,
+`backlog-at-run-end-transient`, `structural-starvation-during-ingestion`, or
+`no-deep-cycles`) and each tracked gap candidate lands its own
+(`promoted-historically`, `promotes-under-quiescence`, `undrained-at-round-cap`,
+or `never-eligible`).
+
+```bash
+uv run python scripts/replay_deep_backlog.py \
+  --gaps <gap-fixture>.json --out .eval-runs/<out-dir>
+```
+
+Artifacts: `deep_backlog_replay_metrics.json` and `deep_backlog_replay_table.md`.
+Like the promotion simulation, it copies each frozen database to a temporary
+directory and reads and heals only the copy, so the byte-frozen inputs are never
+opened. The reconstruction is bounded, not exact. The final-state
+`retired`/`stale`/`needs_review` flags approximate each historical cycle's pool.
+`rem_boost` history is unrecoverable, so every cycle is scored twice, bracketing
+each prediction between the final `rem_boost` and zero. Per-cycle `hit_count` is
+exact only through the `memory_dedup_events` merge decisions -- a database with no
+merge events reconstructs it trivially exactly. Deep's model-backed contradiction
+judge is not modeled. And the phase classification is signature-based, with a
+positional REM-before-Deep fallback for otherwise-ambiguous all-zero rows.
+
 ## Hosted MVP Shell
 
 The dependency-free hosted shell in `vexic.hosted` binds authenticated tenant
