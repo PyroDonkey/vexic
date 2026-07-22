@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sqlite3
 import sys
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import closing, redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from types import ModuleType
@@ -273,6 +274,38 @@ class CoverageTests(_RunFixture):
         self.assertFalse(result["answer_promoted_to_tier3"])
 
 
+class PreMigrationSchemaTests(_RunFixture):
+    def _hand_build_db(self, db_path: Path) -> None:
+        """A pre-migration artifact whose memory_candidates lacks needs_review.
+
+        Built by hand rather than via init_vector_memory so the column is
+        genuinely absent, the way an old frozen run DB is.
+        """
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute(
+                "CREATE TABLE long_term_memory "
+                "(fact_text TEXT, occurred_at TEXT, retired INTEGER)"
+            )
+            conn.execute(
+                "CREATE TABLE memory_candidates "
+                "(fact_text TEXT, retired INTEGER, stale INTEGER)"
+            )
+            conn.execute(
+                "INSERT INTO memory_candidates (fact_text, retired, stale) "
+                "VALUES ('User went camping at Yellowstone.', 0, 0)"
+            )
+            conn.commit()
+
+    def test_tier_texts_tolerates_missing_needs_review_column(self) -> None:
+        db_path = self._db_path("q1")
+        self._hand_build_db(db_path)
+
+        _facts, candidates = probe._tier_texts(db_path)
+
+        self.assertEqual(candidates, ["User went camping at Yellowstone."])
+
+
 class MatchesTests(_RunFixture):
     def test_matches_empty_tokens_returns_false(self) -> None:
         # Pins the empty-token guard in _matches: with no tokens nothing can be
@@ -345,6 +378,45 @@ class CliTests(_RunFixture):
                             "match_tokens": ["Yellowstone"],
                         }
                     ],
+                ),
+            ]
+        )
+        out_dir = self.root / "out"
+
+        with redirect_stdout(StringIO()):
+            exit_code = probe.main(
+                ["--gaps", str(path), "--question-id", "q1", "--out", str(out_dir)]
+            )
+
+        self.assertEqual(exit_code, 0)
+        doc = json.loads((out_dir / "class3_gap_probe.json").read_text())
+        self.assertEqual([q["question_id"] for q in doc["questions"]], ["q1"])
+
+    def test_targeted_question_skips_unselected_malformed_gap(self) -> None:
+        # A malformed UNSELECTED question must not abort a targeted probe:
+        # --question-id q1 validates only the entries it will probe, so q2's
+        # empty match_tokens is irrelevant here.
+        self._seed_db(
+            "q1",
+            [{"id": 1, "category": "fact", "source_message_ids": [1]}],
+            messages={1: "2023-04-29 10:00:00"},
+            facts=[{"id": 1, "fact_text": "User camped at Yellowstone."}],
+        )
+        path = self._fixture(
+            [
+                self._question(
+                    "q1",
+                    [
+                        {
+                            "gap_id": "g1",
+                            "kind": "tier2-undated-event",
+                            "match_tokens": ["Yellowstone"],
+                        }
+                    ],
+                ),
+                self._question(
+                    "q2",
+                    [{"gap_id": "g2", "kind": "transcript-only", "match_tokens": []}],
                 ),
             ]
         )

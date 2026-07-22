@@ -81,9 +81,10 @@ def _reject_empty_match_tokens(entries: list[Any]) -> None:
 
     An empty token list can never match (``_matches`` returns False), so it
     would silently classify as ``absent`` rather than covered -- a fixture
-    defect masquerading as a real miss. This is a load-path check: it fires
-    before any question is probed, and independently of ``--run-dir``, which
-    only turns a missing per-question DB into a reported skip.
+    defect masquerading as a real miss. It validates the entries that will be
+    probed (after any ``--question-id`` filter), fires before any question is
+    probed, and is independent of ``--run-dir``, which only turns a missing
+    per-question DB into a reported skip.
     """
     for entry in entries:
         for gap in entry.gaps:
@@ -118,11 +119,19 @@ def _tier_texts(db_path: Path) -> tuple[list[tuple[str, bool]], list[str]]:
 
     A fact counts as dated when it carries ``occurred_at`` (event time) or the
     derived ``mentioned_at`` provenance date (ADR 0037); a pre-migration
-    artifact has no ``mentioned_at`` column at all.
+    artifact has no ``mentioned_at`` column at all, and likewise may have no
+    ``needs_review`` column on ``memory_candidates`` (retired/stale predate
+    both, so those terms stay unconditional).
     """
     with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(long_term_memory)")}
         mentioned_at_select = "mentioned_at" if "mentioned_at" in columns else "NULL"
+        candidate_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(memory_candidates)")
+        }
+        needs_review_filter = (
+            "AND needs_review = 0" if "needs_review" in candidate_columns else ""
+        )
         facts = [
             (
                 str(row[0]),
@@ -136,10 +145,8 @@ def _tier_texts(db_path: Path) -> tuple[list[tuple[str, bool]], list[str]]:
         candidates = [
             str(row[0])
             for row in conn.execute(
-                """
-                SELECT fact_text FROM memory_candidates
-                WHERE retired = 0 AND stale = 0 AND needs_review = 0
-                """
+                "SELECT fact_text FROM memory_candidates "
+                f"WHERE retired = 0 AND stale = 0 {needs_review_filter}"
             )
         ]
     return facts, candidates
@@ -289,7 +296,6 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         entries = load_gap_fixture(args.gaps)
-        _reject_empty_match_tokens(entries)
     except GapFixtureError as exc:
         print(f"gap fixture error: {exc}", file=sys.stderr)
         return 2
@@ -300,6 +306,13 @@ def main(argv: list[str] | None = None) -> int:
         if missing:
             print(f"question ids not in fixture: {', '.join(missing)}", file=sys.stderr)
             return 2
+    # Validate only the entries that will be probed, and before any DB access:
+    # a malformed UNSELECTED question must not abort a targeted probe.
+    try:
+        _reject_empty_match_tokens(entries)
+    except GapFixtureError as exc:
+        print(f"gap fixture error: {exc}", file=sys.stderr)
+        return 2
 
     results: list[dict[str, Any]] = []
     skipped: list[str] = []
