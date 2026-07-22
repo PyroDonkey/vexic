@@ -294,6 +294,24 @@ class DreamCycleTimelineTests(_RunFixture):
 
         self.assertEqual([cycle.run_id for cycle in timeline.deep_cycles], [3])
 
+    def test_consecutive_deep_rows_do_not_collapse(self) -> None:
+        # Two clearly-Deep rows in a row: the earlier must not be consumed as the
+        # later's REM slot. A clearly-Deep earlier row emits its own DeepCycle, so
+        # the pair yields two cycles with both run_ids present.
+        db_path = self._seed(
+            dream_runs=[
+                {"id": 1, "promotions": 3},
+                {"id": 2, "promotions": 5},
+            ]
+        )
+
+        timeline = replay._dream_cycle_timeline(db_path)
+
+        self.assertEqual([cycle.run_id for cycle in timeline.deep_cycles], [1, 2])
+        self.assertEqual(
+            [cycle.promotions for cycle in timeline.deep_cycles], [3, 5]
+        )
+
     def test_error_rows_are_excluded(self) -> None:
         # A status='error' Deep row is a failed cycle and must not appear. It is
         # dropped before classification, so the surviving REM has no Deep pair.
@@ -413,15 +431,17 @@ class PromotionEventsTests(_RunFixture):
         self.assertEqual(attribution.by_candidate, {12: 0})
         self.assertTrue(attribution.attribution_consistent)
 
-    def test_out_of_interval_fact_is_unattributed_and_inconsistent(self) -> None:
-        # A promoted fact whose created_at falls in no Deep interval cannot be
-        # attributed. It lands in unattributed and breaks attribution_consistent.
+    def test_pre_first_cycle_fact_is_unattributed_and_inconsistent(self) -> None:
+        # A promoted fact created before the first Deep cycle's start cannot be
+        # attributed: Deep is the only long_term_memory writer, so a fact ahead
+        # of the first cycle signals corruption. It lands in unattributed and
+        # breaks attribution_consistent.
         db_path = self._seed(
             facts=[
                 {
                     "id": 70,
                     "promoted_from_candidate_id": 12,
-                    "created_at": "2023-06-01 23:00:00",
+                    "created_at": "2023-06-01 06:00:00",
                 }
             ]
         )
@@ -435,6 +455,30 @@ class PromotionEventsTests(_RunFixture):
         self.assertEqual(attribution.per_cycle_counts, [0])
         self.assertEqual(attribution.unattributed, [12])
         self.assertFalse(attribution.attribution_consistent)
+
+    def test_delayed_commit_after_finished_attributes_to_that_cycle(self) -> None:
+        # commit_deep_cycle persists facts after the run's finished_at is
+        # captured, so a delayed write can land past ceil(finished_at). The
+        # interval for cycle k is [floor(started_at_k), floor(started_at_{k+1})),
+        # so a fact created 3s after cycle 0's finished_at but before cycle 1
+        # starts still attributes to cycle 0.
+        db_path = self._seed(
+            facts=[
+                {"id": 1, "promoted_from_candidate_id": 11, "created_at": "2023-06-01 12:00:13"},
+                {"id": 2, "promoted_from_candidate_id": 13, "created_at": "2023-06-01 13:00:04"},
+            ]
+        )
+        cycles = [
+            _deep_cycle(3, "2023-06-01 12:00:00", "2023-06-01 12:00:10", promotions=1),
+            _deep_cycle(6, "2023-06-01 13:00:00", "2023-06-01 13:00:10", promotions=1),
+        ]
+
+        attribution = replay._promotion_events(db_path, cycles)
+
+        self.assertEqual(attribution.by_candidate, {11: 0, 13: 1})
+        self.assertEqual(attribution.per_cycle_counts, [1, 1])
+        self.assertEqual(attribution.unattributed, [])
+        self.assertTrue(attribution.attribution_consistent)
 
     def test_multi_cycle_counts_cross_check_passes(self) -> None:
         # Two Deep cycles, three facts split across them. Each cycle's attributed
@@ -618,6 +662,28 @@ class CandidateStateTests(_RunFixture):
 
         self.assertIsNotNone(at_promotion)
         self.assertIsNone(later)
+
+    def test_non_isoformat_message_stamp_is_skipped(self) -> None:
+        # Parser parity with production _earliest_date_from_timestamps: only
+        # datetime.fromisoformat is accepted (no permissive LongMemEval
+        # "%Y/%m/%d %H:%M" fallback). A candidate whose only source carries a
+        # slash-dated stamp stays undated rather than healing off a format
+        # production would never accept.
+        db_path = self._seed(
+            candidates=[
+                {
+                    "id": 5,
+                    "created_at": "2023-06-01 08:00:00",
+                    "source_message_ids": [1],
+                }
+            ],
+            messages={1: "2023/03/15 09:30"},
+        )
+
+        state = self._state_at(db_path, 5, "2023-06-10 00:00:00")
+
+        assert state is not None
+        self.assertIsNone(state.mentioned_at)
 
     def test_empty_source_message_ids_yields_none_mentioned_at(self) -> None:
         # A candidate citing no messages has no earliest-mention date to derive;
@@ -816,6 +882,42 @@ class ReplayCyclesTests(_RunFixture):
         self.assertEqual(second.newly_eligible_inflow, 2)
         self.assertTrue(second.saturated)
         self.assertEqual(second.backlog_after, 1)
+
+    def test_late_merged_source_not_healed_before_its_watermark(self) -> None:
+        # Anachronism gate: candidate 10's only source (message 5) sits above the
+        # early cycle's Light watermark (3) -- it was unioned in by a later merge.
+        # At cycle 0 the source is not yet processed, so no mentioned_at is
+        # derived and the undated event is excluded from the healed pool. The
+        # later cycle's watermark (9) covers message 5, so it heals there.
+        db_path = self._seed(
+            candidates=[
+                {
+                    "id": 10,
+                    "category": "event",
+                    "occurred_at": None,
+                    "mentioned_at": None,
+                    "source_message_ids": [5],
+                    "created_at": "2023-06-01 00:00:00",
+                }
+            ],
+            messages={5: "2023-03-01 00:00:00"},
+            dream_runs=[
+                {"id": 1, "last_processed_message_id": 3, "candidates_inserted": 1,
+                 "started_at": "2023-06-02 00:00:00"},
+                {"id": 2, "started_at": "2023-06-05 00:00:00",
+                 "finished_at": "2023-06-05 00:00:10", "retirements": 1},
+                {"id": 3, "last_processed_message_id": 9, "candidates_inserted": 1,
+                 "started_at": "2023-06-10 00:00:00"},
+                {"id": 4, "started_at": "2023-06-15 00:00:00",
+                 "finished_at": "2023-06-15 00:00:10", "retirements": 1},
+            ],
+        )
+
+        cycles = replay._replay_cycles(db_path, top_n=5)
+
+        self.assertEqual(len(cycles), 2)
+        self.assertEqual(cycles[0].healed_pool_size, 0)
+        self.assertEqual(cycles[1].healed_pool_size, 1)
 
     def test_rem_bracket_produces_two_prediction_sets(self) -> None:
         # rem_boost history is unrecoverable (F6), so each cycle is scored twice.
@@ -1288,6 +1390,68 @@ class MainEndToEndTests(_MainFixture):
 
         self.assertEqual(rc, 2)
 
+    def test_unknown_frozen_candidate_id_exits_two(self) -> None:
+        # A gap fixture naming a candidate absent from the run DB is stale; the
+        # harness fails loud (exit 2) rather than silently tracking nothing,
+        # matching the sibling promotion simulator.
+        fixture = self._write_fixture(
+            [
+                {
+                    "question_id": "q-stale",
+                    "seed": self._drained_seed(),
+                    "gaps": [
+                        {"gap_id": "g999", "kind": "tier2-miss", "frozen_candidate_id": 999},
+                    ],
+                }
+            ]
+        )
+
+        rc = replay.main(["--gaps", str(fixture)])
+
+        self.assertEqual(rc, 2)
+
+    def test_state_reconstruction_flags_exact_on_zero_merge_db(self) -> None:
+        # A zero-merge DB whose hit_count log reconciles reports
+        # state_reconstruction_exact True and hit_count_reconciles True.
+        fixture = self._write_fixture(
+            [{"question_id": "q-exact", "seed": self._drained_seed()}]
+        )
+        out = self.root / "out"
+
+        replay.main(["--gaps", str(fixture), "--out", str(out)])
+
+        doc = json.loads((out / "deep_backlog_replay_metrics.json").read_text())
+        summary = doc["questions"][0]["summary"]
+        self.assertTrue(summary["hit_count_reconciles"])
+        self.assertTrue(summary["state_reconstruction_exact"])
+
+    def test_hit_count_mismatch_fails_reconciliation(self) -> None:
+        # A candidate whose stored hit_count (1) disagrees with its merge
+        # events (one merge -> expected 2) fails hit_count_reconciles, and the
+        # merge event also forces state_reconstruction_exact False.
+        seed = {
+            "candidates": [
+                {"id": 1, "category": "fact", "created_at": "2023-06-01 00:00:00",
+                 "source_message_ids": [1]},
+            ],
+            "messages": {1: "2023-03-15 09:30:00"},
+            "dedup_events": [
+                {"id": 1, "candidate_id": 1, "created_at": "2023-06-02 00:00:00"},
+            ],
+            "dream_runs": [
+                {"id": 1, "last_processed_message_id": 5, "candidates_inserted": 1},
+            ],
+        }
+        fixture = self._write_fixture([{"question_id": "q-mismatch", "seed": seed}])
+        out = self.root / "out"
+
+        replay.main(["--gaps", str(fixture), "--out", str(out)])
+
+        doc = json.loads((out / "deep_backlog_replay_metrics.json").read_text())
+        summary = doc["questions"][0]["summary"]
+        self.assertFalse(summary["hit_count_reconciles"])
+        self.assertFalse(summary["state_reconstruction_exact"])
+
     def test_zero_deep_cycle_db_gets_no_deep_cycles_verdict(self) -> None:
         # A DB with only watermark-advancing Light runs and no Deep cycle must
         # not crash; its drain verdict is the defined no-deep-cycles sentinel.
@@ -1450,6 +1614,98 @@ class DrainVerdictTests(_MainFixture):
         self.assertIsNone(tracked["forward_promotes_at_round"])
         self.assertEqual(tracked["verdict"], "undrained-at-round-cap")
         self.assertEqual(doc["summary"]["undrained_at_round_cap"], 1)
+
+    def test_broken_attribution_gates_all_verdicts(self) -> None:
+        # When attribution is inconsistent (a promoted fact lands ahead of the
+        # first Deep cycle, signalling a corrupt reconstruction), the harness must
+        # not emit authoritative classifications: the drain verdict and every
+        # tracked candidate verdict are gated to unreliable-attribution, and the
+        # gating count is rolled up. This also pins precedence over the promoted
+        # flag (candidate 1 is promoted but unattributed).
+        seed = {
+            "candidates": [
+                {"id": 1, "category": "fact", "importance": 5,
+                 "created_at": "2023-06-01 00:00:00", "source_message_ids": [1],
+                 "promoted": 1, "promoted_fact_id": 100},
+            ],
+            "messages": {1: "2023-03-15 09:30:00"},
+            "dream_runs": [
+                {"id": 1, "last_processed_message_id": 5, "candidates_inserted": 1},
+                {"id": 2, "started_at": "2023-06-05 00:00:00",
+                 "finished_at": "2023-06-05 00:00:10", "promotions": 1},
+            ],
+            # Fact created before the first Deep cycle's start -> unattributed.
+            "facts": [
+                {"id": 100, "promoted_from_candidate_id": 1, "created_at": "2023-06-01 00:00:00"},
+            ],
+        }
+        fixture = self._write_fixture(
+            [
+                {
+                    "question_id": "q-gated",
+                    "seed": seed,
+                    "gaps": [
+                        {"gap_id": "g1", "kind": "tier2-miss", "frozen_candidate_id": 1},
+                    ],
+                }
+            ]
+        )
+        out = self.root / "out"
+
+        rc = replay.main(["--gaps", str(fixture), "--out", str(out), "--deep-top-n", "2"])
+
+        self.assertEqual(rc, 0)
+        doc = json.loads((out / "deep_backlog_replay_metrics.json").read_text())
+        question = doc["questions"][0]
+        self.assertFalse(question["summary"]["attribution_consistent"])
+        self.assertEqual(question["summary"]["drain_verdict"], "unreliable-attribution")
+        self.assertEqual(
+            question["tracked_candidates"][0]["verdict"], "unreliable-attribution"
+        )
+        self.assertEqual(doc["summary"]["unreliable_attribution"], 1)
+
+    def test_promoted_flag_without_attribution_is_promoted_unattributed(self) -> None:
+        # A tracked candidate whose final promoted flag is set but which
+        # attribution never placed in a Deep cycle (no matching fact row) lands
+        # the promoted-unattributed verdict -- distinct from never-eligible.
+        # Attribution stays consistent (the lone Deep cycle promotes nothing), so
+        # the gate does not fire and this specific branch is exercised.
+        seed = {
+            "candidates": [
+                {"id": 2, "category": "fact", "importance": 5,
+                 "created_at": "2023-06-01 00:00:00", "source_message_ids": [1],
+                 "promoted": 1, "promoted_fact_id": 100},
+            ],
+            "messages": {1: "2023-03-15 09:30:00"},
+            "dream_runs": [
+                {"id": 1, "last_processed_message_id": 5, "candidates_inserted": 1},
+                {"id": 2, "started_at": "2023-06-05 00:00:00",
+                 "finished_at": "2023-06-05 00:00:10", "retirements": 1},
+            ],
+        }
+        fixture = self._write_fixture(
+            [
+                {
+                    "question_id": "q-pu",
+                    "seed": seed,
+                    "gaps": [
+                        {"gap_id": "g2", "kind": "tier2-miss", "frozen_candidate_id": 2},
+                    ],
+                }
+            ]
+        )
+        out = self.root / "out"
+
+        rc = replay.main(["--gaps", str(fixture), "--out", str(out), "--deep-top-n", "2"])
+
+        self.assertEqual(rc, 0)
+        doc = json.loads((out / "deep_backlog_replay_metrics.json").read_text())
+        question = doc["questions"][0]
+        self.assertTrue(question["summary"]["attribution_consistent"])
+        tracked = question["tracked_candidates"][0]
+        self.assertIsNone(tracked["promoted_at_cycle"])
+        self.assertEqual(tracked["verdict"], "promoted-unattributed")
+        self.assertEqual(doc["summary"]["promoted_unattributed"], 1)
 
     def test_inflow_at_or_above_top_n_is_structural_starvation(self) -> None:
         # Two Deep cycles; each cycle sees >= top_n newly-eligible candidates

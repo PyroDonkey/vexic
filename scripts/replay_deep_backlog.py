@@ -20,9 +20,11 @@ LIMITATIONS:
     REM -> Deep cycle, and flagged ``phase_inferred``. A genuinely ambiguous
     trailing REM-without-Deep row is only distinguishable when it carries a
     boost signature.
-  * Attribution joins fact ``created_at`` (second-truncated) into Deep-run
-    intervals whose bounds carry microseconds, so bounds are floored/ceiled to
-    the second before comparison.
+  * Attribution spans each Deep cycle's start to the next cycle's start
+    (half-open, the last cycle unbounded above) because ``commit_deep_cycle``
+    persists promoted facts after the run's ``finished_at`` is captured. Cycle
+    starts are floored to the second since fact ``created_at`` is
+    second-truncated while run bounds carry microseconds.
 """
 
 from __future__ import annotations
@@ -206,35 +208,42 @@ def _pair_tail(tail: list[_DreamRow]) -> list[DeepCycle]:
         deep_tail = tail
     cycles: list[DeepCycle] = []
     index = len(deep_tail)
-    while index >= 2:
+    while index >= 1:
         deep = deep_tail[index - 1]
-        rem = deep_tail[index - 2]
-        inferred = deep.phase == "ambiguous" or rem.phase == "ambiguous"
-        cycles.append(
-            DeepCycle(
-                run_id=deep.run_id,
-                started_at=deep.started_at,
-                finished_at=deep.finished_at,
-                promotions=deep.promotions,
-                retirements=deep.retirements,
-                phase_inferred=inferred,
+        earlier = deep_tail[index - 2] if index >= 2 else None
+        # The earlier row is only this Deep's REM slot when it is genuinely a REM
+        # (boost signature) or an all-zero ambiguous row. Two consecutive
+        # clearly-Deep rows must not collapse: a clearly-Deep earlier row keeps
+        # its own cycle, so it is not consumed here.
+        if earlier is not None and earlier.phase in ("rem", "ambiguous"):
+            inferred = deep.phase == "ambiguous" or earlier.phase == "ambiguous"
+            cycles.append(
+                DeepCycle(
+                    run_id=deep.run_id,
+                    started_at=deep.started_at,
+                    finished_at=deep.finished_at,
+                    promotions=deep.promotions,
+                    retirements=deep.retirements,
+                    phase_inferred=inferred,
+                )
             )
-        )
-        index -= 2
-    # A single leftover Deep (clearly a Deep with no paired REM) still counts;
-    # a single leftover ambiguous row is treated as a no-op Light, not a Deep.
-    if index == 1 and deep_tail[0].phase == "deep":
-        deep = deep_tail[0]
-        cycles.append(
-            DeepCycle(
-                run_id=deep.run_id,
-                started_at=deep.started_at,
-                finished_at=deep.finished_at,
-                promotions=deep.promotions,
-                retirements=deep.retirements,
-                phase_inferred=False,
+            index -= 2
+            continue
+        # No REM partner (the earlier row is clearly Deep, or there is none). A
+        # clearly-Deep row still counts as its own cycle; a lone ambiguous row is
+        # a superseded no-op Light and produces nothing.
+        if deep.phase == "deep":
+            cycles.append(
+                DeepCycle(
+                    run_id=deep.run_id,
+                    started_at=deep.started_at,
+                    finished_at=deep.finished_at,
+                    promotions=deep.promotions,
+                    retirements=deep.retirements,
+                    phase_inferred=False,
+                )
             )
-        )
+        index -= 1
     cycles.reverse()
     return cycles
 
@@ -282,27 +291,29 @@ def _floor_second(value: datetime) -> datetime:
     return value.replace(microsecond=0)
 
 
-def _ceil_second(value: datetime) -> datetime:
-    if value.microsecond == 0:
-        return value
-    return value.replace(microsecond=0) + timedelta(seconds=1)
-
-
 def _promotion_events(
     conn_or_path: ConnOrPath, deep_cycles: list[DeepCycle]
 ) -> PromotionAttribution:
     """Attribute each promoted fact to the Deep cycle that created it (F3).
 
-    Fact ``created_at`` is second-truncated while a Deep run's interval bounds
-    carry microseconds, so the interval is floored at ``started_at`` and ceiled
-    at ``finished_at`` before the inclusive membership test.
+    ``commit_deep_cycle`` persists a promoted fact *after* the run's
+    ``finished_at`` is captured, so a delayed write can land past
+    ``ceil(finished_at)`` and would spuriously unattribute against the run
+    interval. Deep promotion is the only ``long_term_memory`` writer, so
+    anything between cycle k's start and cycle k+1's start belongs to k: cycle k
+    owns ``[floor(started_at_k), floor(started_at_{k+1}))`` for every cycle but
+    the last, and the last cycle owns ``[floor(started_at), unbounded)``. A fact
+    created before the first cycle's start stays unattributed (it signals
+    corruption). ``started_at`` is floored to the second because fact
+    ``created_at`` is second-truncated while run bounds carry microseconds.
     """
-    intervals: list[tuple[datetime, datetime]] = []
-    for cycle in deep_cycles:
-        start = _floor_second(_timestamp_datetime(cycle.started_at))
-        finished = cycle.finished_at if cycle.finished_at is not None else cycle.started_at
-        end = _ceil_second(_timestamp_datetime(finished))
-        intervals.append((start, end))
+    starts = [_floor_second(_timestamp_datetime(cycle.started_at)) for cycle in deep_cycles]
+    # Half-open intervals [start_k, start_{k+1}); the last cycle is unbounded
+    # above (None end) so a delayed commit past its finished_at still lands in it.
+    intervals: list[tuple[datetime, datetime | None]] = [
+        (starts[index], starts[index + 1] if index + 1 < len(starts) else None)
+        for index in range(len(starts))
+    ]
 
     with _connection(conn_or_path) as conn:
         rows = conn.execute(
@@ -320,7 +331,9 @@ def _promotion_events(
         created = _timestamp_datetime(str(created_at))
         assigned: int | None = None
         for index, (start, end) in enumerate(intervals):
-            if start <= created <= end:
+            if created < start:
+                continue
+            if end is None or created < end:
                 assigned = index
                 break
         if assigned is None:
@@ -468,22 +481,44 @@ def _load_message_times(conn: sqlite3.Connection) -> dict[int, str]:
 def _derive_mentioned_at(
     source_message_ids: Sequence[int],
     message_times: Mapping[int, str],
+    *,
+    watermark: int | None = None,
 ) -> str | None:
     """Earliest cited-message calendar date, date-only ISO (ADR 0037 semantics).
 
     Derived provenance, never model output: a pure function of
-    ``source_message_ids`` over ``messages``. Missing or unparseable message
-    stamps are skipped (fail-soft, matching the production backfill); an empty
-    or fully-unresolvable citation set yields ``None``.
+    ``source_message_ids`` over ``messages``. Parser parity with production's
+    ``_earliest_date_from_timestamps`` (storage/schema.py) is exact -- only
+    ``datetime.fromisoformat`` is accepted (never the permissive LongMemEval
+    ``%Y/%m/%d %H:%M`` fallback ``_timestamp_datetime`` allows), a naive stamp is
+    read as UTC while an aware stamp is converted to UTC, and each stamp
+    fail-softs on ``(ValueError, OverflowError)`` so a single unparseable message
+    is skipped rather than aborting. An empty or fully-unresolvable citation set
+    yields ``None``.
+
+    ``watermark`` is the anachronism gate: a later merge can union in an
+    earlier-dated source message, which would make an early cycle look healed
+    before that source was ever cited. When a watermark is supplied, only source
+    message ids at or below it (the transcript Light had processed by the cycle)
+    are considered; ``None`` disables the gate so every cited message counts.
     """
     earliest: datetime | None = None
     for message_id in source_message_ids:
+        if watermark is not None and int(message_id) > watermark:
+            continue
         raw = message_times.get(int(message_id))
         if raw is None:
             continue
+        text = str(raw).strip()
+        if not text:
+            continue
         try:
-            parsed = _timestamp_datetime(str(raw))
-        except ValueError:
+            parsed = datetime.fromisoformat(text)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            else:
+                parsed = parsed.astimezone(timezone.utc)
+        except (ValueError, OverflowError):
             continue
         if earliest is None or parsed < earliest:
             earliest = parsed
@@ -498,6 +533,7 @@ def _candidate_state_at(
     merge_events: Sequence[datetime],
     message_times: Mapping[int, str],
     promoted_at_cycle: int | None,
+    watermark: int | None = None,
 ) -> CandidateState | None:
     """Exact state of ``candidate`` at Deep cycle ``cycle_index`` (F5).
 
@@ -505,7 +541,10 @@ def _candidate_state_at(
     created after ``started_at``, or it was already promoted in an earlier
     cycle (``promoted_at_cycle < cycle_index``). Otherwise ``hit_count`` is
     ``1 + merges landed by T`` and ``last_seen_at`` is the latest such merge
-    (else the candidate's own ``created_at``).
+    (else the candidate's own ``created_at``). ``watermark`` bounds the
+    per-cycle ``mentioned_at`` derivation to the transcript Light had already
+    processed, so a later-merged earlier source cannot heal an early cycle
+    anachronistically.
     """
     if candidate.created_at > started_at:
         return None
@@ -518,7 +557,9 @@ def _candidate_state_at(
         candidate_id=candidate.candidate_id,
         hit_count=hit_count,
         last_seen_at=last_seen_at,
-        mentioned_at=_derive_mentioned_at(candidate.source_message_ids, message_times),
+        mentioned_at=_derive_mentioned_at(
+            candidate.source_message_ids, message_times, watermark=watermark
+        ),
     )
 
 
@@ -643,6 +684,25 @@ def _top_from_ranks(ranks: Mapping[int, int], top_n: int) -> list[int]:
     ]
 
 
+def _watermark_at(light_runs: Sequence[LightRun], started_at: datetime) -> int | None:
+    """Highest Light watermark reached at or before a Deep cycle's ``started_at``.
+
+    The anachronism gate (F4b): only source messages Light had processed before
+    the cycle should count toward a per-cycle ``mentioned_at``. Light watermarks
+    are strictly increasing, so the max among runs whose ``finished_at`` precedes
+    the cycle is the transcript boundary. Returns ``None`` when no Light run
+    finished by then (a synthetic Deep-only DB), which disables the gate so a
+    zero-merge reconstruction is byte-identical to the pre-gate behavior.
+    """
+    reached: int | None = None
+    for run in light_runs:
+        if run.finished_at is None:
+            continue
+        if _timestamp_datetime(run.finished_at) <= started_at:
+            reached = run.watermark if reached is None else max(reached, run.watermark)
+    return reached
+
+
 def _replay_cycles(
     conn_or_path: ConnOrPath,
     *,
@@ -678,6 +738,7 @@ def _replay_cycles(
     previous_healed_ids: set[int] = set()
     for cycle_index, cycle in enumerate(timeline.deep_cycles):
         started = _timestamp_datetime(cycle.started_at)
+        watermark = _watermark_at(timeline.light_runs, started)
         actual_ids = {
             candidate_id
             for candidate_id, index in attribution.by_candidate.items()
@@ -698,6 +759,7 @@ def _replay_cycles(
                 merge_events=merge_events.get(candidate.candidate_id, []),
                 message_times=message_times,
                 promoted_at_cycle=attribution.by_candidate.get(candidate.candidate_id),
+                watermark=watermark,
             )
             if state is None:
                 continue
@@ -941,6 +1003,28 @@ def _merge_event_count(conn: sqlite3.Connection) -> int:
     return int(row[0]) if row is not None else 0
 
 
+def _hit_count_reconciles(conn: sqlite3.Connection) -> bool:
+    """Every candidate's stored ``hit_count`` equals ``1 + its merge events``.
+
+    Reconstruction-exactness check: a candidate is inserted at
+    ``hit_count=1`` and each ``decision='merge'`` dedup event targeting it
+    reinforces by one, so the stored count must equal ``1 + merge events`` for
+    *every* candidate. A mismatch means the persisted state and the dedup-event
+    log disagree, so per-cycle ``hit_count`` reconstruction cannot be trusted.
+    """
+    merge_counts: dict[int, int] = {}
+    for (candidate_id,) in conn.execute(
+        "SELECT candidate_id FROM memory_dedup_events WHERE decision = 'merge'"
+    ):
+        merge_counts[int(candidate_id)] = merge_counts.get(int(candidate_id), 0) + 1
+    for candidate_id, hit_count in conn.execute(
+        "SELECT id, hit_count FROM memory_candidates"
+    ):
+        if int(hit_count) != 1 + merge_counts.get(int(candidate_id), 0):
+            return False
+    return True
+
+
 def _as_run_backlog(candidates: Sequence[_ReplayCandidate]) -> int:
     """Final as-run eligible-but-unpromoted count (stored ``mentioned_at``).
 
@@ -978,18 +1062,24 @@ def _median_inter_cycle_gap_days(started_ats: Sequence[str]) -> float:
 
 def _drain_verdict(
     *,
+    attribution_consistent: bool,
     deep_cycles: int,
     final_backlog_healed: int,
     structural_starvation: bool,
 ) -> str:
     """Classify the backlog outcome from the measured series, not the forward sim.
 
-    Per F9 the forward drain is near-tautological alone, so "transient" is never
-    inferred from it: a run that actually cleared its healed backlog is
-    ``drained-during-run``; a run whose per-cycle inflow structurally outpaces the
-    cap (mean inflow >= top_n) is ``structural-starvation-during-ingestion``; any
-    remaining backlog with sub-cap inflow is ``backlog-at-run-end-transient``.
+    Gating first: when attribution is inconsistent the per-cycle reconstruction
+    is untrustworthy, so no authoritative backlog classification is emitted --
+    the verdict is ``unreliable-attribution``. Otherwise, per F9 the forward
+    drain is near-tautological alone, so "transient" is never inferred from it: a
+    run that actually cleared its healed backlog is ``drained-during-run``; a run
+    whose per-cycle inflow structurally outpaces the cap (mean inflow >= top_n)
+    is ``structural-starvation-during-ingestion``; any remaining backlog with
+    sub-cap inflow is ``backlog-at-run-end-transient``.
     """
+    if not attribution_consistent:
+        return "unreliable-attribution"
     if deep_cycles == 0:
         return "no-deep-cycles"
     if final_backlog_healed <= 0:
@@ -1001,19 +1091,32 @@ def _drain_verdict(
 
 def _tracked_candidate_verdict(
     *,
+    attribution_consistent: bool,
     promoted_at_cycle: int | None,
+    promoted_flag: bool,
     forward_promotes_at_round: int | None,
     undrained_at_round_cap: bool,
 ) -> str:
     """Classify one tracked gap candidate (measurement, not forward sim alone).
 
-    ``undrained_at_round_cap`` distinguishes an eligible candidate the forward
-    round cap cut off (present in ``ForwardSimulation.unassigned``) from one the
-    ``_deep_eligible`` gate rejects outright: the former would still drain given
-    more rounds, so it must not be mislabeled ``never-eligible``.
+    Precedence: ``unreliable-attribution`` > ``promoted-historically`` >
+    ``promoted-unattributed`` > ``promotes-under-quiescence`` >
+    ``undrained-at-round-cap`` > ``never-eligible``. Gating first -- an
+    inconsistent attribution reconstruction cannot support an authoritative
+    per-candidate verdict. ``promoted-unattributed`` catches a candidate whose
+    final promoted flag (or ``promoted_fact_id``) is set but which attribution
+    never placed in a Deep cycle, so it is not silently demoted to
+    ``never-eligible``. ``undrained-at-round-cap`` distinguishes an eligible
+    candidate the forward round cap cut off (present in
+    ``ForwardSimulation.unassigned``) from one the ``_deep_eligible`` gate
+    rejects outright: the former would still drain given more rounds.
     """
+    if not attribution_consistent:
+        return "unreliable-attribution"
     if promoted_at_cycle is not None:
         return "promoted-historically"
+    if promoted_flag:
+        return "promoted-unattributed"
     if forward_promotes_at_round is not None:
         return "promotes-under-quiescence"
     if undrained_at_round_cap:
@@ -1045,8 +1148,10 @@ def _tracked_candidate_result(
     *,
     cycles: list[CycleReplay],
     promoted_at_cycle: int | None,
+    promoted_flag: bool,
     forward: ForwardSimulation,
     top_n: int,
+    attribution_consistent: bool,
 ) -> dict[str, Any]:
     """Per-tracked-candidate record: trajectory both modes + verdict."""
     trajectory = []
@@ -1081,7 +1186,9 @@ def _tracked_candidate_result(
         "forward_promotes_at_round": forward_round,
         "starved_while_ingesting": starved,
         "verdict": _tracked_candidate_verdict(
+            attribution_consistent=attribution_consistent,
             promoted_at_cycle=promoted_at_cycle,
+            promoted_flag=promoted_flag,
             forward_promotes_at_round=forward_round,
             undrained_at_round_cap=undrained_at_round_cap,
         ),
@@ -1128,7 +1235,29 @@ def replay_question(
     with _connection(as_run_copy) as conn:
         as_run_candidates = _load_replay_candidates(conn)
         merge_event_count = _merge_event_count(conn)
+        hit_count_reconciles = _hit_count_reconciles(conn)
     final_backlog_as_run = _as_run_backlog(as_run_candidates)
+    candidate_ids = {candidate.candidate_id for candidate in as_run_candidates}
+    # Final promoted flag per candidate: the promoted boolean or a non-null
+    # promoted_fact_id. Threaded to the tracked verdict so a candidate promoted
+    # per its flags but unplaced by attribution is not read as never-eligible.
+    promoted_flags = {
+        candidate.candidate_id: (
+            candidate.promoted or candidate.promoted_fact_id is not None
+        )
+        for candidate in as_run_candidates
+    }
+
+    # A gap fixture that names a candidate absent from this DB is stale; fail
+    # loud (sibling harness behavior) rather than silently tracking nothing.
+    for gap in entry.gaps:
+        if gap.frozen_candidate_id is None:
+            continue
+        if gap.frozen_candidate_id not in candidate_ids:
+            raise GapFixtureError(
+                f"question {entry.question_id}: gap {gap.gap_id} names candidate "
+                f"{gap.frozen_candidate_id}, which is not in {db_path}"
+            )
 
     # Healed leg: second copy, init_db backfill, quiescent forward drain.
     healed_copy = _copy_question_db(db_path, workspace / component / "healed")
@@ -1175,7 +1304,15 @@ def replay_question(
         "forward_cycle_gap_days": gap_days,
         "forward_rounds_to_drain": forward_rounds_to_drain,
         "attribution_consistent": attribution.attribution_consistent,
+        # Reconstruction-exactness. When merges exist, final-state
+        # importance/occurred_at/source_message_ids are approximations, so
+        # state_reconstruction_exact tells readers the per-cycle pool is bounded,
+        # not exact; it is true only for a zero-merge DB whose hit_count log
+        # reconciles.
+        "hit_count_reconciles": hit_count_reconciles,
+        "state_reconstruction_exact": merge_event_count == 0 and hit_count_reconciles,
         "drain_verdict": _drain_verdict(
+            attribution_consistent=attribution.attribution_consistent,
             deep_cycles=deep_cycles,
             final_backlog_healed=final_backlog_healed,
             structural_starvation=structural_starvation,
@@ -1187,8 +1324,10 @@ def replay_question(
             candidate_id,
             cycles=cycles,
             promoted_at_cycle=attribution.by_candidate.get(candidate_id),
+            promoted_flag=bool(promoted_flags.get(candidate_id, False)),
             forward=forward,
             top_n=top_n,
+            attribution_consistent=attribution.attribution_consistent,
         )
         for candidate_id in tracked_ids
     ]
@@ -1275,9 +1414,16 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
             "structural-starvation-during-ingestion"
         ),
         "no_deep_cycles": verdicts.count("no-deep-cycles"),
+        # Attribution gating can appear at both granularities: this key
+        # counts the questions whose drain verdict was gated. Every tracked
+        # candidate under a gated question is gated too, visible per-candidate.
+        "unreliable_attribution": verdicts.count("unreliable-attribution"),
         "tracked_candidates": len(tracked),
         "promoted_historically": sum(
             1 for candidate in tracked if candidate["verdict"] == "promoted-historically"
+        ),
+        "promoted_unattributed": sum(
+            1 for candidate in tracked if candidate["verdict"] == "promoted-unattributed"
         ),
         "promotes_under_quiescence": sum(
             1 for candidate in tracked if candidate["verdict"] == "promotes-under-quiescence"
