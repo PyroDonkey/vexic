@@ -472,3 +472,49 @@ def test_live_adapter_judge_agent_rejects_passed_secrets(
         adapter.build_longmemeval_recall_judge_agent(
             "claude", secrets={"OPENROUTER_API_KEY": "x"}
         )
+
+
+def _extraction_instructions_normalized() -> str:
+    """Extraction instructions, lowercased with whitespace collapsed.
+
+    The prompt is hard-wrapped prose, so a rule can straddle a line break.
+    Asserting on the collapsed form lets these tests pin the *rule* rather
+    than the current line wrapping (ADR 0039, option A).
+    """
+    import re
+
+    adapter = _load_adapter()
+    return re.sub(r"\s+", " ", adapter.EXTRACTION_INSTRUCTIONS.lower()).strip()
+
+
+def test_extraction_instructions_route_named_entities_into_subject() -> None:
+    # ADR 0039: the extraction prompt gave no guidance on the subject field, so
+    # the model emitted "User" for nearly every fact and real entities never
+    # got their own bucket. The prompt must name the subject field and tell the
+    # model to use the specific named entity a fact is about.
+    instructions = _extraction_instructions_normalized()
+
+    assert "subject" in instructions
+    assert "named entity" in instructions
+
+
+def test_extraction_instructions_reserve_user_subject_for_user_scoped_facts() -> None:
+    # The other half of ADR 0039 option A: "User" must stop being the default
+    # bucket. The prompt has to say the subject "User" is reserved for facts
+    # genuinely about the user themselves.
+    instructions = _extraction_instructions_normalized()
+
+    assert "reserve" in instructions
+    assert '"user"' in instructions
+    assert "about the user themselves" in instructions
+
+
+def test_extraction_instructions_keep_fact_text_self_contained_under_subject_guidance() -> None:
+    # Failure mode the subject guidance could introduce: the model treats
+    # subject as where the entity lives and drops it from fact_text, which is
+    # the field retrieval and scoring actually read. Subject is a key, not a
+    # substitute for the statement.
+    instructions = _extraction_instructions_normalized()
+
+    assert "fact_text" in instructions
+    assert "self-contained" in instructions

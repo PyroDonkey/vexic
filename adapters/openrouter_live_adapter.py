@@ -41,6 +41,12 @@ _EMBED_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 # projects, stack, and working preferences. The instructions name that shape
 # explicitly and narrow the empty-list escape to transcripts that establish
 # nothing durable at all.
+#
+# The subject paragraph is ADR 0039 option A. With no guidance on the field at
+# all, the model emitted "User" for nearly every fact, collapsing real entities
+# into one bucket; the normalizations shipped alongside that ADR only fold
+# case/whitespace variants of a token, so the mega-bucket itself is prompt
+# work. Subject stays a plain string -- no contract or schema change.
 EXTRACTION_INSTRUCTIONS = """\
 Extract durable facts about the user from the transcript.
 Durable user facts are stated directly ("I use uv for all my projects") or
@@ -57,6 +63,15 @@ about the user or their projects. Ground every fact in what the user said or
 asked for, not in what the assistant did on its own.
 Use the closed category vocabulary exactly: preference, fact, goal, event,
 relationship, skill, constraint, context.
+Set subject to whoever or whatever the fact is actually about. When a fact is
+about a specific named entity -- a person, pet, place, organization, product,
+or tool -- the subject is that entity's own name ("Rachel", "Luna",
+"AutoCAD LT 2013"), not the user.
+Reserve the subject "User" for facts that are genuinely about the user
+themselves -- their own preferences, goals, skills, and constraints -- and
+write it exactly as "User", never a synonym such as "the user".
+Subject is a key, not a substitute for the statement: keep fact_text
+self-contained and name the entity in it as well.
 Every candidate must include source_message_ids from the [message_id=N] markers.
 Because every fact is grounded in the user, source_message_ids must include
 at least one User message -- the request or correction that establishes the
