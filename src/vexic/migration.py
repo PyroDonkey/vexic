@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage import init_db, init_vector_memory
 from vexic.storage.operators import MemoryProjectionRepairReport, repair_memory_projections
+from vexic.storage.schema import CANONICAL_TABLES
 from vexic.storage.connection import (
     StorageTarget,
     _is_libsql_target,
@@ -22,20 +23,6 @@ from vexic.storage.connection import (
 
 ARTIFACT_VERSION = "vexic.canonical-migration.v1"
 MIGRATION_METADATA_TABLE = "canonical_migration_imports"
-
-CANONICAL_TABLES = (
-    "messages",
-    "source_transcript_ledger",
-    "memory_candidates",
-    "memory_dedup_events",
-    "dream_runs",
-    "long_term_memory",
-    "retrieval_events",
-    "candidate_retrieval_events",
-    "scope_tombstones",
-    "promotion_labels",
-    "session_summaries",
-)
 
 VEXIC_PROJECTION_TABLES = frozenset(
     {

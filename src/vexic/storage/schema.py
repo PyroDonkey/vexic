@@ -72,6 +72,26 @@ CATEGORY_CHECK = (
     "'relationship', 'skill', 'constraint', 'context')"
 )
 
+# The canonical (source-of-truth) memory tables. FTS and embedding tables are
+# deliberately absent: those are rebuildable projections, not source of truth.
+# All but ``memory_dedup_events`` are created by ``init_db``; that one belongs to
+# the vector schema and arrives with ``init_vector_memory``. Lives here rather
+# than in the migration module so operator tooling can check a database for
+# completeness without importing back through it.
+CANONICAL_TABLES = (
+    "messages",
+    "source_transcript_ledger",
+    "memory_candidates",
+    "memory_dedup_events",
+    "dream_runs",
+    "long_term_memory",
+    "retrieval_events",
+    "candidate_retrieval_events",
+    "scope_tombstones",
+    "promotion_labels",
+    "session_summaries",
+)
+
 
 def _fts_match_query(query: str) -> str | None:
     # Shared FTS5 MATCH sanitizer: free-text queries may contain FTS operators
