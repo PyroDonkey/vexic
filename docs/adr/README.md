@@ -186,7 +186,10 @@ Notes:
   sequenced after COA-414 so its ablation control is not rebaselined; a separate
   `entity` field (option B) stays evidence-gated behind COA-351. The real 96%
   `User` mega-bucket and the `the user` synonym are extraction-driven and do not
-  move under normalization alone.
+  move under normalization alone. Option A has since landed under COA-419 --
+  `EXTRACTION_INSTRUCTIONS` now routes named entities into `subject` and
+  reserves `"User"` for user-scoped facts -- with its live impact measurement
+  still deferred.
 - These numbers are the Vexic `docs/adr/` series and are self-contained.
   `src/vexic` source no longer carries any `upstream ADR-00NN` extraction-source
   labels (they were removed when the COA boundary policy was clarified), so there

@@ -113,6 +113,17 @@ touches no extraction code, no contract, and no schema.
   measures whether the prompt guidance actually reduced the bucket. Under B/C
   it stays explicitly deferred, satisfying the COA-415 acceptance clause's "or
   explicitly deferred" branch.
+- **Option A landed under COA-419** once COA-414 released the ablation control.
+  `EXTRACTION_INSTRUCTIONS` (`adapters/openrouter_live_adapter.py`) now names
+  the `subject` field: a fact about a specific named entity takes that entity's
+  own name, `"User"` is reserved for genuinely user-scoped facts and spelled
+  exactly (closing the `the user` synonym at the source), and `fact_text` must
+  stay self-contained so the entity is not moved out of the field retrieval
+  reads. Prompt layer only -- `subject` is still a plain contract string, and
+  option B remains evidence-gated behind COA-351. The guidance is pinned by
+  semantic assertions in `tests/test_host_live_adapter.py`; the live rerun that
+  would show whether `distinct_subjects` actually rises is provider-budgeted
+  and remains unrun, so the impact metric is still unmeasured.
 - Regression coverage: a same-entity case/whitespace variant now merges, and
   distinct subjects with identical vectors still do not over-merge
   (`tests/test_pipeline.py`); the histogram folds case/whitespace variants into
