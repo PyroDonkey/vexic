@@ -186,10 +186,12 @@ Notes:
   sequenced after COA-414 so its ablation control is not rebaselined; a separate
   `entity` field (option B) stays evidence-gated behind COA-351. The real 96%
   `User` mega-bucket and the `the user` synonym are extraction-driven and do not
-  move under normalization alone. Option A has since landed under COA-419 --
-  `EXTRACTION_INSTRUCTIONS` now routes named entities into `subject` and
-  reserves `"User"` for user-scoped facts -- with its live impact measurement
-  still deferred.
+  move under normalization alone. Option A landed under COA-419:
+  `EXTRACTION_INSTRUCTIONS` routes named entities into `subject`, reserves
+  `"User"` for user-scoped facts, and keeps unnamed user work under `"User"`
+  instead of an invented label. Its effect on the bucket is a separate
+  measurement gate -- a live eval rerun through `longmemeval_analysis.py` --
+  which the prompt change does not itself satisfy.
 - These numbers are the Vexic `docs/adr/` series and are self-contained.
   `src/vexic` source no longer carries any `upstream ADR-00NN` extraction-source
   labels (they were removed when the COA boundary policy was clarified), so there

@@ -70,6 +70,10 @@ or tool -- the subject is that entity's own name ("Rachel", "Luna",
 Reserve the subject "User" for facts that are genuinely about the user
 themselves -- their own preferences, goals, skills, and constraints -- and
 write it exactly as "User", never a synonym such as "the user".
+When a fact is about the user's own work -- their projects, tools, employer,
+or workflow -- and the transcript gives no proper name for it, keep the
+subject "User" rather than inventing a descriptive label such as "the user's
+project" or "their CAD workflow".
 Subject is a key, not a substitute for the statement: keep fact_text
 self-contained and name the entity in it as well.
 Every candidate must include source_message_ids from the [message_id=N] markers.

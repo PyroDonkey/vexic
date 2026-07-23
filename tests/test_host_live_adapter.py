@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import re
 from pathlib import Path
 
 import pytest
@@ -481,8 +482,6 @@ def _extraction_instructions_normalized() -> str:
     Asserting on the collapsed form lets these tests pin the *rule* rather
     than the current line wrapping (ADR 0039, option A).
     """
-    import re
-
     adapter = _load_adapter()
     return re.sub(r"\s+", " ", adapter.EXTRACTION_INSTRUCTIONS.lower()).strip()
 
@@ -494,8 +493,11 @@ def test_extraction_instructions_route_named_entities_into_subject() -> None:
     # model to use the specific named entity a fact is about.
     instructions = _extraction_instructions_normalized()
 
-    assert "subject" in instructions
+    # Asserted as one collapsed phrase, not two independent memberships:
+    # "subject" now also appears in the reserve and key sentences, so separate
+    # `in` checks would survive deleting the named-entity rule outright.
     assert "named entity" in instructions
+    assert "the subject is that entity's own name" in instructions
 
 
 def test_extraction_instructions_reserve_user_subject_for_user_scoped_facts() -> None:
@@ -518,3 +520,17 @@ def test_extraction_instructions_keep_fact_text_self_contained_under_subject_gui
 
     assert "fact_text" in instructions
     assert "self-contained" in instructions
+
+
+def test_extraction_instructions_keep_user_subject_for_unnamed_user_work() -> None:
+    # The gap the named-entity rule opens: subject is a required bare str, so a
+    # fact about the user's unnamed project, employer, or workflow forces the
+    # model to emit something. Without this clause it invents free-text labels
+    # ("the user's project", "their CAD workflow") that vary between
+    # extractions and fragment the dedup key -- the exact failure ADR 0039
+    # exists to fix. Unnamed user work stays under "User".
+    instructions = _extraction_instructions_normalized()
+
+    assert "no proper name" in instructions
+    assert 'keep the subject "user"' in instructions
+    assert "inventing" in instructions

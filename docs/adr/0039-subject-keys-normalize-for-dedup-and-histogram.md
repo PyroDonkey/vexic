@@ -119,11 +119,18 @@ touches no extraction code, no contract, and no schema.
   own name, `"User"` is reserved for genuinely user-scoped facts and spelled
   exactly (closing the `the user` synonym at the source), and `fact_text` must
   stay self-contained so the entity is not moved out of the field retrieval
-  reads. Prompt layer only -- `subject` is still a plain contract string, and
-  option B remains evidence-gated behind COA-351. The guidance is pinned by
-  semantic assertions in `tests/test_host_live_adapter.py`; the live rerun that
-  would show whether `distinct_subjects` actually rises is provider-budgeted
-  and remains unrun, so the impact metric is still unmeasured.
+  reads. Unnamed user work (a project, employer, or workflow the transcript
+  never names) stays under `"User"` rather than acquiring an invented
+  free-text label, which would fragment the dedup key the normalizations
+  above exist to consolidate. Prompt layer only -- `subject` is still a plain
+  contract string, and option B remains evidence-gated behind COA-351. The
+  guidance is pinned by semantic assertions in
+  `tests/test_host_live_adapter.py`.
+- Whether that guidance actually moves the mega-bucket is a separate
+  measurement gate, not a property of the prompt edit. To satisfy it, rerun a
+  live Light->Deep eval through `longmemeval_analysis.py` (provider-budgeted
+  per ADR 0033) and compare `distinct_subjects` and the top-subject share
+  against the pre-change audit. Landing option A did not satisfy that gate.
 - Regression coverage: a same-entity case/whitespace variant now merges, and
   distinct subjects with identical vectors still do not over-merge
   (`tests/test_pipeline.py`); the histogram folds case/whitespace variants into
