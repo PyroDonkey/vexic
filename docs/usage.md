@@ -318,6 +318,52 @@ promotion miss, retrieval miss, candidate fallback, or provider/runtime failure;
 answer synthesis is recorded separately as `not_run` with the reserved
 `judge_synthesis_issue` taxonomy slot for this retrieval-only smoke.
 
+## Operator Memory Tooling
+
+`vexic operator` groups the operator-run memory audit and recovery commands.
+Both act directly on a local SQLite memory database and neither is a
+`MemoryService` operation. They follow the ADR 0011 framing that operator work
+runs out of band, through an operator-run path rather than a public contract
+operation or a hosted endpoint.
+
+`--db-path` must name an existing database file. Both commands read it through
+`init_db`, which would otherwise create an empty schema, so a mistyped path is
+rejected instead of producing a review of nothing.
+
+```bash
+# Markdown audit of Tier 2 candidates and Tier 3 facts, with provenance,
+# retirement state, promotion labels, and retrieval counters.
+vexic operator review-export --db-path ./memory.db --output ./memory-review.md
+```
+
+The export refuses to clobber an existing file; pass `--overwrite` to replace
+one. Success prints a JSON summary (`output_path`, `rows_exported`,
+`bytes_written`) on stdout and exits 0. Any failure prints `error: ...` on
+stderr and exits nonzero.
+
+```bash
+# Corruption / data-loss recovery: copy the database to a new file and
+# rebuild its projections in the copy.
+vexic operator rebuild-copy --db-path ./memory.db --output ./memory-rebuilt.db
+```
+
+`rebuild-copy` leaves the source database untouched. It copies with
+`VACUUM INTO`, then rebuilds the copy's FTS tables and recomputes its
+retrieval/use counters from the retrieval-event tables -- rebuildable
+projections only, never Tier 1 transcript rows. Vector embeddings are copied as
+they stand; re-embedding needs a host embedding port and is not part of this
+command. It refuses to write over an existing `--output` file, and it deletes a
+partial copy if the copy or the rebuild fails, so no half-written database is
+left to be mistaken for a good one. Success prints a JSON summary with the
+rebuilt row counts.
+
+Both commands accept repeated `--forbidden-value SECRET` flags and fail closed
+on a match, per the redaction invariant. `review-export` scans the rendered
+markdown before writing it; `rebuild-copy` scans the source database's text
+columns *before* the copy runs, so a match leaves no copy on disk at all.
+Supply the same forbidden values the host configures elsewhere; an operator
+artifact is privileged egress.
+
 ## LongMemEval Memory Harness
 
 `vexic.longmemeval` is the full LongMemEval benchmark harness (rehomed from the
