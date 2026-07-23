@@ -95,12 +95,31 @@ def _fetch_long_term_facts_readonly(
     """
     if not fact_ids:
         return []
+    # Real July-19 shard runs wrote a long_term_memory table that predates the
+    # mentioned_at (ADR 0037) and occurred_at columns. Selecting a column the
+    # legacy schema lacks raises "no such column" and (via the caller's broad
+    # except) silently collapses the fact set to empty. Detect which of the two
+    # newer, optional columns are present and substitute None otherwise; every
+    # other column is present in the oldest supported artifact. LongTermFact and
+    # _with_events_sorted both accept None for these two.
+    available = {
+        str(row[1])
+        for row in conn.execute(
+            "PRAGMA table_info(long_term_memory)"
+        ).fetchall()
+    }
+    has_occurred_at = "occurred_at" in available
+    has_mentioned_at = "mentioned_at" in available
+    occurred_at_select = "occurred_at" if has_occurred_at else "NULL AS occurred_at"
+    mentioned_at_select = (
+        "mentioned_at" if has_mentioned_at else "NULL AS mentioned_at"
+    )
     placeholders = ", ".join("?" for _ in fact_ids)
     rows = conn.execute(
         f"""
         SELECT id, fact_text, subject, category, importance, confidence,
                source_message_ids, retrieved_count, used_count, editable,
-               created_at, occurred_at, mentioned_at
+               created_at, {occurred_at_select}, {mentioned_at_select}
         FROM long_term_memory
         WHERE id IN ({placeholders})
         """,
@@ -150,9 +169,17 @@ def _reconstruct_retrieved_facts(
         with closing(_open_readonly(db_path)) as conn:
             _, _, fused_returned = _answer_retrieval_arrays(conn, question_id)
             facts = _fetch_long_term_facts_readonly(conn, fused_returned)
-    except Exception:
+    except Exception as exc:
         # A corrupt question DB must not sink the rescore; the row is still
-        # written, judged over an empty fact set, flagged incomplete.
+        # written, judged over an empty fact set, flagged incomplete. But never
+        # silently: warn on stderr (same style as the dataset-mismatch warning
+        # above) so the operator does not read a not_supported verdict over an
+        # empty fact set as a real rubric miss.
+        print(
+            f"warning: reconstruction failed for {question_id}: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
         return [], False
 
     facts = _with_events_sorted(facts)

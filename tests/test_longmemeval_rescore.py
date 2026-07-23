@@ -12,7 +12,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
-from contextlib import closing, redirect_stdout
+from contextlib import closing, redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from vexic.longmemeval import (
@@ -141,6 +141,96 @@ class LongMemEvalRescoreTests(unittest.TestCase):
                     json.dumps(
                         vector_fact_ids if vector_fact_ids is not None else fused_fact_ids
                     ),
+                    json.dumps(fused_fact_ids),
+                ),
+            )
+            conn.commit()
+        return db_path
+
+    def _seed_legacy_question_db(
+        self,
+        question_id: str,
+        facts: list[tuple[str, str, str, str | None]],
+        *,
+        fused_fact_ids: list[int],
+    ) -> Path:
+        """Seed a question memory.db whose ``long_term_memory`` predates the
+        ``mentioned_at`` column (real July-19 shard runs).
+
+        Built from raw SQL with the legacy column list (ending at
+        ``occurred_at``, no ``mentioned_at``) rather than ``init_db`` + ALTER,
+        so it reproduces the exact "no such column: mentioned_at" the rescore
+        SELECT hit on those artifacts. ``facts`` is a list of
+        ``(fact_text, subject, category, occurred_at)``; ids are 1..N.
+        """
+        db_path = question_db_path(self.run_dir, question_id)
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute(
+                """
+                CREATE TABLE long_term_memory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    fact_text TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    importance INTEGER NOT NULL,
+                    confidence REAL NOT NULL,
+                    source_message_ids TEXT NOT NULL,
+                    agent_id TEXT,
+                    promoted_from_candidate_id INTEGER NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    retrieved_count INTEGER NOT NULL DEFAULT 0,
+                    used_count INTEGER NOT NULL DEFAULT 0,
+                    retired BOOLEAN NOT NULL DEFAULT 0,
+                    retired_at DATETIME,
+                    retired_by_fact_id INTEGER,
+                    editable BOOLEAN NOT NULL DEFAULT 1,
+                    occurred_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE retrieval_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    fact_id INTEGER NOT NULL,
+                    session_id TEXT NOT NULL,
+                    agent_id TEXT,
+                    query TEXT NOT NULL,
+                    rewritten_query TEXT,
+                    keyword_fact_ids TEXT NOT NULL DEFAULT '[]',
+                    vector_fact_ids TEXT NOT NULL DEFAULT '[]',
+                    fused_fact_ids TEXT NOT NULL DEFAULT '[]',
+                    retrieved_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    used INTEGER,
+                    judged_at DATETIME
+                )
+                """
+            )
+            for index, (fact_text, subject, category, occurred_at) in enumerate(
+                facts, start=1
+            ):
+                conn.execute(
+                    """
+                    INSERT INTO long_term_memory (
+                        fact_text, subject, category, importance, confidence,
+                        source_message_ids, occurred_at,
+                        promoted_from_candidate_id
+                    ) VALUES (?, ?, ?, 5, 0.9, '[1]', ?, ?)
+                    """,
+                    (fact_text, subject, category, occurred_at, index),
+                )
+            conn.execute(
+                """
+                INSERT INTO retrieval_events (
+                    fact_id, session_id, query,
+                    keyword_fact_ids, vector_fact_ids, fused_fact_ids
+                ) VALUES (?, ?, 'q', ?, ?, ?)
+                """,
+                (
+                    fused_fact_ids[0] if fused_fact_ids else 1,
+                    f"longmemeval:{question_id}:answer",
+                    json.dumps(fused_fact_ids),
+                    json.dumps(fused_fact_ids),
                     json.dumps(fused_fact_ids),
                 ),
             )
@@ -588,6 +678,90 @@ class LongMemEvalRescoreTests(unittest.TestCase):
             sorted(p.name for p in self.run_dir.glob("*.tmp")),
             ["preference_rescore.jsonl.tmp"],
         )
+
+
+    def test_rescore_reconstructs_facts_from_legacy_schema_db(self) -> None:
+        # Real July-19 shard runs wrote a long_term_memory table that predates
+        # the mentioned_at column. The rescore SELECT must tolerate its absence
+        # and still reconstruct the facts the eval-time judge saw, not degrade
+        # to an empty fact set.
+        self._write_run(
+            [_diagnostics_row("q-legacy", retrieved_long_term_fact_count=1)]
+        )
+        dataset_path = self._write_dataset([self._dataset_row("q-legacy")])
+        self._seed_legacy_question_db(
+            "q-legacy",
+            [("Prefers dark-roast coffee.", "user", "preference", None)],
+            fused_fact_ids=[1],
+        )
+        judge = _FakeRecallJudge(
+            LongMemEvalRecallJudgeVerdict(
+                verdict="supported", reason="Rubric satisfied.", confidence=0.8
+            )
+        )
+
+        artifact = self._run(dataset_path, judge)
+
+        self.assertEqual(len(judge.calls), 1)
+        self.assertEqual(
+            judge.calls[0].retrieved_fact_texts,
+            ("Prefers dark-roast coffee.",),
+        )
+        rows = self._read_rescore(artifact)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0].reconstruction_complete)
+
+    def test_reconstruction_failure_warns_on_stderr(self) -> None:
+        # A genuinely broken question DB (here: long_term_memory missing
+        # entirely) must not silently rescore over empty facts. The row is
+        # still written flagged incomplete, but a stderr warning naming the
+        # question_id makes the degrade visible to the operator.
+        self._write_run(
+            [_diagnostics_row("q-broken", retrieved_long_term_fact_count=1)]
+        )
+        dataset_path = self._write_dataset([self._dataset_row("q-broken")])
+        db_path = question_db_path(self.run_dir, "q-broken")
+        with closing(sqlite3.connect(db_path)) as conn:
+            # retrieval_events carries fused ids so reconstruction reaches the
+            # fact SELECT, but long_term_memory does not exist -> OperationalError.
+            conn.execute(
+                """
+                CREATE TABLE retrieval_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    fact_id INTEGER NOT NULL,
+                    session_id TEXT NOT NULL,
+                    query TEXT NOT NULL,
+                    keyword_fact_ids TEXT NOT NULL DEFAULT '[]',
+                    vector_fact_ids TEXT NOT NULL DEFAULT '[]',
+                    fused_fact_ids TEXT NOT NULL DEFAULT '[]'
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO retrieval_events (
+                    fact_id, session_id, query,
+                    keyword_fact_ids, vector_fact_ids, fused_fact_ids
+                ) VALUES (1, ?, 'q', '[1]', '[1]', '[1]')
+                """,
+                (f"longmemeval:q-broken:answer",),
+            )
+            conn.commit()
+        judge = _FakeRecallJudge(
+            LongMemEvalRecallJudgeVerdict(
+                verdict="not_supported", reason="No facts.", confidence=0.4
+            )
+        )
+
+        buffer = io.StringIO()
+        with redirect_stderr(buffer):
+            artifact = self._run(dataset_path, judge)
+
+        stderr = buffer.getvalue()
+        self.assertIn("q-broken", stderr)
+        rows = self._read_rescore(artifact)
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(rows[0].reconstruction_complete)
 
 
 if __name__ == "__main__":
