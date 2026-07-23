@@ -326,9 +326,13 @@ Both act directly on a local SQLite memory database and neither is a
 runs out of band, through an operator-run path rather than a public contract
 operation or a hosted endpoint.
 
-`--db-path` must name an existing database file. Both commands read it through
-`init_db`, which would otherwise create an empty schema, so a mistyped path is
-rejected instead of producing a review of nothing.
+`--db-path` must name an existing database file. Neither underlying operation
+requires the file to exist: `review-export` opens the source through `init_db`,
+which creates an empty schema when the file is absent, and `rebuild-copy` opens
+the source through `connect()`, which materializes an empty file the same way
+(`init_db` then runs on the *copy*). Either way a mistyped path would otherwise
+succeed against a database that was never there, so the CLI rejects it up front
+rather than handing back a review of nothing.
 
 ```bash
 # Markdown audit of Tier 2 candidates and Tier 3 facts, with provenance,
@@ -337,9 +341,9 @@ vexic operator review-export --db-path ./memory.db --output ./memory-review.md
 ```
 
 The export refuses to clobber an existing file; pass `--overwrite` to replace
-one. Success prints a JSON summary (`output_path`, `rows_exported`,
-`bytes_written`) on stdout and exits 0. Any failure prints `error: ...` on
-stderr and exits nonzero.
+one. Success prints a JSON summary on stdout -- `ok`, `output_path`,
+`rows_exported`, `bytes_written` -- and exits 0. Any failure prints
+`error: ...` on stderr and exits nonzero.
 
 ```bash
 # Corruption / data-loss recovery: copy the database to a new file and
@@ -354,8 +358,10 @@ projections only, never Tier 1 transcript rows. Vector embeddings are copied as
 they stand; re-embedding needs a host embedding port and is not part of this
 command. It refuses to write over an existing `--output` file, and it deletes a
 partial copy if the copy or the rebuild fails, so no half-written database is
-left to be mistaken for a good one. Success prints a JSON summary with the
-rebuilt row counts.
+left to be mistaken for a good one. Success prints a JSON summary on stdout --
+`ok`, `output_path`, `messages_fts_rows`, `candidate_fts_rows`,
+`long_term_fts_rows`, `candidate_counters_recomputed`,
+`long_term_counters_recomputed` -- and exits 0.
 
 Both commands accept repeated `--forbidden-value SECRET` flags and fail closed
 on a match, per the redaction invariant. `review-export` scans the rendered
@@ -363,6 +369,13 @@ markdown before writing it; `rebuild-copy` scans the source database's text
 columns *before* the copy runs, so a match leaves no copy on disk at all.
 Supply the same forbidden values the host configures elsewhere; an operator
 artifact is privileged egress.
+
+`--forbidden-value` takes the secret on the command line, so it lands in shell
+history and is visible to any local `ps`. There is no config-file source for it
+today, unlike the recorder's `--api-key`. Run these commands from a shell with
+history disabled for the invocation (a leading space with `HISTCONTROL=ignorespace`
+in bash, `setopt histignorespace` in zsh) on a host where the process list is
+not shared, and clear the entry afterwards if it was recorded.
 
 ## LongMemEval Memory Harness
 

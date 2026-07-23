@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import io
+import json
 import sqlite3
 import tempfile
 import unittest
-from contextlib import closing
+from contextlib import closing, redirect_stdout
 from pathlib import Path
 
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
+from vexic.cli import main as vexic_main
 from vexic.embeddings import EMBEDDING_DIM
 from vexic.models import FactCandidate
 from vexic.storage import (
@@ -36,7 +39,20 @@ class OperatorCliTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
-    def _seed(self, transcript_text: str = "cedar operator transcript") -> None:
+    def _run(self, *argv: str) -> tuple[int, str]:
+        """Drive the public CLI entry point, capturing its stdout."""
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            code = vexic_main(list(argv))
+        return code, stdout.getvalue()
+
+    def _seed(
+        self,
+        transcript_text: str = "cedar operator transcript",
+        *,
+        fact_text: str = "cedar operator durable fact",
+        subject: str = "Ryan",
+    ) -> None:
         init_db(str(self.db_path))
         message_json = single_message_adapter.dump_json(
             ModelRequest(parts=[UserPromptPart(content=transcript_text)])
@@ -60,8 +76,8 @@ class OperatorCliTests(unittest.TestCase):
             str(self.db_path),
             [
                 FactCandidate(
-                    fact_text="cedar operator durable fact",
-                    subject="Ryan",
+                    fact_text=fact_text,
+                    subject=subject,
                     category="fact",
                     importance=7,
                     confidence=0.9,
@@ -85,42 +101,47 @@ class OperatorCliTests(unittest.TestCase):
         )
 
     def test_review_export_writes_markdown_review_and_exits_zero(self) -> None:
-        from vexic.cli import main as vexic_main
-
         self._seed()
         output = self.root / "review.md"
 
-        code = vexic_main(
-            [
-                "operator",
-                "review-export",
-                "--db-path",
-                str(self.db_path),
-                "--output",
-                str(output),
-            ]
+        code, stdout = self._run(
+            "operator",
+            "review-export",
+            "--db-path",
+            str(self.db_path),
+            "--output",
+            str(output),
         )
 
         self.assertEqual(code, 0)
         rendered = output.read_text(encoding="utf-8")
         self.assertIn("# Memory Review Export", rendered)
         self.assertIn("cedar operator durable fact", rendered)
+        # The JSON summary is the documented machine-readable result. Pin the
+        # whole object: a renamed key silently breaks that contract, and the
+        # doc-drift gate does not read JSON keys. rows_exported is 2 here --
+        # the one Tier 2 candidate plus the one Tier 3 fact it was promoted to.
+        self.assertEqual(
+            json.loads(stdout),
+            {
+                "ok": True,
+                "output_path": str(output),
+                "rows_exported": 2,
+                "bytes_written": len(output.read_bytes()),
+            },
+        )
 
     def test_rebuild_copy_writes_a_rebuilt_copy_and_exits_zero(self) -> None:
-        from vexic.cli import main as vexic_main
-
         self._seed()
         copy_path = self.root / "rebuild-copy.db"
 
-        code = vexic_main(
-            [
-                "operator",
-                "rebuild-copy",
-                "--db-path",
-                str(self.db_path),
-                "--output",
-                str(copy_path),
-            ]
+        code, stdout = self._run(
+            "operator",
+            "rebuild-copy",
+            "--db-path",
+            str(self.db_path),
+            "--output",
+            str(copy_path),
         )
 
         self.assertEqual(code, 0)
@@ -130,100 +151,141 @@ class OperatorCliTests(unittest.TestCase):
             fts_rows = conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0]
         self.assertEqual(facts, [("cedar operator durable fact",)])
         self.assertEqual(fts_rows, 1)
+        # Same contract pin as review-export: the counters an operator reads to
+        # confirm the rebuild landed must keep their documented names.
+        self.assertEqual(
+            json.loads(stdout),
+            {
+                "ok": True,
+                "output_path": str(copy_path),
+                "messages_fts_rows": 1,
+                "candidate_fts_rows": 1,
+                "long_term_fts_rows": 1,
+                "candidate_counters_recomputed": 1,
+                "long_term_counters_recomputed": 1,
+            },
+        )
 
-    def test_review_export_without_output_exits_nonzero(self) -> None:
-        from vexic.cli import main as vexic_main
-
+    def test_review_export_without_output_exits_2_and_writes_nothing(self) -> None:
         self._seed()
+        before = sorted(path.name for path in self.root.iterdir())
 
-        code = vexic_main(["operator", "review-export", "--db-path", str(self.db_path)])
+        code, stdout = self._run(
+            "operator", "review-export", "--db-path", str(self.db_path)
+        )
 
-        self.assertNotEqual(code, 0)
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout, "")
+        self.assertEqual(sorted(path.name for path in self.root.iterdir()), before)
 
     def test_review_export_on_a_missing_database_exits_nonzero(self) -> None:
         # A typo'd --db-path must not silently create an empty database and
         # hand the operator a review of nothing.
-        from vexic.cli import main as vexic_main
-
         missing_db = self.root / "not-there.db"
         output = self.root / "review.md"
 
-        code = vexic_main(
-            [
-                "operator",
-                "review-export",
-                "--db-path",
-                str(missing_db),
-                "--output",
-                str(output),
-            ]
+        code, _ = self._run(
+            "operator",
+            "review-export",
+            "--db-path",
+            str(missing_db),
+            "--output",
+            str(output),
         )
 
         self.assertNotEqual(code, 0)
         self.assertFalse(output.exists())
         self.assertFalse(missing_db.exists())
 
-    def test_rebuild_copy_refuses_to_copy_a_forbidden_secret_value(self) -> None:
-        # Redaction fails closed: the copy guard runs before the file copy, so
-        # no partial copy is left on disk for the operator to mistake for good.
-        from vexic.cli import main as vexic_main
-
-        self._seed("the deploy key is sk-operator-secret")
+    def test_rebuild_copy_rejects_a_forbidden_secret_before_copying(self) -> None:
+        # Redaction fails closed, and specifically *before* the file copy: the
+        # secret sits in the candidate/fact `subject` column, which the
+        # pre-copy database scan reads but the copy's own projection-repair
+        # guard (message_json and fact_text only) does not. So an absent copy
+        # here can only mean the pre-copy guard stopped the run.
+        self._seed(subject="sk-operator-secret")
         copy_path = self.root / "rebuild-copy.db"
 
-        code = vexic_main(
-            [
-                "operator",
-                "rebuild-copy",
-                "--db-path",
-                str(self.db_path),
-                "--output",
-                str(copy_path),
-                "--forbidden-value",
-                "sk-operator-secret",
-            ]
+        code, _ = self._run(
+            "operator",
+            "rebuild-copy",
+            "--db-path",
+            str(self.db_path),
+            "--output",
+            str(copy_path),
+            "--forbidden-value",
+            "sk-operator-secret",
         )
 
         self.assertNotEqual(code, 0)
         self.assertFalse(copy_path.exists())
 
-    def test_review_export_refuses_to_clobber_an_existing_file(self) -> None:
-        from vexic.cli import main as vexic_main
+    def test_review_export_refuses_to_write_a_forbidden_secret_value(self) -> None:
+        self._seed(fact_text="the deploy key is sk-operator-secret")
+        output = self.root / "review.md"
 
+        code, _ = self._run(
+            "operator",
+            "review-export",
+            "--db-path",
+            str(self.db_path),
+            "--output",
+            str(output),
+            "--forbidden-value",
+            "sk-operator-secret",
+        )
+
+        self.assertNotEqual(code, 0)
+        self.assertFalse(output.exists())
+
+    def test_review_export_refuses_to_clobber_an_existing_file(self) -> None:
         self._seed()
         output = self.root / "review.md"
         output.write_text("earlier review", encoding="utf-8")
 
-        code = vexic_main(
-            [
-                "operator",
-                "review-export",
-                "--db-path",
-                str(self.db_path),
-                "--output",
-                str(output),
-            ]
+        code, _ = self._run(
+            "operator",
+            "review-export",
+            "--db-path",
+            str(self.db_path),
+            "--output",
+            str(output),
         )
 
         self.assertNotEqual(code, 0)
         self.assertEqual(output.read_text(encoding="utf-8"), "earlier review")
 
-        overwritten = vexic_main(
-            [
-                "operator",
-                "review-export",
-                "--db-path",
-                str(self.db_path),
-                "--output",
-                str(output),
-                "--overwrite",
-            ]
+        overwritten, _ = self._run(
+            "operator",
+            "review-export",
+            "--db-path",
+            str(self.db_path),
+            "--output",
+            str(output),
+            "--overwrite",
         )
 
         self.assertEqual(overwritten, 0)
-        self.assertIn(
-            "# Memory Review Export", output.read_text(encoding="utf-8")
+        self.assertIn("# Memory Review Export", output.read_text(encoding="utf-8"))
+
+    def test_rebuild_copy_refuses_to_clobber_an_existing_output(self) -> None:
+        # rebuild-copy has no --overwrite escape hatch: a recovery copy must
+        # never overwrite whatever the operator already has at that path.
+        self._seed()
+        copy_path = self.root / "rebuild-copy.db"
+        copy_path.write_bytes(b"earlier copy")
+
+        code, _ = self._run(
+            "operator",
+            "rebuild-copy",
+            "--db-path",
+            str(self.db_path),
+            "--output",
+            str(copy_path),
         )
+
+        self.assertNotEqual(code, 0)
+        self.assertEqual(copy_path.read_bytes(), b"earlier copy")
 
 
 if __name__ == "__main__":
