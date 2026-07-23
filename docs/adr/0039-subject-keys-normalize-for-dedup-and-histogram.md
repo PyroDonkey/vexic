@@ -113,6 +113,45 @@ touches no extraction code, no contract, and no schema.
   measures whether the prompt guidance actually reduced the bucket. Under B/C
   it stays explicitly deferred, satisfying the COA-415 acceptance clause's "or
   explicitly deferred" branch.
+- **Option A landed under COA-419** once COA-414 released the ablation control.
+  `EXTRACTION_INSTRUCTIONS` (`adapters/openrouter_live_adapter.py`) now gives
+  `subject` a **first-match decision procedure** rather than a set of
+  independent rules. Independent rules were the defect: `subject` is a dedup
+  and histogram key, so any fact two rules resolve differently ("I prefer uv
+  for my Python projects" is both a named-tool fact and a user preference)
+  splits one entity across two keys with two hit counts -- the exact
+  fragmentation the normalizations above remove. Ordered, the rules are a
+  total function from fact to subject:
+
+  1. A named entity: its own name as written. This wins over the preference
+     reading. Several names break on a fixed kind order (person, pet,
+     organization or place, product or tool), so the tie is mechanical rather
+     than a per-extraction judgement call.
+  2. An unnamed person or pet: the bare relationship word, lowercase and
+     without a possessive (`sister`, not `my sister`) -- a real entity that
+     is neither named nor the user, and previously fell through every rule.
+  3. Anything else, including the user themselves and their unnamed projects,
+     tools, employer, or workflow: exactly `"User"`. This closes the
+     procedure so nothing reaches an improvised key, spells the token exactly
+     (closing the `the user` synonym at the source), and keeps unnamed user
+     work off invented free-text labels like `the user's project`.
+
+  Alongside it, `fact_text` must still name the entity so it stands alone --
+  `subject` is a key, not a place to move the entity out of the field
+  retrieval and scoring read. Subject examples are deliberately free of
+  four-digit numbers (`AutoCAD LT 2013` was replaced): a year-shaped token in
+  the subject rules feeds the `occurred_at` rules further down the same prompt
+  a date the fact does not have, and Memory Invariant 11 forbids an ungrounded
+  `occurred_at`. Prompt layer only -- `subject` is still a plain contract
+  string, and option B remains evidence-gated behind COA-351. Each rule is
+  pinned by its own contiguous-phrase assertion in
+  `tests/test_host_live_adapter.py`, verified by mutation: gutting one rule
+  fails exactly one test.
+- Whether that guidance actually moves the mega-bucket is a separate
+  measurement gate, not a property of the prompt edit. To satisfy it, rerun a
+  live Light->Deep eval through `longmemeval_analysis.py` (provider-budgeted
+  per ADR 0033) and compare `distinct_subjects` and the top-subject share
+  against the pre-change audit. Landing option A did not satisfy that gate.
 - Regression coverage: a same-entity case/whitespace variant now merges, and
   distinct subjects with identical vectors still do not over-merge
   (`tests/test_pipeline.py`); the histogram folds case/whitespace variants into
