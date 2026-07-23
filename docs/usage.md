@@ -326,13 +326,24 @@ Both act directly on a local SQLite memory database and neither is a
 runs out of band, through an operator-run path rather than a public contract
 operation or a hosted endpoint.
 
-`--db-path` must name an existing database file. Neither underlying operation
-requires the file to exist: `review-export` opens the source through `init_db`,
-which creates an empty schema when the file is absent, and `rebuild-copy` opens
-the source through `connect()`, which materializes an empty file the same way
-(`init_db` then runs on the *copy*). Either way a mistyped path would otherwise
-succeed against a database that was never there, so the CLI rejects it up front
-rather than handing back a review of nothing.
+`--db-path` must name a file that is already an initialized memory database.
+Neither underlying operation requires that: `review-export` opens the source
+through `init_db`, which creates an empty schema when the file is absent or
+empty, and `rebuild-copy` opens the source through `connect()`, which
+materializes an empty file the same way (`init_db` then runs on the *copy*).
+Either way a mistyped path would otherwise succeed against a database that was
+never there. So the CLI checks the source up front, before forwarding anything:
+the path must exist, and a read-only `mode=ro` connection must find the Tier 1,
+Tier 2, and Tier 3 tables (`messages`, `memory_candidates`,
+`long_term_memory`) in it. The probe initializes nothing, so a path it rejects
+is left exactly as it was -- an existing empty file is rejected still empty,
+not silently converted into a fresh database and reviewed as one.
+
+Neither command will write its `--output` over the source database. Both reject
+an `--output` that resolves to `--db-path`, including through a symlink or a
+hard link, before any work starts. Without that check `review-export --output
+./memory.db --overwrite` would replace the memory database with the markdown
+report and exit 0.
 
 ```bash
 # Markdown audit of Tier 2 candidates and Tier 3 facts, with provenance,
@@ -341,7 +352,8 @@ vexic operator review-export --db-path ./memory.db --output ./memory-review.md
 ```
 
 The export refuses to clobber an existing file; pass `--overwrite` to replace
-one. Success prints a JSON summary on stdout -- `ok`, `output_path`,
+one. `--overwrite` replaces a stale review, and nothing else: the source-alias
+check above still applies to it. Success prints a JSON summary on stdout -- `ok`, `output_path`,
 `rows_exported`, `bytes_written` -- and exits 0. Any failure prints
 `error: ...` on stderr and exits nonzero.
 
