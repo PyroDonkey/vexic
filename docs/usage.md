@@ -318,6 +318,77 @@ promotion miss, retrieval miss, candidate fallback, or provider/runtime failure;
 answer synthesis is recorded separately as `not_run` with the reserved
 `judge_synthesis_issue` taxonomy slot for this retrieval-only smoke.
 
+## Operator Memory Tooling
+
+`vexic operator` groups the operator-run memory audit and recovery commands.
+Both act directly on a local SQLite memory database and neither is a
+`MemoryService` operation. They follow the ADR 0011 framing that operator work
+runs out of band, through an operator-run path rather than a public contract
+operation or a hosted endpoint.
+
+`--db-path` must name a file that is already an initialized memory database.
+Neither underlying operation requires that: `review-export` opens the source
+through `init_db`, which creates an empty schema when the file is absent or
+empty, and `rebuild-copy` opens the source through `connect()`, which
+materializes an empty file the same way (`init_db` then runs on the *copy*).
+Either way a mistyped path would otherwise succeed against a database that was
+never there. So the CLI checks the source up front, before forwarding anything:
+the path must exist, and a read-only `mode=ro` connection must find the Tier 1,
+Tier 2, and Tier 3 tables (`messages`, `memory_candidates`,
+`long_term_memory`) in it. The probe initializes nothing, so a path it rejects
+is left exactly as it was -- an existing empty file is rejected still empty,
+not silently converted into a fresh database and reviewed as one.
+
+Neither command will write its `--output` over the source database. Both reject
+an `--output` that resolves to `--db-path`, including through a symlink or a
+hard link, before any work starts. Without that check `review-export --output
+./memory.db --overwrite` would replace the memory database with the markdown
+report and exit 0.
+
+```bash
+# Markdown audit of Tier 2 candidates and Tier 3 facts, with provenance,
+# retirement state, promotion labels, and retrieval counters.
+vexic operator review-export --db-path ./memory.db --output ./memory-review.md
+```
+
+The export refuses to clobber an existing file; pass `--overwrite` to replace
+one. `--overwrite` replaces a stale review, and nothing else: the source-alias
+check above still applies to it. Success prints a JSON summary on stdout -- `ok`, `output_path`,
+`rows_exported`, `bytes_written` -- and exits 0. Any failure prints
+`error: ...` on stderr and exits nonzero.
+
+```bash
+# Corruption / data-loss recovery: copy the database to a new file and
+# rebuild its projections in the copy.
+vexic operator rebuild-copy --db-path ./memory.db --output ./memory-rebuilt.db
+```
+
+`rebuild-copy` leaves the source database untouched. It copies with
+`VACUUM INTO`, then rebuilds the copy's FTS tables and recomputes its
+retrieval/use counters from the retrieval-event tables -- rebuildable
+projections only, never Tier 1 transcript rows. Vector embeddings are copied as
+they stand; re-embedding needs a host embedding port and is not part of this
+command. It refuses to write over an existing `--output` file, and it deletes a
+partial copy if the copy or the rebuild fails, so no half-written database is
+left to be mistaken for a good one. Success prints a JSON summary on stdout --
+`ok`, `output_path`, `messages_fts_rows`, `candidate_fts_rows`,
+`long_term_fts_rows`, `candidate_counters_recomputed`,
+`long_term_counters_recomputed` -- and exits 0.
+
+Both commands accept repeated `--forbidden-value SECRET` flags and fail closed
+on a match, per the redaction invariant. `review-export` scans the rendered
+markdown before writing it; `rebuild-copy` scans the source database's text
+columns *before* the copy runs, so a match leaves no copy on disk at all.
+Supply the same forbidden values the host configures elsewhere; an operator
+artifact is privileged egress.
+
+`--forbidden-value` takes the secret on the command line, so it lands in shell
+history and is visible to any local `ps`. There is no config-file source for it
+today, unlike the recorder's `--api-key`. Run these commands from a shell with
+history disabled for the invocation (a leading space with `HISTCONTROL=ignorespace`
+in bash, `setopt histignorespace` in zsh) on a host where the process list is
+not shared, and clear the entry afterwards if it was recorded.
+
 ## LongMemEval Memory Harness
 
 `vexic.longmemeval` is the full LongMemEval benchmark harness (rehomed from the

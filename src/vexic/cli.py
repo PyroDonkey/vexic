@@ -22,6 +22,10 @@ def main(argv: list[str] | None = None) -> int:
         from vexic.recorders.cli import main as recorder_main
 
         return recorder_main(["setup-mcp-client", *args[2:]])
+    if args and args[0] == "operator":
+        from vexic.operator_cli import main as operator_main
+
+        return operator_main(args[1:])
     if args and args[0] == "mcp-stdio":
         from vexic.mcp_stdio import main as stdio_main
 
@@ -36,7 +40,8 @@ def main(argv: list[str] | None = None) -> int:
             "  setup claude-code   install the Claude Code recorder hooks\n"
             "  setup codex         print the opt-in `codex mcp add` connect command\n"
             "  setup mcp-client    print the opt-in connect command for a generic MCP client\n"
-            "  mcp-stdio           run the read-only stdio MCP server"
+            "  mcp-stdio           run the read-only stdio MCP server\n"
+            "  operator            operator memory audit and recovery tooling"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
