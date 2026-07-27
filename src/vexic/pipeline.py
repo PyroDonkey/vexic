@@ -50,13 +50,16 @@ LIGHT_PHASE_BATCH_SIZE = 50
 _LOCAL_EMBEDDER = embed_texts
 
 _MARKER_RE = re.compile(r"\[\s*message_id\s*=\s*\d+[^\]]*\]")
-# Bare (unbracketed) observed=YYYY-MM-DD Day echo -- the exact label body
-# _observed_label emits. Stripped so an extractor that copies the label
-# without its brackets cannot leave the token in fact_text/subject or have its
-# date misread as an in-text event date. Whitespace around ``=`` is tolerated
-# in both patterns: an extractor that reformats the label (``message_id = 3``,
-# ``observed = 2023-11-17``) must not slip the scaffolding past the strip.
-_OBSERVED_TOKEN_RE = re.compile(r"observed\s*=\s*\d{4}-\d{2}-\d{2}\s+\w{3}\b")
+# Bare (unbracketed) observed= echo -- the label body _observed_label emits.
+# Stripped so an extractor that copies the label without its brackets cannot
+# leave the token in fact_text/subject or have its date misread as an in-text
+# event date. Everything the extractor is liable to reformat is optional: the
+# separator (``observed=``, ``observed:``, bare ``observed 2023-11-17``),
+# whitespace around it, and the trailing weekday abbreviation. Requiring the
+# weekday is what let ``observed=2023-11-17`` through and put a recording date
+# in occurred_at; a shape-independent backstop in
+# apply_occurred_at_guards now covers wordings this pattern cannot anticipate.
+_OBSERVED_TOKEN_RE = re.compile(r"observed\s*[:=]?\s*\d{4}-\d{2}-\d{2}(?:\s+\w{3}\b)?")
 _YEAR_RE = re.compile(r"\b(1\d{3}|20\d{2})\b")
 _ISO_FULL_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
 _ISO_YM_RE = re.compile(r"\b(\d{4})-(\d{2})\b(?!-)")
@@ -204,6 +207,24 @@ def _plausible_years(rows: list[tuple[int, str | None, ModelMessage]], transcrip
     return years
 
 
+def _observed_dates_by_message_id(
+    rows: list[tuple[int, str | None, ModelMessage]],
+) -> dict[int, str]:
+    """Each rendered message's observed (recording) date, keyed by message id.
+
+    The same fail-soft parse `_observed_label` uses: a message whose timestamp
+    is absent or unreadable simply has no entry, so it constrains nothing.
+    """
+    observed: dict[int, str] = {}
+    for message_id, timestamp, _ in rows:
+        if isinstance(timestamp, str) and timestamp:
+            try:
+                observed[message_id] = date.fromisoformat(timestamp[:10]).isoformat()
+            except ValueError:
+                continue
+    return observed
+
+
 def _single_intext_date(fact_text: str) -> str | None:
     """The one absolute date stated in fact_text, at stated precision, or
     None. A calendar-invalid match (e.g. "February 30, 2023") still counts as
@@ -287,8 +308,12 @@ def apply_occurred_at_guards(
 
     Fabricated components degrade to undated (ADR 0037 Tier 2 sink) rather
     than dropping the candidate; in-text dates copy at stated precision only.
+    A candidate reduced to empty text by the marker strip is dropped outright
+    (ADR 0031 per-candidate drop posture). The list is filtered in place --
+    every call site relies on mutation and ignores the return value.
     """
     plausible = _plausible_years(rows, transcript)
+    observed_by_id = _observed_dates_by_message_id(rows)
     for candidate in candidates:
         # Strip echoed render markers first: they carry an observed= date that
         # _single_intext_date would otherwise misread as an event date, and
@@ -300,23 +325,39 @@ def apply_occurred_at_guards(
         if candidate.occurred_at is not None:
             if int(candidate.occurred_at[:4]) not in plausible:
                 candidate.occurred_at = None
+        # Shape-independent scaffolding backstop: a date that IS the recording
+        # date of one of this candidate's own source messages is mention time,
+        # not event time, however the extractor worded it. _OBSERVED_TOKEN_RE
+        # can only catch echoes it can anticipate; this catches the rest.
+        # Degrading to undated costs no recall -- the derived mentioned_at
+        # carries that same date on the ladder -- and Invariant 11 forbids the
+        # alternative. Resolved once, so EVERY path below that assigns
+        # occurred_at from fact_text is covered, not just the copy-backfill.
+        intext = _single_intext_date(candidate.fact_text)
+        if intext is not None and intext in {
+            observed_by_id.get(mid) for mid in candidate.source_message_ids
+        }:
+            intext = None
         if candidate.occurred_at is None and candidate.category == "event":
-            candidate.occurred_at = _single_intext_date(candidate.fact_text)
+            candidate.occurred_at = intext
         if candidate.occurred_at is not None:
             if int(candidate.occurred_at[:4]) not in plausible:
                 candidate.occurred_at = None
-        # Ungrounded-precision cap: if fact_text states a single in-text date
-        # that is a strict, shorter prefix of the (model-supplied) occurred_at,
-        # truncate occurred_at to the in-text precision. Precision reduction
-        # only -- never extension (ADR 0038 day-invention mitigation).
+        # Stated-date wins: when fact_text states exactly one absolute date,
+        # an occurred_at that is not covered by it is model invention -- either
+        # a strict extension of the stated precision (day invented from
+        # "June 2023") or an outright contradiction ("June 2023" -> 2023-07-15).
+        # Both degrade to the stated date (ADR 0038). occurred_at LESS precise
+        # than the text is left alone: that invents nothing.
         if candidate.occurred_at is not None:
-            intext = _single_intext_date(candidate.fact_text)
-            if (
-                intext is not None
-                and candidate.occurred_at.startswith(intext)
-                and len(candidate.occurred_at) > len(intext)
-            ):
+            if intext is not None and not intext.startswith(candidate.occurred_at):
                 candidate.occurred_at = intext
+                if int(candidate.occurred_at[:4]) not in plausible:
+                    candidate.occurred_at = None
+    # An echo-only candidate strips to "". fact_text TEXT NOT NULL accepts '',
+    # which would stage an empty FTS body, and an empty subject shares one
+    # ADR 0039 lower(trim(subject)) merge bucket with every other such row.
+    candidates[:] = [c for c in candidates if c.fact_text and c.subject]
     return candidates
 
 

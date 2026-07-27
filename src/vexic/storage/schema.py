@@ -191,8 +191,13 @@ def _backfill_mentioned_at(conn: sqlite3.Connection, table_name: str) -> None:
     # not a per-row round trip, which matters against hosted libSQL/Turso.
     # Rows whose sources are missing/unparseable derive None and stay NULL;
     # they are rescanned on later inits, a benign no-op at this row count.
+    # Blank-ish counts as missing, not as a value: the importer can bind ""
+    # where Light writes NULL, and NULLIF-based retrieval, the promotion gate,
+    # and the Deep filter all read "" as absent. An IS NULL-only predicate
+    # would leave such a row unhealable and sunk in Tier 2 forever.
     rows = conn.execute(
-        f"SELECT id, source_message_ids FROM {table_name} WHERE mentioned_at IS NULL"
+        f"SELECT id, source_message_ids FROM {table_name} "
+        "WHERE mentioned_at IS NULL OR trim(mentioned_at) = ''"
     ).fetchall()
     if not rows:
         return
@@ -229,7 +234,7 @@ def _backfill_mentioned_at(conn: sqlite3.Connection, table_name: str) -> None:
         # merge value is computed over a superset of sources and always wins.
         conn.executemany(
             f"UPDATE {table_name} SET mentioned_at = ? "
-            "WHERE id = ? AND mentioned_at IS NULL",
+            "WHERE id = ? AND (mentioned_at IS NULL OR trim(mentioned_at) = '')",
             updates,
         )
 

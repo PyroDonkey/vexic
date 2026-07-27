@@ -1676,6 +1676,111 @@ class MentionedAtDerivationTests(unittest.TestCase):
         mentioned_at, _ = self._mentioned_at(candidate_id)
         self.assertEqual(mentioned_at, "2026-03-05")
 
+    def test_promotion_refuses_a_non_canonical_mentioned_at(self) -> None:
+        # Light is not the only writer. The canonical-migration importer binds
+        # artifact rows verbatim and a host may write memory_candidates
+        # directly, so "deterministic derived provenance" is an assumption
+        # about one path, not a guarantee about the column. A non-date value
+        # must be normalized away exactly as occurred_at is -- otherwise it
+        # becomes the durable Tier 3 temporal key and, sorting outside the
+        # 20xx- range, is invisible to every as_of/event_before filter and
+        # matches every event_after filter, silently and forever.
+        first = self._save_message(
+            "We finally visited Yellowstone.",
+            timestamp="2026-03-05T10:00:00+00:00",
+        )
+        candidate_id = self._commit_candidate(
+            _candidate(
+                "Ryan visited Yellowstone.",
+                message_ids=[first],
+                category="event",
+                occurred_at=None,
+            )
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE memory_candidates SET mentioned_at = 'yesterday' WHERE id = ?",
+                (candidate_id,),
+            )
+            conn.commit()
+
+        with self.assertRaises(ValueError):
+            commit_deep_cycle(
+                self.db_path,
+                [
+                    PromotionDecision(
+                        candidate_id=candidate_id, embedding=_unit_vector(1.0)
+                    )
+                ],
+                started_at="2026-06-01T00:01:00+00:00",
+                finished_at="2026-06-01T00:01:01+00:00",
+            )
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            leaked = conn.execute(
+                "SELECT COUNT(*) FROM long_term_memory WHERE mentioned_at = 'yesterday'"
+            ).fetchone()[0]
+        self.assertEqual(leaked, 0)
+
+    def test_init_backfill_heals_a_blank_mentioned_at(self) -> None:
+        # The importer can write "" where Light writes NULL. NULLIF-based
+        # retrieval, the promotion gate, and the Deep filter all read "" as
+        # missing, but an `IS NULL`-only backfill never heals it -- so the row
+        # is skipped by Deep in perpetuity with no path back.
+        first = self._save_message(
+            "We finally visited Yellowstone.",
+            timestamp="2026-03-05T10:00:00+00:00",
+        )
+        candidate_id = self._commit_candidate(
+            _candidate(
+                "Ryan visited Yellowstone.",
+                message_ids=[first],
+                category="event",
+            )
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE memory_candidates SET mentioned_at = '' WHERE id = ?",
+                (candidate_id,),
+            )
+            conn.commit()
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            _backfill_mentioned_at(conn, "memory_candidates")
+            conn.commit()
+
+        mentioned_at, _ = self._mentioned_at(candidate_id)
+        self.assertEqual(mentioned_at, "2026-03-05")
+
+    def test_deep_selection_skips_a_non_canonical_mentioned_at(self) -> None:
+        # Selection and the promotion gate must agree on what counts as a
+        # date. If selection accepts a value promotion refuses, the refusal
+        # aborts the Deep cycle and every retry re-selects the same row.
+        candidates = [
+            PromotionCandidate(
+                candidate_id=1,
+                fact_text="Ryan visited Yellowstone.",
+                subject="Ryan",
+                category="event",
+                confidence=0.9,
+                importance=5,
+                hit_count=1,
+                last_seen_at=datetime(2026, 6, 1, tzinfo=timezone.utc),
+                rem_boost=0.0,
+                embedding=_unit_vector(1.0),
+                occurred_at=None,
+                mentioned_at="yesterday",
+            ),
+        ]
+
+        selected = select_promotions(
+            candidates,
+            now=datetime(2026, 6, 2, tzinfo=timezone.utc),
+            top_n=10,
+        )
+
+        self.assertEqual(selected, [])
+
 
 class LongTermSearchAsOfFilterTests(unittest.TestCase):
     # `as_of` restricts keyword (FTS) and vector (KNN) Tier 3 search to facts

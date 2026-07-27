@@ -196,15 +196,20 @@ def _promote_candidate(
         occurred_at,
         mentioned_at,
     ) = row
-    # Normalize occurred_at from legacy or externally written candidate rows:
+    # Normalize both dates from legacy or externally written candidate rows:
     # Deep promotion reads candidates straight from SQL, bypassing the
     # FactCandidate validator, so a datetime-shaped or junk value would reach
     # Tier 3 unchanged. canonical_partial_date truncates a datetime to its date
     # part and nulls junk (Memory Invariant 11: truncation, never invention),
-    # matching the validator exactly. mentioned_at is deterministic derived
-    # provenance; only its blank-ish normalization is needed here.
+    # matching the validator exactly. mentioned_at gets the same treatment:
+    # Light derives it deterministically, but the canonical-migration importer
+    # binds artifact rows verbatim and a host may write memory_candidates
+    # directly, so "always canonical or blank" is a property of one writer, not
+    # of the column. A junk value that survived here would become the durable
+    # temporal key -- sorting outside the 20xx- range, it is excluded by every
+    # as_of/event_before filter and matched by every event_after filter.
     occurred_at = canonical_partial_date(occurred_at)
-    mentioned_at = mentioned_at if (mentioned_at or "").strip() else None
+    mentioned_at = canonical_partial_date(mentioned_at)
 
     if retired or stale:
         raise ValueError(

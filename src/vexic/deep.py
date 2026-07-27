@@ -137,20 +137,23 @@ def select_promotions(
     # With mentioned_at derived at insert and backfilled on init, this skip is
     # now the residual case (legacy rows not yet healed, or sources missing/
     # unparseable); such candidates stay in Tier 2 like ADR 0031 drops
-    # miscited candidates. The occurred_at gate runs the SAME
-    # `canonical_partial_date` the promotion path uses: a nonblank-but-invalid
-    # value ("not-a-date") that a bare `.strip()` would pass gets selected,
-    # then canonicalizes to None in promotion and fails loud -- aborting the
-    # cycle, with retries re-selecting the same row (a permanent deadlock).
-    # mentioned_at stays blank-strip semantics: it is deterministically
-    # derived provenance, always canonical or blank.
+    # miscited candidates. Both gates run the SAME `canonical_partial_date`
+    # the promotion path uses, so selection and promotion cannot disagree
+    # about what counts as a date. A bare `.strip()` gate would let a
+    # nonblank-but-invalid value ("not-a-date") through: it would be selected,
+    # canonicalize to None in promotion, and fail loud -- aborting the cycle,
+    # with retries re-selecting the same row (a permanent deadlock). With
+    # canonicalization here the same value is skipped and stays in Tier 2.
+    # mentioned_at needs this as much as occurred_at does: Light derives it
+    # deterministically, but the canonical-migration importer and any direct
+    # host write can put arbitrary text in the column.
     candidates = [
         c
         for c in candidates
         if not (
             c.category == "event"
             and canonical_partial_date(c.occurred_at) is None
-            and not (c.mentioned_at or "").strip()
+            and canonical_partial_date(c.mentioned_at) is None
         )
     ]
     if not candidates:

@@ -3559,6 +3559,102 @@ class OccurredAtGuardTests(unittest.TestCase):
         self.assertEqual(bare.fact_text, "User ran the race")
         self.assertIsNone(bare.occurred_at)
 
+    def test_guard_strips_observed_token_without_weekday(self) -> None:
+        # The weekday suffix is part of the label _observed_label
+        # emits, not part of what an extractor reliably echoes. A token that
+        # drops the weekday, or the '=', is still scaffolding: it must be
+        # stripped from persisted text and must never reach the copy-backfill.
+        for text in (
+            "User ran the race on observed=2023-11-17",
+            "User ran the race (observed 2023-11-17)",
+            "User ran the race on observed: 2023-11-17",
+            "User ran the race on observed = 2023-11-17",
+        ):
+            with self.subTest(text=text):
+                c = _event_candidate(fact_text=text, occurred_at=None)
+                apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+                self.assertNotIn("observed", c.fact_text)
+                self.assertNotIn("2023-11-17", c.fact_text)
+                self.assertIsNone(c.occurred_at)
+
+    def test_guard_strips_observed_token_from_subject_without_weekday(self) -> None:
+        # subject is persisted and exported like fact_text, and the
+        # ADR 0039 dedup key is built from it, so the same strip applies.
+        c = _event_candidate(subject="observed=2023-11-17 Ryan", occurred_at=None)
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(c.subject, "Ryan")
+
+    def test_guard_never_copies_a_source_row_observed_date(self) -> None:
+        # Shape-independent backstop. Whatever wording an extractor
+        # wraps it in, a date that IS the recording date of one of the
+        # candidate's own source messages is mention time, not event time
+        # (Invariant 11, ADR 0037). Degrading to undated loses no recall: the
+        # derived mentioned_at carries that same date on the retrieval ladder.
+        c = _event_candidate(
+            fact_text="User ran the race, recorded 2023-11-17 by the agent",
+            occurred_at=None,
+            source_message_ids=[1],
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertIsNone(c.occurred_at)
+
+    def test_guard_never_substitutes_a_source_observed_date_for_a_model_date(
+        self,
+    ) -> None:
+        # The backstop has to cover every path that assigns occurred_at from
+        # fact_text, not just the null->copy one. Here the model supplies a
+        # plausible date, so the copy path is skipped entirely and the
+        # stated-date-wins branch is what reaches for the in-text date -- which
+        # is the source message's recording date. Substituting it would persist
+        # mention time as event time just as surely as copying it would.
+        c = _event_candidate(
+            fact_text="User ran the race, recorded 2023-11-17 by the agent",
+            occurred_at="2023-12-01",
+            source_message_ids=[1],
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(c.occurred_at, "2023-12-01")
+
+    def test_guard_still_copies_a_genuine_intext_date(self) -> None:
+        # The backstop is narrow: an in-text date that is not a source row's
+        # recording date still backfills, so ADR 0038's copy path survives.
+        c = _event_candidate(
+            fact_text="User ran the race on 2023-10-02",
+            occurred_at=None,
+            source_message_ids=[1],
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(c.occurred_at, "2023-10-02")
+
+    def test_guard_prefers_intext_date_over_contradicting_model_date(self) -> None:
+        # The precision cap only fires when occurred_at extends the
+        # in-text date. A model date that CONTRADICTS the single date the text
+        # states is fabricated just the same, and must lose to the text.
+        c = _event_candidate(
+            fact_text="Sarah's wedding is in June 2023",
+            occurred_at="2023-07-15",
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(c.occurred_at, "2023-06")
+
+    def test_guard_drops_candidate_left_empty_by_the_strip(self) -> None:
+        # A candidate whose text was nothing but an echoed marker
+        # comes out empty. An empty fact_text is NOT NULL-legal, would stage an
+        # empty FTS body, and under the ADR 0039 lower(trim(subject)) key would
+        # share a merge bucket with every other empty-subject candidate. Drop
+        # it per the ADR 0031 per-candidate drop posture. The list is mutated
+        # in place because every call site ignores the return value.
+        empty = _event_candidate(
+            fact_text="[message_id=1 observed=2023-11-17 Fri]",
+            subject="[message_id=1 observed=2023-11-17 Fri]",
+            occurred_at=None,
+        )
+        kept = _event_candidate(fact_text="User ran the race", occurred_at=None)
+        candidates = [empty, kept]
+        returned = apply_occurred_at_guards(candidates, _rows_nov_2023(), "...")
+        self.assertEqual(candidates, [kept])
+        self.assertEqual(returned, [kept])
+
 
 if __name__ == "__main__":
     unittest.main()
