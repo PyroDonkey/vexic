@@ -3598,6 +3598,21 @@ class OccurredAtGuardTests(unittest.TestCase):
         apply_occurred_at_guards([c], _rows_nov_2023(), "...")
         self.assertIsNone(c.occurred_at)
 
+    def test_guard_recovers_intext_date_after_dropping_implausible_model_year(
+        self,
+    ) -> None:
+        # The two plausibility passes are not redundant: the first runs BEFORE
+        # the copy-backfill so a fabricated model year is cleared out of the
+        # way and the grounded in-text date can take its place. Collapse them
+        # into one pass after the backfill and this candidate ends up undated,
+        # silently losing an event date the transcript actually grounds.
+        c = _event_candidate(
+            fact_text="Ryan ran the Berlin half on 2023-09-24",
+            occurred_at="2027-01-01",
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(c.occurred_at, "2023-09-24")
+
     def test_guard_never_substitutes_a_source_observed_date_for_a_model_date(
         self,
     ) -> None:

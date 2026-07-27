@@ -1752,6 +1752,43 @@ class MentionedAtDerivationTests(unittest.TestCase):
         mentioned_at, _ = self._mentioned_at(candidate_id)
         self.assertEqual(mentioned_at, "2026-03-05")
 
+    def test_promotion_nulls_a_whitespace_only_mentioned_at_on_a_non_event(
+        self,
+    ) -> None:
+        # The fail-loud event guard cannot cover this: it never runs for a
+        # non-event category, so blank-ish normalization is the only thing
+        # standing between an externally written '   ' and Tier 3. Stored, it
+        # wins COALESCE(NULLIF(occurred_at,''), NULLIF(mentioned_at,''),
+        # created_at) -- NULLIF does not strip whitespace -- and sorts before
+        # every digit, so it matches every event_after filter and is excluded
+        # by every as_of/event_before filter.
+        first = self._save_message(
+            "Ryan prefers uv.",
+            timestamp="2026-03-05T10:00:00+00:00",
+        )
+        candidate_id = self._commit_candidate(
+            _candidate("Ryan prefers uv.", message_ids=[first], category="fact")
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE memory_candidates SET mentioned_at = '   ' WHERE id = ?",
+                (candidate_id,),
+            )
+            conn.commit()
+
+        commit_deep_cycle(
+            self.db_path,
+            [PromotionDecision(candidate_id=candidate_id, embedding=_unit_vector(1.0))],
+            started_at="2026-06-01T00:01:00+00:00",
+            finished_at="2026-06-01T00:01:01+00:00",
+        )
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            stored = conn.execute(
+                "SELECT mentioned_at FROM long_term_memory ORDER BY id DESC LIMIT 1"
+            ).fetchone()[0]
+        self.assertIsNone(stored)
+
     def test_deep_selection_skips_a_non_canonical_mentioned_at(self) -> None:
         # Selection and the promotion gate must agree on what counts as a
         # date. If selection accepts a value promotion refuses, the refusal

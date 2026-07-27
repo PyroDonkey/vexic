@@ -75,6 +75,30 @@ class RebuildCopyRedactionTests(unittest.TestCase):
 
         self.assertFalse(self.copy_db.exists())
 
+    def test_rebuild_copy_fails_closed_on_non_ascii_secret_in_blob_column(self) -> None:
+        # The ASCII case above cannot tell decoding apart from repr: str(b"...")
+        # still contains an ASCII secret as a substring. A non-ASCII forbidden
+        # value can: bytes.decode("utf-8") matches it, str(bytes) renders it as
+        # "\xc3\xa9" and the Invariant 9 guard would pass a live secret through
+        # into the rebuild copy.
+        secret = "passphrase-café"
+        self._execute(
+            "CREATE TABLE background_tool_audit (id INTEGER PRIMARY KEY, payload BLOB)"
+        )
+        self._execute(
+            "INSERT INTO background_tool_audit (payload) VALUES (?)",
+            (f"tool call used {secret}".encode("utf-8"),),
+        )
+
+        with self.assertRaises(ValueError):
+            create_memory_rebuild_copy(
+                str(self.source_db),
+                str(self.copy_db),
+                forbidden_secret_values=(secret,),
+            )
+
+        self.assertFalse(self.copy_db.exists())
+
     def test_rebuild_copy_still_skips_retrieval_event_fact_id_lists(self) -> None:
         # These three columns hold JSON arrays of integer fact ids, never free
         # text, so they stay exempt: scanning them can only produce spurious
