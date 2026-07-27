@@ -1013,10 +1013,19 @@ def _embedded_candidate_ids(conn: sqlite3.Connection) -> set[int]:
     raises ``no such module: vec0``). We first check ``sqlite_master``: if the
     table was never created there are genuinely no embeddings, so we return an
     empty set without loading the extension or creating any schema (avoiding a
-    write on this diagnostic read path). When the table exists,
-    ``_ensure_vector_memory_schema`` only loads the extension -- its
-    ``CREATE ... IF NOT EXISTS`` are no-ops -- before we read the ids.
+    write on this diagnostic read path). When the table exists we load the
+    extension and nothing else.
+
+    Deliberately NOT ``_ensure_vector_memory_schema``: that also runs
+    ``_ensure_dedup_events`` (an ``ALTER TABLE``), ``_ensure_embedding_metadata``
+    (an ``INSERT`` when absent), and ``create_embeddings_table``. Those are
+    no-ops only on a database whose schema is already current -- and this
+    function is handed a ``?mode=ro`` connection over a frozen run artifact
+    precisely when it is not. On a legacy artifact the ``ALTER`` raises
+    "attempt to write a readonly database", aborting the replay with an error
+    that points at file permissions instead of at the schema drift.
     """
+    from vexic.storage.vectors import select_vector_backend
 
     table_exists = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -1024,7 +1033,7 @@ def _embedded_candidate_ids(conn: sqlite3.Connection) -> set[int]:
     ).fetchone()
     if table_exists is None:
         return set()
-    _ensure_vector_memory_schema(conn)
+    select_vector_backend(conn).prepare(conn)
     rows = conn.execute(
         "SELECT candidate_id FROM memory_candidate_embeddings"
     ).fetchall()
@@ -1724,6 +1733,16 @@ async def run_longmemeval_subset(
         except Exception as exc:
             if "forbidden secret" in str(exc):
                 raise
+            # Degrading silently makes a diagnostics failure indistinguishable
+            # from a genuine "the answer was never extracted" result: every
+            # field reads False/None either way, so an operator concludes Light
+            # produced nothing when Tier 2 may be fully populated. Say so.
+            print(
+                f"warning: answer diagnostics failed for question "
+                f"{getattr(instance, 'question_id', '?')}: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
             answer_diagnostics = _diagnostics_error_result(instance)
 
         if answer_mode == "judged-recall" and (
