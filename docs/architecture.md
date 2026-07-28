@@ -22,6 +22,8 @@ Key modules:
 - `vexic.rem` - REM boost phase (local embedding-centrality heuristic)
 - `vexic.deep` - Deep promotion/supersession phase
 - `vexic.subagents.retrieval` - hybrid Tier 3 retrieval and candidate fallback
+- `vexic.operator_cli` - operator-run memory review-export and rebuild-copy
+  behind `vexic operator` (ADR 0011)
 - `vexic.mcp_stdio` - read-only local stdio MCP MVP
 - `vexic.mcp_http` - read-only native HTTP MCP adapter over hosted auth
 - `vexic.ports` - host-supplied model-agent ports
@@ -102,6 +104,10 @@ is a consumer, not a dependency.
   message ids, lifecycle flags, and reinforcement counters.
 - Candidate embeddings live in `memory_candidate_embeddings`.
 - `memory_dedup_events` records vector dedup decisions.
+- Dedup is gated on the normalized subject key `lower(trim(subject))` within
+  the same category and agent scope, so trivial variants such as `User` and
+  `user` share one merge bucket. The stored `subject` stays verbatim
+  (ADR 0039).
 - Candidates may be promoted, retired, marked stale, or marked for review.
 - Candidate fallback retrieves active unpromoted candidates only when Tier 3
   retrieval returns no durable facts.
@@ -127,8 +133,10 @@ Rows on both memory tiers carry two optional dates plus the insert timestamp
 
 - `occurred_at` - event time, extracted by the Light model at whatever
   partial ISO precision the transcript states (`2025`, `2025-03`,
-  `2025-03-14`). Never fabricated; `category="event"` facts need it or
-  `mentioned_at` to promote (Memory Invariant 11).
+  `2025-03-14`). Never fabricated -- enforced deterministically rather than
+  trusted to the model: a fabricated or ungrounded value degrades the candidate
+  to undated (ADR 0038). `category="event"` facts need it or `mentioned_at` to
+  promote (Memory Invariant 11).
 - `mentioned_at` - derived provenance: the earliest UTC calendar date of the
   row's source messages, computed deterministically from `messages.timestamp`
   at candidate insert, recomputed over the union on merge, and backfilled for
@@ -154,9 +162,13 @@ local and deterministic and uses no model port (ADR 0020).
 ### Light
 
 `vexic.pipeline.run_light_phase` reads transcript rows since the last
-watermark, renders stable message ids, asks a host-supplied extraction agent for
-structured `FactCandidate` output, validates source ids, embeds fact text
-through the supplied embedding port or optional local adapter, and commits
+watermark and renders stable message ids, each labeled with the message's
+day-precision recording date (`[message_id=N observed=YYYY-MM-DD Ddd]`). That
+label is transient prompt scaffolding and is never persisted (ADR 0038,
+Memory Invariant 2). Light then asks a host-supplied extraction agent for
+structured `FactCandidate` output, validates source ids, strips echoed markers
+and degrades any fabricated or ungrounded `occurred_at` to undated, embeds fact
+text through the supplied embedding port or optional local adapter, and commits
 candidate inserts/merges with a `dream_runs` audit row.
 
 Dream watermarks are scoped by compatible memory scope including `agent_id`.
@@ -370,3 +382,9 @@ Vexic v0.1 includes storage primitives, service operations, and tests for
 export, replay, rebuild, and lifecycle tombstones. Repair/rebuild work preserves
 the lossless invariant: build new projections or repaired copies without
 deleting canonical transcript, candidate, fact, or retrieval-event history.
+
+The operator-facing entry point is `vexic operator` (`vexic.operator_cli`,
+ADR 0011): `review-export` renders a markdown audit of Tier 2 candidates and
+Tier 3 facts, and `rebuild-copy` copies the database to a new file and rebuilds
+that copy's projections, leaving the source untouched. See `docs/usage.md` for
+the commands and their redaction flags.

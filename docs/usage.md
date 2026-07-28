@@ -172,8 +172,8 @@ Setup also works from a plain `pip install vexic` (no source checkout and no
 invoke the installing interpreter directly, while the printed connect command
 launches `python -m vexic.mcp_stdio_main --recorder-config ...`. Long-term
 semantic search through the local MCP server needs the embedding extra, so
-install with `pip install 'vexic[local-embed]'` if you want `search_long_term`
-available.
+install with `pip install 'vexic[local-embed]'` if you want the
+`recall_user_memory` tool available.
 
 On Claude Code stop events, the recorder reads the JSONL transcript, keeps
 visible user/assistant text, maps source keys as
@@ -670,14 +670,63 @@ attributes to the cycle that produced it. Deep's model-backed contradiction
 judge is not modeled. And the phase classification is signature-based, with a
 positional REM-before-Deep fallback for otherwise-ambiguous all-zero rows.
 
+### Oracle-Evidence Experiment
+
+`scripts/oracle_evidence_experiment.py` separates two causes of a class-3 miss:
+incomplete retrieval versus failed answer-time derivation from evidence that
+was in fact retrieved. For each hand-curated miss it builds several evidence
+sets over an existing LongMemEval run database and scores each with the same
+recall judge `vexic.longmemeval` uses:
+
+- `oracle` -- the hand-selected constituent facts, the combined ceiling of
+  complete evidence plus judge derivation.
+- `baseline` -- the reconstructed fused top-5 the run actually returned,
+  re-judged. Informational only: a question's N is defined by the run's
+  recorded verdict, never by this re-judge.
+- sweep `k` -- reconstructed fused[:k] for k in 8, 10, and 15, plus the
+  deterministic constituent-capture fraction at each k.
+
+Pass means a judge verdict of `supported` only, matching
+`judged_recall_pass`; a `partial` verdict counts as a miss and is reported
+separately.
+
+The only live provider calls are the recall-judge invocations. Fused[:k]
+reconstruction, constituent capture, the pre-fusion-pool ceiling, and the
+headroom membership sets are deterministic, so the whole capture-and-ceiling
+table runs under `--bind-only` with no provider access:
+
+```bash
+uv run python scripts/oracle_evidence_experiment.py --bind-only \
+  --oracle-fixture <oracle-fixture>.json
+```
+
+A judged run spends provider budget and is gated behind `--allow-live` plus a
+call cap, the same shape as the extraction-prompt ablation:
+
+```bash
+OPENROUTER_API_KEY=... uv run python scripts/oracle_evidence_experiment.py \
+  --allow-live --adapter adapters/openrouter_live_adapter.py \
+  --oracle-fixture <oracle-fixture>.json \
+  --out .eval-runs/<out-dir> --max-provider-calls 250 --repeats 3
+```
+
+Artifacts: `oracle_evidence_metrics.json` and `oracle_evidence_table.md`.
+`--judge-model-group` defaults to `claude`, so the judge model comes from
+`VEXIC_LIVE_CLAUDE_MODEL`. Like the gap fixture used by the class-3 harnesses,
+the oracle fixture is hand-curated and run-local: it references
+`long_term_memory` rowids inside frozen, git-ignored `.eval-runs/**`
+databases, so it is attached to the issue rather than committed. The
+deterministic path the tests exercise builds its own synthetic run database.
+
 ## Hosted MVP Shell
 
 The dependency-free hosted shell in `vexic.hosted` binds authenticated tenant
 scope before delegation and can route sanitized request/job usage events to an
 adapter-owned telemetry sink. Concrete tenant provisioning, API-key storage,
 and the internal-alpha HTTP transport live in adapters outside the memory core.
-The Railway alpha at `https://api.vexic.dev` is for throwaway internal testing,
-not a public product service. See `docs/hosted-mvp.md`. External
+The examples below use `https://api.vexic.dev`, the internal Railway alpha base
+URL; treat it as throwaway internal testing, not a public product service. See
+`docs/hosted-mvp.md`. External
 customer-memory readiness is still gated by hosted security, privacy, backup,
 and abuse controls.
 

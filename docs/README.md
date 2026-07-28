@@ -5,7 +5,10 @@ Start here if you are new to the project.
 ## Using Vexic
 
 - [Usage guide](usage.md) - running the memory service locally, wiring the
-  MCP server into Claude Code and Codex, dream-phase configuration.
+  MCP server into Claude Code and Codex, dream-phase configuration, the
+  `vexic operator` audit and recovery commands, and the eval harnesses.
+- [Configuration](configuration.md) - every environment variable the package
+  and its adapters read.
 - [Examples](examples.md) - agent behavior and contributor operating patterns,
   including a worked retrieval-evals run.
 - [Memory service contract](memory-service-contract.md) - the versioned
@@ -13,7 +16,8 @@ Start here if you are new to the project.
   implementations must satisfy.
 - [Architecture](architecture.md) - the three-tier memory model and how the
   pieces fit together.
-- [Provenance](provenance.md) - how every stored fact carries its source.
+- [Provenance](provenance.md) - how Vexic was extracted from its private
+  predecessor host, and what was rehomed since.
 
 ## Hosted service (internal alpha)
 
