@@ -327,6 +327,54 @@ class LightPhaseProvenanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1 dropped", output.getvalue())
         self.assertNotIn("Mars", output.getvalue())
 
+    async def test_guard_dropped_candidates_reach_the_durable_drop_count(self) -> None:
+        # The guards discard echo-only candidates in place, after provenance
+        # filtering has already produced its count. Without folding them in, a
+        # cycle whose every candidate was render scaffolding commits status
+        # "ok" with zero extracted and zero dropped -- indistinguishable from
+        # "the model found nothing", which is the signal ADR 0031's drop count
+        # exists to give the operator.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "memory.db")
+            init_db(db_path)
+            message_id = save_messages(
+                db_path,
+                [ModelRequest(parts=[UserPromptPart(content="I prefer compact reports.")])],
+            )[0]
+
+            class ExtractionAgent:
+                async def run(self, transcript: str) -> object:
+                    return SimpleNamespace(
+                        output=[
+                            FactCandidate(
+                                fact_text=f"[message_id={message_id}]",
+                                subject=f"[message_id={message_id}]",
+                                category="preference",
+                                importance=7,
+                                confidence=0.9,
+                                source_message_ids=[message_id],
+                            ),
+                        ],
+                        usage=_fake_usage(),
+                    )
+
+            output = StringIO()
+            with redirect_stdout(output):
+                await run_light_phase(
+                    db_path,
+                    "glm",
+                    extraction_agent_factory=lambda group, secrets=None: ExtractionAgent(),
+                    embed=lambda texts: [[0.0] * EMBEDDING_DIM for _ in texts],
+                )
+
+            with closing(sqlite3.connect(db_path)) as conn:
+                dropped = conn.execute(
+                    "SELECT candidates_dropped FROM dream_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()[0]
+
+        self.assertEqual(dropped, 1)
+        self.assertIn("1 dropped", output.getvalue())
+
     async def test_error_after_filtering_still_records_known_drop_count(self) -> None:
         # A failure between provenance filtering and commit must not zero the
         # already-known drop count on the error audit row: the failed cycle's
@@ -3566,9 +3614,9 @@ class OccurredAtGuardTests(unittest.TestCase):
         # stripped from persisted text and must never reach the copy-backfill.
         for text in (
             "User ran the race on observed=2023-11-17",
-            "User ran the race (observed 2023-11-17)",
             "User ran the race on observed: 2023-11-17",
             "User ran the race on observed = 2023-11-17",
+            "User ran the race on observed=2023-11-17 Fri",
         ):
             with self.subTest(text=text):
                 c = _event_candidate(fact_text=text, occurred_at=None)
@@ -3576,6 +3624,22 @@ class OccurredAtGuardTests(unittest.TestCase):
                 self.assertNotIn("observed", c.fact_text)
                 self.assertNotIn("2023-11-17", c.fact_text)
                 self.assertIsNone(c.occurred_at)
+
+    def test_guard_leaves_separatorless_observed_prose_intact(self) -> None:
+        # _observed_label always emits "observed=", so "observed <date>" with no
+        # separator is prose, not a label echo. Stripping it would delete real
+        # content. The date still must not become occurred_at -- that is the
+        # backstop's job, not the regex's.
+        c = _event_candidate(
+            fact_text="The eclipse was observed 2023-11-17 from the ridge",
+            occurred_at=None,
+            source_message_ids=[1],
+        )
+        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
+        self.assertEqual(
+            c.fact_text, "The eclipse was observed 2023-11-17 from the ridge"
+        )
+        self.assertIsNone(c.occurred_at)
 
     def test_guard_strips_observed_token_from_subject_without_weekday(self) -> None:
         # subject is persisted and exported like fact_text, and the

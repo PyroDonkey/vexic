@@ -53,13 +53,18 @@ _MARKER_RE = re.compile(r"\[\s*message_id\s*=\s*\d+[^\]]*\]")
 # Bare (unbracketed) observed= echo -- the label body _observed_label emits.
 # Stripped so an extractor that copies the label without its brackets cannot
 # leave the token in fact_text/subject or have its date misread as an in-text
-# event date. Everything the extractor is liable to reformat is optional: the
-# separator (``observed=``, ``observed:``, bare ``observed 2023-11-17``),
-# whitespace around it, and the trailing weekday abbreviation. Requiring the
-# weekday is what let ``observed=2023-11-17`` through and put a recording date
-# in occurred_at; a shape-independent backstop in
-# apply_occurred_at_guards now covers wordings this pattern cannot anticipate.
-_OBSERVED_TOKEN_RE = re.compile(r"observed\s*[:=]?\s*\d{4}-\d{2}-\d{2}(?:\s+\w{3}\b)?")
+# event date. The weekday abbreviation is optional and the separator may be
+# ``=`` or ``:``: requiring the weekday is what let ``observed=2023-11-17``
+# through and put a recording date in occurred_at.
+#
+# A separator is still REQUIRED. _observed_label always emits ``observed=``, so
+# a separator-less "observed 2024-04-08" is prose, not a label echo -- and
+# stripping it would delete real content from fact_text ("the eclipse was
+# observed 2024-04-08"), or empty the candidate outright. Leaving that phrase
+# alone is safe because the shape-independent backstop in
+# apply_occurred_at_guards, not this pattern, is what stops a recording date
+# reaching occurred_at.
+_OBSERVED_TOKEN_RE = re.compile(r"observed\s*[:=]\s*\d{4}-\d{2}-\d{2}(?:\s+\w{3}\b)?")
 _YEAR_RE = re.compile(r"\b(1\d{3}|20\d{2})\b")
 _ISO_FULL_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
 _ISO_YM_RE = re.compile(r"\b(\d{4})-(\d{2})\b(?!-)")
@@ -457,7 +462,13 @@ async def run_light_phase(
         candidates, dropped = keep_candidates_with_valid_source_ids(
             result.output, evidence_ids
         )
+        # The guards drop echo-only candidates in place, so fold that into the
+        # same count: without it a cycle whose every candidate was scaffolding
+        # records status "ok" with zero extracted and zero dropped, which reads
+        # as "the model found nothing" rather than "everything was discarded".
+        before_guards = len(candidates)
         apply_occurred_at_guards(candidates, rows, transcript)
+        dropped += before_guards - len(candidates)
 
         missing_embeddings = load_candidates_missing_embeddings(
             db_path,
@@ -503,7 +514,8 @@ async def run_light_phase(
             forbidden_secret_values=forbidden,
         )
         dropped_note = (
-            f" ({dropped} dropped: source_message_ids missing or outside the window)"
+            f" ({dropped} dropped: source_message_ids missing or outside the "
+            "window, or no text left after stripping render scaffolding)"
             if dropped
             else ""
         )
