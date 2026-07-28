@@ -53,18 +53,18 @@ _MARKER_RE = re.compile(r"\[\s*message_id\s*=\s*\d+[^\]]*\]")
 # Bare (unbracketed) observed= echo -- the label body _observed_label emits.
 # Stripped so an extractor that copies the label without its brackets cannot
 # leave the token in fact_text/subject or have its date misread as an in-text
-# event date. The weekday abbreviation is optional and the separator may be
-# ``=`` or ``:``: requiring the weekday is what let ``observed=2023-11-17``
-# through and put a recording date in occurred_at.
+# event date. Every part an extractor is liable to reformat is loose -- the
+# separator (``=``, ``:``, or none) and the trailing weekday are all optional --
+# because requiring the weekday is what let ``observed=2023-11-17`` through and
+# put a recording date in occurred_at.
 #
-# A separator is still REQUIRED. _observed_label always emits ``observed=``, so
-# a separator-less "observed 2024-04-08" is prose, not a label echo -- and
-# stripping it would delete real content from fact_text ("the eclipse was
-# observed 2024-04-08"), or empty the candidate outright. Leaving that phrase
-# alone is safe because the shape-independent backstop in
-# apply_occurred_at_guards, not this pattern, is what stops a recording date
-# reaching occurred_at.
-_OBSERVED_TOKEN_RE = re.compile(r"observed\s*[:=]\s*\d{4}-\d{2}-\d{2}(?:\s+\w{3}\b)?")
+# Matching loosely is only safe because _strip_marker_echo strips a bare match
+# solely when the captured date is one of the window's own recording dates. The
+# date is captured (group 1) for exactly that test: a genuine label echo always
+# names a recorded date, and "Symptoms observed: 2024-04-08" does not.
+_OBSERVED_TOKEN_RE = re.compile(
+    r"observed\s*[:=]?\s*(\d{4}-\d{2}-\d{2})(?:\s+\w{3}\b)?"
+)
 _YEAR_RE = re.compile(r"\b(1\d{3}|20\d{2})\b")
 _ISO_FULL_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
 _ISO_YM_RE = re.compile(r"\b(\d{4})-(\d{2})\b(?!-)")
@@ -274,20 +274,30 @@ def _single_intext_date(fact_text: str) -> str | None:
     return found[0] if len(found) == 1 else None
 
 
-def _strip_marker_echo(text: str) -> str:
+def _strip_marker_echo(text: str, observed_dates: frozenset[str] = frozenset()) -> str:
     """Remove any echoed ``[message_id=... observed=...]`` marker -- and any
-    bare ``observed=...`` token -- from ``text`` and collapse the resulting
-    whitespace.
+    bare ``observed=<date>`` token naming a date this window actually recorded
+    -- from ``text``, collapsing the resulting whitespace.
 
     The render marker is transient prompt scaffolding (Memory Invariant 2); an
     extractor that copies it into fact_text or subject would persist it into
     Tier 2 text and FTS, and its ``observed=`` date could be misread as an
-    in-text event date. Both bracketed markers (including whitespace-padded
-    variants) and unbracketed ``observed=`` tokens are stripped before the
-    date-copy logic and before embedding/commit.
+    in-text event date.
+
+    A bracketed marker is unambiguous and always stripped. A bare token is not:
+    "Symptoms observed: 2024-04-08" is a fact, not scaffolding, and deleting
+    its date would destroy content and could empty the candidate. So the bare
+    strip additionally requires the date to be one of the window's own
+    recording dates -- which every genuine echo carries and ordinary prose
+    does not. That makes the strip scaffolding-aware rather than shape-aware,
+    so the separator and weekday can stay loose without eating real text.
     """
     without_markers = _MARKER_RE.sub(" ", text)
-    without_bare = _OBSERVED_TOKEN_RE.sub(" ", without_markers)
+
+    def _strip_if_scaffolding(match: re.Match[str]) -> str:
+        return " " if match.group(1) in observed_dates else match.group(0)
+
+    without_bare = _OBSERVED_TOKEN_RE.sub(_strip_if_scaffolding, without_markers)
     return re.sub(r"\s+", " ", without_bare).strip()
 
 
@@ -319,14 +329,19 @@ def apply_occurred_at_guards(
     """
     plausible = _plausible_years(rows, transcript)
     observed_by_id = _observed_dates_by_message_id(rows)
+    # Every recording date this window rendered. A bare observed= token is
+    # scaffolding only if it names one of these; the strip uses the whole
+    # window (not the candidate's own sources) because an extractor can echo
+    # any label it was shown, regardless of which message it ends up citing.
+    window_observed = frozenset(observed_by_id.values())
     for candidate in candidates:
         # Strip echoed render markers first: they carry an observed= date that
         # _single_intext_date would otherwise misread as an event date, and
         # must not survive into stored fact_text or subject (runs before
         # embedding at the run_light_phase call site). subject is persisted and
         # exported like fact_text, so it gets the same strip.
-        candidate.fact_text = _strip_marker_echo(candidate.fact_text)
-        candidate.subject = _strip_marker_echo(candidate.subject)
+        candidate.fact_text = _strip_marker_echo(candidate.fact_text, window_observed)
+        candidate.subject = _strip_marker_echo(candidate.subject, window_observed)
         if candidate.occurred_at is not None:
             if int(candidate.occurred_at[:4]) not in plausible:
                 candidate.occurred_at = None

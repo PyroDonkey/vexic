@@ -3616,6 +3616,7 @@ class OccurredAtGuardTests(unittest.TestCase):
             "User ran the race on observed=2023-11-17",
             "User ran the race on observed: 2023-11-17",
             "User ran the race on observed = 2023-11-17",
+            "User ran the race (observed 2023-11-17)",
             "User ran the race on observed=2023-11-17 Fri",
         ):
             with self.subTest(text=text):
@@ -3625,21 +3626,37 @@ class OccurredAtGuardTests(unittest.TestCase):
                 self.assertNotIn("2023-11-17", c.fact_text)
                 self.assertIsNone(c.occurred_at)
 
-    def test_guard_leaves_separatorless_observed_prose_intact(self) -> None:
-        # _observed_label always emits "observed=", so "observed <date>" with no
-        # separator is prose, not a label echo. Stripping it would delete real
-        # content. The date still must not become occurred_at -- that is the
-        # backstop's job, not the regex's.
+    def test_guard_leaves_observed_prose_about_an_unrecorded_date_intact(self) -> None:
+        # The bare strip is scaffolding-aware, not shape-aware: a genuine label
+        # echo always names a date the window recorded, and prose does not.
+        # 2019-07-02 is no message's recording date here, so the phrase and its
+        # date survive -- and, being a real stated event date, it backfills.
         c = _event_candidate(
-            fact_text="The eclipse was observed 2023-11-17 from the ridge",
+            fact_text="The eclipse was observed 2019-07-02 from the ridge",
             occurred_at=None,
             source_message_ids=[1],
         )
-        apply_occurred_at_guards([c], _rows_nov_2023(), "...")
-        self.assertEqual(
-            c.fact_text, "The eclipse was observed 2023-11-17 from the ridge"
+        apply_occurred_at_guards(
+            [c], _rows_nov_2023(), "we talked about the 2019 eclipse"
         )
-        self.assertIsNone(c.occurred_at)
+        self.assertEqual(
+            c.fact_text, "The eclipse was observed 2019-07-02 from the ridge"
+        )
+        self.assertEqual(c.occurred_at, "2019-07-02")
+
+    def test_guard_leaves_colon_form_prose_about_an_unrecorded_date_intact(self) -> None:
+        # The colon form is the one most likely to appear in real structured
+        # prose ("Symptoms observed: <date>"); it must survive when the date is
+        # not one the window recorded.
+        c = _event_candidate(
+            fact_text="Symptoms observed: 2019-07-02 by the clinic",
+            occurred_at=None,
+            source_message_ids=[1],
+        )
+        apply_occurred_at_guards(
+            [c], _rows_nov_2023(), "we talked about the 2019 visit"
+        )
+        self.assertEqual(c.fact_text, "Symptoms observed: 2019-07-02 by the clinic")
 
     def test_guard_strips_observed_token_from_subject_without_weekday(self) -> None:
         # subject is persisted and exported like fact_text, and the
