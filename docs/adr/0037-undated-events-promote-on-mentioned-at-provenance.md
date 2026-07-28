@@ -100,6 +100,18 @@ category-mutation machinery exists).
   precedent). `export_scope` payloads omit `occurred_at` today and equally
   omit `mentioned_at`; stated here deliberately rather than inherited
   silently.
+- "Additive" was not sufficient for wire compatibility on its own. Every
+  contract model inherited `extra="forbid"`, and `HostedHttpMemoryServiceClient`
+  validates the server's JSON against its own pinned models - so a client
+  running a pre-0037 `vexic` package raised `ValidationError` on any Tier 3
+  result from a newer server, with `contract_version` unchanged on both sides
+  so neither could detect the skew. The `occurred_at` precedent carried the
+  identical hazard and simply never fired. Results (`MemoryResult` and the
+  payload models that only travel caller-ward) now derive from
+  `MemoryResultModel`, which sets `extra="ignore"`; requests and the payload
+  models that ride inside them keep `extra="forbid"`, because an unknown key
+  in caller-written input is a typo and should still fail loud. Additive
+  result fields are backward compatible by construction from here on.
 - Invariant 11 is amended in `AGENTS.md`, not bypassed: events must carry
   `occurred_at` or, failing that, `mentioned_at`; fabricating either remains
   forbidden.

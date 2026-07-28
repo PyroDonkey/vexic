@@ -508,8 +508,14 @@ def _collect_windows(dbs: list[str]) -> list[Window]:
                 f"--db {db} has no completed Light cycles in dream_runs; "
                 "no persisted Light windows exist to reconstruct."
             )
+        # read_only=True, like _light_window_boundaries and the sibling
+        # time-context harness: this measures a frozen eval corpus it must
+        # never mutate. Production sets journal_mode=WAL, so a read-write open
+        # of a corpus left with an uncheckpointed -wal folds that -wal into the
+        # database on close and deletes it -- the evidence artifact's bytes
+        # change, silently.
         rows = load_messages_since(
-            db, 0, exclude_session_prefixes=("onboarding:",)
+            db, 0, exclude_session_prefixes=("onboarding:",), read_only=True
         )
         for index, window_rows in enumerate(
             _slice_rows_by_boundaries(rows, boundaries)

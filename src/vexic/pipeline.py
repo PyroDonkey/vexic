@@ -50,13 +50,21 @@ LIGHT_PHASE_BATCH_SIZE = 50
 _LOCAL_EMBEDDER = embed_texts
 
 _MARKER_RE = re.compile(r"\[\s*message_id\s*=\s*\d+[^\]]*\]")
-# Bare (unbracketed) observed=YYYY-MM-DD Day echo -- the exact label body
-# _observed_label emits. Stripped so an extractor that copies the label
-# without its brackets cannot leave the token in fact_text/subject or have its
-# date misread as an in-text event date. Whitespace around ``=`` is tolerated
-# in both patterns: an extractor that reformats the label (``message_id = 3``,
-# ``observed = 2023-11-17``) must not slip the scaffolding past the strip.
-_OBSERVED_TOKEN_RE = re.compile(r"observed\s*=\s*\d{4}-\d{2}-\d{2}\s+\w{3}\b")
+# Bare (unbracketed) observed= echo -- the label body _observed_label emits.
+# Stripped so an extractor that copies the label without its brackets cannot
+# leave the token in fact_text/subject or have its date misread as an in-text
+# event date. Every part an extractor is liable to reformat is loose -- the
+# separator (``=``, ``:``, or none) and the trailing weekday are all optional --
+# because requiring the weekday is what let ``observed=2023-11-17`` through and
+# put a recording date in occurred_at.
+#
+# Matching loosely is only safe because _strip_marker_echo strips a bare match
+# solely when the captured date is one of the window's own recording dates. The
+# date is captured (group 1) for exactly that test: a genuine label echo always
+# names a recorded date, and "Symptoms observed: 2024-04-08" does not.
+_OBSERVED_TOKEN_RE = re.compile(
+    r"observed\s*[:=]?\s*(\d{4}-\d{2}-\d{2})(?:\s+\w{3}\b)?"
+)
 _YEAR_RE = re.compile(r"\b(1\d{3}|20\d{2})\b")
 _ISO_FULL_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
 _ISO_YM_RE = re.compile(r"\b(\d{4})-(\d{2})\b(?!-)")
@@ -204,6 +212,24 @@ def _plausible_years(rows: list[tuple[int, str | None, ModelMessage]], transcrip
     return years
 
 
+def _observed_dates_by_message_id(
+    rows: list[tuple[int, str | None, ModelMessage]],
+) -> dict[int, str]:
+    """Each rendered message's observed (recording) date, keyed by message id.
+
+    The same fail-soft parse `_observed_label` uses: a message whose timestamp
+    is absent or unreadable simply has no entry, so it constrains nothing.
+    """
+    observed: dict[int, str] = {}
+    for message_id, timestamp, _ in rows:
+        if isinstance(timestamp, str) and timestamp:
+            try:
+                observed[message_id] = date.fromisoformat(timestamp[:10]).isoformat()
+            except ValueError:
+                continue
+    return observed
+
+
 def _single_intext_date(fact_text: str) -> str | None:
     """The one absolute date stated in fact_text, at stated precision, or
     None. A calendar-invalid match (e.g. "February 30, 2023") still counts as
@@ -248,20 +274,30 @@ def _single_intext_date(fact_text: str) -> str | None:
     return found[0] if len(found) == 1 else None
 
 
-def _strip_marker_echo(text: str) -> str:
+def _strip_marker_echo(text: str, observed_dates: frozenset[str] = frozenset()) -> str:
     """Remove any echoed ``[message_id=... observed=...]`` marker -- and any
-    bare ``observed=...`` token -- from ``text`` and collapse the resulting
-    whitespace.
+    bare ``observed=<date>`` token naming a date this window actually recorded
+    -- from ``text``, collapsing the resulting whitespace.
 
     The render marker is transient prompt scaffolding (Memory Invariant 2); an
     extractor that copies it into fact_text or subject would persist it into
     Tier 2 text and FTS, and its ``observed=`` date could be misread as an
-    in-text event date. Both bracketed markers (including whitespace-padded
-    variants) and unbracketed ``observed=`` tokens are stripped before the
-    date-copy logic and before embedding/commit.
+    in-text event date.
+
+    A bracketed marker is unambiguous and always stripped. A bare token is not:
+    "Symptoms observed: 2024-04-08" is a fact, not scaffolding, and deleting
+    its date would destroy content and could empty the candidate. So the bare
+    strip additionally requires the date to be one of the window's own
+    recording dates -- which every genuine echo carries and ordinary prose
+    does not. That makes the strip scaffolding-aware rather than shape-aware,
+    so the separator and weekday can stay loose without eating real text.
     """
     without_markers = _MARKER_RE.sub(" ", text)
-    without_bare = _OBSERVED_TOKEN_RE.sub(" ", without_markers)
+
+    def _strip_if_scaffolding(match: re.Match[str]) -> str:
+        return " " if match.group(1) in observed_dates else match.group(0)
+
+    without_bare = _OBSERVED_TOKEN_RE.sub(_strip_if_scaffolding, without_markers)
     return re.sub(r"\s+", " ", without_bare).strip()
 
 
@@ -287,36 +323,61 @@ def apply_occurred_at_guards(
 
     Fabricated components degrade to undated (ADR 0037 Tier 2 sink) rather
     than dropping the candidate; in-text dates copy at stated precision only.
+    A candidate reduced to empty text by the marker strip is dropped outright
+    (ADR 0031 per-candidate drop posture). The list is filtered in place --
+    every call site relies on mutation and ignores the return value.
     """
     plausible = _plausible_years(rows, transcript)
+    observed_by_id = _observed_dates_by_message_id(rows)
+    # Every recording date this window rendered. A bare observed= token is
+    # scaffolding only if it names one of these; the strip uses the whole
+    # window (not the candidate's own sources) because an extractor can echo
+    # any label it was shown, regardless of which message it ends up citing.
+    window_observed = frozenset(observed_by_id.values())
     for candidate in candidates:
         # Strip echoed render markers first: they carry an observed= date that
         # _single_intext_date would otherwise misread as an event date, and
         # must not survive into stored fact_text or subject (runs before
         # embedding at the run_light_phase call site). subject is persisted and
         # exported like fact_text, so it gets the same strip.
-        candidate.fact_text = _strip_marker_echo(candidate.fact_text)
-        candidate.subject = _strip_marker_echo(candidate.subject)
+        candidate.fact_text = _strip_marker_echo(candidate.fact_text, window_observed)
+        candidate.subject = _strip_marker_echo(candidate.subject, window_observed)
         if candidate.occurred_at is not None:
             if int(candidate.occurred_at[:4]) not in plausible:
                 candidate.occurred_at = None
+        # Shape-independent scaffolding backstop: a date that IS the recording
+        # date of one of this candidate's own source messages is mention time,
+        # not event time, however the extractor worded it. _OBSERVED_TOKEN_RE
+        # can only catch echoes it can anticipate; this catches the rest.
+        # Degrading to undated costs no recall -- the derived mentioned_at
+        # carries that same date on the ladder -- and Invariant 11 forbids the
+        # alternative. Resolved once, so EVERY path below that assigns
+        # occurred_at from fact_text is covered, not just the copy-backfill.
+        intext = _single_intext_date(candidate.fact_text)
+        if intext is not None and intext in {
+            observed_by_id.get(mid) for mid in candidate.source_message_ids
+        }:
+            intext = None
         if candidate.occurred_at is None and candidate.category == "event":
-            candidate.occurred_at = _single_intext_date(candidate.fact_text)
+            candidate.occurred_at = intext
         if candidate.occurred_at is not None:
             if int(candidate.occurred_at[:4]) not in plausible:
                 candidate.occurred_at = None
-        # Ungrounded-precision cap: if fact_text states a single in-text date
-        # that is a strict, shorter prefix of the (model-supplied) occurred_at,
-        # truncate occurred_at to the in-text precision. Precision reduction
-        # only -- never extension (ADR 0038 day-invention mitigation).
+        # Stated-date wins: when fact_text states exactly one absolute date,
+        # an occurred_at that is not covered by it is model invention -- either
+        # a strict extension of the stated precision (day invented from
+        # "June 2023") or an outright contradiction ("June 2023" -> 2023-07-15).
+        # Both degrade to the stated date (ADR 0038). occurred_at LESS precise
+        # than the text is left alone: that invents nothing.
         if candidate.occurred_at is not None:
-            intext = _single_intext_date(candidate.fact_text)
-            if (
-                intext is not None
-                and candidate.occurred_at.startswith(intext)
-                and len(candidate.occurred_at) > len(intext)
-            ):
+            if intext is not None and not intext.startswith(candidate.occurred_at):
                 candidate.occurred_at = intext
+                if int(candidate.occurred_at[:4]) not in plausible:
+                    candidate.occurred_at = None
+    # An echo-only candidate strips to "". fact_text TEXT NOT NULL accepts '',
+    # which would stage an empty FTS body, and an empty subject shares one
+    # ADR 0039 lower(trim(subject)) merge bucket with every other such row.
+    candidates[:] = [c for c in candidates if c.fact_text and c.subject]
     return candidates
 
 
@@ -416,7 +477,13 @@ async def run_light_phase(
         candidates, dropped = keep_candidates_with_valid_source_ids(
             result.output, evidence_ids
         )
+        # The guards drop echo-only candidates in place, so fold that into the
+        # same count: without it a cycle whose every candidate was scaffolding
+        # records status "ok" with zero extracted and zero dropped, which reads
+        # as "the model found nothing" rather than "everything was discarded".
+        before_guards = len(candidates)
         apply_occurred_at_guards(candidates, rows, transcript)
+        dropped += before_guards - len(candidates)
 
         missing_embeddings = load_candidates_missing_embeddings(
             db_path,
@@ -462,7 +529,8 @@ async def run_light_phase(
             forbidden_secret_values=forbidden,
         )
         dropped_note = (
-            f" ({dropped} dropped: source_message_ids missing or outside the window)"
+            f" ({dropped} dropped: source_message_ids missing or outside the "
+            "window, or no text left after stripping render scaffolding)"
             if dropped
             else ""
         )

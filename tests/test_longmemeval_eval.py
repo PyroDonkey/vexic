@@ -21,6 +21,8 @@ from vexic.longmemeval import (
     PREFERENCE_QUESTION_TYPES,
     _PREFERENCE_RUBRIC_GUIDANCE,
     _answer_variants,
+    _embedded_candidate_ids,
+    _load_diagnostic_candidates,
     _render_recall_judge_input,
     _select_instances,
     drain_light_then_consolidate,
@@ -33,6 +35,7 @@ from vexic.longmemeval import (
 )
 from vexic.embeddings import EMBEDDING_DIM
 from vexic.models import FactCandidate
+from vexic.storage.schema import init_vector_memory
 from vexic.storage import (
     CandidateNote,
     LongTermFact,
@@ -2796,6 +2799,58 @@ class DeepEligibleFilterTests(unittest.TestCase):
 
         pref = _diag_candidate(candidate_id=1, category="preference", occurred_at=None)
         self.assertEqual(self._ids(_deep_eligible([pref])), [1])
+
+
+class EmbeddedCandidateIdsTests(unittest.TestCase):
+    """`_embedded_candidate_ids` is a diagnostic READ. The replay harness hands
+    it a `?mode=ro` connection on purpose, so it must not issue DDL or DML."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "run.db"
+        init_db(str(self.db_path))
+        init_vector_memory(str(self.db_path))
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_diagnostics_read_a_run_db_predating_mentioned_at(self) -> None:
+        # The diagnostics SELECT names mentioned_at, a column this release
+        # added. On a frozen pre-migration run DB that raises "no such column",
+        # which the handler classifies as operational and turns into [] -- so
+        # EVERY question in the run reports "Light extracted nothing" while
+        # Tier 2 is fully populated. Probe the schema instead.
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("ALTER TABLE memory_candidates DROP COLUMN mentioned_at")
+            conn.execute(
+                "INSERT INTO memory_candidates (fact_text, subject, category, "
+                "importance, confidence, source_message_ids) "
+                "VALUES ('Ryan ran the race', 'Ryan', 'event', 5, 0.9, '[1]')"
+            )
+            conn.commit()
+
+        candidates = _load_diagnostic_candidates(self.db_path)
+
+        self.assertEqual([c.fact_text for c in candidates], ["Ryan ran the race"])
+        self.assertIsNone(candidates[0].mentioned_at)
+
+    def test_reads_a_legacy_run_db_opened_read_only(self) -> None:
+        # A frozen run artifact whose memory_dedup_events predates the newer
+        # columns is exactly the legacy shape the replay harness targets.
+        # _ensure_vector_memory_schema would ALTER that table -- on a read-only
+        # connection that aborts the whole question's replay with an error
+        # pointing at file permissions rather than at the schema drift.
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            for column in ("incoming_fact_text", "incoming_source_message_ids"):
+                conn.execute(
+                    f"ALTER TABLE memory_dedup_events DROP COLUMN {column}"
+                )
+            conn.commit()
+
+        with closing(
+            sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        ) as conn:
+            self.assertEqual(_embedded_candidate_ids(conn), set())
 
 
 if __name__ == "__main__":

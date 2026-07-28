@@ -1063,5 +1063,34 @@ class AuditProvenanceIdentityTests(AblationExecutionHarness):
             self.assertEqual(record["db_resolved"], str(Path(link).resolve()))
 
 
+class GuardAppliedToAuditRecordsTests(AblationExecutionHarness):
+    """The harness's whole acceptance claim is that the *guarded* fabrication
+    rate is 0. That is only meaningful if apply_occurred_at_guards actually
+    ran: deleting the call makes guarded identical to raw and the metric
+    silently becomes a tautology, with every other test in this file still
+    green."""
+
+    def test_audit_records_carry_a_guarded_value_distinct_from_raw(self) -> None:
+        db = self._db_path()
+        self._install_windows({db: [[1, 2]]})
+        # The model leaves occurred_at unset; the guard's in-text copy-backfill
+        # is what supplies it. raw stays None, guarded becomes the stated date
+        # -- so raw == guarded proves the guard call was skipped.
+        self._install_agents(fact_text="Ryan ran the Berlin marathon on 2024-09-29.")
+
+        exit_code = self._run([db], repeats=1, max_windows=1, max_provider_calls=10)
+
+        self.assertEqual(exit_code, 0, self.stderr)
+        candidates = [
+            record
+            for record in self._audit_records()
+            if record.get("record_type") == "candidate"
+        ]
+        self.assertTrue(candidates)
+        for record in candidates:
+            self.assertIsNone(record["occurred_at_raw"])
+            self.assertEqual(record["occurred_at_guarded"], "2024-09-29")
+
+
 if __name__ == "__main__":
     unittest.main()
