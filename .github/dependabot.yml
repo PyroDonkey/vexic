@@ -2,10 +2,19 @@
 # pinned to full commit SHAs (with version comments) because floating major
 # tags are mutable; Dependabot understands SHA pins and bumps them alongside
 # the version comment.
+#
+# Bump PRs target `dev`, not the default branch. Vexic work flows
+# feature -> `dev` -> `main` (AGENTS.md, Repository Workflow), and a push to
+# `main` deploys the hosted service, so a `main`-targeted bump both bypasses
+# `dev` and redeploys production for a pin change. `ci.yml` runs on PRs into
+# `dev`, so the bumps are still tested; they reach `main` with the next
+# release PR. Dependabot reads this file from the default branch only, so
+# edits here take effect once they land on `main`.
 version: 2
 updates:
   - package-ecosystem: "github-actions"
     directory: "/"
+    target-branch: "dev"
     schedule:
       interval: "weekly"
     groups:
