@@ -54,6 +54,16 @@ trail, and `hosted_projects`/`tenants` had no working soft-delete
    server import the same contract module), so the version is deliberately held
    at `0.1.0` and version policy is revisited at the first external release.
 
+   > **Later narrowing (2026-07-27, ADR 0037).** "The contract models set
+   > `extra="forbid"`" was true when this ADR was written and is no longer true
+   > as a blanket claim: results (`MemoryResult` and the payload models that
+   > only travel caller-ward) now derive from `MemoryResultModel`, which sets
+   > `extra="ignore"`. Requests and the payload models that ride inside them
+   > keep `extra="forbid"`. This decision is unaffected --
+   > `PurgeScopeRequest` is a request model, so the skew reasoning above still
+   > holds for it -- but do not read the sentence as a statement about the
+   > contract as a whole. See ADR 0037's Consequences for why the split exists.
+
 3. **Soft-delete control-plane projects and tenants.** `hosted_projects` and
    `tenants` gain inline `retired_at`/`retired_by` columns (ALTER-guarded
    migration, mirroring the `revoked_at`/`revoked_by` idiom already used for

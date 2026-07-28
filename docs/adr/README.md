@@ -34,7 +34,7 @@ index (and the reverse).
 | 0016 | Local embedding and deferrable contradiction lower the LLM floor | accepted |
 | 0017 | Claude Code setup scaffolds a disabled Vexic MCP entry           | superseded by ADR 0027 |
 | 0018 | Claude Code read path splits SessionStart priming and MCP on-demand pull | accepted |
-| 0019 | Hosted storage cutover starts Turso-only, Neon deferred         | accepted |
+| 0019 | Hosted storage cutover starts Turso-only, Neon deferred         | accepted (Neon control-plane thread retired by Addendum 5) |
 | 0020 | Heuristic REM lowers the dream-phase LLM floor                  | accepted |
 | 0021 | MCP memory surfaces are proactive and prose-first               | accepted |
 | 0022 | Physical purge erases tombstoned scopes from the primary database | accepted |
@@ -64,12 +64,13 @@ Notes:
   The remaining pre-launch abuse gates named in 0006 (durable distributed quota,
   dream-phase concurrency lock, spend caps, edge throttles, alerting, abuse
   response) are tracked by COA-263. The 0005/0008 Turso/Neon production cutover
-  (the hosted alpha currently runs SQLite on a Railway volume) is tracked by
-  COA-264, and ADR 0019 records how that cutover starts: Turso-only as a
-  bootstrap posture. Customer memory moved to per-tenant managed libSQL first
-  (Addendum 2); the control-plane catalog and API-key store followed later
-  (ADR 0019 Addendum 5, COA-360), so both now run on Turso, gated by
-  `VEXIC_CONTROL_PLANE_TARGET`. (Addendum 4 recorded the interim period when
+  is tracked by COA-264, and ADR 0019 records how that cutover starts:
+  Turso-only as a bootstrap posture. Customer memory gained a per-tenant
+  managed libSQL path first (Addendum 2); the control-plane catalog and
+  API-key store followed later (ADR 0019 Addendum 5, COA-360), so a deployment
+  can route both to managed Turso -- customer memory with
+  `VEXIC_STORAGE_BACKEND`, the catalog with `VEXIC_CONTROL_PLANE_TARGET`.
+  (Addendum 4 recorded the interim period when
   only customer memory had moved.) The eventual managed control-plane store is
   Turso, not Neon; ADR 0008's deferred Neon Postgres control plane is retired
   (Addendum 5). ADR 0019's 2026-07-01 addendum

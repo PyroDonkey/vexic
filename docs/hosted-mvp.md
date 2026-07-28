@@ -15,9 +15,10 @@ All environment variables referenced below are catalogued in
 
 ## What Exists
 
-- `HostedMemoryService` exposes the public memory contract operation names,
-  binds tenant/principal/capability scope from an adapter-supplied auth context,
-  and delegates to `LocalMemoryService`.
+- `HostedMemoryService` exposes the public memory contract operation names
+  except `purge_scope`, adds `trigger_dream_phase` (ADR 0025), binds
+  tenant/principal/capability scope from an adapter-supplied auth context, and
+  delegates to `LocalMemoryService`.
 - `vexic.hosted_local.HostedTenantCatalog` persists local staging tenant routing
   in a SQLite control-plane database and provisions one isolated
   SQLite-compatible Customer Memory Database per tenant.
@@ -39,9 +40,9 @@ All environment variables referenced below are catalogued in
 - `HostedMemoryService` applies single-process in-memory operation quotas for
   authenticated local staging traffic before delegating to the memory core.
 - `vexic.hosted_http` exposes an internal-alpha FastAPI transport over
-  `HostedMemoryService` for `append_transcript`, `search_transcript`,
-  `search_long_term`, and `expand_history`, with API-key auth, request caps,
-  error mapping, and `/health`.
+  `HostedMemoryService` for the hosted read, write, and dream-trigger routes
+  listed under "Internal Alpha HTTP API" below, with API-key auth, request
+  caps, error mapping, and `/health`.
 - `vexic.hosted_control_plane_http` is the hosted control-plane HTTP adapter.
   It wraps the hosted memory app and registers `/control/v1/*` without adding
   control-plane routes to the core `vexic.hosted_http` app.
@@ -133,9 +134,11 @@ uv run --with-editable . --extra hosted python -m uvicorn vexic.hosted_control_p
 
 `VEXIC_CONTROL_PLANE_TOKENS` is read only by the repo-local
 `vexic.hosted_control_plane_http` adapter as a comma-separated list for
-`/control/v1/*` Console service credentials. If it is unset or contains a blank
-token, the control plane fails closed. Running `vexic.hosted_http:create_app`
-directly starts the hosted memory and MCP app without control-plane routes.
+`/control/v1/*` Console service credentials. Blank entries in the list are
+stripped; if it is unset or resolves to no non-blank token, the control plane
+fails closed and rejects every `/control/v1/*` request with `401`. Running
+`vexic.hosted_http:create_app` directly starts the hosted memory and MCP app
+without control-plane routes.
 
 Issue a tester key against the same hosted root:
 
@@ -465,17 +468,20 @@ deployment sets `VEXIC_STORAGE_BACKEND=turso` and
 Turso databases addressed by the control-plane `tenants.customer_target` DSN,
 and the control-plane catalog and API-key store live in a managed Turso database
 (ADR 0019 Addendum 5), migrated off the volume with
-`vexic.migrate_control_plane`. The Railway persistent volume stays mounted at
-`/data/vexic` (`VEXIC_HOSTED_ROOT=/data/vexic`), but its `control-plane.db` is
-then only a rollback handle -- setting `VEXIC_CONTROL_PLANE_TARGET=local` falls
-back to it -- not the catalog the service reads.
+`vexic.migrate_control_plane`. Keep the Railway persistent volume mounted at
+`/data/vexic` (`VEXIC_HOSTED_ROOT=/data/vexic`); under that configuration its
+`control-plane.db` is only a rollback handle -- setting
+`VEXIC_CONTROL_PLANE_TARGET=local` falls back to it -- not the catalog the
+service reads.
 
 **Operator hazard.** Under that configuration the volume's databases are not
-live state. Any `customer-*.db` files on it are vestigial artifacts of the
-pre-cutover layout, and its `control-plane.db` is neither read nor written by
-the serving app. Reading them tells you nothing about the service and has
-already produced one confident, wrong diagnosis: empty files on the volume are
-what a correctly-working Turso deployment looks like. Resolve
+live state. With `VEXIC_STORAGE_BACKEND=turso` the serving app reads no
+`customer-*.db` file from the volume (any that exist there are leftovers of the
+pre-cutover layout), and with `VEXIC_CONTROL_PLANE_TARGET=turso` it neither
+reads nor writes the volume's `control-plane.db`. Reading them tells you
+nothing about the service and has already produced one confident, wrong
+diagnosis: empty files on the volume are what a correctly-working Turso
+deployment looks like. Resolve
 `tenants.customer_target` for customer memory, or query the Turso control-plane
 database for the catalog, keys, and `dream_sweep_state`.
 
@@ -499,7 +505,7 @@ service, never committed):
 - `VEXIC_STORAGE_BACKEND=turso`
 - `VEXIC_CONTROL_PLANE_TARGET=turso`
 - `TURSO_ORG`, `TURSO_GROUP`, `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`,
-  `TURSO_PLATFORM_API_TOKEN` (see "Turso storage backend" in
+  `TURSO_PLATFORM_API_TOKEN` (see "Turso backends (operator-only)" in
   `docs/configuration.md`)
 - `VEXIC_PROVISION_EXISTING_TURSO_TARGETS=1` to backfill Turso databases for
   stores provisioned before the Turso backend
@@ -556,8 +562,9 @@ GitHub Actions deploy trigger:
   `https://api.vexic.dev/health` with bounded curl timeouts and retries, and
   finally asserts that an unauthenticated `/control/v1/*` request returns `401`
   so a deploy cannot silently expose the control plane.
-- The deploy job runs in the `railway-alpha` GitHub environment; environment
-  protection rules therefore gate every hosted deploy.
+- The deploy job runs in the `railway-alpha` GitHub environment, so any
+  environment protection rules configured there gate hosted deploys. Configure
+  them; the workflow names the environment but cannot supply the rules.
 - Required GitHub secret: `RAILWAY_TOKEN`, a Railway project token scoped to
   the `production` environment.
 - Required GitHub variable: `RAILWAY_PROJECT_ID=<railway-project-id>`.
@@ -567,17 +574,17 @@ GitHub Actions deploy trigger:
   successful deployment and using Railway's rollback action. Railway restores
   that deployment's Docker image and custom variables, subject to retention.
 
-Internal-alpha smoke has exercised this shell end to end (concrete
-deployment identifiers and drill evidence are tracked in the private ops
-repository, not here):
+Smoke an internal-alpha deployment of this shell end to end against the
+checklist below. Record each run, its concrete deployment identifiers, and its
+drill evidence in the private ops repository, not here:
 
-- `/health` returns `200` with the current contract version.
-- The persistent volume survives a redeploy; append/search state persists.
-- API-key auth rejects missing and invalid keys, and cross-agent scoped MCP
-  search does not leak another agent's markers.
-- A full Light/REM/Deep promotion/search path passed with tenant isolation
-  intact and hosted job usage counters recorded. (REM is a local heuristic per
-  ADR 0020, so a fresh smoke records zero REM model usage.)
+- `/health` must return `200` with the current contract version.
+- Append/search state must survive a redeploy of the persistent volume.
+- API-key auth must reject missing and invalid keys, and cross-agent scoped MCP
+  search must not leak another agent's markers.
+- A full Light/REM/Deep promotion/search path must complete with tenant
+  isolation intact and hosted job usage counters recorded. (REM is a local
+  heuristic per ADR 0020, so a fresh smoke records zero REM model usage.)
 - Tester keys are alpha-only and should be revoked after each check. Revoke them
   through the Console control plane or run the CLI with the service's
   control-plane environment loaded, as described below.

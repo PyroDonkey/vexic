@@ -146,6 +146,25 @@ The set of a session's most recent, non-superseded `session_summaries` rows
 transcript without gaps, oldest-first.
 _Avoid_: All summaries, summary history
 
+**Mention Time**:
+The derived `mentioned_at` provenance date on a candidate or fact: the earliest
+UTC calendar date of its source messages, computed deterministically from
+transcript timestamps. Never model output, and never copied into `occurred_at`.
+An event that has no `occurred_at` promotes on this instead (ADR 0037).
+_Avoid_: Event time, occurred_at, created_at
+
+**Observed Time**:
+The day-precision recording date the Light render attaches to each transcript
+message marker so the extraction model can date what it reads. Transient prompt
+scaffolding only; it is never persisted to any row (ADR 0038).
+_Avoid_: Occurred_at, mention time, timestamp
+
+**Subject Key**:
+The normalized `lower(trim(subject))` form used to bucket candidates for dedup
+and merge, and to group the eval subject histogram. The stored `subject` value
+itself stays verbatim (ADR 0039).
+_Avoid_: Subject, entity, normalized subject
+
 **Fresh Context**:
 The bounded, no-query recap-plus-tail read (summary frontier plus a
 token-budgeted raw transcript tail) that primes a new or resumed conversation,

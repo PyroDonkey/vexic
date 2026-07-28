@@ -66,6 +66,35 @@ shipped through public package registries and omitted values map to the
 explicit shared agent scope. A future incompatible request semantic change
 should still bump the contract version.
 
+### Unknown Fields: Strict Requests, Tolerant Results
+
+Strictness is asymmetric by direction, and the split is deliberate (ADR 0037).
+
+- **Requests reject unknown fields.** `MemoryContractModel` sets
+  `extra="forbid"`, and every request model plus the payload models that ride
+  inside one (`RetrievalEvent`, `SourceTranscriptMessage`) inherit it. Caller
+  input is caller-written, so an unknown key there is a typo and must fail
+  loud.
+- **Results ignore unknown fields.** `MemoryResultModel` sets
+  `extra="ignore"`. `MemoryResult` and the payload models that only travel
+  caller-ward -- `TranscriptHit`, `LongTermFact`, `CandidateNote`,
+  `SummaryNode`, `TombstoneRecord`, and
+  `SourceTranscriptIngestItemResult` -- derive from it.
+
+The reason is wire skew that `contract_version` cannot detect. A client such as
+`HostedHttpMemoryServiceClient` validates the server's JSON against its own
+pinned copy of these models. Under `extra="forbid"` every additive result field
+is a hard break for every older pinned client, and an additive field does not
+change `contract_version`, so neither side can see the skew. Ignoring unknown
+result fields makes additive server-side evolution backward compatible by
+construction; a field this contract declares is still validated exactly as
+before.
+
+Adding an optional result field is therefore additive and needs no
+`CONTRACT_VERSION` bump. Adding a request field remains a compatibility event
+even when it is optional, because an older server will reject a payload
+carrying it.
+
 ## Capabilities
 
 Capabilities are explicit strings through `MemoryCapability`.
@@ -211,6 +240,42 @@ oldest-first), `recap_text` (the rendered summary-frontier recap, `None` when
 no frontier exists), and `truncated` (`True` when earlier session messages
 exist that the returned window omits). Both `messages_json` entries and
 `recap_text` run through the fail-closed redaction guard before return.
+
+## Long-Term Facts And Event Dating
+
+`SearchLongTermResult` carries `facts` (durable Tier 3 `LongTermFact` rows) and
+`candidate_notes` (tentative Tier 2 `CandidateNote` fallback, returned only
+when Tier 3 matched nothing and always surfaced as unverified).
+
+`LongTermFact` carries the fact text, `subject`, `category`, `importance`,
+`confidence`, `source_message_ids`, `editable`, `created_at`, the
+`retrieved_count`/`used_count` counters, and two optional dates (ADR 0037):
+
+- `occurred_at` -- event time for `category="event"` facts, `None` otherwise.
+  Extracted at whatever partial ISO precision the transcript states (`2025`,
+  `2025-03`, `2025-03-14`). Never fabricated, and never filled from derived
+  provenance.
+- `mentioned_at` -- derived provenance: the earliest UTC calendar date
+  (date-only ISO) of the fact's source messages, computed deterministically
+  from transcript timestamps. Never model output, and never copied into
+  `occurred_at`.
+
+Per Memory Invariant 11, a `category="event"` fact must carry `occurred_at`
+or, failing that, `mentioned_at`; promotion fails loud when neither resolves,
+and Deep selection skips such candidates so one cannot abort a cycle. Rows
+whose sources are purged or unparseable keep `mentioned_at` as `None`.
+
+`SearchLongTermRequest` exposes three optional temporal filters -- `as_of`,
+`event_after`, and `event_before` -- which resolve each row's date through the
+ladder `occurred_at`, then `mentioned_at`, then `created_at`, compared as
+plain ISO strings. The ladder carries no category predicate, so any row with a
+resolvable mention date windows by when it was said rather than when it was
+ingested. For an event that has only `mentioned_at`, a filter named for event
+time therefore answers by mention time; that is the honest upper bound
+available for an undated event. Callers must pass bounds in a shape comparable
+to the stored precision, and a date-only value passes any same-day `<=` cutoff.
+
+`export_scope` payloads omit both dates.
 
 ## Redaction
 
