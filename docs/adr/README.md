@@ -52,6 +52,9 @@ index (and the reverse).
 | 0034 | Claude Code harness envelopes are filtered, not ingested | accepted |
 | 0035 | Hosted dreaming runs on per-tenant provisioned provider keys | accepted (not yet implemented; hosted dreaming still reads the single `OPENROUTER_API_KEY` until COA-381 lands) |
 | 0036 | Transcript recall uses any-token OR FTS semantics | accepted |
+| 0037 | Undated events promote on deterministic mention-time provenance | accepted |
+| 0038 | Light render carries transient observed time                   | accepted |
+| 0039 | Subject keys normalize for dedup and histogram; entity signal deferred | accepted |
 
 Notes:
 
@@ -158,6 +161,38 @@ Notes:
   retirement cut live access at binding time. Extends ADR 0022. Infra
   controls (PITR/backups, Railway SSH) and the `adapters/` credential-scoping
   work stay deferred to their own workstreams.
+- 0037 settles COA-411's undated-event Tier 2 sink: a derived, deterministic
+  `mentioned_at` provenance date (earliest source-message date) lets undated
+  events promote without fabricating `occurred_at`, and slots into the
+  retrieval windowing ladder between `occurred_at` and `created_at`. Amends
+  Memory Invariant 11 in `AGENTS.md`; extends the COA-410 selection skip into
+  a residual guard.
+- 0038 settles COA-412's `occurred_at` fabrication fix: `load_messages_since`
+  carries each message's timestamp, `render_transcript` labels its existing
+  `[message_id=N]` marker with a per-message, day-precision `observed=`
+  date and code-computed weekday (transient prompt scaffolding, never
+  persisted -- Invariant 2, ADR 0034), the extraction prompt gets guarded
+  absolute/relative resolution rules keyed off that label, and
+  `apply_occurred_at_guards` plus the `FactCandidate.occurred_at` validator
+  deterministically degrade a fabricated or ungrounded date to undated (the
+  ADR 0037 sink) rather than blocking the candidate. Amends Memory Invariant
+  11 in `AGENTS.md`.
+- 0039 settles COA-415's subject-key degeneracy: the dedup gate
+  (`_nearest_candidate`) and the eval subject histogram (`_subject_counts`)
+  both key on `lower(trim(subject))` so case/whitespace variants (`User`/`user`)
+  share one merge/group bucket, while the stored subject stays verbatim
+  (normalize the key, not the value). The entity-signal work is deferred with a
+  recorded direction: extraction prompt subject guidance (option A) is COA-419,
+  sequenced after COA-414 so its ablation control is not rebaselined; a separate
+  `entity` field (option B) stays evidence-gated behind COA-351. The real 96%
+  `User` mega-bucket and the `the user` synonym are extraction-driven and do not
+  move under normalization alone. Option A landed under COA-419:
+  `EXTRACTION_INSTRUCTIONS` gives `subject` a first-match decision procedure
+  (named entity, then unnamed person or pet, then `"User"` as the catch-all)
+  so every fact resolves to one key instead of splitting across two. Its
+  effect on the bucket is a separate measurement gate -- a live eval rerun
+  through `longmemeval_analysis.py` -- which the prompt change does not itself
+  satisfy.
 - These numbers are the Vexic `docs/adr/` series and are self-contained.
   `src/vexic` source no longer carries any `upstream ADR-00NN` extraction-source
   labels (they were removed when the COA boundary policy was clarified), so there

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import re
 from pathlib import Path
 
 import pytest
@@ -472,3 +473,148 @@ def test_live_adapter_judge_agent_rejects_passed_secrets(
         adapter.build_longmemeval_recall_judge_agent(
             "claude", secrets={"OPENROUTER_API_KEY": "x"}
         )
+
+
+def _extraction_instructions_normalized() -> str:
+    """Extraction instructions, lowercased with whitespace collapsed.
+
+    The prompt is hard-wrapped prose, so a rule can straddle a line break.
+    Asserting on the collapsed form lets these tests pin the *rule* rather
+    than the current line wrapping (ADR 0039, option A).
+    """
+    adapter = _load_adapter()
+    return re.sub(r"\s+", " ", adapter.EXTRACTION_INSTRUCTIONS.lower()).strip()
+
+
+def test_extraction_instructions_choose_subject_by_an_ordered_procedure() -> None:
+    # ADR 0039 option A only works if the rules compose into a total function
+    # from fact to subject. Unordered rules overlap -- "I prefer uv" is both a
+    # named-tool fact and a user preference -- and the model resolves the
+    # overlap differently between runs, splitting one entity across two
+    # subject keys. The prompt must state an explicit first-match order.
+    instructions = _extraction_instructions_normalized()
+
+    assert (
+        "set subject to the entity a fact is about, by the first rule that applies"
+        in instructions
+    )
+
+
+def test_extraction_instructions_route_named_entities_into_subject() -> None:
+    # ADR 0039: with no guidance on the subject field the model emitted "User"
+    # for nearly every fact and real entities never got their own bucket. The
+    # first rule of the procedure must hand the bucket to the named entity.
+    #
+    # Asserted as one contiguous phrase rather than separate `in` checks for
+    # "named entity" and "subject": those words appear all over the block, so
+    # independent memberships would survive deleting this rule outright, or
+    # even survive a prompt that said the opposite.
+    instructions = _extraction_instructions_normalized()
+
+    assert "a named entity: use its own name as the transcript writes it" in instructions
+
+
+def test_extraction_instructions_resolve_the_preference_overlap_to_the_entity() -> None:
+    # The overlap that fragments the key in practice: "I prefer uv for my
+    # Python projects" is both a named-tool fact and a user preference, so an
+    # unordered ruleset yields "uv" on one run and "User" on the next and the
+    # same fact lands in two dedup buckets with two hit counts. First-match
+    # order alone is only deterministic if the prompt says which way this
+    # common case resolves, so the tiebreak is stated and worked.
+    instructions = _extraction_instructions_normalized()
+
+    assert (
+        'even when the fact is also a user preference -- "i prefer uv for my '
+        'python projects" has subject "uv"' in instructions
+    )
+
+
+def test_extraction_instructions_order_multiple_named_entities_by_kind() -> None:
+    # "Rachel works for Acme" matches the named-entity rule twice, so the rule
+    # is not yet a function: one run keys the fact under "Rachel", the next
+    # under "Acme". The tiebreak has to be mechanical (a fixed kind order, not
+    # a judgement call about which entity the sentence is "really" about) or
+    # the model re-litigates it every extraction.
+    instructions = _extraction_instructions_normalized()
+
+    assert (
+        "when several names appear, take the first by kind: person, pet, "
+        "organization or place, product or tool" in instructions
+    )
+    assert '"rachel works for acme" has subject "rachel"' in instructions
+
+
+def test_extraction_instructions_label_unnamed_non_user_people() -> None:
+    # "My sister is a doctor" is about a person, not about the user and not
+    # about the user's own work, so it matches no other rule. Left uncovered
+    # the model emits "my sister", "Sister", or an invented name -- three keys
+    # for one entity. The label is pinned to a bare, possessive-free word so
+    # the normalized key is stable across extractions.
+    instructions = _extraction_instructions_normalized()
+
+    assert (
+        "an unnamed person or pet: use the bare relationship word, lowercase "
+        "and without a possessive" in instructions
+    )
+    assert '"my sister is a doctor" has subject "sister"' in instructions
+
+
+def test_extraction_instructions_close_the_procedure_with_the_user_subject() -> None:
+    # The last rule is what makes the procedure total: it must match every
+    # remaining fact, or the model improvises a key. It carries two jobs at
+    # once -- facts about the user themselves, and the user's own work that
+    # the transcript never names (a project, employer, or workflow), which
+    # would otherwise acquire an invented free-text label that varies per
+    # extraction. Both the exact spelling and the ban on synonyms are pinned:
+    # "the user" does not fold into "User" under lower(trim()).
+    instructions = _extraction_instructions_normalized()
+
+    assert (
+        "anything else, including facts about the user themselves and about "
+        "their unnamed projects, tools, employer, or workflow: use exactly "
+        '"user"' in instructions
+    )
+    assert (
+        'never a synonym such as "the user" and never an invented label such '
+        'as "the user\'s project"' in instructions
+    )
+
+
+def test_extraction_instructions_require_the_entity_inside_fact_text() -> None:
+    # Failure mode the whole procedure could introduce: the model decides the
+    # entity now lives in subject and strips it from fact_text -- the field
+    # retrieval and scoring actually read -- turning "Rachel works for Acme"
+    # into subject "Rachel", fact_text "works for Acme". That is a silent
+    # recall regression, so the assertion is one contiguous phrase naming
+    # fact_text: separate "fact_text" / "self-contained" memberships passed
+    # even with the entity clause deleted.
+    instructions = _extraction_instructions_normalized()
+
+    assert (
+        "name the entity in fact_text too, so fact_text stands alone" in instructions
+    )
+
+
+def _subject_guidance_block() -> str:
+    """The subject rules only, sliced out of the extraction instructions.
+
+    The temporal rules below the block legitimately contain years, so a
+    whole-prompt scan would be meaningless; the slice is what lets the year
+    guard below be about the subject examples.
+    """
+    adapter = _load_adapter()
+    instructions = adapter.EXTRACTION_INSTRUCTIONS
+    start = instructions.index("Set subject to the entity")
+    end = instructions.index("Every candidate must include")
+    return instructions[start:end]
+
+
+def test_subject_guidance_examples_carry_no_year_like_token() -> None:
+    # A subject example containing a four-digit number ("AutoCAD LT 2013")
+    # collides with the ADR 0037/0038 date rules further down the same prompt:
+    # it puts a year-shaped token in front of the model in a fact carrying no
+    # event date, inviting occurred_at="2013" from a version number. Memory
+    # Invariant 11 forbids an ungrounded occurred_at, so the subject examples
+    # must stay year-free rather than relying on the model to keep the two
+    # rule sets apart.
+    assert re.search(r"\b(?:19|20)\d{2}\b", _subject_guidance_block()) is None

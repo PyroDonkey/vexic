@@ -1,0 +1,19 @@
+[
+  {
+    "question_id": "pref-premiere-smoke",
+    "question_type": "single-session-preference",
+    "question": "When I ask for help with a video edit, what kind of resource suggestions do I prefer?",
+    "answer": "Suggestions should be tailored to Adobe Premiere Pro workflows, favoring Premiere-Pro-specific panels, keyboard shortcuts, and tutorials over generic video-editing advice that does not name the tool the user actually works in.",
+    "question_date": "2026-02-14",
+    "answer_session_ids": ["session-pref-1"],
+    "haystack_session_ids": ["session-pref-1"],
+    "haystack_dates": ["2026-02-10T09:15:00Z"],
+    "haystack_sessions": [
+      [
+        {"role": "user", "content": "I edit all of my client videos in Adobe Premiere Pro, so please keep advice specific to that app."},
+        {"role": "assistant", "content": "Understood - I will keep suggestions focused on Premiere Pro rather than generic editing tips."},
+        {"role": "user", "content": "Right. Generic 'use any NLE' answers waste my time; I want Premiere-Pro-specific panels and shortcuts."}
+      ]
+    ]
+  }
+]

@@ -180,6 +180,25 @@ class MemoryContractModel(BaseModel):
     model_config = ConfigDict(extra="forbid", use_enum_values=False)
 
 
+class MemoryResultModel(MemoryContractModel):
+    """Base for everything that travels caller-ward: unknown fields ignored.
+
+    Strictness is right for requests, which the caller writes -- an unknown key
+    there is a typo and should fail loud. It is wrong for results, which the
+    server writes and which a client may parse with an older pinned copy of
+    this contract: ``HostedHttpMemoryServiceClient`` validates the server's
+    JSON against its own models. Under ``extra="forbid"`` every additive result
+    field is a hard break for every older client, and ``contract_version`` does
+    not change on an additive field, so neither side can detect the skew.
+
+    Ignoring unknown result fields makes additive server-side evolution
+    backward compatible by construction. It costs nothing: no consumer depends
+    on unknown keys being absent, and a field this contract declares is still
+    validated exactly as before.
+    """
+    model_config = ConfigDict(extra="ignore")
+
+
 class Principal(MemoryContractModel):
     """The acting identity attached to a scope: an id plus its type."""
     principal_id: str = Field(min_length=1)
@@ -288,12 +307,12 @@ class SessionScopedRedactionRequiredRequest(RedactionRequiredRequest):
         return self
 
 
-class MemoryResult(MemoryContractModel):
+class MemoryResult(MemoryResultModel):
     """Base result: echoes the contract version."""
     contract_version: Literal["0.1.0"] = CONTRACT_VERSION
 
 
-class TranscriptHit(MemoryContractModel):
+class TranscriptHit(MemoryResultModel):
     """One transcript message matched by search or replay."""
     message_id: int
     session_id: str
@@ -301,7 +320,7 @@ class TranscriptHit(MemoryContractModel):
     body: str
 
 
-class LongTermFact(MemoryContractModel):
+class LongTermFact(MemoryResultModel):
     """A promoted durable fact, traceable to its source message ids."""
     fact_id: int
     fact_text: str
@@ -316,9 +335,12 @@ class LongTermFact(MemoryContractModel):
     used_count: int = 0
     # Event time (partial-precision ISO) for category="event" facts; None otherwise.
     occurred_at: str | None = None
+    # Earliest-mention provenance date (date-only ISO), derived deterministically
+    # from the fact's source messages; never model output (ADR 0037).
+    mentioned_at: str | None = None
 
 
-class CandidateNote(MemoryContractModel):
+class CandidateNote(MemoryResultModel):
     """A staged (not yet promoted) memory candidate."""
     candidate_id: int
     fact_text: str
@@ -338,7 +360,7 @@ class RetrievalEvent(MemoryContractModel):
     judged_at: str | None = None
 
 
-class SummaryNode(MemoryContractModel):
+class SummaryNode(MemoryResultModel):
     """A compacted summary covering a contiguous transcript span."""
     summary_id: int
     session_id: str
@@ -375,7 +397,7 @@ class SourceTranscriptMessage(MemoryContractModel):
         return value
 
 
-class SourceTranscriptIngestItemResult(MemoryContractModel):
+class SourceTranscriptIngestItemResult(MemoryResultModel):
     """Per-message ingest outcome: inserted, skipped, or rejected."""
     source_host: str
     source_session_id: str
@@ -595,7 +617,7 @@ class DeleteScopeRequest(RedactionRequiredRequest):
         return self
 
 
-class TombstoneRecord(MemoryContractModel):
+class TombstoneRecord(MemoryResultModel):
     """A scope tombstone: what is blocked, by whom, and why."""
     tombstone_id: str
     target_scope: MemoryScopeSelector

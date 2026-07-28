@@ -41,6 +41,23 @@ _EMBED_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 # projects, stack, and working preferences. The instructions name that shape
 # explicitly and narrow the empty-list escape to transcripts that establish
 # nothing durable at all.
+#
+# The subject block is ADR 0039 option A. With no guidance on the field at
+# all, the model emitted "User" for nearly every fact, collapsing real entities
+# into one bucket; the normalizations shipped alongside that ADR only fold
+# case/whitespace variants of a token, so the mega-bucket itself is prompt
+# work. Subject stays a plain string -- no contract or schema change.
+#
+# It is written as a first-match decision procedure, not a set of independent
+# rules, because subject is a dedup and histogram key: any fact the rules
+# resolve two ways lands in two buckets with two hit counts, which is the
+# fragmentation the ADR exists to remove. So the rules are ordered, every
+# overlap has a stated winner ("I prefer uv" is a named-tool fact before it is
+# a preference), multi-entity ties break on a fixed kind order rather than a
+# judgement call, and the last rule is a catch-all so no fact falls through to
+# an improvised key. Subject examples stay free of four-digit numbers: a
+# year-shaped token here would feed the occurred_at rules below a date the
+# fact does not have (Memory Invariant 11).
 EXTRACTION_INSTRUCTIONS = """\
 Extract durable facts about the user from the transcript.
 Durable user facts are stated directly ("I use uv for all my projects") or
@@ -57,19 +74,44 @@ about the user or their projects. Ground every fact in what the user said or
 asked for, not in what the assistant did on its own.
 Use the closed category vocabulary exactly: preference, fact, goal, event,
 relationship, skill, constraint, context.
+Set subject to the entity a fact is about, by the first rule that applies:
+- A named entity: use its own name as the transcript writes it ("Rachel",
+  "Luna", "Postgres"), even when the fact is also a user preference -- "I
+  prefer uv for my Python projects" has subject "uv". When several names
+  appear, take the first by kind: person, pet, organization or place,
+  product or tool -- "Rachel works for Acme" has subject "Rachel".
+- An unnamed person or pet: use the bare relationship word, lowercase and
+  without a possessive -- "my sister is a doctor" has subject "sister".
+- Anything else, including facts about the user themselves and about their
+  unnamed projects, tools, employer, or workflow: use exactly "User", never
+  a synonym such as "the user" and never an invented label such as "the
+  user's project".
+Subject is a key, not a substitute for the statement: name the entity in
+fact_text too, so fact_text stands alone.
 Every candidate must include source_message_ids from the [message_id=N] markers.
 Because every fact is grounded in the user, source_message_ids must include
 at least one User message -- the request or correction that establishes the
 fact. Cite the Assistant message that carries the detail alongside it, never
 alone.
-When the transcript states or clearly implies a temporal reference for when
-the fact occurred (a date, month, year, or relative time you can resolve
-against context), populate occurred_at with an ISO 8601 string at whatever
-precision is actually known: a full date ("2025-03-14"), a year-month
-("2025-03"), or a year ("2025"). Never fabricate a day or month you were not
-told. Leave occurred_at null when no temporal reference exists. Look
-especially hard for a date on category="event" facts, since event facts
-should carry an occurred_at whenever the transcript gives any basis for one.
+Each transcript line's marker may carry observed=YYYY-MM-DD Day -- the date
+that message was recorded. Observed time is recording time, never event time:
+never copy an observed date into occurred_at by itself.
+Populate occurred_at only from temporal references in the transcript text:
+- An absolute date stated in the text: copy it at exactly its stated
+  precision -- "2025-03-14" for a full date, "2025-03" for a month, "2025"
+  for a year. If the text states a month and day but no year, use the
+  observed date's year only when tense and context make the year
+  unambiguous; otherwise leave occurred_at null. Never invent a year.
+- A relative reference ("last Sunday", "three weekends ago", "back in
+  March"): resolve it against the observed date of the message that says it,
+  and only when the resolution is unambiguous. Output only the precision the
+  resolution supports: "last Sunday" against a known observed date gives a
+  full date; "a few months ago" gives at most a year-month; "years ago"
+  resolves to nothing -- leave it null.
+Never fabricate any component: no invented days, months, or years, and no
+defaulting missing components to 01. When in doubt, less precision or null.
+Leave occurred_at null when no temporal reference exists. Look especially
+hard for a date on category="event" facts.
 Return an empty list only when the transcript establishes no durable user
 facts at all, not merely because the session is task-focused.\
 """

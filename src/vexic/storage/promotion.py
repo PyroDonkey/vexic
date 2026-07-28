@@ -4,6 +4,7 @@ from contextlib import closing
 from dataclasses import dataclass
 
 from vexic.embeddings import EMBEDDING_DIM
+from vexic.models import canonical_partial_date
 from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage.candidates import (
     _load_source_message_ids,
@@ -193,7 +194,22 @@ def _promote_candidate(
         retired,
         stale,
         occurred_at,
+        mentioned_at,
     ) = row
+    # Normalize both dates from legacy or externally written candidate rows:
+    # Deep promotion reads candidates straight from SQL, bypassing the
+    # FactCandidate validator, so a datetime-shaped or junk value would reach
+    # Tier 3 unchanged. canonical_partial_date truncates a datetime to its date
+    # part and nulls junk (Memory Invariant 11: truncation, never invention),
+    # matching the validator exactly. mentioned_at gets the same treatment:
+    # Light derives it deterministically, but the canonical-migration importer
+    # binds artifact rows verbatim and a host may write memory_candidates
+    # directly, so "always canonical or blank" is a property of one writer, not
+    # of the column. A junk value that survived here would become the durable
+    # temporal key -- sorting outside the 20xx- range, it is excluded by every
+    # as_of/event_before filter and matched by every event_after filter.
+    occurred_at = canonical_partial_date(occurred_at)
+    mentioned_at = canonical_partial_date(mentioned_at)
 
     if retired or stale:
         raise ValueError(
@@ -209,17 +225,24 @@ def _promote_candidate(
             "fact; refusing to skip a corrupt promotion state."
         )
 
-    if category == "event" and not occurred_at:
-        # Invariant 11: category "event" facts must carry occurred_at. Fail
-        # loud here rather than write an undated event to Tier 3. Checked after
-        # the `promoted` skip above so a legacy already-promoted event candidate
-        # (predating this column, occurred_at still NULL) stays a benign
-        # idempotent no-op instead of raising on rerun. `not occurred_at` also
-        # treats "" as missing, matching the merge-side COALESCE(NULLIF(...))
-        # backfill semantics below.
+    if (
+        category == "event"
+        and not (occurred_at or "").strip()
+        and not (mentioned_at or "").strip()
+    ):
+        # Invariant 11 (as amended by ADR 0037): category "event" facts must
+        # carry occurred_at or, failing that, the derived mentioned_at
+        # provenance date. Fail loud here rather than write a dateless event to
+        # Tier 3. Checked after the `promoted` skip above so a legacy
+        # already-promoted event candidate (predating these columns) stays a
+        # benign idempotent no-op instead of raising on rerun. `.strip()`
+        # treats "" and whitespace-only values as missing (same semantics as
+        # the Deep selection filter): a migrated or externally written
+        # blank-ish date is truthy but useless, and the NULLIF('')-based
+        # retrieval ladder downstream would treat it as a real temporal key.
         raise ValueError(
             f"Refusing to promote candidate {decision.candidate_id} with category "
-            "'event' and no occurred_at."
+            "'event' and no occurred_at or mentioned_at."
         )
 
     source_message_ids = sorted(set(_load_source_message_ids(source_ids_json)))
@@ -258,6 +281,7 @@ def _promote_candidate(
         editable=editable,
         embedding=decision.embedding,
         occurred_at=occurred_at,
+        mentioned_at=mentioned_at,
     )
     link_candidate_to_promoted_fact(conn, decision.candidate_id, fact_id)
 

@@ -150,6 +150,19 @@ These rules define correctness for the memory core.
 10. Tenant isolation in the current local core is the opened SQLite database
     context plus `MemoryScope` validation. Do not add shared-storage assumptions
     without an explicit storage decision.
+11. Tier 3 `category="event"` facts must carry `occurred_at` or, failing
+    that, `mentioned_at` - the deterministic date of the fact's earliest
+    source message (ADR 0037). Promotion fails loud when neither resolves
+    (`src/vexic/storage/promotion.py`), and Deep selection skips such
+    candidates so one cannot abort the cycle; they stay in Tier 2. Never
+    fabricate either value: `occurred_at` is event time only and partial
+    precision (year or year-month) is allowed but invented components are
+    not; `mentioned_at` is derived provenance, never model output, and never
+    substituted into `occurred_at`. A fabricated or ungrounded `occurred_at`
+    year degrades the candidate to undated rather than blocking promotion,
+    an in-text date copies only at the precision it is stated in, and Light
+    render's per-message `observed=` time label is transient prompt
+    scaffolding under Invariant 2 - never persisted (ADR 0038).
 
 ### Closed Category Vocabulary
 

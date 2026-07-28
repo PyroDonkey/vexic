@@ -49,6 +49,7 @@ class LongTermFact:
     editable: bool = True
     created_at: str = ""
     occurred_at: str | None = None
+    mentioned_at: str | None = None
 
 
 def keyword_long_term_fact_ids(
@@ -64,22 +65,23 @@ def keyword_long_term_fact_ids(
     """BM25-ranked live Tier 3 fact ids for a free-text query, best first.
 
     `as_of`, if given, restricts results to rows where
-    `COALESCE(NULLIF(occurred_at, ''), created_at) <= as_of` -- a plain
-    TEXT-affinity string comparison. `event_after`/`event_before`, if given,
-    are the lower/upper bounds of a temporal range over the same
-    `COALESCE(NULLIF(occurred_at, ''), created_at)` fallback:
-    `... >= event_after` and/or `... <= event_before`. All three are optional
-    and independent; `event_before` and `as_of` may coexist (both `<=` clauses
-    are emitted). `occurred_at` is a partial-precision ISO
-    string; a partial string is always lexicographically `<=` any of its own
-    completions, so a fact with an unknown exact day always passes an `as_of`
-    or `event_before` check for any cutoff at or after that partial period's
-    start. `created_at`
-    is the full `"YYYY-MM-DD HH:MM:SS"` fallback used when `occurred_at` is
-    NULL or empty -- callers must pass these bounds in a directly comparable
-    shape (matching separator/precision) or same-day boundary comparisons will
-    behave unexpectedly. This is a deliberate, documented approximation, not
-    a bug.
+    `COALESCE(NULLIF(occurred_at, ''), NULLIF(mentioned_at, ''), created_at)
+    <= as_of` -- a plain TEXT-affinity string comparison.
+    `event_after`/`event_before`, if given, are the lower/upper bounds of a
+    temporal range over the same ladder: `... >= event_after` and/or
+    `... <= event_before`. All three are optional and independent;
+    `event_before` and `as_of` may coexist (both `<=` clauses are emitted).
+    `occurred_at` is a partial-precision ISO string; a partial string is
+    always lexicographically `<=` any of its own completions, so a fact with
+    an unknown exact day always passes an `as_of` or `event_before` check for
+    any cutoff at or after that partial period's start. `mentioned_at` (ADR
+    0037) is the date-only earliest-mention provenance ladder rung, used when
+    `occurred_at` is NULL or empty; being date-only it behaves like any other
+    partial-precision value. `created_at` is the full `"YYYY-MM-DD HH:MM:SS"`
+    last-resort fallback -- callers must pass these bounds in a directly
+    comparable shape (matching separator/precision) or same-day boundary
+    comparisons will behave unexpectedly. This is a deliberate, documented
+    approximation, not a bug.
     """
     safe_query = _fts_match_query(query)
     if safe_query is None:
@@ -88,13 +90,13 @@ def keyword_long_term_fact_ids(
     date_clause = ""
     params: list[object] = [safe_query, agent_id]
     if as_of is not None:
-        date_clause += " AND COALESCE(NULLIF(l.occurred_at, ''), l.created_at) <= ?"
+        date_clause += " AND COALESCE(NULLIF(l.occurred_at, ''), NULLIF(l.mentioned_at, ''), l.created_at) <= ?"
         params.append(as_of)
     if event_after is not None:
-        date_clause += " AND COALESCE(NULLIF(l.occurred_at, ''), l.created_at) >= ?"
+        date_clause += " AND COALESCE(NULLIF(l.occurred_at, ''), NULLIF(l.mentioned_at, ''), l.created_at) >= ?"
         params.append(event_after)
     if event_before is not None:
-        date_clause += " AND COALESCE(NULLIF(l.occurred_at, ''), l.created_at) <= ?"
+        date_clause += " AND COALESCE(NULLIF(l.occurred_at, ''), NULLIF(l.mentioned_at, ''), l.created_at) <= ?"
         params.append(event_before)
     params.append(k)
 
@@ -141,7 +143,7 @@ def fetch_long_term_facts(
             f"""
             SELECT id, fact_text, subject, category, importance, confidence,
                    source_message_ids, retrieved_count, used_count, editable, created_at,
-                   occurred_at
+                   occurred_at, mentioned_at
             FROM long_term_memory
             WHERE id IN ({placeholders})
                 AND agent_id IS ?
@@ -163,6 +165,7 @@ def fetch_long_term_facts(
             editable=bool(row[9]),
             created_at=str(row[10]),
             occurred_at=row[11],
+            mentioned_at=row[12],
         )
         for row in rows
     }
@@ -342,22 +345,23 @@ def nearest_long_term_facts(
     """Nearest live Tier 3 facts to `embedding` by cosine distance, best first.
 
     `as_of`, if given, restricts results to rows where
-    `COALESCE(NULLIF(occurred_at, ''), created_at) <= as_of` -- a plain
-    TEXT-affinity string comparison. `event_after`/`event_before`, if given,
-    are the lower/upper bounds of a temporal range over the same
-    `COALESCE(NULLIF(occurred_at, ''), created_at)` fallback:
-    `... >= event_after` and/or `... <= event_before`. All three are optional
-    and independent; `event_before` and `as_of` may coexist (both `<=` clauses
-    are emitted). `occurred_at` is a partial-precision ISO
-    string; a partial string is always lexicographically `<=` any of its own
-    completions, so a fact with an unknown exact day always passes an `as_of`
-    or `event_before` check for any cutoff at or after that partial period's
-    start. `created_at`
-    is the full `"YYYY-MM-DD HH:MM:SS"` fallback used when `occurred_at` is
-    NULL or empty -- callers must pass these bounds in a directly comparable
-    shape (matching separator/precision) or same-day boundary comparisons will
-    behave unexpectedly. This is a deliberate, documented approximation, not
-    a bug.
+    `COALESCE(NULLIF(occurred_at, ''), NULLIF(mentioned_at, ''), created_at)
+    <= as_of` -- a plain TEXT-affinity string comparison.
+    `event_after`/`event_before`, if given, are the lower/upper bounds of a
+    temporal range over the same ladder: `... >= event_after` and/or
+    `... <= event_before`. All three are optional and independent;
+    `event_before` and `as_of` may coexist (both `<=` clauses are emitted).
+    `occurred_at` is a partial-precision ISO string; a partial string is
+    always lexicographically `<=` any of its own completions, so a fact with
+    an unknown exact day always passes an `as_of` or `event_before` check for
+    any cutoff at or after that partial period's start. `mentioned_at` (ADR
+    0037) is the date-only earliest-mention provenance ladder rung, used when
+    `occurred_at` is NULL or empty; being date-only it behaves like any other
+    partial-precision value. `created_at` is the full `"YYYY-MM-DD HH:MM:SS"`
+    last-resort fallback -- callers must pass these bounds in a directly
+    comparable shape (matching separator/precision) or same-day boundary
+    comparisons will behave unexpectedly. This is a deliberate, documented
+    approximation, not a bug.
     """
     if len(embedding) != EMBEDDING_DIM:
         raise ValueError(f"Expected {EMBEDDING_DIM}-dim embedding; got {len(embedding)}.")
@@ -372,13 +376,13 @@ def nearest_long_term_facts(
     date_clause = ""
     params: list[object] = [_serialize_float32(normalized), fetch_k, agent_id]
     if as_of is not None:
-        date_clause += " AND COALESCE(NULLIF(l.occurred_at, ''), l.created_at) <= ?"
+        date_clause += " AND COALESCE(NULLIF(l.occurred_at, ''), NULLIF(l.mentioned_at, ''), l.created_at) <= ?"
         params.append(as_of)
     if event_after is not None:
-        date_clause += " AND COALESCE(NULLIF(l.occurred_at, ''), l.created_at) >= ?"
+        date_clause += " AND COALESCE(NULLIF(l.occurred_at, ''), NULLIF(l.mentioned_at, ''), l.created_at) >= ?"
         params.append(event_after)
     if event_before is not None:
-        date_clause += " AND COALESCE(NULLIF(l.occurred_at, ''), l.created_at) <= ?"
+        date_clause += " AND COALESCE(NULLIF(l.occurred_at, ''), NULLIF(l.mentioned_at, ''), l.created_at) <= ?"
         params.append(event_before)
     params.append(k)
 
@@ -445,6 +449,7 @@ def insert_long_term_fact(
     editable: bool,
     embedding: list[float],
     occurred_at: str | None = None,
+    mentioned_at: str | None = None,
 ) -> int:
     # Conn-scoped Tier 3 write used by the promotion transaction. Inserts the
     # durable fact and its embedding in the caller's connection so the whole
@@ -455,8 +460,8 @@ def insert_long_term_fact(
         INSERT INTO long_term_memory
             (fact_text, subject, category, importance, confidence,
              source_message_ids, agent_id, promoted_from_candidate_id,
-             retrieved_count, used_count, editable, occurred_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             retrieved_count, used_count, editable, occurred_at, mentioned_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             fact_text,
@@ -471,6 +476,7 @@ def insert_long_term_fact(
             used_count,
             editable,
             occurred_at,
+            mentioned_at,
         ),
     )
     fact_id = int(cursor.lastrowid)

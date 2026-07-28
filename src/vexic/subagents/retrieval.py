@@ -77,10 +77,11 @@ def _with_events_sorted(facts: list[LongTermFact]) -> list[LongTermFact]:
 
     Only the positions holding event facts are permuted among themselves;
     every other slot keeps its fused-rank fact. The sort key is the event's
-    ``occurred_at`` (a partial-precision ISO string), falling back to
-    ``created_at`` when it is missing, truncated to day grain so a
-    full-timestamp fallback compares like-for-like with a partial event date.
-    Python's stable sort keeps equal-key events in their original RRF order.
+    ``occurred_at`` (a partial-precision ISO string), falling back to the
+    ``mentioned_at`` provenance date (ADR 0037) and then ``created_at`` when
+    earlier rungs are missing, truncated to day grain so a full-timestamp
+    fallback compares like-for-like with a partial event date. Python's
+    stable sort keeps equal-key events in their original RRF order.
     """
     result = list(facts)
     positions = [
@@ -92,7 +93,11 @@ def _with_events_sorted(facts: list[LongTermFact]) -> list[LongTermFact]:
         return result
     ordered = sorted(
         (result[index] for index in positions),
-        key=lambda fact: ((fact.occurred_at or "").strip() or fact.created_at)[:10],
+        key=lambda fact: (
+            (fact.occurred_at or "").strip()
+            or (fact.mentioned_at or "").strip()
+            or fact.created_at
+        )[:10],
         reverse=True,
     )
     for position, fact in zip(positions, ordered):

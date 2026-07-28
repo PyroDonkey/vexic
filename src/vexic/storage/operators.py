@@ -8,6 +8,7 @@ from pathlib import Path
 from vexic.embeddings import EMBEDDING_DIM
 from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage.schema import (
+    CANONICAL_TABLES,
     _ensure_vector_memory_schema,
     _normalize_embedding,
     _serialize_float32,
@@ -135,18 +136,16 @@ def _quote_identifier(identifier: str) -> str:
     return f'"{identifier.replace("\"", "\"\"")}"'
 
 
-def _is_text_like_column(declared_type: object) -> bool:
-    normalized = str(declared_type or "").upper()
-    return (
-        normalized == ""
-        or normalized == "ANY"
-        or "CHAR" in normalized
-        or "CLOB" in normalized
-        or "JSON" in normalized
-        or "TEXT" in normalized
-    )
-
-
+# The file-copy secret scan covers every column of every table regardless of its
+# declared type. SQLite is dynamically typed, so a declared type does not
+# constrain what a column stores, and host-owned extension tables carry column
+# types Vexic does not control -- a declared-type filter would let a secret in a
+# `payload STRING` or `payload BLOB` column ride out in the copy, which
+# Invariant 9 forbids.
+#
+# These three columns are the one exemption: they hold JSON arrays of integer
+# fact ids, never free text, so scanning them can only produce spurious
+# digit-substring matches on a recovery path an operator runs mid-incident.
 _FILE_COPY_TEXT_GUARD_SKIPPED_COLUMNS = frozenset(
     {
         ("retrieval_events", "keyword_fact_ids"),
@@ -156,14 +155,18 @@ _FILE_COPY_TEXT_GUARD_SKIPPED_COLUMNS = frozenset(
 )
 
 
-def _should_guard_database_text_column(
-    table_name: str,
-    column_name: str,
-    declared_type: object,
-) -> bool:
-    if not _is_text_like_column(declared_type):
-        return False
-    return (table_name, column_name) not in _FILE_COPY_TEXT_GUARD_SKIPPED_COLUMNS
+def _scan_text(value: object) -> str:
+    """Coerce any stored SQLite value to text for the forbidden-value scan.
+
+    Bytes are decoded rather than repr'd so a secret stored as a BLOB is matched
+    the same way it would be as TEXT; undecodable bytes become replacement
+    characters and cannot mask an ASCII secret.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).decode("utf-8", "replace")
+    return str(value)
 
 
 def _guard_database_text_for_file_copy(
@@ -199,11 +202,7 @@ def _guard_database_text_for_file_copy(
 
         for column_row in column_rows:
             column_name = str(column_row[1])
-            if not _should_guard_database_text_column(
-                table_name,
-                column_name,
-                column_row[2],
-            ):
+            if (table_name, column_name) in _FILE_COPY_TEXT_GUARD_SKIPPED_COLUMNS:
                 continue
             try:
                 rows = conn.execute(
@@ -224,7 +223,40 @@ def _guard_database_text_for_file_copy(
                     continue
                 raise
             for row in rows:
-                assert_no_forbidden_secret_values(forbidden_values, str(row[0]))
+                assert_no_forbidden_secret_values(forbidden_values, _scan_text(row[0]))
+
+
+# `memory_dedup_events` is excluded deliberately: it belongs to the vector
+# schema (`init_vector_memory`), so a transcript-only database legitimately
+# lacks it, and the projection repair below never recreates it -- it cannot be
+# silently substituted, which is the failure this check exists to catch.
+_REQUIRED_SOURCE_TABLES = tuple(
+    table for table in CANONICAL_TABLES if table != "memory_dedup_events"
+)
+
+
+def _assert_source_is_complete(conn: sqlite3.Connection) -> None:
+    """Reject a source database that is missing a canonical table.
+
+    The rebuild copy runs ``init_db`` on the *copy*, which is how rebuildable
+    projections get repaired. Applied to a half-restored source that is missing,
+    say, ``long_term_memory``, that same step would create an empty replacement
+    and report success -- the operator would be told the rebuild worked while
+    Tier 3 was silently gone. Presence, not row count, is the test: a freshly
+    initialized database with every canonical table and zero rows is valid input.
+    """
+    present = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    missing = [table for table in _REQUIRED_SOURCE_TABLES if table not in present]
+    if missing:
+        raise ValueError(
+            "Refusing to rebuild from an incomplete source database; missing "
+            f"canonical tables: {', '.join(missing)}."
+        )
 
 
 def repair_memory_projections(
@@ -424,6 +456,7 @@ def create_memory_rebuild_copy(
 
     forbidden_values = tuple(forbidden_secret_values)
     with closing(connect(db_path)) as conn:
+        _assert_source_is_complete(conn)
         _guard_database_text_for_file_copy(conn, forbidden_values)
         try:
             conn.execute("VACUUM INTO ?", (str(target),))

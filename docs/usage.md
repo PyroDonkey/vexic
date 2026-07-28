@@ -318,6 +318,77 @@ promotion miss, retrieval miss, candidate fallback, or provider/runtime failure;
 answer synthesis is recorded separately as `not_run` with the reserved
 `judge_synthesis_issue` taxonomy slot for this retrieval-only smoke.
 
+## Operator Memory Tooling
+
+`vexic operator` groups the operator-run memory audit and recovery commands.
+Both act directly on a local SQLite memory database and neither is a
+`MemoryService` operation. They follow the ADR 0011 framing that operator work
+runs out of band, through an operator-run path rather than a public contract
+operation or a hosted endpoint.
+
+`--db-path` must name a file that is already an initialized memory database.
+Neither underlying operation requires that: `review-export` opens the source
+through `init_db`, which creates an empty schema when the file is absent or
+empty, and `rebuild-copy` opens the source through `connect()`, which
+materializes an empty file the same way (`init_db` then runs on the *copy*).
+Either way a mistyped path would otherwise succeed against a database that was
+never there. So the CLI checks the source up front, before forwarding anything:
+the path must exist, and a read-only `mode=ro` connection must find the Tier 1,
+Tier 2, and Tier 3 tables (`messages`, `memory_candidates`,
+`long_term_memory`) in it. The probe initializes nothing, so a path it rejects
+is left exactly as it was -- an existing empty file is rejected still empty,
+not silently converted into a fresh database and reviewed as one.
+
+Neither command will write its `--output` over the source database. Both reject
+an `--output` that resolves to `--db-path`, including through a symlink or a
+hard link, before any work starts. Without that check `review-export --output
+./memory.db --overwrite` would replace the memory database with the markdown
+report and exit 0.
+
+```bash
+# Markdown audit of Tier 2 candidates and Tier 3 facts, with provenance,
+# retirement state, promotion labels, and retrieval counters.
+vexic operator review-export --db-path ./memory.db --output ./memory-review.md
+```
+
+The export refuses to clobber an existing file; pass `--overwrite` to replace
+one. `--overwrite` replaces a stale review, and nothing else: the source-alias
+check above still applies to it. Success prints a JSON summary on stdout -- `ok`, `output_path`,
+`rows_exported`, `bytes_written` -- and exits 0. Any failure prints
+`error: ...` on stderr and exits nonzero.
+
+```bash
+# Corruption / data-loss recovery: copy the database to a new file and
+# rebuild its projections in the copy.
+vexic operator rebuild-copy --db-path ./memory.db --output ./memory-rebuilt.db
+```
+
+`rebuild-copy` leaves the source database untouched. It copies with
+`VACUUM INTO`, then rebuilds the copy's FTS tables and recomputes its
+retrieval/use counters from the retrieval-event tables -- rebuildable
+projections only, never Tier 1 transcript rows. Vector embeddings are copied as
+they stand; re-embedding needs a host embedding port and is not part of this
+command. It refuses to write over an existing `--output` file, and it deletes a
+partial copy if the copy or the rebuild fails, so no half-written database is
+left to be mistaken for a good one. Success prints a JSON summary on stdout --
+`ok`, `output_path`, `messages_fts_rows`, `candidate_fts_rows`,
+`long_term_fts_rows`, `candidate_counters_recomputed`,
+`long_term_counters_recomputed` -- and exits 0.
+
+Both commands accept repeated `--forbidden-value SECRET` flags and fail closed
+on a match, per the redaction invariant. `review-export` scans the rendered
+markdown before writing it; `rebuild-copy` scans the source database's text
+columns *before* the copy runs, so a match leaves no copy on disk at all.
+Supply the same forbidden values the host configures elsewhere; an operator
+artifact is privileged egress.
+
+`--forbidden-value` takes the secret on the command line, so it lands in shell
+history and is visible to any local `ps`. There is no config-file source for it
+today, unlike the recorder's `--api-key`. Run these commands from a shell with
+history disabled for the invocation (a leading space with `HISTCONTROL=ignorespace`
+in bash, `setopt histignorespace` in zsh) on a host where the process list is
+not shared, and clear the entry afterwards if it was recorded.
+
 ## LongMemEval Memory Harness
 
 `vexic.longmemeval` is the full LongMemEval benchmark harness (rehomed from the
@@ -351,12 +422,19 @@ built from the adapter's `build_longmemeval_recall_judge_agent`). Each run
 writes `predictions.jsonl` and `diagnostics.jsonl` (stage decomposition:
 `answer_extracted_to_tier2`, `answer_promoted_to_tier3`,
 `answer_retrieved_from_tier3`, `answer_candidate_rank`), plus per-question-type
-judged-recall rates. `--selection stratified` round-robins across question
-types; repeatable `--type-weight multi-session=3` takes N rows from that
-question type per round-robin pass (others default to 1) for a diagnostic
-subset weighted toward specific types, still fully deterministic.
-`--resume-from-run` skips rows already `ok` in a prior run's
-diagnostics. Dream-phase runs require `--allow-live` and an `--adapter`; the
+judged-recall rates. `answer_candidate_rank` ranks the raw active-candidate
+population; `answer_candidate_rank_filtered` ranks only the promotion-eligible
+subset (excludes promoted, undated-event, and unembedded candidates) as a
+filter-surviving approximation of the pool Deep actually scores, so the two
+differ when an ineligible candidate outranks the answer. `--selection
+stratified` round-robins across question types; repeatable `--type-weight
+multi-session=3` takes N rows from that question type per round-robin pass
+(others default to 1) for a diagnostic subset weighted toward specific types,
+still fully deterministic. `--resume-from-run` skips rows already `ok` in a
+prior run's diagnostics. `--max-transient-retries` (default 2) bounds in-run
+retries for transient provider-shape faults (malformed JSON /
+`finish_reason='error'`) at each provider call site, logged to stderr and
+counted in the diagnostics `transient_retry_count`. Dream-phase runs require `--allow-live` and an `--adapter`; the
 judge fails closed with `HostPortNotConfigured` when no judge port is supplied.
 Do not vendor the LongMemEval benchmark corpus into this repo.
 
@@ -375,6 +453,222 @@ persisted per-retriever arrays), or class 3 (join/derivation candidates
 flagged `needs_manual_review`, including answers that appear verbatim nowhere
 in the transcript). Every `memory.db` is opened read-only; the output is
 `analysis_report.json` in the run directory plus a stdout summary.
+
+`single-session-preference` misses are held out of classes 1-3: their gold
+answers are prose rubrics, not literal strings, so token containment is the
+wrong lens. They land in the report's `preference` section instead. When a
+precomputed `preference_rescore.jsonl` is present in the run directory, the
+section also reports the literal-vs-rubric verdict delta, bucketing
+incomplete-reconstruction rows separately.
+
+To produce that artifact, re-judge a completed run's preference misses under
+the rubric-aware judge render (live provider, opt-in):
+
+```bash
+uv run python -m vexic.longmemeval_rescore \
+  --run-dir .eval-runs/longmemeval/<run-id> \
+  --dataset /path/to/longmemeval_s_cleaned.json \
+  --adapter adapters/openrouter_live_adapter.py --allow-live
+```
+
+Without `--allow-live` it prints a skip notice and never loads the adapter.
+It reopens the run's question databases read-only, reconstructs the exact
+fact list and ordering the eval-time judge saw, and writes
+`preference_rescore.jsonl`; rows whose fact set cannot be faithfully rebuilt
+(candidate-note fallback, count mismatch, missing database) are flagged
+`reconstruction_complete: false` rather than dropped.
+
+### Extraction-Prompt Ablation
+
+`scripts/ablate_extraction_prompts.py` is a window-faithful ablation over the
+Light extraction instructions. It reconstructs the exact persisted Light windows
+from prior LongMemEval run databases (slicing the shared-scope history at the
+`dream_runs` watermarks each Light cycle recorded), binds a fixed set of target
+cases to their
+answer-bearing windows through declarative locator substrings, and runs a
+four-condition factorial over additions appended to the adapter's
+`EXTRACTION_INSTRUCTIONS`: control (shipped instructions), a granularity/table
+addition, an update-scanning addition, and both combined. Each target is scored
+against an explicit CNF keyword rubric as a binary HIT or miss per repeat, and
+the run reports per-condition recall with variance (mean and sample standard
+deviation), candidate volume as a Tier 2 cost proxy, and token-usage deltas.
+
+```bash
+uv run python scripts/ablate_extraction_prompts.py \
+  --db .eval-runs/<run>/<timestamp>/<case-id>/memory.db \
+  --allow-live --repeats 5 --out .eval-runs/extraction-ablation
+```
+
+`--db` is repeatable and points at machine-local `.eval-runs/` databases (they
+are gitignored, not vendored). The run is gated behind `--allow-live` with a
+provider-call budget cap (`--max-provider-calls`, default 140); without
+`--allow-live` it prints a skip notice and exits. The `--out` directory receives
+`ablation_metrics.json` and `ablation_audit.jsonl`. Pass `--bind-only` to print
+the target-to-window binding table and exit before any provider call, which
+validates binding without `--allow-live` or budget.
+
+### Light Time-Context Ablation
+
+`scripts/ablate_light_time_context.py` is the evidence harness for ADR 0038. It
+reconstructs the Light windows of one or more LongMemEval databases by
+re-slicing their history at the default batch size and replays them through two
+extraction variants -- `baseline` (transcript rendered without
+`observed=` labels, prior temporal paragraph) and `treated` (the shipped
+`render_transcript` plus the current `EXTRACTION_INSTRUCTIONS`) -- and reports
+five deterministic metrics per repeat, aggregated mean/min/max across repeats.
+`fabricated_year_rate` is scored both pre-guard and post-guard.
+
+```bash
+uv run python scripts/ablate_light_time_context.py \
+  --db .eval-runs/<run>/<question-id>/memory.db \
+  --allow-live --repeats 5 --max-windows 8 \
+  --out .eval-runs/light-time-context-ablation
+```
+
+`--db` is repeatable and points at machine-local `.eval-runs/` databases (they
+are gitignored, not vendored). Two `--db` values naming the same physical
+database are a config error (exit 2): identity is device plus inode, so a
+repeated path, a symlink, and a hard link are all rejected, since measuring one
+corpus twice would double its weight in the aggregate metrics and re-spend
+budget on it. The run is gated behind `--allow-live` with a
+provider-call budget cap (`--max-provider-calls`, default 120); without
+`--allow-live` it prints a skip notice and exits. The `--out` directory receives
+`ablation_metrics.json` and `ablation_audit.jsonl`. Each
+`window_transcript_hash` audit record carries both the `--db` spelling that was
+supplied (`db`) and the path it resolved to at collection time (`db_resolved`).
+
+Those windows match what Light actually saw only when that database's history
+was consumed at the default batch size, under the default shared agent scope,
+in full batches; a run that used a different batch size, an agent-scoped
+history, or stopped mid-batch reconstructs different windows. The script's
+module docstring carries the full evidence caveats.
+
+Repeats are scheduled atomically over the whole window panel: a repeat runs
+every window's every variant or is not scheduled at all, so a truncated run's
+repeats all cover the identical panel and no window is ever scored by one
+variant alone. A budget below one full panel (the windows actually collected,
+which may be fewer than `max_windows`, times the variants) scores nothing. A
+transient provider failure is recorded as a `call_error` audit record and voids
+that repeat for every variant, leaving the rest of the run intact;
+`provider_errors` and per-variant `calls_failed` appear in the metrics document,
+voided candidates are marked `voided` in the audit, and a run whose every call
+failed writes no artifacts at all. Input databases are opened read-only. To run against non-fixture data, set forbidden values in the module's
+`REDACTION` constant; transcripts are checked before any provider call and the
+whole artifact payload before anything is written.
+
+### Class-3 Gap Simulation And Probe
+
+Two provider-free harnesses re-measure the class-3 miss analysis against
+current code. Both are read-only over LongMemEval run artifacts and take a gap
+fixture: a machine-local JSON file naming, per question, the missing
+constituents behind that miss (Tier-2 candidate id, Tier-3 fact id, or neither
+for transcript-only gaps) plus the match tokens that identify them. Like the
+oracle fixture, it is a run-local artifact attached to the issue, not committed.
+
+`scripts/simulate_mentioned_at_promotion.py` answers what the ADR 0037
+`mentioned_at` backfill does to promotion eligibility. It copies each frozen
+question database to a temporary directory, lets schema init heal the copy, and
+reports per gap candidate whether `mentioned_at` derives, whether Deep
+promotion eligibility flips, and where the candidate ranks inside the eligible
+pool. A flip lands one of three verdicts (with matching summary counters): it
+flips within `--deep-top-n` (`flips-eligible-and-ranked`), flips but ranks
+outside it (`flips-eligible-outside-top-n`), or flips into a pool no larger than
+the top-n slice (`flips-eligible-degenerate-pool`) -- where the top-n trivially
+covers the whole pool, so "within top-n" says nothing about ranking. Eligibility
+and ranking are not re-derived: it reuses `_deep_eligible`
+and `_rank_diagnostic_candidates` from `vexic.longmemeval`.
+
+```bash
+uv run python scripts/simulate_mentioned_at_promotion.py \
+  --gaps <gap-fixture>.json --out .eval-runs/<out-dir>
+```
+
+Artifacts: `promotion_simulation_metrics.json` and
+`promotion_simulation_table.md`. The frozen inputs are never opened: the
+harness copies each question database to a temporary directory first and reads
+and heals only the copy, so no read-only handle can leave a WAL sidecar next to
+the source. The result
+bounds the undated-event bucket rather than confirming it: it is a post-run
+snapshot of the final candidate pool, not a replay of the per-cycle Deep pool,
+it does not model Deep's model-backed contradiction check, and it says nothing
+about later extraction-prompt changes.
+
+`scripts/probe_class3_gaps.py` classifies each gap against a run's tiers as
+`covered` (a live Tier-3 fact matches every token), `tier2-only` (extracted but
+never promoted), `tier3-undated` (the fact exists but carries no date, for gaps
+that are about datedness), or `absent`. Point it at the frozen runs for the
+baseline, or at a fresh run with `--run-dir` to measure the same gaps on current
+code; questions with no database under an overridden `--run-dir` are skipped and
+listed in the artifact.
+
+```bash
+uv run python scripts/probe_class3_gaps.py \
+  --gaps <gap-fixture>.json --run-dir .eval-runs/<run>/<timestamp> \
+  --out .eval-runs/<out-dir>
+```
+
+Artifacts: `class3_gap_probe.json` and `class3_gap_probe.md`. Matching is
+deterministic case-folded substring containment over the curated tokens, so
+`covered` means the constituent text is present in Tier 3 -- not that the run
+answered the question. A gap with an empty token list or a blank token is a
+fixture error (exit 2, `gap fixture error`) checked before any question is
+probed, since neither can match honestly and would silently misclassify. The
+check covers the questions selected for the run -- all of them by default,
+only the `--question-id` subset when that flag is passed. Unlike the
+simulation, the probe copies nothing and opens the run databases directly:
+a read-only open of a WAL-mode run database may create or update `-wal`/`-shm`
+sidecars next to it, so byte-frozen provenance is the simulation harness's
+guarantee (it heals a copy), not the probe's.
+
+### Deep Backlog Replay
+
+`scripts/replay_deep_backlog.py` measures whether the promotion-eligible Tier-2
+backlog drains across successive Deep cycles or starves. It is read-only and
+provider-free over frozen LongMemEval run databases and takes the same gap
+fixture as the class-3 harnesses. It reconstructs each historical Deep cycle's
+candidate pool from the persisted `dream_runs`, `long_term_memory`, and
+`memory_dedup_events` tables -- there is no stored phase column, so the
+Light/REM/Deep timeline is rebuilt from each row's counter signature -- and then
+forward-simulates a quiescent drain of the healed final backlog to tell a
+transient end-of-run backlog apart from structural starvation during ingestion.
+Each question lands a drain verdict (`drained-during-run`,
+`backlog-at-run-end-transient`, `structural-starvation-during-ingestion`,
+`no-deep-cycles`, or `unreliable-attribution`) and each tracked gap candidate
+lands its own (`promoted-historically`, `promoted-unattributed`,
+`promotes-under-quiescence`, `undrained-at-round-cap`, `never-eligible`, or
+`unreliable-attribution`). When the promotion attribution join is inconsistent
+the reconstruction is untrustworthy, so both the drain verdict and every tracked
+verdict are gated to `unreliable-attribution` rather than emitting an
+authoritative classification.
+
+```bash
+uv run python scripts/replay_deep_backlog.py \
+  --gaps <gap-fixture>.json --out .eval-runs/<out-dir>
+```
+
+Artifacts: `deep_backlog_replay_metrics.json` and `deep_backlog_replay_table.md`.
+Like the promotion simulation, it copies each frozen database to a temporary
+directory and reads and heals only the copy, so the byte-frozen inputs are never
+opened. The reconstruction is bounded, not exact. The final-state
+`retired`/`stale`/`needs_review` flags approximate each historical cycle's pool.
+`rem_boost` history is unrecoverable, so every cycle is scored twice, bracketing
+each prediction between the final `rem_boost` and zero. Per-cycle `hit_count` is
+exact only through the `memory_dedup_events` merge decisions -- a database with no
+merge events reconstructs it trivially exactly. The candidate `importance`,
+`occurred_at`, and `source_message_ids` used for each historical cycle are the
+final-state values: merges mutate them in place and no per-field history is kept,
+so when merges exist those cycle inputs are approximations. The per-question
+`state_reconstruction_exact` flag is true only for a zero-merge database whose
+stored `hit_count` reconciles against its merge log, telling readers when this
+matters. The forward simulation freezes the final `rem_boost` on every survivor,
+while production reruns REM centrality each cycle over the shrinking pool -- the
+quiescent drain outcome is invariant to this, but the round numbers are
+approximate. Attribution spans each Deep cycle's start to the next cycle's start
+(the last cycle unbounded above) because `commit_deep_cycle` persists a promoted
+fact after the run's `finished_at` is recorded, so a delayed write still
+attributes to the cycle that produced it. Deep's model-backed contradiction
+judge is not modeled. And the phase classification is signature-based, with a
+positional REM-before-Deep fallback for otherwise-ambiguous all-zero rows.
 
 ## Hosted MVP Shell
 

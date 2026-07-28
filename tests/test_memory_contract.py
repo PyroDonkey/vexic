@@ -5,6 +5,16 @@ from typing import get_type_hints
 from pydantic import ValidationError
 
 from vexic.contract import (
+    AppendTranscriptResult,
+    CandidateNote,
+    LongTermFact,
+    RetrievalEvent,
+    SearchLongTermRequest,
+    SearchLongTermResult,
+    SourceTranscriptMessage,
+    SummaryNode,
+    TombstoneRecord,
+    TranscriptHit,
     CONTRACT_VERSION,
     AppendTranscriptRequest,
     CandidateNote,
@@ -435,6 +445,7 @@ class MemoryContractModelTests(unittest.TestCase):
             created_at="2026-06-18T18:00:00Z",
             retrieved_count=3,
             used_count=2,
+            mentioned_at="2026-06-18",
         )
         note = CandidateNote(
             candidate_id=11,
@@ -615,6 +626,65 @@ class MemoryContractProtocolTests(unittest.TestCase):
         self.assertEqual(CONTRACT_VERSION, "0.1.0")
         self.assertEqual(ContractVersion.V0_1.value, CONTRACT_VERSION)
         self.assertEqual(EgressKind.EXPAND_HISTORY.value, "expand_history")
+
+
+class ResultModelForwardCompatibilityTests(unittest.TestCase):
+    """Requests are strict, results are tolerant.
+
+    A request is written by the caller, so an unknown key there is a typo and
+    must fail loud. A result is written by the server, which may be newer than
+    the client parsing it -- ``HostedHttpMemoryServiceClient`` validates the
+    server's JSON against its own locally pinned models. Under extra="forbid"
+    any additive result field is a hard break for every older client, with
+    contract_version unchanged so neither side can detect the skew.
+    """
+
+    RESULT_PAYLOAD_MODELS = (
+        TranscriptHit,
+        LongTermFact,
+        CandidateNote,
+        SummaryNode,
+        TombstoneRecord,
+    )
+
+    def test_result_models_ignore_unknown_fields(self) -> None:
+        for model in (SearchLongTermResult, AppendTranscriptResult):
+            with self.subTest(model=model.__name__):
+                self.assertEqual(model.model_config.get("extra"), "ignore")
+
+    def test_result_payload_models_ignore_unknown_fields(self) -> None:
+        # The break that prompted this was a payload field (mentioned_at on
+        # LongTermFact), not an envelope field, so the nested models carry the
+        # tolerance too.
+        for model in self.RESULT_PAYLOAD_MODELS:
+            with self.subTest(model=model.__name__):
+                self.assertEqual(model.model_config.get("extra"), "ignore")
+
+    def test_a_newer_servers_extra_result_field_parses(self) -> None:
+        # The concrete regression: a field a future release adds to
+        # LongTermFact must not hard-fail a client pinned to today's contract.
+        payload = {
+            "fact_id": 1,
+            "fact_text": "Ryan prefers uv.",
+            "subject": "Ryan",
+            "category": "preference",
+            "importance": 5,
+            "confidence": 0.9,
+            "source_message_ids": [1],
+            "editable": True,
+            "created_at": "2026-03-05T10:00:00+00:00",
+            "a_field_from_a_future_release": "whatever",
+        }
+        fact = LongTermFact.model_validate(payload)
+        self.assertEqual(fact.fact_text, "Ryan prefers uv.")
+        self.assertFalse(hasattr(fact, "a_field_from_a_future_release"))
+
+    def test_request_models_still_forbid_unknown_fields(self) -> None:
+        # Tolerance must not leak onto the caller-written side, including the
+        # two payload models that ride inside requests.
+        for model in (SearchLongTermRequest, RetrievalEvent, SourceTranscriptMessage):
+            with self.subTest(model=model.__name__):
+                self.assertEqual(model.model_config.get("extra"), "forbid")
 
 
 if __name__ == "__main__":

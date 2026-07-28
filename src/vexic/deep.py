@@ -15,6 +15,7 @@ from math import log
 from typing import Any
 
 from vexic.error_reporting import format_error_detail, mark_dream_recorded
+from vexic.models import canonical_partial_date
 from vexic.ports import AgentFactory, missing_host_port
 from vexic.redaction import assert_no_forbidden_secret_values
 from vexic.storage import (
@@ -129,6 +130,32 @@ def select_promotions(
     Top-N self-normalizes against score-scale drift, so there is no absolute
     score floor (see the Deep section of docs/architecture.md).
     """
+    # Dateless event candidates never reach promotion: Invariant 11 (as
+    # amended by ADR 0037) refuses category="event" with neither occurred_at
+    # nor a derived mentioned_at, and one refused candidate aborts the whole
+    # Deep cycle — a permanent dream deadlock, since retries re-select it.
+    # With mentioned_at derived at insert and backfilled on init, this skip is
+    # now the residual case (legacy rows not yet healed, or sources missing/
+    # unparseable); such candidates stay in Tier 2 like ADR 0031 drops
+    # miscited candidates. Both gates run the SAME `canonical_partial_date`
+    # the promotion path uses, so selection and promotion cannot disagree
+    # about what counts as a date. A bare `.strip()` gate would let a
+    # nonblank-but-invalid value ("not-a-date") through: it would be selected,
+    # canonicalize to None in promotion, and fail loud -- aborting the cycle,
+    # with retries re-selecting the same row (a permanent deadlock). With
+    # canonicalization here the same value is skipped and stays in Tier 2.
+    # mentioned_at needs this as much as occurred_at does: Light derives it
+    # deterministically, but the canonical-migration importer and any direct
+    # host write can put arbitrary text in the column.
+    candidates = [
+        c
+        for c in candidates
+        if not (
+            c.category == "event"
+            and canonical_partial_date(c.occurred_at) is None
+            and canonical_partial_date(c.mentioned_at) is None
+        )
+    ]
     if not candidates:
         return []
 
