@@ -937,7 +937,7 @@ def _deep_eligible(
             or (
                 candidate.category == "event"
                 and canonical_partial_date(candidate.occurred_at) is None
-                and not (candidate.mentioned_at or "").strip()
+                and canonical_partial_date(candidate.mentioned_at) is None
             )
         )
     ]
@@ -1130,13 +1130,24 @@ def _load_diagnostic_candidates(db_path: Path) -> list[_DiagnosticCandidate]:
     if not db_path.exists():
         return []
     with closing(storage_connect(db_path)) as conn:
+        # A frozen run DB captured before the ADR 0037 migration lacks the
+        # mentioned_at column. Probe rather than let the SELECT raise: the
+        # handler below classifies "no such column" as operational and returns
+        # [], which reads downstream as "Light extracted nothing" for EVERY
+        # question in the run -- a false, fully-populated-Tier-2 miss with no
+        # warning. The replay harness probes the same way for the same reason.
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(memory_candidates)").fetchall()
+        }
+        mentioned_at_select = "mentioned_at" if "mentioned_at" in columns else "NULL"
         try:
             rows = conn.execute(
-                """
+                f"""
                 SELECT id, fact_text, importance, hit_count,
                        COALESCE(last_seen_at, created_at) AS last_seen_at,
                        created_at, rem_boost, promoted, promoted_fact_id,
-                       category, occurred_at, mentioned_at
+                       category, occurred_at, {mentioned_at_select}
                 FROM memory_candidates
                 WHERE retired = 0
                     AND stale = 0

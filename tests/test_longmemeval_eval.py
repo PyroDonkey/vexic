@@ -22,6 +22,7 @@ from vexic.longmemeval import (
     _PREFERENCE_RUBRIC_GUIDANCE,
     _answer_variants,
     _embedded_candidate_ids,
+    _load_diagnostic_candidates,
     _render_recall_judge_input,
     _select_instances,
     drain_light_then_consolidate,
@@ -2812,6 +2813,26 @@ class EmbeddedCandidateIdsTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
+
+    def test_diagnostics_read_a_run_db_predating_mentioned_at(self) -> None:
+        # The diagnostics SELECT names mentioned_at, a column this release
+        # added. On a frozen pre-migration run DB that raises "no such column",
+        # which the handler classifies as operational and turns into [] -- so
+        # EVERY question in the run reports "Light extracted nothing" while
+        # Tier 2 is fully populated. Probe the schema instead.
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("ALTER TABLE memory_candidates DROP COLUMN mentioned_at")
+            conn.execute(
+                "INSERT INTO memory_candidates (fact_text, subject, category, "
+                "importance, confidence, source_message_ids) "
+                "VALUES ('Ryan ran the race', 'Ryan', 'event', 5, 0.9, '[1]')"
+            )
+            conn.commit()
+
+        candidates = _load_diagnostic_candidates(self.db_path)
+
+        self.assertEqual([c.fact_text for c in candidates], ["Ryan ran the race"])
+        self.assertIsNone(candidates[0].mentioned_at)
 
     def test_reads_a_legacy_run_db_opened_read_only(self) -> None:
         # A frozen run artifact whose memory_dedup_events predates the newer

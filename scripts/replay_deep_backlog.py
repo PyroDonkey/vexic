@@ -1484,6 +1484,15 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    # Same guard: 0 runs no rounds at all, so every eligible candidate reads
+    # "undrained-at-round-cap" and forward_rounds_to_drain is None. That is a
+    # coherent-looking table asserting structural non-drain, from a flag typo.
+    if args.max_forward_rounds <= 0:
+        print(
+            f"--max-forward-rounds must be positive, got {args.max_forward_rounds}",
+            file=sys.stderr,
+        )
+        return 2
     try:
         entries = load_gap_fixture(args.gaps)
     except GapFixtureError as exc:

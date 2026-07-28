@@ -75,6 +75,27 @@ class RebuildCopyRedactionTests(unittest.TestCase):
 
         self.assertFalse(self.copy_db.exists())
 
+    def test_rebuild_copy_fails_closed_on_secret_in_a_canonical_column(self) -> None:
+        # Both other redaction tests plant their secret in a host-owned
+        # extension table, so nothing pins the scan over Vexic's OWN canonical
+        # columns. Adding e.g. ("memory_candidates", "subject") to
+        # _FILE_COPY_TEXT_GUARD_SKIPPED_COLUMNS would silently re-narrow the
+        # scan this release deliberately widened, with the suite still green.
+        self._execute(
+            "INSERT INTO memory_candidates (fact_text, subject, category, "
+            "importance, confidence, source_message_ids) "
+            "VALUES ('a fact', 'sk-secret-value', 'fact', 3, 0.9, '[1]')"
+        )
+
+        with self.assertRaises(ValueError):
+            create_memory_rebuild_copy(
+                str(self.source_db),
+                str(self.copy_db),
+                forbidden_secret_values=("sk-secret-value",),
+            )
+
+        self.assertFalse(self.copy_db.exists())
+
     def test_rebuild_copy_fails_closed_on_non_ascii_secret_in_blob_column(self) -> None:
         # The ASCII case above cannot tell decoding apart from repr: str(b"...")
         # still contains an ASCII secret as a substring. A non-ASCII forbidden

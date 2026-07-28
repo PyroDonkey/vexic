@@ -276,18 +276,6 @@ async def rescore_preference_rows(
     # still renames an empty artifact into place -- which the analysis loader
     # reads as "ran, nothing usable" (``[]``), distinct from "never ran"
     # (absent -> ``None``).
-    # A unique temp name per invocation (in run_dir, so on the same filesystem
-    # for os.replace atomicity) isolates concurrent rescores over one run dir:
-    # two invocations must not share, truncate, or unlink each other's in-flight
-    # temp. mkstemp creates the file empty and returns an fd we close at once,
-    # keeping only the path -- the empty file is exactly the "ran, zero misses"
-    # signal the rename semantics below rely on.
-    tmp_fd, tmp_name = tempfile.mkstemp(
-        dir=run_dir, prefix=f"{RESCORE_ARTIFACT_NAME}.", suffix=".tmp"
-    )
-    os.close(tmp_fd)
-    tmp_path = Path(tmp_name)
-
     diagnostics_rows, _ = _load_diagnostics(run_dir)
     # A resumed/retried run can emit several rows per question_id; the last row
     # is the question's final state.
@@ -308,6 +296,20 @@ async def rescore_preference_rows(
     if judge_scorer is None and judge_agent_factory is not None:
         recall_judge_agent = judge_agent_factory(judge_model_group, secrets=secrets)
         judge_model_id = _judge_model_id_from_agent(recall_judge_agent)
+
+    # A unique temp name per invocation (in run_dir, so on the same filesystem
+    # for os.replace atomicity) isolates concurrent rescores over one run dir:
+    # two invocations must not share, truncate, or unlink each other's in-flight
+    # temp. mkstemp creates the file empty and returns an fd we close at once,
+    # keeping only the path -- the empty file is exactly the "ran, zero misses"
+    # signal the rename semantics below rely on. Created immediately before the
+    # try that owns its cleanup: the loads and the judge-agent build above can
+    # all fail, and an mkstemp before them leaks a .tmp on every failed run.
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        dir=run_dir, prefix=f"{RESCORE_ARTIFACT_NAME}.", suffix=".tmp"
+    )
+    os.close(tmp_fd)
+    tmp_path = Path(tmp_name)
 
     try:
         for question_id, diagnostics_row in rows_by_question_id.items():
