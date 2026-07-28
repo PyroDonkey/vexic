@@ -5,6 +5,74 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8] - 2026-07-28
+
+Event dating gains a provenance fallback, and the public contract stops
+breaking older clients on additive result fields. `CONTRACT_VERSION` stays
+`0.1.0`.
+
+### Added
+
+- Tier 3 `event` facts may promote on `mentioned_at` -- the deterministic
+  earliest date of a fact's source messages -- when no `occurred_at` is
+  available, instead of sinking in Tier 2 forever. `mentioned_at` is derived
+  provenance, never model output, and is never substituted into `occurred_at`
+  (ADR 0037, Memory Invariant 11). It is exposed on `LongTermFact` and joins
+  `occurred_at` ahead of `created_at` on every temporal filter and on the
+  event-timeline sort.
+- Light renders each message with a transient `observed=<date> <Day>` label so
+  the extractor can resolve relative references. The label is prompt
+  scaffolding and is never persisted (ADR 0038).
+- Operator memory tooling in the CLI: `vexic operator review-export` and
+  `vexic operator rebuild-copy`.
+- Offline evaluation and diagnostic harnesses under `scripts/`: extraction
+  prompt and Light time-context ablations, an oracle-evidence experiment, a
+  class-3 gap probe and simulation, and a Deep-backlog replay. Plus
+  preference rescoring (`vexic.longmemeval_rescore`) and rubric-aware judging
+  for preference question types.
+
+### Changed
+
+- Result models tolerate unknown fields. `MemoryResult` and the result-only
+  payload models now derive from `MemoryResultModel` (`extra="ignore"`), so a
+  client pinned to an older contract no longer raises `ValidationError` when a
+  newer server returns an additive field -- which adding `mentioned_at` would
+  otherwise have done to every pre-0.1.8 client. Requests and their payload
+  models keep `extra="forbid"`, because an unknown key in caller-written input
+  is a typo and should still fail loud.
+- Deep candidate subject keys normalize case and whitespace for dedup and
+  histogram grouping (ADR 0039), and extraction prefers named entities as the
+  subject.
+- The rebuild-copy secret scan covers every column of every table rather than
+  only text-declared ones, and refuses a source database missing a canonical
+  table instead of silently creating an empty replacement.
+
+### Fixed
+
+- An echoed `observed=` render label could persist into candidate text and
+  have its recording date copied into `occurred_at` as event time. The label
+  strip now keys on whether the date is one the window actually recorded, and
+  a source-date backstop refuses any in-text date that is a cited message's
+  recording date, whatever wording surrounds it.
+- `occurred_at` no longer survives when it contradicts, or invents precision
+  beyond, the single date the fact text states.
+- `mentioned_at` is canonicalized on the promotion path and in Deep selection,
+  so a value written by the canonical-migration importer or a host cannot
+  become a durable temporal key that no `as_of` or `event_before` filter
+  matches. Blank values are healable by the init backfill instead of sinking
+  the candidate permanently.
+- Candidates reduced to empty text by the marker strip are dropped and counted
+  in the run's drop telemetry rather than staged with an empty FTS body.
+- Diagnostic candidate reads no longer issue schema DDL, so a frozen run
+  database opened read-only is readable, and a run database predating
+  `mentioned_at` reports its real candidates instead of an empty set.
+- The extraction ablation harness opens its frozen corpus read-only, so a
+  WAL-mode evidence artifact is not rewritten on close.
+- Preference rescore tolerates legacy run-database schemas, and the recorder
+  hook fails fast rather than blocking when handed an interactive stdin.
+
+[0.1.8]: https://github.com/PyroDonkey/vexic/releases/tag/v0.1.8
+
 ## [0.1.7] - 2026-07-18
 
 Recorder deadline, retry, and error-reporting reliability for the async Stop

@@ -49,7 +49,7 @@ from vexic.contract import (
     TrustBoundary,
 )
 
-__version__ = "0.1.7"
+__version__ = "0.1.8"
 
 __all__ = [
     "CONTRACT_VERSION",
