@@ -1762,6 +1762,29 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
                 self.assertEqual(recorder_main(argv), 0)
             self.assertEqual([len(batch) for batch in calls], [100, 1])
 
+    def test_timeout_flag_rejects_non_positive_and_non_finite_values(self) -> None:
+        # --timeout-seconds bounds the un-preempted socket-read overshoot that
+        # _warn_hook_kill_margin reserves margin for. A non-finite value reaches
+        # urlopen(timeout=inf) and removes that bound entirely, so the read can
+        # run past the hook kill with no status write and no controlled exit.
+        # Both subcommands take the same guard --deadline-seconds already has.
+        # Assert on the validator's own message: both subcommands exit 2 for
+        # unrelated reasons (missing --config), so a bare exit-code check would
+        # pass vacuously.
+        for command in ("ingest", "prime"):
+            for value in ("0", "-1", "inf", "nan"):
+                with self.subTest(command=command, timeout=value):
+                    stderr = io.StringIO()
+                    with contextlib.redirect_stderr(stderr):
+                        code = recorder_main(
+                            [command, "--timeout-seconds", value]
+                        )
+                    self.assertEqual(code, 2)
+                    self.assertIn(
+                        "must be a positive, finite number of seconds",
+                        stderr.getvalue(),
+                    )
+
     def test_ingest_deadline_flag_rejects_non_positive_values(self) -> None:
         # recorder_main converts the argparse SystemExit into a return code.
         for value in ("0", "-1"):

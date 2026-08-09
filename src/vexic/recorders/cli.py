@@ -249,7 +249,7 @@ def _parser() -> argparse.ArgumentParser:
     ingest.add_argument("--session-id")
     ingest.add_argument("--agent-id")
     ingest.add_argument(
-        "--timeout-seconds", type=float, default=INGEST_TIMEOUT_SECONDS
+        "--timeout-seconds", type=_positive_float, default=INGEST_TIMEOUT_SECONDS
     )
     ingest.add_argument(
         "--deadline-seconds",
@@ -267,7 +267,7 @@ def _parser() -> argparse.ArgumentParser:
     prime.add_argument("--project-id")
     prime.add_argument("--session-id")
     prime.add_argument("--agent-id")
-    prime.add_argument("--timeout-seconds", type=float, default=15.0)
+    prime.add_argument("--timeout-seconds", type=_positive_float, default=15.0)
     prime.add_argument(
         "--deadline-seconds",
         type=_positive_float,
