@@ -494,6 +494,11 @@ def _ingest(args: argparse.Namespace) -> int:
         read_overshoot_seconds=args.timeout_seconds,
     )
     items: list[SourceTranscriptIngestItemResult] = []
+    # Stashed on args (like transcript_path above) so the fail-open handler in
+    # main can report what the batches that did post cost. A degraded run is
+    # exactly the one worth measuring.
+    post_durations_ms: list[int] = []
+    args.post_durations_ms = post_durations_ms
     batches = list(_iter_hosted_message_batches(messages))
     for index, batch in enumerate(batches):
         # One clock read per batch: the remaining deadline both gates the
@@ -506,12 +511,14 @@ def _ingest(args: argparse.Namespace) -> int:
                 f"hosted ingest deadline of {args.deadline_seconds:g}s "
                 f"exceeded: {index}/{len(batches)} batches posted"
             )
+        post_started = time.monotonic()
         result = post_source_messages(
             config,
             messages=batch,
             forbidden_values=tuple(args.forbidden_value),
             budget_seconds=remaining,
         )
+        post_durations_ms.append(int((time.monotonic() - post_started) * 1000))
         items.extend(_validated_ingest_items(result, batch))
     inserted = sum(item.status == "inserted" for item in items)
     skipped = sum(item.status == "skipped" for item in items)
@@ -530,6 +537,8 @@ def _ingest(args: argparse.Namespace) -> int:
         skipped=skipped,
         rejected=rejected,
         ignored=ignored,
+        duration_ms=int((time.monotonic() - started) * 1000),
+        post_durations_ms=post_durations_ms,
     )
     error = _try_write_status(args.status_path, status)
     if error is not None:
@@ -942,6 +951,7 @@ def main(argv: list[str] | None = None) -> int:
                 source_session_id=getattr(args, "source_session_id", None),
                 transcript_path=getattr(args, "transcript_path", None),
                 error=str(exc),
+                post_durations_ms=getattr(args, "post_durations_ms", None) or None,
             ),
         )
         print(f"warning: {exc}", file=sys.stderr)
@@ -957,6 +967,7 @@ def main(argv: list[str] | None = None) -> int:
                 error="argument parsing failed"
                 if isinstance(exc, MissingIngestOption)
                 else str(exc),
+                post_durations_ms=getattr(args, "post_durations_ms", None) or None,
             ),
         )
         print(f"error: {exc}", file=sys.stderr)

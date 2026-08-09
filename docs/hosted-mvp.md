@@ -788,7 +788,11 @@ exits `0` and never affects prime's own output or exit code.
   end-to-end deadline (`--deadline-seconds` on `recorder ingest`, default
   100s inside the async Stop hook's 120s kill) that stops posting, writes a
   degraded status, and fails open with exit 1 on expiry; the next run
-  re-posts from the start and the hosted source ledger dedups. An in-flight
+  re-posts from the start and the hosted source ledger dedups. The ingest
+  status records `duration_ms` for the whole run and one
+  `post_durations_ms` entry per POST, on both the success and the fail-open
+  path, so a slow or timing-out Stop hook is diagnosable from the status
+  file without correlating against server-side request logs. An in-flight
   response read is not preempted, so a single recv can block up to the
   per-attempt socket timeout past the deadline before the controlled exit
   runs; the default socket timeout (`--timeout-seconds`, 10s) is sized so

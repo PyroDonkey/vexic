@@ -25,7 +25,12 @@ class RecorderStatus:
     # durations and outcomes (ADR 0025 D4 follow-up).
     phase: str | None = None
     legs: dict[str, dict[str, object]] | None = None
+    # Wall time of the whole run. Prime has always carried it; ingest sets it
+    # too, alongside one post_durations_ms entry per POST. Ingest latency was
+    # otherwise invisible from the client, so diagnosing a timing-out Stop hook
+    # meant inferring per-POST cost from server-side logs.
     duration_ms: int | None = None
+    post_durations_ms: list[int] | None = None
     # Write attribution. The file stays last-writer-wins by design (status has
     # no principled ordering key across overlapping runs); these fields exist
     # so a human or tooling can tell which run wrote it. Stamped by

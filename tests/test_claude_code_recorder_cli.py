@@ -1602,6 +1602,76 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
         with patch("vexic.recorders.cli.sys.stdin", _PipedStdin(b'{"ok": 1}')):
             self.assertEqual(_read_hook_input_bytes(None), b'{"ok": 1}')
 
+    def test_ingest_status_records_run_and_per_post_durations(self) -> None:
+        # Ingest latency was previously unmeasurable from the client: only
+        # prime carried duration_ms, so diagnosing a slow or timing-out hook
+        # meant inferring per-POST cost from server-side logs. Record the run
+        # total and one entry per POST so the status file answers it directly.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            transcript = root / "session.jsonl"
+            rows = [
+                {
+                    "type": "user",
+                    "sessionId": "claude-session",
+                    "uuid": f"uuid-{index}",
+                    "message": {"role": "user", "content": f"remember cedar {index}"},
+                }
+                for index in range(150)
+            ]
+            transcript.write_text(
+                "\n".join(json.dumps(row) for row in rows),
+                encoding="utf-8",
+            )
+            hook_payload = root / "hook.json"
+            hook_payload.write_text(
+                json.dumps(
+                    {
+                        "session_id": "claude-session",
+                        "transcript_path": str(transcript),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            status_path = root / "status.json"
+
+            def fake_post(config, *, messages, forbidden_values, budget_seconds=None):
+                return _ingest_result(messages)
+
+            with (
+                patch("vexic.recorders.cli.post_source_messages", fake_post),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                code = recorder_main(
+                    [
+                        "ingest",
+                        "--hook-input",
+                        str(hook_payload),
+                        "--base-url",
+                        "https://api.example.test",
+                        "--api-key",
+                        "vx_secret",
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "vexic-session",
+                        "--status-path",
+                        str(status_path),
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            # 150 messages -> two POSTs at the 100-message cap.
+            self.assertEqual(len(status["post_durations_ms"]), 2)
+            for value in status["post_durations_ms"]:
+                self.assertIsInstance(value, int)
+                self.assertGreaterEqual(value, 0)
+            self.assertIsInstance(status["duration_ms"], int)
+            self.assertGreaterEqual(
+                status["duration_ms"], sum(status["post_durations_ms"])
+            )
+
     def test_ingest_batches_hosted_posts_at_one_hundred_messages(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -1705,10 +1775,18 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
             status_path = root / "status.json"
             calls = []
             budgets: list[float | None] = []
+            # A clock the posting loop drives, rather than a fixed side_effect
+            # list: the number of monotonic() reads per batch is an
+            # implementation detail, and pinning it makes any added timing
+            # measurement look like a deadline regression.
+            clock = {"now": 0.0}
 
             def fake_post(config, *, messages, forbidden_values, budget_seconds=None):
                 calls.append(messages)
                 budgets.append(budget_seconds)
+                # The 100s default deadline is spent while batch 1 posts, so
+                # batch 2 must never be attempted.
+                clock["now"] = 150.0
                 return _ingest_result(messages)
 
             argv = [
@@ -1732,10 +1810,7 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
                 patch("vexic.recorders.cli.post_source_messages", fake_post),
                 patch(
                     "vexic.recorders.cli.time.monotonic",
-                    # started, batch-1 deadline check, batch-2 deadline check:
-                    # the 100s default is spent while batch 1 posts, so batch 2
-                    # must never be attempted.
-                    side_effect=[0.0, 0.0, 150.0],
+                    side_effect=lambda: clock["now"],
                 ),
                 contextlib.redirect_stdout(io.StringIO()),
                 contextlib.redirect_stderr(stderr),
@@ -1751,6 +1826,10 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
             self.assertFalse(status["ok"])
             self.assertIn("deadline", status["error"])
             self.assertIn("warning:", stderr.getvalue())
+            # A degraded run is the one worth measuring: record what the
+            # batches that did post cost, so a timing-out hook is diagnosable
+            # from the status file alone.
+            self.assertEqual(len(status["post_durations_ms"]), 1)
 
             # A rerun with a live clock re-posts every row; the hosted ledger
             # dedups the 100 rows batch 1 already delivered.
