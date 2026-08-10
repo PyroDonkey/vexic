@@ -1602,6 +1602,327 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
         with patch("vexic.recorders.cli.sys.stdin", _PipedStdin(b'{"ok": 1}')):
             self.assertEqual(_read_hook_input_bytes(None), b'{"ok": 1}')
 
+    def test_ingest_status_records_run_and_per_post_durations(self) -> None:
+        # Ingest latency was previously unmeasurable from the client: only
+        # prime carried duration_ms, so diagnosing a slow or timing-out hook
+        # meant inferring per-POST cost from server-side logs. Record the run
+        # total and one entry per POST so the status file answers it directly.
+        #
+        # Every phase advances a driven clock by a distinct amount so the
+        # assertions below pin measured values rather than field presence. On
+        # the real clock with an instant fake_post every duration rounds to 0
+        # or 1 ms, and a status that fabricated its numbers would still pass.
+        from vexic.recorders import cli as cli_module
+
+        real_read_hook_payload = cli_module._read_hook_payload
+        real_scan = cli_module.scan_claude_code_transcript
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            transcript = root / "session.jsonl"
+            rows = [
+                {
+                    "type": "user",
+                    "sessionId": "claude-session",
+                    "uuid": f"uuid-{index}",
+                    "message": {"role": "user", "content": f"remember cedar {index}"},
+                }
+                for index in range(150)
+            ]
+            transcript.write_text(
+                "\n".join(json.dumps(row) for row in rows),
+                encoding="utf-8",
+            )
+            hook_payload = root / "hook.json"
+            hook_payload.write_text(
+                json.dumps(
+                    {
+                        "session_id": "claude-session",
+                        "transcript_path": str(transcript),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            status_path = root / "status.json"
+            clock = {"now": 0.0}
+
+            def slow_read_hook_payload(*args, **kwargs):
+                # Stands in for the hook pipe the harness holds open. This
+                # wait is not bounded by --deadline-seconds.
+                clock["now"] += 2.0
+                return real_read_hook_payload(*args, **kwargs)
+
+            def slow_scan(*args, **kwargs):
+                clock["now"] += 3.0
+                return real_scan(*args, **kwargs)
+
+            def fake_post(config, *, messages, forbidden_values, budget_seconds=None):
+                clock["now"] += 7.0
+                return _ingest_result(messages)
+
+            with (
+                patch("vexic.recorders.cli.post_source_messages", fake_post),
+                patch(
+                    "vexic.recorders.cli._read_hook_payload", slow_read_hook_payload
+                ),
+                patch("vexic.recorders.cli.scan_claude_code_transcript", slow_scan),
+                patch(
+                    "vexic.recorders.cli.time.monotonic",
+                    side_effect=lambda: clock["now"],
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                code = recorder_main(
+                    [
+                        "ingest",
+                        "--hook-input",
+                        str(hook_payload),
+                        "--base-url",
+                        "https://api.example.test",
+                        "--api-key",
+                        "vx_secret",
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "vexic-session",
+                        "--status-path",
+                        str(status_path),
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            # 150 messages -> two POSTs at the 100-message cap.
+            self.assertEqual(status["post_durations_ms"], [7000, 7000])
+            # 2s hook read + 3s scan + 14s posting. Asserted exactly, and
+            # exactly this way, because the run total is where the clock's
+            # ORIGIN is observable: 17000 would mean the clock started after
+            # the hook read (the unbounded stdin wait), 14000 that it started
+            # after the transcript scan. Both are real regressions that a
+            # `duration_ms >= sum(post_durations_ms)` check cannot see.
+            self.assertEqual(status["duration_ms"], 19000)
+
+    def test_prime_parse_failure_does_not_overwrite_the_ingest_status(self) -> None:
+        # Prime keeps a sibling status file so an overlapping Stop-hook ingest
+        # and prime cannot erase each other's evidence. A prime parse failure
+        # must respect that: writing to the raw --status-path would replace a
+        # real ingest record with a parse error labelled "ingest".
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            ingest_status = root / "status.json"
+            ingest_status.write_text(
+                json.dumps({"ok": True, "operation": "ingest", "inserted": 7}),
+                encoding="utf-8",
+            )
+
+            with contextlib.redirect_stderr(io.StringIO()):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(root / "missing.json"),
+                        "--status-path",
+                        str(ingest_status),
+                        "--timeout-seconds",
+                        "nan",
+                    ]
+                )
+
+            self.assertEqual(code, 2)
+            preserved = json.loads(ingest_status.read_text(encoding="utf-8"))
+            self.assertEqual(preserved["inserted"], 7)
+            prime_status = json.loads(
+                (root / "status-prime.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(prime_status["ok"])
+            self.assertEqual(prime_status["operation"], "prime")
+
+    def test_ingest_duration_covers_the_config_read(self) -> None:
+        # _load_config reads a file synchronously before _ingest is entered,
+        # and that cost counts against the same Stop-hook kill as everything
+        # after it. A clock started inside _ingest would omit it from the run
+        # total and hand the posting loop a deadline the hook cannot afford.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config = root / "config.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "vexic-session",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            status_path = root / "status.json"
+            from vexic.recorders.cli import _load_config
+
+            clock = {"now": 0.0}
+            real_load = _load_config
+
+            def slow_load(*args, **kwargs):
+                clock["now"] += 5.0
+                return real_load(*args, **kwargs)
+
+            def failing_read(*args, **kwargs):
+                raise ValueError("hook input was not valid JSON")
+
+            with (
+                patch("vexic.recorders.cli._load_config", slow_load),
+                patch("vexic.recorders.cli._read_hook_payload", failing_read),
+                patch(
+                    "vexic.recorders.cli.time.monotonic",
+                    side_effect=lambda: clock["now"],
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                code = recorder_main(
+                    [
+                        "ingest",
+                        "--config",
+                        str(config),
+                        "--status-path",
+                        str(status_path),
+                    ]
+                )
+
+            self.assertEqual(code, 2)
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual(status["duration_ms"], 5000)
+
+    def test_ingest_status_times_a_failure_during_the_hook_read(self) -> None:
+        # _read_hook_payload blocks on sys.stdin until the harness closes the
+        # pipe, and that wait is not bounded by --deadline-seconds (the
+        # deadline is only checked inside the posting loop). Stashing the run
+        # clock after that read leaves this failure class -- the one that
+        # burns the most wall time -- reporting duration_ms: null.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            status_path = root / "status.json"
+            clock = {"now": 0.0}
+
+            def failing_read(*args, **kwargs):
+                clock["now"] += 2.0
+                raise ValueError("hook input was not valid JSON")
+
+            with (
+                patch("vexic.recorders.cli._read_hook_payload", failing_read),
+                patch(
+                    "vexic.recorders.cli.time.monotonic",
+                    side_effect=lambda: clock["now"],
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                code = recorder_main(
+                    [
+                        "ingest",
+                        "--base-url",
+                        "https://api.example.test",
+                        "--api-key",
+                        "vx_secret",
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "vexic-session",
+                        "--status-path",
+                        str(status_path),
+                    ]
+                )
+
+            self.assertEqual(code, 2)
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertFalse(status["ok"])
+            self.assertEqual(status["duration_ms"], 2000)
+            # Posting never began, so the field does not apply at all -- as
+            # distinct from the empty tuple, which means it began and
+            # completed no batch.
+            self.assertIsNone(status["post_durations_ms"])
+
+    def test_ingest_status_records_durations_for_a_failing_post(self) -> None:
+        # The POST that spends the retry or socket budget and then raises is
+        # the most valuable timing in the file. Appending only after a
+        # successful return drops exactly that one, and the degraded status
+        # carried no run total at all -- so the telemetry added for timeout
+        # failures went missing on the timeouts.
+        from vexic.recorders.hosted_ingest import HostedIngestTransportError
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            transcript = root / "session.jsonl"
+            rows = [
+                {
+                    "type": "user",
+                    "sessionId": "claude-session",
+                    "uuid": f"uuid-{index}",
+                    "message": {"role": "user", "content": f"remember cedar {index}"},
+                }
+                for index in range(150)
+            ]
+            transcript.write_text(
+                "\n".join(json.dumps(row) for row in rows),
+                encoding="utf-8",
+            )
+            hook_payload = root / "hook.json"
+            hook_payload.write_text(
+                json.dumps(
+                    {
+                        "session_id": "claude-session",
+                        "transcript_path": str(transcript),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            status_path = root / "status.json"
+            calls = []
+            clock = {"now": 0.0}
+
+            def fake_post(config, *, messages, forbidden_values, budget_seconds=None):
+                calls.append(messages)
+                clock["now"] += 7.0
+                if len(calls) == 2:
+                    raise HostedIngestTransportError(
+                        "hosted ingest failed: TimeoutError"
+                    )
+                return _ingest_result(messages)
+
+            with (
+                patch("vexic.recorders.cli.post_source_messages", fake_post),
+                patch(
+                    "vexic.recorders.cli.time.monotonic",
+                    side_effect=lambda: clock["now"],
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                code = recorder_main(
+                    [
+                        "ingest",
+                        "--hook-input",
+                        str(hook_payload),
+                        "--base-url",
+                        "https://api.example.test",
+                        "--api-key",
+                        "vx_secret",
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "vexic-session",
+                        "--status-path",
+                        str(status_path),
+                    ]
+                )
+
+            self.assertEqual(code, 1)
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertFalse(status["ok"])
+            # Both POSTs are timed: the one that succeeded and the one that
+            # raised after spending 7s.
+            self.assertEqual(status["post_durations_ms"], [7000, 7000])
+            self.assertEqual(status["duration_ms"], 14000)
+
     def test_ingest_batches_hosted_posts_at_one_hundred_messages(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -1705,10 +2026,18 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
             status_path = root / "status.json"
             calls = []
             budgets: list[float | None] = []
+            # A clock the posting loop drives, rather than a fixed side_effect
+            # list: the number of monotonic() reads per batch is an
+            # implementation detail, and pinning it makes any added timing
+            # measurement look like a deadline regression.
+            clock = {"now": 0.0}
 
             def fake_post(config, *, messages, forbidden_values, budget_seconds=None):
                 calls.append(messages)
                 budgets.append(budget_seconds)
+                # The 100s default deadline is spent while batch 1 posts, so
+                # batch 2 must never be attempted.
+                clock["now"] = 150.0
                 return _ingest_result(messages)
 
             argv = [
@@ -1732,10 +2061,7 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
                 patch("vexic.recorders.cli.post_source_messages", fake_post),
                 patch(
                     "vexic.recorders.cli.time.monotonic",
-                    # started, batch-1 deadline check, batch-2 deadline check:
-                    # the 100s default is spent while batch 1 posts, so batch 2
-                    # must never be attempted.
-                    side_effect=[0.0, 0.0, 150.0],
+                    side_effect=lambda: clock["now"],
                 ),
                 contextlib.redirect_stdout(io.StringIO()),
                 contextlib.redirect_stderr(stderr),
@@ -1751,6 +2077,10 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
             self.assertFalse(status["ok"])
             self.assertIn("deadline", status["error"])
             self.assertIn("warning:", stderr.getvalue())
+            # A degraded run is the one worth measuring: record what the
+            # batches that did post cost, so a timing-out hook is diagnosable
+            # from the status file alone.
+            self.assertEqual(len(status["post_durations_ms"]), 1)
 
             # A rerun with a live clock re-posts every row; the hosted ledger
             # dedups the 100 rows batch 1 already delivered.
@@ -1761,6 +2091,39 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
             ):
                 self.assertEqual(recorder_main(argv), 0)
             self.assertEqual([len(batch) for batch in calls], [100, 1])
+
+    def test_timeout_flag_rejects_non_positive_and_non_finite_values(self) -> None:
+        # Rejects at parse time, with a clear message, what would otherwise
+        # fail deep in the socket layer. Measured on this runtime:
+        # settimeout(inf) and settimeout(1e308) raise OverflowError,
+        # settimeout(nan) raises ValueError.
+        #
+        # It matters most on prime, which passes timeout_seconds to urlopen
+        # uncapped: OverflowError is not an OSError/ValueError, so it escapes
+        # _post_search's handlers and _worker's `except RuntimeError`, leaving
+        # legs[name] unset for the join to KeyError on. Ingest is already
+        # immune -- post_source_messages caps every attempt at
+        # min(timeout, remaining_budget), so inf never reaches the socket.
+        #
+        # Deliberately NOT claimed: that this bounds the timeout. It does not.
+        # 1e9 is finite, passes this guard, and settimeout accepts it (~31
+        # years), which is effectively no timeout at all.
+        # Assert on the validator's own message: both subcommands exit 2 for
+        # unrelated reasons (missing --config), so a bare exit-code check would
+        # pass vacuously.
+        for command in ("ingest", "prime"):
+            for value in ("0", "-1", "inf", "nan"):
+                with self.subTest(command=command, timeout=value):
+                    stderr = io.StringIO()
+                    with contextlib.redirect_stderr(stderr):
+                        code = recorder_main(
+                            [command, "--timeout-seconds", value]
+                        )
+                    self.assertEqual(code, 2)
+                    self.assertIn(
+                        "must be a positive, finite number of seconds",
+                        stderr.getvalue(),
+                    )
 
     def test_ingest_deadline_flag_rejects_non_positive_values(self) -> None:
         # recorder_main converts the argparse SystemExit into a return code.
@@ -2042,6 +2405,12 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
             self.assertFalse(status["ok"])
             self.assertIn("exceeds hosted ingest payload cap", status["error"])
             post_source_messages_mock.assert_not_called()
+            # The empty case: the run got as far as batching (where the
+            # oversized-message cap raises) and completed no batch. Distinct
+            # from null, which means it failed before batching -- a
+            # distinction _posted_durations documents as deliberate, so pin it
+            # rather than leave it prose.
+            self.assertEqual(status["post_durations_ms"], [])
 
 
 class ClaudeCodeRecorderHostedRoundTripTests(unittest.TestCase):
@@ -3124,6 +3493,11 @@ class ClaudeCodeRecorderIngestCommandMoreTests(unittest.TestCase):
             status = json.loads(status_path.read_text(encoding="utf-8"))
             self.assertFalse(status["ok"])
             self.assertEqual(status["error"], "something else broke")
+            # The exit-2 handler carries the same timings as the fail-open one:
+            # a run that died on a non-transport fault still burned wall time,
+            # and a POST that raised is still a measurement.
+            self.assertIsInstance(status["duration_ms"], int)
+            self.assertEqual(len(status["post_durations_ms"]), 1)
 
     def test_ingest_status_write_failure_returns_two_without_traceback(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -788,7 +788,17 @@ exits `0` and never affects prime's own output or exit code.
   end-to-end deadline (`--deadline-seconds` on `recorder ingest`, default
   100s inside the async Stop hook's 120s kill) that stops posting, writes a
   degraded status, and fails open with exit 1 on expiry; the next run
-  re-posts from the start and the hosted source ledger dedups. An in-flight
+  re-posts from the start and the hosted source ledger dedups. The ingest
+  status records `duration_ms` for the whole run and one
+  `post_durations_ms` entry per posted batch, on the success path and on
+  both failure paths; each entry spans that batch's whole call including its
+  in-call retries, and a batch that raises is timed too, so the POST that
+  spent the budget is the one the file reports. That covers a run that
+  reaches a controlled exit; it does not cover a run the 120s hook kill
+  terminates, which writes nothing at all and leaves the previous run's
+  record in place with no marker that a later run died (prime has a
+  `phase: "started"` marker for exactly this case, ingest has no
+  equivalent). An in-flight
   response read is not preempted, so a single recv can block up to the
   per-attempt socket timeout past the deadline before the controlled exit
   runs; the default socket timeout (`--timeout-seconds`, 10s) is sized so

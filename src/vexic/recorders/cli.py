@@ -216,6 +216,27 @@ def _warn_hook_kill_margin(
         )
 
 
+def _elapsed_ms_since(started: float | None) -> int | None:
+    """Monotonic ms since an `_ingest` run started, for the failure-path status."""
+    if started is None:
+        return None
+    return int((time.monotonic() - started) * 1000)
+
+
+def _posted_durations(args: argparse.Namespace) -> tuple[int, ...] | None:
+    """Per-batch durations recorded so far, or None before batching started.
+
+    Empty and None are distinct on purpose, but the boundary is where the
+    accumulator is created, not where the posting loop begins: `()` means the
+    run got as far as batching and completed no batch (the oversized-message
+    cap raises during batching, and a blown deadline can raise before the
+    first POST), `None` means it failed earlier still -- config, hook payload,
+    or transcript scan -- so the field does not apply to this run at all.
+    """
+    recorded = getattr(args, "post_durations_ms", None)
+    return None if recorded is None else tuple(recorded)
+
+
 def _prime_status_path(path: Path | None) -> Path | None:
     # Prime records land in a sibling file, never the ingest status file: an
     # async Stop ingest overwriting a killed prime's stale "started" marker
@@ -249,7 +270,7 @@ def _parser() -> argparse.ArgumentParser:
     ingest.add_argument("--session-id")
     ingest.add_argument("--agent-id")
     ingest.add_argument(
-        "--timeout-seconds", type=float, default=INGEST_TIMEOUT_SECONDS
+        "--timeout-seconds", type=_positive_float, default=INGEST_TIMEOUT_SECONDS
     )
     ingest.add_argument(
         "--deadline-seconds",
@@ -267,7 +288,7 @@ def _parser() -> argparse.ArgumentParser:
     prime.add_argument("--project-id")
     prime.add_argument("--session-id")
     prime.add_argument("--agent-id")
-    prime.add_argument("--timeout-seconds", type=float, default=15.0)
+    prime.add_argument("--timeout-seconds", type=_positive_float, default=15.0)
     prime.add_argument(
         "--deadline-seconds",
         type=_positive_float,
@@ -461,7 +482,16 @@ def _ingest(args: argparse.Namespace) -> int:
     # The deadline clock starts before the transcript scan: a large full
     # reread eats hook-kill margin too, and "end-to-end" must mean the whole
     # run, not just the posting loop.
-    started = time.monotonic()
+    # Set in main before the config read; the fallback keeps a directly
+    # constructed Namespace working. Either way it precedes the hook read,
+    # which blocks on sys.stdin until the harness closes the pipe and is not
+    # bounded by --deadline-seconds (the deadline is only checked inside the
+    # posting loop). A clock started after it would report duration_ms: null
+    # for the failure class that burns the most wall time.
+    started = getattr(args, "ingest_started", None)
+    if started is None:
+        started = time.monotonic()
+        args.ingest_started = started
     payload = _read_hook_payload(args.hook_input)
     transcript_path = payload.transcript_path
     source_session_id = payload.session_id
@@ -494,6 +524,11 @@ def _ingest(args: argparse.Namespace) -> int:
         read_overshoot_seconds=args.timeout_seconds,
     )
     items: list[SourceTranscriptIngestItemResult] = []
+    # Stashed on args (like transcript_path above) so the fail-open handler in
+    # main can report what the batches that did post cost. A degraded run is
+    # exactly the one worth measuring.
+    post_durations_ms: list[int] = []
+    args.post_durations_ms = post_durations_ms
     batches = list(_iter_hosted_message_batches(messages))
     for index, batch in enumerate(batches):
         # One clock read per batch: the remaining deadline both gates the
@@ -506,12 +541,19 @@ def _ingest(args: argparse.Namespace) -> int:
                 f"hosted ingest deadline of {args.deadline_seconds:g}s "
                 f"exceeded: {index}/{len(batches)} batches posted"
             )
-        result = post_source_messages(
-            config,
-            messages=batch,
-            forbidden_values=tuple(args.forbidden_value),
-            budget_seconds=remaining,
-        )
+        # Timed in a finally: the POST that spends the budget and then raises
+        # is the most valuable entry in the file, and appending only after a
+        # successful return would drop exactly that one.
+        post_started = time.monotonic()
+        try:
+            result = post_source_messages(
+                config,
+                messages=batch,
+                forbidden_values=tuple(args.forbidden_value),
+                budget_seconds=remaining,
+            )
+        finally:
+            post_durations_ms.append(int((time.monotonic() - post_started) * 1000))
         items.extend(_validated_ingest_items(result, batch))
     inserted = sum(item.status == "inserted" for item in items)
     skipped = sum(item.status == "skipped" for item in items)
@@ -530,6 +572,8 @@ def _ingest(args: argparse.Namespace) -> int:
         skipped=skipped,
         rejected=rejected,
         ignored=ignored,
+        duration_ms=int((time.monotonic() - started) * 1000),
+        post_durations_ms=tuple(post_durations_ms),
     )
     error = _try_write_status(args.status_path, status)
     if error is not None:
@@ -892,12 +936,19 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = parser.parse_args(raw_argv)
     except SystemExit as exc:
-        if _argv_status_path(raw_argv) is not None:
+        status_path = _argv_status_path(raw_argv)
+        if status_path is not None:
+            # Route a prime parse failure to prime's sibling file. Prime keeps
+            # a separate record precisely so an overlapping Stop-hook ingest
+            # and prime cannot erase each other's evidence; writing a parse
+            # error to the raw path would destroy an ingest record with a
+            # row labelled "ingest" that ingest never wrote.
+            is_prime = bool(raw_argv) and raw_argv[0] == "prime"
             _try_write_status(
-                _argv_status_path(raw_argv),
+                _prime_status_path(status_path) if is_prime else status_path,
                 RecorderStatus(
                     ok=False,
-                    operation="ingest",
+                    operation="prime" if is_prime else "ingest",
                     source_session_id=None,
                     transcript_path=None,
                     error="argument parsing failed",
@@ -907,6 +958,12 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.command == "ingest":
+            # Clock starts before the config read, not inside _ingest:
+            # _load_config reads a file synchronously, and that cost counts
+            # against the same Stop-hook kill as everything after it. Starting
+            # later would both underreport the run and hand the posting loop a
+            # full deadline the hook can no longer afford.
+            args.ingest_started = time.monotonic()
             _apply_ingest_config(args)
             return _ingest(args)
         if args.command == "prime":
@@ -942,6 +999,8 @@ def main(argv: list[str] | None = None) -> int:
                 source_session_id=getattr(args, "source_session_id", None),
                 transcript_path=getattr(args, "transcript_path", None),
                 error=str(exc),
+                post_durations_ms=_posted_durations(args),
+                duration_ms=_elapsed_ms_since(getattr(args, "ingest_started", None)),
             ),
         )
         print(f"warning: {exc}", file=sys.stderr)
@@ -957,6 +1016,8 @@ def main(argv: list[str] | None = None) -> int:
                 error="argument parsing failed"
                 if isinstance(exc, MissingIngestOption)
                 else str(exc),
+                post_durations_ms=_posted_durations(args),
+                duration_ms=_elapsed_ms_since(getattr(args, "ingest_started", None)),
             ),
         )
         print(f"error: {exc}", file=sys.stderr)
