@@ -1701,6 +1701,97 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
             # `duration_ms >= sum(post_durations_ms)` check cannot see.
             self.assertEqual(status["duration_ms"], 19000)
 
+    def test_prime_parse_failure_does_not_overwrite_the_ingest_status(self) -> None:
+        # Prime keeps a sibling status file so an overlapping Stop-hook ingest
+        # and prime cannot erase each other's evidence. A prime parse failure
+        # must respect that: writing to the raw --status-path would replace a
+        # real ingest record with a parse error labelled "ingest".
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            ingest_status = root / "status.json"
+            ingest_status.write_text(
+                json.dumps({"ok": True, "operation": "ingest", "inserted": 7}),
+                encoding="utf-8",
+            )
+
+            with contextlib.redirect_stderr(io.StringIO()):
+                code = recorder_main(
+                    [
+                        "prime",
+                        "--config",
+                        str(root / "missing.json"),
+                        "--status-path",
+                        str(ingest_status),
+                        "--timeout-seconds",
+                        "nan",
+                    ]
+                )
+
+            self.assertEqual(code, 2)
+            preserved = json.loads(ingest_status.read_text(encoding="utf-8"))
+            self.assertEqual(preserved["inserted"], 7)
+            prime_status = json.loads(
+                (root / "status-prime.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(prime_status["ok"])
+            self.assertEqual(prime_status["operation"], "prime")
+
+    def test_ingest_duration_covers_the_config_read(self) -> None:
+        # _load_config reads a file synchronously before _ingest is entered,
+        # and that cost counts against the same Stop-hook kill as everything
+        # after it. A clock started inside _ingest would omit it from the run
+        # total and hand the posting loop a deadline the hook cannot afford.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config = root / "config.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://api.example.test",
+                        "api_key": "vx_secret",
+                        "project_id": "project-a",
+                        "session_id": "vexic-session",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            status_path = root / "status.json"
+            from vexic.recorders.cli import _load_config
+
+            clock = {"now": 0.0}
+            real_load = _load_config
+
+            def slow_load(*args, **kwargs):
+                clock["now"] += 5.0
+                return real_load(*args, **kwargs)
+
+            def failing_read(*args, **kwargs):
+                raise ValueError("hook input was not valid JSON")
+
+            with (
+                patch("vexic.recorders.cli._load_config", slow_load),
+                patch("vexic.recorders.cli._read_hook_payload", failing_read),
+                patch(
+                    "vexic.recorders.cli.time.monotonic",
+                    side_effect=lambda: clock["now"],
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                code = recorder_main(
+                    [
+                        "ingest",
+                        "--config",
+                        str(config),
+                        "--status-path",
+                        str(status_path),
+                    ]
+                )
+
+            self.assertEqual(code, 2)
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual(status["duration_ms"], 5000)
+
     def test_ingest_status_times_a_failure_during_the_hook_read(self) -> None:
         # _read_hook_payload blocks on sys.stdin until the harness closes the
         # pipe, and that wait is not bounded by --deadline-seconds (the
@@ -2002,14 +2093,21 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
             self.assertEqual([len(batch) for batch in calls], [100, 1])
 
     def test_timeout_flag_rejects_non_positive_and_non_finite_values(self) -> None:
-        # Parse-time hygiene and parity with --deadline-seconds, which already
-        # validates. Deliberately NOT claimed: that this bounds the socket-read
-        # overshoot. It does not. On ingest, post_source_messages already caps
-        # each attempt at min(timeout, remaining_budget), so inf never reaches
-        # urlopen as inf; on prime nothing caps it, but 1e9 is finite, passes
-        # this guard, and behaves identically to inf. What the guard buys is a
-        # clear argparse message instead of nan surfacing later as an opaque
-        # socket.settimeout "Invalid value NaN".
+        # Rejects at parse time, with a clear message, what would otherwise
+        # fail deep in the socket layer. Measured on this runtime:
+        # settimeout(inf) and settimeout(1e308) raise OverflowError,
+        # settimeout(nan) raises ValueError.
+        #
+        # It matters most on prime, which passes timeout_seconds to urlopen
+        # uncapped: OverflowError is not an OSError/ValueError, so it escapes
+        # _post_search's handlers and _worker's `except RuntimeError`, leaving
+        # legs[name] unset for the join to KeyError on. Ingest is already
+        # immune -- post_source_messages caps every attempt at
+        # min(timeout, remaining_budget), so inf never reaches the socket.
+        #
+        # Deliberately NOT claimed: that this bounds the timeout. It does not.
+        # 1e9 is finite, passes this guard, and settimeout accepts it (~31
+        # years), which is effectively no timeout at all.
         # Assert on the validator's own message: both subcommands exit 2 for
         # unrelated reasons (missing --config), so a bare exit-code check would
         # pass vacuously.
@@ -2307,10 +2405,11 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
             self.assertFalse(status["ok"])
             self.assertIn("exceeds hosted ingest payload cap", status["error"])
             post_source_messages_mock.assert_not_called()
-            # The empty case, and the only reachable one: ingest reached the
-            # posting loop and completed no batch. Distinct from null, which
-            # means posting never began at all -- a distinction the status
-            # documents as deliberate, so pin it rather than leave it prose.
+            # The empty case: the run got as far as batching (where the
+            # oversized-message cap raises) and completed no batch. Distinct
+            # from null, which means it failed before batching -- a
+            # distinction _posted_durations documents as deliberate, so pin it
+            # rather than leave it prose.
             self.assertEqual(status["post_durations_ms"], [])
 
 

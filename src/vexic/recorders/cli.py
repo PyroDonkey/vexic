@@ -224,11 +224,14 @@ def _elapsed_ms_since(started: float | None) -> int | None:
 
 
 def _posted_durations(args: argparse.Namespace) -> tuple[int, ...] | None:
-    """Per-batch durations recorded so far, or None when posting never began.
+    """Per-batch durations recorded so far, or None before batching started.
 
-    Empty and None are distinct on purpose: `()` means ingest reached the
-    posting loop and completed no batch, `None` means the field does not apply
-    to this run at all.
+    Empty and None are distinct on purpose, but the boundary is where the
+    accumulator is created, not where the posting loop begins: `()` means the
+    run got as far as batching and completed no batch (the oversized-message
+    cap raises during batching, and a blown deadline can raise before the
+    first POST), `None` means it failed earlier still -- config, hook payload,
+    or transcript scan -- so the field does not apply to this run at all.
     """
     recorded = getattr(args, "post_durations_ms", None)
     return None if recorded is None else tuple(recorded)
@@ -479,13 +482,16 @@ def _ingest(args: argparse.Namespace) -> int:
     # The deadline clock starts before the transcript scan: a large full
     # reread eats hook-kill margin too, and "end-to-end" must mean the whole
     # run, not just the posting loop.
-    started = time.monotonic()
-    # Stashed before the hook read, not after: _read_hook_payload blocks on
-    # sys.stdin until the harness closes the pipe, and that wait is not bounded
-    # by --deadline-seconds (the deadline is only checked inside the posting
-    # loop). Stashing later would report duration_ms: null for the failure
-    # class that burns the most wall time -- the opposite of the point.
-    args.ingest_started = started
+    # Set in main before the config read; the fallback keeps a directly
+    # constructed Namespace working. Either way it precedes the hook read,
+    # which blocks on sys.stdin until the harness closes the pipe and is not
+    # bounded by --deadline-seconds (the deadline is only checked inside the
+    # posting loop). A clock started after it would report duration_ms: null
+    # for the failure class that burns the most wall time.
+    started = getattr(args, "ingest_started", None)
+    if started is None:
+        started = time.monotonic()
+        args.ingest_started = started
     payload = _read_hook_payload(args.hook_input)
     transcript_path = payload.transcript_path
     source_session_id = payload.session_id
@@ -930,12 +936,19 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = parser.parse_args(raw_argv)
     except SystemExit as exc:
-        if _argv_status_path(raw_argv) is not None:
+        status_path = _argv_status_path(raw_argv)
+        if status_path is not None:
+            # Route a prime parse failure to prime's sibling file. Prime keeps
+            # a separate record precisely so an overlapping Stop-hook ingest
+            # and prime cannot erase each other's evidence; writing a parse
+            # error to the raw path would destroy an ingest record with a
+            # row labelled "ingest" that ingest never wrote.
+            is_prime = bool(raw_argv) and raw_argv[0] == "prime"
             _try_write_status(
-                _argv_status_path(raw_argv),
+                _prime_status_path(status_path) if is_prime else status_path,
                 RecorderStatus(
                     ok=False,
-                    operation="ingest",
+                    operation="prime" if is_prime else "ingest",
                     source_session_id=None,
                     transcript_path=None,
                     error="argument parsing failed",
@@ -945,6 +958,12 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.command == "ingest":
+            # Clock starts before the config read, not inside _ingest:
+            # _load_config reads a file synchronously, and that cost counts
+            # against the same Stop-hook kill as everything after it. Starting
+            # later would both underreport the run and hand the posting loop a
+            # full deadline the hook can no longer afford.
+            args.ingest_started = time.monotonic()
             _apply_ingest_config(args)
             return _ingest(args)
         if args.command == "prime":
