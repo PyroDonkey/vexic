@@ -25,15 +25,21 @@ class RecorderStatus:
     # durations and outcomes (ADR 0025 D4 follow-up).
     phase: str | None = None
     legs: dict[str, dict[str, object]] | None = None
-    # Wall time of the whole run. Prime has always carried it; ingest sets it
-    # too, on both the success and the failure path, alongside one
-    # post_durations_ms entry per posted batch. Each entry spans that batch's
-    # whole call including any in-call retries, and a batch that raises is
-    # timed too -- the POST that spends the budget is the one worth measuring.
-    # Ingest latency was otherwise invisible from the client, so diagnosing a
-    # timing-out Stop hook meant inferring cost from server-side request logs.
+    # Monotonic elapsed time for the whole run. Prime has always carried it;
+    # ingest sets it too, on both the success and the failure paths, alongside
+    # one post_durations_ms entry per posted batch. Each entry spans that
+    # batch's whole call including any in-call retries, and a batch that raises
+    # is timed too -- the POST that spends the budget is the one worth
+    # measuring. Ingest latency was otherwise invisible from the client, so
+    # diagnosing a timing-out Stop hook meant inferring cost from server-side
+    # request logs.
+    #
+    # A tuple, not a list: the dataclass is frozen, and a mutable field would
+    # make every successful ingest status unhashable. asdict/json render it as
+    # an array either way. Empty means "ingest ran and posted nothing"; None
+    # means "not applicable" (prime, setup, or a failure before posting began).
     duration_ms: int | None = None
-    post_durations_ms: list[int] | None = None
+    post_durations_ms: tuple[int, ...] | None = None
     # Write attribution. The file stays last-writer-wins by design (status has
     # no principled ordering key across overlapping runs); these fields exist
     # so a human or tooling can tell which run wrote it. Stamped by

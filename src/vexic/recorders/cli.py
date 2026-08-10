@@ -217,10 +217,21 @@ def _warn_hook_kill_margin(
 
 
 def _elapsed_ms_since(started: float | None) -> int | None:
-    """Wall time since an `_ingest` run started, for the failure-path status."""
+    """Monotonic ms since an `_ingest` run started, for the failure-path status."""
     if started is None:
         return None
     return int((time.monotonic() - started) * 1000)
+
+
+def _posted_durations(args: argparse.Namespace) -> tuple[int, ...] | None:
+    """Per-batch durations recorded so far, or None when posting never began.
+
+    Empty and None are distinct on purpose: `()` means ingest reached the
+    posting loop and completed no batch, `None` means the field does not apply
+    to this run at all.
+    """
+    recorded = getattr(args, "post_durations_ms", None)
+    return None if recorded is None else tuple(recorded)
 
 
 def _prime_status_path(path: Path | None) -> Path | None:
@@ -469,14 +480,17 @@ def _ingest(args: argparse.Namespace) -> int:
     # reread eats hook-kill margin too, and "end-to-end" must mean the whole
     # run, not just the posting loop.
     started = time.monotonic()
+    # Stashed before the hook read, not after: _read_hook_payload blocks on
+    # sys.stdin until the harness closes the pipe, and that wait is not bounded
+    # by --deadline-seconds (the deadline is only checked inside the posting
+    # loop). Stashing later would report duration_ms: null for the failure
+    # class that burns the most wall time -- the opposite of the point.
+    args.ingest_started = started
     payload = _read_hook_payload(args.hook_input)
     transcript_path = payload.transcript_path
     source_session_id = payload.session_id
     args.transcript_path = transcript_path
     args.source_session_id = source_session_id
-    # Stashed like the fields above so a degraded run still reports how long
-    # it ran before failing, not just which POSTs completed.
-    args.ingest_started = started
 
     transcript = Path(transcript_path)
     cursor_dir = _cursor_dir(args)
@@ -553,7 +567,7 @@ def _ingest(args: argparse.Namespace) -> int:
         rejected=rejected,
         ignored=ignored,
         duration_ms=int((time.monotonic() - started) * 1000),
-        post_durations_ms=post_durations_ms,
+        post_durations_ms=tuple(post_durations_ms),
     )
     error = _try_write_status(args.status_path, status)
     if error is not None:
@@ -966,7 +980,7 @@ def main(argv: list[str] | None = None) -> int:
                 source_session_id=getattr(args, "source_session_id", None),
                 transcript_path=getattr(args, "transcript_path", None),
                 error=str(exc),
-                post_durations_ms=getattr(args, "post_durations_ms", None) or None,
+                post_durations_ms=_posted_durations(args),
                 duration_ms=_elapsed_ms_since(getattr(args, "ingest_started", None)),
             ),
         )
@@ -983,7 +997,7 @@ def main(argv: list[str] | None = None) -> int:
                 error="argument parsing failed"
                 if isinstance(exc, MissingIngestOption)
                 else str(exc),
-                post_durations_ms=getattr(args, "post_durations_ms", None) or None,
+                post_durations_ms=_posted_durations(args),
                 duration_ms=_elapsed_ms_since(getattr(args, "ingest_started", None)),
             ),
         )

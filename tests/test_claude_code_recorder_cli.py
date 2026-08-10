@@ -1924,11 +1924,14 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
             self.assertEqual([len(batch) for batch in calls], [100, 1])
 
     def test_timeout_flag_rejects_non_positive_and_non_finite_values(self) -> None:
-        # --timeout-seconds bounds the un-preempted socket-read overshoot that
-        # _warn_hook_kill_margin reserves margin for. A non-finite value reaches
-        # urlopen(timeout=inf) and removes that bound entirely, so the read can
-        # run past the hook kill with no status write and no controlled exit.
-        # Both subcommands take the same guard --deadline-seconds already has.
+        # Parse-time hygiene and parity with --deadline-seconds, which already
+        # validates. Deliberately NOT claimed: that this bounds the socket-read
+        # overshoot. It does not. On ingest, post_source_messages already caps
+        # each attempt at min(timeout, remaining_budget), so inf never reaches
+        # urlopen as inf; on prime nothing caps it, but 1e9 is finite, passes
+        # this guard, and behaves identically to inf. What the guard buys is a
+        # clear argparse message instead of nan surfacing later as an opaque
+        # socket.settimeout "Invalid value NaN".
         # Assert on the validator's own message: both subcommands exit 2 for
         # unrelated reasons (missing --config), so a bare exit-code check would
         # pass vacuously.
@@ -3308,6 +3311,11 @@ class ClaudeCodeRecorderIngestCommandMoreTests(unittest.TestCase):
             status = json.loads(status_path.read_text(encoding="utf-8"))
             self.assertFalse(status["ok"])
             self.assertEqual(status["error"], "something else broke")
+            # The exit-2 handler carries the same timings as the fail-open one:
+            # a run that died on a non-transport fault still burned wall time,
+            # and a POST that raised is still a measurement.
+            self.assertIsInstance(status["duration_ms"], int)
+            self.assertEqual(len(status["post_durations_ms"]), 1)
 
     def test_ingest_status_write_failure_returns_two_without_traceback(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
