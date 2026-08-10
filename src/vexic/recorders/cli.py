@@ -216,6 +216,13 @@ def _warn_hook_kill_margin(
         )
 
 
+def _elapsed_ms_since(started: float | None) -> int | None:
+    """Wall time since an `_ingest` run started, for the failure-path status."""
+    if started is None:
+        return None
+    return int((time.monotonic() - started) * 1000)
+
+
 def _prime_status_path(path: Path | None) -> Path | None:
     # Prime records land in a sibling file, never the ingest status file: an
     # async Stop ingest overwriting a killed prime's stale "started" marker
@@ -467,6 +474,9 @@ def _ingest(args: argparse.Namespace) -> int:
     source_session_id = payload.session_id
     args.transcript_path = transcript_path
     args.source_session_id = source_session_id
+    # Stashed like the fields above so a degraded run still reports how long
+    # it ran before failing, not just which POSTs completed.
+    args.ingest_started = started
 
     transcript = Path(transcript_path)
     cursor_dir = _cursor_dir(args)
@@ -511,14 +521,19 @@ def _ingest(args: argparse.Namespace) -> int:
                 f"hosted ingest deadline of {args.deadline_seconds:g}s "
                 f"exceeded: {index}/{len(batches)} batches posted"
             )
+        # Timed in a finally: the POST that spends the budget and then raises
+        # is the most valuable entry in the file, and appending only after a
+        # successful return would drop exactly that one.
         post_started = time.monotonic()
-        result = post_source_messages(
-            config,
-            messages=batch,
-            forbidden_values=tuple(args.forbidden_value),
-            budget_seconds=remaining,
-        )
-        post_durations_ms.append(int((time.monotonic() - post_started) * 1000))
+        try:
+            result = post_source_messages(
+                config,
+                messages=batch,
+                forbidden_values=tuple(args.forbidden_value),
+                budget_seconds=remaining,
+            )
+        finally:
+            post_durations_ms.append(int((time.monotonic() - post_started) * 1000))
         items.extend(_validated_ingest_items(result, batch))
     inserted = sum(item.status == "inserted" for item in items)
     skipped = sum(item.status == "skipped" for item in items)
@@ -952,6 +967,7 @@ def main(argv: list[str] | None = None) -> int:
                 transcript_path=getattr(args, "transcript_path", None),
                 error=str(exc),
                 post_durations_ms=getattr(args, "post_durations_ms", None) or None,
+                duration_ms=_elapsed_ms_since(getattr(args, "ingest_started", None)),
             ),
         )
         print(f"warning: {exc}", file=sys.stderr)
@@ -968,6 +984,7 @@ def main(argv: list[str] | None = None) -> int:
                 if isinstance(exc, MissingIngestOption)
                 else str(exc),
                 post_durations_ms=getattr(args, "post_durations_ms", None) or None,
+                duration_ms=_elapsed_ms_since(getattr(args, "ingest_started", None)),
             ),
         )
         print(f"error: {exc}", file=sys.stderr)

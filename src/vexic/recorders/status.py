@@ -26,9 +26,12 @@ class RecorderStatus:
     phase: str | None = None
     legs: dict[str, dict[str, object]] | None = None
     # Wall time of the whole run. Prime has always carried it; ingest sets it
-    # too, alongside one post_durations_ms entry per POST. Ingest latency was
-    # otherwise invisible from the client, so diagnosing a timing-out Stop hook
-    # meant inferring per-POST cost from server-side logs.
+    # too, on both the success and the failure path, alongside one
+    # post_durations_ms entry per posted batch. Each entry spans that batch's
+    # whole call including any in-call retries, and a batch that raises is
+    # timed too -- the POST that spends the budget is the one worth measuring.
+    # Ingest latency was otherwise invisible from the client, so diagnosing a
+    # timing-out Stop hook meant inferring cost from server-side request logs.
     duration_ms: int | None = None
     post_durations_ms: list[int] | None = None
     # Write attribution. The file stays last-writer-wins by design (status has

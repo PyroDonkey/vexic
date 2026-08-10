@@ -790,9 +790,12 @@ exits `0` and never affects prime's own output or exit code.
   degraded status, and fails open with exit 1 on expiry; the next run
   re-posts from the start and the hosted source ledger dedups. The ingest
   status records `duration_ms` for the whole run and one
-  `post_durations_ms` entry per POST, on both the success and the fail-open
-  path, so a slow or timing-out Stop hook is diagnosable from the status
-  file without correlating against server-side request logs. An in-flight
+  `post_durations_ms` entry per posted batch, on both the success and the
+  fail-open path; each entry spans that batch's whole call including its
+  in-call retries, and a batch that raises is timed too, so the POST that
+  spent the budget is the one the file reports. A slow or timing-out Stop
+  hook is therefore diagnosable from the status file alone, without
+  correlating against server-side request logs. An in-flight
   response read is not preempted, so a single recv can block up to the
   per-attempt socket timeout past the deadline before the controlled exit
   runs; the default socket timeout (`--timeout-seconds`, 10s) is sized so

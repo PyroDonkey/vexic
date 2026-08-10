@@ -1672,6 +1672,88 @@ class ClaudeCodeRecorderIngestCommandTests(unittest.TestCase):
                 status["duration_ms"], sum(status["post_durations_ms"])
             )
 
+    def test_ingest_status_records_durations_for_a_failing_post(self) -> None:
+        # The POST that spends the retry or socket budget and then raises is
+        # the most valuable timing in the file. Appending only after a
+        # successful return drops exactly that one, and the degraded status
+        # carried no run total at all -- so the telemetry added for timeout
+        # failures went missing on the timeouts.
+        from vexic.recorders.hosted_ingest import HostedIngestTransportError
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            transcript = root / "session.jsonl"
+            rows = [
+                {
+                    "type": "user",
+                    "sessionId": "claude-session",
+                    "uuid": f"uuid-{index}",
+                    "message": {"role": "user", "content": f"remember cedar {index}"},
+                }
+                for index in range(150)
+            ]
+            transcript.write_text(
+                "\n".join(json.dumps(row) for row in rows),
+                encoding="utf-8",
+            )
+            hook_payload = root / "hook.json"
+            hook_payload.write_text(
+                json.dumps(
+                    {
+                        "session_id": "claude-session",
+                        "transcript_path": str(transcript),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            status_path = root / "status.json"
+            calls = []
+            clock = {"now": 0.0}
+
+            def fake_post(config, *, messages, forbidden_values, budget_seconds=None):
+                calls.append(messages)
+                clock["now"] += 7.0
+                if len(calls) == 2:
+                    raise HostedIngestTransportError(
+                        "hosted ingest failed: TimeoutError"
+                    )
+                return _ingest_result(messages)
+
+            with (
+                patch("vexic.recorders.cli.post_source_messages", fake_post),
+                patch(
+                    "vexic.recorders.cli.time.monotonic",
+                    side_effect=lambda: clock["now"],
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                code = recorder_main(
+                    [
+                        "ingest",
+                        "--hook-input",
+                        str(hook_payload),
+                        "--base-url",
+                        "https://api.example.test",
+                        "--api-key",
+                        "vx_secret",
+                        "--project-id",
+                        "project-a",
+                        "--session-id",
+                        "vexic-session",
+                        "--status-path",
+                        str(status_path),
+                    ]
+                )
+
+            self.assertEqual(code, 1)
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertFalse(status["ok"])
+            # Both POSTs are timed: the one that succeeded and the one that
+            # raised after spending 7s.
+            self.assertEqual(status["post_durations_ms"], [7000, 7000])
+            self.assertEqual(status["duration_ms"], 14000)
+
     def test_ingest_batches_hosted_posts_at_one_hundred_messages(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
