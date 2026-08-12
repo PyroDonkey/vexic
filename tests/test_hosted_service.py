@@ -7,6 +7,7 @@ import re
 import sqlite3
 import stat
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -654,6 +655,99 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         ledger_text = repr(audit_events) + repr(usage_events)
         self.assertNotIn(api_key.raw_key, ledger_text)
         self.assertNotIn("cedar", ledger_text)
+
+    async def test_successful_request_records_phase_timings(self) -> None:
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.SEARCH},
+            project_ids={"project-a"},
+        )
+
+        await self.service.search_transcript(
+            api_key.raw_key,
+            SearchTranscriptRequest(
+                scope=_scope(capabilities={MemoryCapability.SEARCH}),
+                query="cedar",
+            ),
+        )
+
+        usage_events = self.catalog.usage_events("tenant-a")
+        self.assertEqual(len(usage_events), 1)
+        event = usage_events[0]
+        for field_name in ("auth_ms", "bind_ms", "delegate_ms", "audit_write_ms", "total_ms"):
+            with self.subTest(field=field_name):
+                value = getattr(event, field_name)
+                self.assertIsNotNone(value, f"{field_name} must be recorded")
+                self.assertGreaterEqual(value, 0)
+        # `total_ms` spans the whole call, so it cannot be shorter than any
+        # phase nested inside it.
+        self.assertGreaterEqual(event.total_ms, event.auth_ms)
+        self.assertGreaterEqual(event.total_ms, event.bind_ms)
+        self.assertGreaterEqual(event.total_ms, event.delegate_ms)
+
+    async def test_delegate_ms_reflects_time_spent_in_the_storage_operation(self) -> None:
+        # Pins the measurement to real elapsed time rather than to a constant:
+        # an instrumentation that reported zero, or that timed the wrong span,
+        # passes the presence check above but fails this one.
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.SEARCH},
+            project_ids={"project-a"},
+        )
+        delay_seconds = 0.05
+        original_local_service = self.service._local_service
+
+        def slow_local_service(tenant):
+            time.sleep(delay_seconds)
+            return original_local_service(tenant)
+
+        with patch.object(self.service, "_local_service", slow_local_service):
+            await self.service.search_transcript(
+                api_key.raw_key,
+                SearchTranscriptRequest(
+                    scope=_scope(capabilities={MemoryCapability.SEARCH}),
+                    query="cedar",
+                ),
+            )
+
+        event = self.catalog.usage_events("tenant-a")[0]
+        self.assertGreaterEqual(event.delegate_ms, int(delay_seconds * 1000))
+        # The delay is inside the delegate, so the phases before it stay fast.
+        self.assertLess(event.auth_ms, int(delay_seconds * 1000))
+
+    async def test_failed_request_records_phase_timings(self) -> None:
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.SEARCH},
+            project_ids={"project-a"},
+        )
+
+        with self.assertRaises(PermissionError):
+            await self.service.search_transcript(
+                api_key.raw_key,
+                SearchTranscriptRequest(
+                    scope=_scope(tenant_id="tenant-b", capabilities={MemoryCapability.SEARCH}),
+                    query="cedar",
+                ),
+            )
+
+        # Binding failed before `bound` existed, so the event is attributed
+        # from the authenticated key's tenant rather than from the request.
+        usage_events = self.catalog.usage_events("tenant-a")
+        self.assertEqual(len(usage_events), 1)
+        event = usage_events[0]
+        self.assertEqual(event.status, "error")
+        # Auth succeeded and binding raised, so both are measurable while the
+        # delegate never ran.
+        self.assertIsNotNone(event.auth_ms)
+        self.assertIsNotNone(event.total_ms)
+        self.assertIsNone(event.delegate_ms)
 
     async def test_reloaded_catalog_reads_sanitized_request_ledgers_from_control_plane(
         self,

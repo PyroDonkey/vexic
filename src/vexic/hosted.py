@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -421,6 +421,52 @@ class HostedUsageEvent:
     error_type: str | None = None
     project_id: str | None = None
     key_id: str | None = None
+    # Per-request phase timings. `None` means the phase did not run (a request
+    # that fails during binding never reaches the delegate) or that the caller
+    # recorded no timing at all. `delegate_ms` bundles storage-target
+    # resolution, the memoized schema check, and the storage operation itself:
+    # those run inside the delegate, and splitting them further needs a
+    # context-local accumulator that survives an offload to a worker thread.
+    # `audit_write_ms` covers the audit write only -- the usage write cannot
+    # time itself, since this event is its payload.
+    auth_ms: int | None = None
+    bind_ms: int | None = None
+    delegate_ms: int | None = None
+    audit_write_ms: int | None = None
+    total_ms: int | None = None
+
+
+def _elapsed_ms(started: float) -> int:
+    return int((time.monotonic() - started) * 1000)
+
+
+class _RequestTimings:
+    """Mutable phase accumulator for one hosted request.
+
+    Deliberately not a frozen dataclass: phases are filled in as the request
+    proceeds, and a phase that never runs stays ``None`` so the recorded event
+    distinguishes "took no time" from "did not happen".
+    """
+
+    __slots__ = ("auth_ms", "bind_ms", "delegate_ms", "audit_write_ms", "total_ms")
+
+    def __init__(self) -> None:
+        self.auth_ms: int | None = None
+        self.bind_ms: int | None = None
+        self.delegate_ms: int | None = None
+        self.audit_write_ms: int | None = None
+        self.total_ms: int | None = None
+
+    @contextlib.contextmanager
+    def phase(self, name: str) -> Iterator[None]:
+        # Records on the way out even when the phase raises: a failed bind
+        # still consumed the wall time it consumed, and dropping it would hide
+        # exactly the slow-failure case worth seeing.
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            setattr(self, name, _elapsed_ms(started))
 
 
 @dataclass(frozen=True)
@@ -1357,30 +1403,44 @@ class HostedMemoryService:
     ) -> object:
         auth: HostedAuthContext | None = None
         bound: _RequestT | None = None
+        # Every hosted request does blocking work in several distinct places
+        # -- an auth read of the control plane, a tenant read, then the
+        # storage operation -- and without splitting them apart a latency
+        # claim about this service is unfalsifiable.
+        timings = _RequestTimings()
+        started = time.monotonic()
         try:
-            auth = self.api_keys.authenticate(api_key)
-            bound, tenant = self._bind_request(auth, request, capability)
+            with timings.phase("auth_ms"):
+                auth = self.api_keys.authenticate(api_key)
+            with timings.phase("bind_ms"):
+                bound, tenant = self._bind_request(auth, request, capability)
             self.rate_limiter.check(operation, auth)
-            result = await delegate(bound, tenant)
+            with timings.phase("delegate_ms"):
+                result = await delegate(bound, tenant)
         except HostedRateLimitExceeded as exc:
+            timings.total_ms = _elapsed_ms(started)
             self._record_request_failure_best_effort(
                 operation,
                 bound,
                 status="rate_limited",
                 error_type=type(exc).__name__,
                 auth=auth,
+                timings=timings,
             )
             raise
         except Exception as exc:
+            timings.total_ms = _elapsed_ms(started)
             self._record_request_failure_best_effort(
                 operation,
                 bound,
                 status="error",
                 error_type=type(exc).__name__,
                 auth=auth,
+                timings=timings,
             )
             raise
-        self._record_request(operation, bound, status="ok", auth=auth)
+        timings.total_ms = _elapsed_ms(started)
+        self._record_request(operation, bound, status="ok", auth=auth, timings=timings)
         return result
 
     def _bind_request(
@@ -1572,9 +1632,11 @@ class HostedMemoryService:
         status: str,
         error_type: str | None = None,
         auth: HostedAuthContext | None = None,
+        timings: _RequestTimings | None = None,
     ) -> None:
         if self.telemetry is None:
             return
+        timings = timings if timings is not None else _RequestTimings()
         if request is not None:
             tenant_id = request.scope.tenant_id
             principal_id = request.scope.principal.principal_id
@@ -1589,16 +1651,17 @@ class HostedMemoryService:
             project_id = None
         key_id = auth.key_id if auth is not None else None
         recorded_at = _now()
-        self.telemetry.record_audit_event(
-            HostedAuditEvent(
-                operation=operation,
-                tenant_id=tenant_id,
-                principal_id=principal_id,
-                status=status,
-                recorded_at=recorded_at,
-                error_type=error_type,
+        with timings.phase("audit_write_ms"):
+            self.telemetry.record_audit_event(
+                HostedAuditEvent(
+                    operation=operation,
+                    tenant_id=tenant_id,
+                    principal_id=principal_id,
+                    status=status,
+                    recorded_at=recorded_at,
+                    error_type=error_type,
+                )
             )
-        )
         self.telemetry.record_usage_event(
             HostedUsageEvent(
                 kind="request",
@@ -1610,6 +1673,11 @@ class HostedMemoryService:
                 error_type=error_type,
                 project_id=project_id,
                 key_id=key_id,
+                auth_ms=timings.auth_ms,
+                bind_ms=timings.bind_ms,
+                delegate_ms=timings.delegate_ms,
+                audit_write_ms=timings.audit_write_ms,
+                total_ms=timings.total_ms,
             )
         )
 
@@ -1621,6 +1689,7 @@ class HostedMemoryService:
         status: str,
         error_type: str | None = None,
         auth: HostedAuthContext | None = None,
+        timings: _RequestTimings | None = None,
     ) -> None:
         """Record a failed request without replacing its primary exception."""
         try:
@@ -1630,6 +1699,7 @@ class HostedMemoryService:
                 status=status,
                 error_type=error_type,
                 auth=auth,
+                timings=timings,
             )
         except Exception as exc:
             logger.warning(
