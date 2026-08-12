@@ -136,8 +136,12 @@ risk).
   `scripts/ablate_light_time_context.py`, `scripts/ablate_extraction_prompts.py`,
   `scripts/oracle_evidence_experiment.py`); all are opt-in behind `--allow-live`,
   most behind a provider-call budget cap as well -- `vexic.longmemeval_rescore`
-  has no cap, so it is the least safe to run by accident. Out of scope. The
-  provider-free offline
+  has no cap, so it is the least safe to run by accident. Out of scope.
+- Do not run `scripts/hosted_ingest_latency_sweep.py`. It makes no provider
+  calls, but it is opt-in behind `--allow-live` because it posts real
+  transcript messages to the deployed hosted service and drives it at
+  several concurrency levels. Out of scope for review.
+  The provider-free offline
   harnesses (`scripts/probe_class3_gaps.py`,
   `scripts/replay_deep_backlog.py`,
   `scripts/simulate_mentioned_at_promotion.py`) make no provider calls, but they
