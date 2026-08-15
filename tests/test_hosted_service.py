@@ -681,16 +681,30 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                 value = getattr(event, field_name)
                 self.assertIsNotNone(value, f"{field_name} must be recorded")
                 self.assertGreaterEqual(value, 0)
-        # `total_ms` spans the whole call, so it cannot be shorter than any
-        # phase nested inside it.
+        # `total_ms` is stamped after the audit write, so it contains every
+        # phase including that write.
         self.assertGreaterEqual(event.total_ms, event.auth_ms)
         self.assertGreaterEqual(event.total_ms, event.bind_ms)
         self.assertGreaterEqual(event.total_ms, event.delegate_ms)
+        self.assertGreaterEqual(event.total_ms, event.audit_write_ms)
 
-    async def test_delegate_ms_reflects_time_spent_in_the_storage_operation(self) -> None:
-        # Pins the measurement to real elapsed time rather than to a constant:
-        # an instrumentation that reported zero, or that timed the wrong span,
-        # passes the presence check above but fails this one.
+    # A delay long enough to clear the millisecond truncation in `_elapsed_ms`
+    # by a wide margin. Without an injected delay every in-process phase
+    # rounds to 0, and assertions like `total_ms >= auth_ms` reduce to
+    # `0 >= 0` -- vacuously true, and blind to a phase that measures nothing
+    # or measures the wrong span.
+    _PHASE_DELAY_SECONDS = 0.06
+    _PHASE_DELAY_MS = 50
+    _PHASE_FAST_MS = 40
+
+    async def _search_with_slow(self, attr_owner: object, attr_name: str) -> tuple:
+        """Run one search with `attr_name` on `attr_owner` artificially slowed.
+
+        Returns the recorded usage event and the wall time actually spent in
+        the call, so tests can bound the reported timings from ABOVE as well as
+        below. Without a ceiling, a hardcoded `total_ms` satisfies every
+        lower-bound assertion.
+        """
         self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
         api_key = self.keys.create_key(
             tenant_id="tenant-a",
@@ -698,14 +712,14 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             capabilities={MemoryCapability.SEARCH},
             project_ids={"project-a"},
         )
-        delay_seconds = 0.05
-        original_local_service = self.service._local_service
+        original = getattr(attr_owner, attr_name)
 
-        def slow_local_service(tenant):
-            time.sleep(delay_seconds)
-            return original_local_service(tenant)
+        def slowed(*args, **kwargs):
+            time.sleep(self._PHASE_DELAY_SECONDS)
+            return original(*args, **kwargs)
 
-        with patch.object(self.service, "_local_service", slow_local_service):
+        with patch.object(attr_owner, attr_name, slowed):
+            call_started = time.monotonic()
             await self.service.search_transcript(
                 api_key.raw_key,
                 SearchTranscriptRequest(
@@ -713,11 +727,116 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                     query="cedar",
                 ),
             )
+            wall_ms = int((time.monotonic() - call_started) * 1000)
+        return self.catalog.usage_events("tenant-a")[0], wall_ms
 
+    async def test_each_phase_measures_only_its_own_span(self) -> None:
+        # One delay at a time, asserting a lower bound on the phase that should
+        # have absorbed it AND an upper bound on every other phase. The upper
+        # bounds are what kill an over-wide span: an instrumentation timing
+        # `delegate_ms` from the start of `_call` still passes a lower-bound
+        # check, but fails here as soon as the delay sits in `auth`.
+        # `setUp()` below rebuilds `self.service`, so the owner has to be
+        # resolved after the reset -- capturing it up front patches a service
+        # the request no longer goes through.
+        cases = (
+            ("auth_ms", lambda test: test.service.api_keys, "authenticate"),
+            ("bind_ms", lambda test: test.service, "_bind_request"),
+            ("delegate_ms", lambda test: test.service, "_local_service"),
+        )
+        for expected_field, resolve_owner, attr in cases:
+            with self.subTest(phase=expected_field):
+                self.setUp()
+                event, wall_ms = await self._search_with_slow(resolve_owner(self), attr)
+                self.assertGreaterEqual(
+                    getattr(event, expected_field),
+                    self._PHASE_DELAY_MS,
+                    f"{expected_field} did not absorb a delay injected into {attr}",
+                )
+                for other in ("auth_ms", "bind_ms", "delegate_ms"):
+                    if other == expected_field:
+                        continue
+                    self.assertLess(
+                        getattr(event, other),
+                        self._PHASE_FAST_MS,
+                        f"{other} absorbed a delay that belongs to {expected_field}",
+                    )
+                self.assertGreaterEqual(event.total_ms, getattr(event, expected_field))
+                # Ceiling: `_call` cannot have taken longer than the whole
+                # awaited call it sits inside.
+                self.assertLessEqual(event.total_ms, wall_ms)
+
+    async def test_total_ms_contains_the_audit_write(self) -> None:
+        # Regression: `total_ms` used to be stamped BEFORE `_record_request`,
+        # while `audit_write_ms` is measured inside it. That made `total_ms`
+        # smaller than a phase it claims to contain, and hid two control-plane
+        # writes the caller waits for.
+        event, wall_ms = await self._search_with_slow(
+            self.service.telemetry, "record_audit_event"
+        )
+        self.assertGreaterEqual(event.audit_write_ms, self._PHASE_DELAY_MS)
+        self.assertGreaterEqual(event.total_ms, event.audit_write_ms)
+        self.assertLessEqual(event.total_ms, wall_ms)
+
+    def test_usage_event_timings_round_trip_to_their_own_columns(self) -> None:
+        # Distinct values per field: `usage_events()` builds the dataclass
+        # positionally from the SELECT, so any column-order drift between the
+        # INSERT, the SELECT and the field order silently swaps two timings.
+        # Equal placeholder values would not notice.
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        self.catalog.record_usage_event(
+            HostedUsageEvent(
+                kind="request",
+                operation="search_transcript",
+                tenant_id="tenant-a",
+                principal_id="agent-a",
+                status="ok",
+                recorded_at="2026-01-01T00:00:00+00:00",
+                auth_ms=11,
+                bind_ms=22,
+                delegate_ms=33,
+                audit_write_ms=44,
+                total_ms=55,
+            )
+        )
         event = self.catalog.usage_events("tenant-a")[0]
-        self.assertGreaterEqual(event.delegate_ms, int(delay_seconds * 1000))
-        # The delay is inside the delegate, so the phases before it stay fast.
-        self.assertLess(event.auth_ms, int(delay_seconds * 1000))
+        self.assertEqual(
+            (
+                event.auth_ms,
+                event.bind_ms,
+                event.delegate_ms,
+                event.audit_write_ms,
+                event.total_ms,
+            ),
+            (11, 22, 33, 44, 55),
+        )
+
+    async def test_failure_telemetry_never_replaces_the_primary_exception(self) -> None:
+        # The timing context manager wraps the audit write on the failure path
+        # too. If it let an exception from that write escape, a PermissionError
+        # would surface as something else entirely.
+        self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
+        api_key = self.keys.create_key(
+            tenant_id="tenant-a",
+            principal_id="agent-a",
+            capabilities={MemoryCapability.SEARCH},
+            project_ids={"project-a"},
+        )
+        with patch.object(
+            self.service.telemetry,
+            "record_audit_event",
+            side_effect=RuntimeError("audit sink unavailable"),
+        ):
+            with self.assertRaises(PermissionError):
+                await self.service.search_transcript(
+                    api_key.raw_key,
+                    SearchTranscriptRequest(
+                        scope=_scope(
+                            tenant_id="tenant-b", capabilities={MemoryCapability.SEARCH}
+                        ),
+                        query="cedar",
+                    ),
+                )
 
     async def test_failed_request_records_phase_timings(self) -> None:
         self.catalog.provision_tenant("tenant-a", project_ids={"project-a"})
@@ -744,8 +863,10 @@ class HostedMemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         event = usage_events[0]
         self.assertEqual(event.status, "error")
         # Auth succeeded and binding raised, so both are measurable while the
-        # delegate never ran.
+        # delegate never ran. `bind_ms` is recorded despite the failure: the
+        # time was really spent, and dropping it would hide a slow failure.
         self.assertIsNotNone(event.auth_ms)
+        self.assertIsNotNone(event.bind_ms)
         self.assertIsNotNone(event.total_ms)
         self.assertIsNone(event.delegate_ms)
 

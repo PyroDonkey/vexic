@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Awaitable, Callable, NamedTuple, Protocol, TypeVar
+from typing import Any, Awaitable, Callable, Literal, NamedTuple, Protocol, TypeVar
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 from vexic.error_reporting import validation_error_message
@@ -421,14 +421,35 @@ class HostedUsageEvent:
     error_type: str | None = None
     project_id: str | None = None
     key_id: str | None = None
-    # Per-request phase timings. `None` means the phase did not run (a request
-    # that fails during binding never reaches the delegate) or that the caller
-    # recorded no timing at all. `delegate_ms` bundles storage-target
-    # resolution, the memoized schema check, and the storage operation itself:
-    # those run inside the delegate, and splitting them further needs a
-    # context-local accumulator that survives an offload to a worker thread.
-    # `audit_write_ms` covers the audit write only -- the usage write cannot
-    # time itself, since this event is its payload.
+    # Per-request phase timings, all measured inside `HostedMemoryService._call`.
+    # `None` means the phase did not run (a request that fails during binding
+    # never reaches the delegate) or that the caller recorded no timing at all
+    # (a preflight failure never enters `_call`).
+    #
+    # Read these with their boundaries in mind, because each is narrower than
+    # its name suggests:
+    #
+    # `auth_ms` times `api_keys.authenticate`, which is NOT always a control
+    # plane read. Over HTTP, `_handle_hosted_write` authenticates during
+    # preflight and the request-scoped memo makes `_call`'s call a cache hit,
+    # so this reads ~0 there; it is a real read only for in-process callers
+    # that reach `_call` first.
+    #
+    # `delegate_ms` bundles storage-target resolution, the memoized schema
+    # check, and the storage operation itself: those run inside the delegate,
+    # and splitting them further needs a context-local accumulator that
+    # survives an offload to a worker thread. It is wall time across an
+    # `await`, so once any hosted operation is offloaded it will also include
+    # time the event loop spent elsewhere.
+    #
+    # `total_ms` is stamped after the audit write, so it covers everything the
+    # caller waits for except the usage write -- which cannot time itself,
+    # because this event is its payload. It deliberately excludes the HTTP
+    # preflight (auth, scope binding, body validation, payload caps) that runs
+    # before `_call`, so it is not an end-to-end request duration.
+    #
+    # The phases do not sum to `total_ms`: the rate-limiter check between
+    # `bind_ms` and `delegate_ms` is unattributed, as is accumulator overhead.
     auth_ms: int | None = None
     bind_ms: int | None = None
     delegate_ms: int | None = None
@@ -440,17 +461,32 @@ def _elapsed_ms(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
 
 
+_PhaseName = Literal["auth_ms", "bind_ms", "delegate_ms", "audit_write_ms"]
+
+
 class _RequestTimings:
     """Mutable phase accumulator for one hosted request.
 
     Deliberately not a frozen dataclass: phases are filled in as the request
     proceeds, and a phase that never runs stays ``None`` so the recorded event
     distinguishes "took no time" from "did not happen".
+
+    Construct with ``started`` to enable ``total_ms``. A caller that never
+    entered ``_call`` (an HTTP preflight failure) constructs without it, and
+    every field stays ``None`` rather than reporting a fabricated zero.
     """
 
-    __slots__ = ("auth_ms", "bind_ms", "delegate_ms", "audit_write_ms", "total_ms")
+    __slots__ = (
+        "auth_ms",
+        "bind_ms",
+        "delegate_ms",
+        "audit_write_ms",
+        "total_ms",
+        "_started",
+    )
 
-    def __init__(self) -> None:
+    def __init__(self, *, started: float | None = None) -> None:
+        self._started = started
         self.auth_ms: int | None = None
         self.bind_ms: int | None = None
         self.delegate_ms: int | None = None
@@ -458,15 +494,22 @@ class _RequestTimings:
         self.total_ms: int | None = None
 
     @contextlib.contextmanager
-    def phase(self, name: str) -> Iterator[None]:
+    def phase(self, name: _PhaseName) -> Iterator[None]:
         # Records on the way out even when the phase raises: a failed bind
         # still consumed the wall time it consumed, and dropping it would hide
-        # exactly the slow-failure case worth seeing.
+        # exactly the slow-failure case worth seeing. `name` is a Literal and
+        # every member is a declared slot, so the `finally` cannot raise
+        # AttributeError over an in-flight exception.
         started = time.monotonic()
         try:
             yield
         finally:
             setattr(self, name, _elapsed_ms(started))
+
+    def stamp_total(self) -> None:
+        """Close out `total_ms`. No-op when this request never entered `_call`."""
+        if self._started is not None:
+            self.total_ms = _elapsed_ms(self._started)
 
 
 @dataclass(frozen=True)
@@ -1407,8 +1450,7 @@ class HostedMemoryService:
         # -- an auth read of the control plane, a tenant read, then the
         # storage operation -- and without splitting them apart a latency
         # claim about this service is unfalsifiable.
-        timings = _RequestTimings()
-        started = time.monotonic()
+        timings = _RequestTimings(started=time.monotonic())
         try:
             with timings.phase("auth_ms"):
                 auth = self.api_keys.authenticate(api_key)
@@ -1418,7 +1460,6 @@ class HostedMemoryService:
             with timings.phase("delegate_ms"):
                 result = await delegate(bound, tenant)
         except HostedRateLimitExceeded as exc:
-            timings.total_ms = _elapsed_ms(started)
             self._record_request_failure_best_effort(
                 operation,
                 bound,
@@ -1429,7 +1470,6 @@ class HostedMemoryService:
             )
             raise
         except Exception as exc:
-            timings.total_ms = _elapsed_ms(started)
             self._record_request_failure_best_effort(
                 operation,
                 bound,
@@ -1439,7 +1479,6 @@ class HostedMemoryService:
                 timings=timings,
             )
             raise
-        timings.total_ms = _elapsed_ms(started)
         self._record_request(operation, bound, status="ok", auth=auth, timings=timings)
         return result
 
@@ -1662,6 +1701,11 @@ class HostedMemoryService:
                     error_type=error_type,
                 )
             )
+        # After the audit write, not before it: the caller waits on that write
+        # too, and stamping earlier let `total_ms` come out SMALLER than the
+        # `audit_write_ms` it is supposed to contain. The usage write below
+        # stays outside, because this event is its payload.
+        timings.stamp_total()
         self.telemetry.record_usage_event(
             HostedUsageEvent(
                 kind="request",
