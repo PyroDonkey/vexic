@@ -1253,9 +1253,10 @@ class HostedTenantCatalog:
                 INSERT INTO hosted_usage_events (
                     kind, operation, tenant_id, principal_id, status, recorded_at,
                     model_requests, input_tokens, output_tokens, total_tokens,
-                    estimated_cost_micros, error_type, project_id, key_id
+                    estimated_cost_micros, error_type, project_id, key_id,
+                    auth_ms, bind_ms, delegate_ms, audit_write_ms, total_ms
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.kind,
@@ -1272,6 +1273,11 @@ class HostedTenantCatalog:
                     event.error_type,
                     event.project_id,
                     event.key_id,
+                    event.auth_ms,
+                    event.bind_ms,
+                    event.delegate_ms,
+                    event.audit_write_ms,
+                    event.total_ms,
                 ),
             )
             conn.commit()
@@ -1382,7 +1388,8 @@ class HostedTenantCatalog:
                 f"""
                 SELECT kind, operation, tenant_id, principal_id, status, recorded_at,
                        model_requests, input_tokens, output_tokens, total_tokens,
-                       estimated_cost_micros, error_type, project_id, key_id
+                       estimated_cost_micros, error_type, project_id, key_id,
+                       auth_ms, bind_ms, delegate_ms, audit_write_ms, total_ms
                 FROM hosted_usage_events
                 WHERE {where_clause}
                 ORDER BY id
@@ -1502,6 +1509,18 @@ class HostedTenantCatalog:
                 conn.execute(statement)
             _add_column_if_missing(conn, "hosted_usage_events", "project_id", "TEXT")
             _add_column_if_missing(conn, "hosted_usage_events", "key_id", "TEXT")
+            # Per-request phase timings. Nullable and additive, so an older
+            # control plane keeps reading and writing without them.
+            for _timing_column in (
+                "auth_ms",
+                "bind_ms",
+                "delegate_ms",
+                "audit_write_ms",
+                "total_ms",
+            ):
+                _add_column_if_missing(
+                    conn, "hosted_usage_events", _timing_column, "INTEGER"
+                )
             _add_column_if_missing(conn, "hosted_audit_events", "project_id", "TEXT")
             _add_column_if_missing(conn, "hosted_audit_events", "key_id", "TEXT")
             _add_column_if_missing(conn, "hosted_job_events", "project_id", "TEXT")
